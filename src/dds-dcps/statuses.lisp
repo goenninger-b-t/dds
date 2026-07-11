@@ -55,6 +55,29 @@
   "Maps a DDS communication-status keyword to its StatusKind bit (dds_rtf2_dcps.idl §80-92),
    shared by %notify-status callers and the StatusCondition trigger predicate.")
 
+;;; ---- The DDS state masks (dds_rtf2_dcps.idl §294-320: SampleStateKind / ViewStateKind /
+;;;      InstanceStateKind + the ANY_*_STATE masks). The IDL models each mask as a bitmask over the
+;;;      *_KIND bits; here a mask is the keyword LIST of the kinds it admits — a caller writes
+;;;      '(:not-read) and MEMBER is the mask test. Same expressive power, no bit arithmetic. ----
+
+(defparameter +any-sample-states+ '(:read :not-read)
+  "ANY_SAMPLE_STATE (dds_rtf2_dcps.idl §300 = 0xffff): every SampleStateKind — READ_SAMPLE_STATE +
+   NOT_READ_SAMPLE_STATE (§295-296). The default sample_states mask of read/take + get_datareaders;
+   selects a sample whether or not the application has already accessed it.")
+
+(defparameter +any-view-states+ '(:new :not-new)
+  "ANY_VIEW_STATE (dds_rtf2_dcps.idl §309 = 0xffff): every ViewStateKind — NEW_VIEW_STATE +
+   NOT_NEW_VIEW_STATE (§304-305). The default view_states mask; selects a sample whether or not its
+   INSTANCE has been accessed before (the view state is a property of the instance as seen by the
+   reader, DDS 1.4 §2.2.2.5.1.4).")
+
+(defparameter +any-instance-states+ '(:alive :not-alive-disposed :not-alive-no-writers)
+  "ANY_INSTANCE_STATE (dds_rtf2_dcps.idl §319 = 0xffff): every InstanceStateKind —
+   ALIVE_INSTANCE_STATE + NOT_ALIVE_DISPOSED_INSTANCE_STATE + NOT_ALIVE_NO_WRITERS_INSTANCE_STATE
+   (§313-315). The default instance_states mask; selects a sample whatever the liveness of its instance.
+   NOT_ALIVE_INSTANCE_STATE (§320 = 0x006, the two NOT_ALIVE kinds together) is written here as the
+   two-element list '(:not-alive-disposed :not-alive-no-writers).")
+
 ;;; ---- QosPolicyId_t (dds_rtf2_dcps.idl §363-385; DATA_REPRESENTATION from
 ;;;      xtypes-1_3-discovery-builtin-topic.idl §177) ----
 

@@ -104,9 +104,19 @@ level-based statuses (unread-sample driven, not bitmask-edge driven): `%status-a
 `:data-on-readers` on a Subscriber (any reader with unread data) as it already answered `:data-available`
 on a reader, and a Subscriber's default enabled_statuses is `(:data-on-readers)`.
 
-`Subscriber::get_datareaders subscriber &key sample-states` (default `(:not-read)`) drains each reader
-and returns those holding a matching sample; `notify_datareaders subscriber` fires `on_data_available`
-on each such reader. (The DDS view_state / instance_state filters are v1-deferred; sample_state only.)
+`Subscriber::get_datareaders subscriber &key sample-states view-states instance-states` (defaults
+`(:not-read)` / ANY / ANY) drains each reader and returns those holding a matching sample;
+`notify_datareaders subscriber` fires `on_data_available` on each such reader.
+
+> **The v1 view_state / instance_state deferral recorded here is CLOSED (2026-07-11).** The full DDS
+> three-mask selection (sample_states + view_states + instance_states) is now implemented once, in
+> `%state-mask-match-p`, and carried by `get_datareaders`, `read`/`take` (+ the `_instance` / `_next_*`
+> variants) and Read/QueryConditions alike. Every mask defaults to its `ANY_*_STATE`, so all pre-existing
+> call sites are unchanged. Closing it also fixed a latent SampleInfo bug: `view_state` and
+> `instance_state` are per-INSTANCE properties that DDS 1.4 §2.2.2.5.4 computes when the samples are
+> RETURNED, but `instance_state` was frozen at delivery — so a sample received while its instance was
+> ALIVE still reported ALIVE after the instance was disposed. Both are now snapshot at read time
+> (`%snapshot-view-state` / `%snapshot-instance-state`). Test `dcps-state-masks`.
 
 ## 3. Consequences / limitations (honest gaps)
 

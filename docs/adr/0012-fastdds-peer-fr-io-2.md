@@ -1,6 +1,6 @@
 # ADR 0012 — Fast DDS 3.6.1 peer: FR-IO-2 is met; the ADR 0010 deferred TypeLookup leg is closed
 
-- **Status:** Accepted (2026-06-12) — recorded during the owner-authorized autonomous run; pending owner ratification at push review
+- **Status:** Accepted (2026-06-12); **RATIFIED by the owner 2026-07-11**
 - **Deciders:** A0 (integrator), under the owner's standing go-ahead for this feature
 - **Completes:** FR-IO-2 (REQUIREMENTS §8: wire-interoperate with ≥1 of Fast DDS / Cyclone
   DDS / OpenDDS); ADR 0010 decision 1 (the TypeLookup live leg deferred to a Fast DDS peer)

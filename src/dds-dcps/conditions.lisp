@@ -33,8 +33,13 @@
 
 (defclass read-condition (wait-condition)
   ((reader :initarg :reader :reader rc-reader)
-   (states :initarg :states :initform '(:not-read) :reader rc-states))
-  (:documentation "Triggers when its DataReader holds samples matching the sample-state mask."))
+   (states :initarg :states :initform '(:not-read) :reader rc-states)
+   (view-states :initarg :view-states :initform +any-view-states+ :reader rc-view-states)
+   (instance-states :initarg :instance-states :initform +any-instance-states+
+                    :reader rc-instance-states))
+  (:documentation "Triggers when its DataReader holds samples matching ALL THREE DDS state masks
+   (sample_states + view_states + instance_states, DDS 1.4 §2.2.2.5.8). The view/instance masks default
+   to their ANY_*_STATE, so a condition created with only :states behaves exactly as before."))
 
 (defclass query-condition (read-condition)
   ((query-fn :initarg :query-fn :initform #'%where-any :reader qc-query-fn))
@@ -87,10 +92,16 @@
   (setf (%wc-trigger gc) (and value t))
   (%notify-condition gc))
 
-(defun* create-readcondition (reader &key (states '(:not-read)))
-    (function (data-reader &key (:states list)) read-condition)
-  "DataReader::create_readcondition — triggers when samples matching STATES exist."
-  (let ((c (make-instance 'read-condition :reader reader :states states)))
+(defun* create-readcondition (reader &key (states '(:not-read))
+                                          (view-states +any-view-states+)
+                                          (instance-states +any-instance-states+))
+    (function (data-reader &key (:states list) (:view-states list) (:instance-states list))
+              read-condition)
+  "DataReader::create_readcondition (DDS 1.4 §2.2.2.5.8) — triggers when READER holds a sample matching
+   all three state masks: sample_state in STATES, view_state in VIEW-STATES, instance_state in
+   INSTANCE-STATES (the latter two default to ANY_*_STATE = no further restriction)."
+  (let ((c (make-instance 'read-condition :reader reader :states states
+                          :view-states view-states :instance-states instance-states)))
     (push c (dr-conditions reader))
     c))
 
@@ -99,19 +110,25 @@
 (declaim (ftype (function (string list function) function) compile-filter))
 
 (defun* create-querycondition (reader &key (states '(:not-read)) (query #'%where-any)
-                                          expression (parameters '()))
-    (function (data-reader &key (:states list) (:query function) (:expression (or null string)) (:parameters list)) query-condition)
+                                          expression (parameters '())
+                                          (view-states +any-view-states+)
+                                          (instance-states +any-instance-states+))
+    (function (data-reader &key (:states list) (:query function) (:expression (or null string))
+                    (:parameters list) (:view-states list) (:instance-states list))
+              query-condition)
   "DataReader::create_querycondition — a ReadCondition that also filters by a query.
    With :EXPRESSION (a DDS Annex B query_expression) + :PARAMETERS (the DDS
    expression_parameters), the query is compiled against the reader's topic type via
    the SQL-subset grammar (FR-DCPS-5); otherwise :QUERY is a Lisp predicate over the
-   deserialized sample (%where-any selects all). Triggers / selects only samples whose
-   sample-state is in STATES AND that satisfy the query."
+   deserialized sample (%where-any selects all). Triggers / selects only samples matching all THREE
+   state masks (STATES / VIEW-STATES / INSTANCE-STATES, the latter two defaulting to ANY_*_STATE) AND
+   satisfying the query."
   (let* ((qfn (if expression
                   (compile-filter expression parameters
                                   (%field-resolver (topic-type-support (dr-topic reader))))
                   query))
-         (c (make-instance 'query-condition :reader reader :states states :query-fn qfn)))
+         (c (make-instance 'query-condition :reader reader :states states :query-fn qfn
+                           :view-states view-states :instance-states instance-states)))
     (push c (dr-conditions reader))
     c))
 
@@ -163,20 +180,25 @@
    enabled on SC (a list of DDS status keywords)."
   (sc-mask sc))
 
-(defun* %count-matching (dr states)
-    (function (data-reader list) (integer 0))
-  "Drain newly-received samples and count those whose sample-state is in STATES."
-  (%drain dr)
-  (count-if (lambda (cs) (member (sample-info-sample-state (cached-sample-info cs)) states))
-            (dr-cache dr)))
-
-(defun* %count-matching-query (dr states query-fn)
-    (function (data-reader list function) (integer 0))
-  "Drain newly-received samples and count those whose sample-state is in STATES and
-   whose data satisfies QUERY-FN (the query-condition trigger predicate)."
+(defun* %count-matching (dr states &optional (view-states +any-view-states+)
+                                             (instance-states +any-instance-states+))
+    (function (data-reader list &optional list list) (integer 0))
+  "Drain newly-received samples and count those matching the DDS THREE state masks — sample_state in
+   STATES, view_state in VIEW-STATES, instance_state in INSTANCE-STATES (%state-mask-match-p; the mask
+   defaults are ANY, so a two-argument call is the pre-three-mask sample-state-only count)."
   (%drain dr)
   (count-if (lambda (cs)
-              (and (member (sample-info-sample-state (cached-sample-info cs)) states)
+              (%state-mask-match-p dr (cached-sample-info cs) states view-states instance-states))
+            (dr-cache dr)))
+
+(defun* %count-matching-query (dr states query-fn &optional (view-states +any-view-states+)
+                                                            (instance-states +any-instance-states+))
+    (function (data-reader list function &optional list list) (integer 0))
+  "Drain newly-received samples and count those matching the DDS three state masks (as %count-matching)
+   AND whose data satisfies QUERY-FN (the query-condition trigger predicate)."
+  (%drain dr)
+  (count-if (lambda (cs)
+              (and (%state-mask-match-p dr (cached-sample-info cs) states view-states instance-states)
                    (funcall query-fn (cached-sample-data cs))))
             (dr-cache dr)))
 
@@ -184,9 +206,11 @@
   (:documentation "DDS Condition::get_trigger_value — the current trigger state."))
 (defmethod condition-trigger-value ((c guard-condition)) (%wc-trigger c))
 (defmethod condition-trigger-value ((c read-condition))
-  (plusp (%count-matching (rc-reader c) (rc-states c))))
+  (plusp (%count-matching (rc-reader c) (rc-states c)
+                          (rc-view-states c) (rc-instance-states c))))
 (defmethod condition-trigger-value ((c query-condition))
-  (plusp (%count-matching-query (rc-reader c) (rc-states c) (qc-query-fn c))))
+  (plusp (%count-matching-query (rc-reader c) (rc-states c) (qc-query-fn c)
+                                (rc-view-states c) (rc-instance-states c))))
 (defun* %status-active-p (entity kind)
     (function (entity keyword) t)
   "Whether the communication status KIND is currently active on ENTITY (the trigger predicate
@@ -256,12 +280,16 @@
 
 (defun* read-w-condition (dr condition)
     (function (data-reader read-condition) list)
-  "DataReader::read_w_condition — non-destructively read the cached samples selected by
-   CONDITION (its sample-state mask, plus a QueryCondition's query predicate)."
-  (read-samples dr :states (rc-states condition) :where (%condition-predicate condition)))
+  "DataReader::read_w_condition — non-destructively read the cached samples selected by CONDITION: its
+   THREE state masks (sample/view/instance) plus a QueryCondition's query predicate."
+  (read-samples dr :states (rc-states condition) :where (%condition-predicate condition)
+                   :view-states (rc-view-states condition)
+                   :instance-states (rc-instance-states condition)))
 
 (defun* take-w-condition (dr condition)
     (function (data-reader read-condition) list)
-  "DataReader::take_w_condition — take (remove) the cached samples selected by CONDITION
-   (its sample-state mask, plus a QueryCondition's query predicate)."
-  (take-samples dr :states (rc-states condition) :where (%condition-predicate condition)))
+  "DataReader::take_w_condition — take (remove) the cached samples selected by CONDITION: its THREE
+   state masks (sample/view/instance) plus a QueryCondition's query predicate."
+  (take-samples dr :states (rc-states condition) :where (%condition-predicate condition)
+                   :view-states (rc-view-states condition)
+                   :instance-states (rc-instance-states condition)))

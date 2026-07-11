@@ -55,6 +55,9 @@
            #:get-default-participant-qos #:set-default-participant-qos
            #:sample-info #:make-sample-info
            #:sample-info-sample-state #:sample-info-view-state #:sample-info-instance-state
+           ;; the DDS state masks (dds_rtf2_dcps.idl §294-320): ANY_SAMPLE/VIEW/INSTANCE_STATE
+           #:+any-sample-states+ #:+any-view-states+ #:+any-instance-states+
+           #:rc-view-states #:rc-instance-states
            #:sample-info-source-timestamp #:sample-info-instance-handle
            #:sample-info-publication-handle #:sample-info-valid-data
            #:sample-info-disposed-generation-count #:sample-info-no-writers-generation-count

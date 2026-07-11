@@ -159,8 +159,8 @@ source docstrings (`src/dds-dcps/*.lisp`); the docstrings are the contract.
 | `dds.dcps:register-instance` (`dw sample`) | `DataWriter::register_instance` (DDS 1.4 §2.2.2.4.2.5) — register `sample`'s instance and return its 16-octet handle (the type-support key-hash; `HANDLE_NIL` for an unkeyed type). Writer-local; no wire message. |
 | `dds.dcps:dispose-instance` (`dw sample-or-handle`) | `DataWriter::dispose` (DDS 1.4 §2.2.2.4.2.10) — dispose the instance (a sample or a registered handle); emits a no-payload dispose `DATA` (StatusInfo Disposed, RTPS 2.5 §9.6.4.9) over the reliable engine. Returns the handle. |
 | `dds.dcps:unregister-instance` (`dw sample-or-handle`) | `DataWriter::unregister_instance` (DDS 1.4 §2.2.2.4.2.7) — unregister the instance over the reliable engine. Per `WRITER_DATA_LIFECYCLE.autodispose_unregistered_instances` (§2.2.3.21, default **TRUE**) the unregister also **disposes** the instance: the no-payload `DATA` carries StatusInfo `Disposed\|Unregistered` (0x03) so readers report `NOT_ALIVE_DISPOSED`; with autodispose `FALSE` it carries `Unregistered` (0x02) only. Returns the handle. |
-| `dds.dcps:read-samples` (`dr &key states where`) | `DataReader::read` — return the cached samples whose sample-state is in `states` (default `(:read :not-read)` = ANY) and whose data satisfies `where`, **without** removing them; mark each `:read` and set its view-state. Returns a list of `cached-sample`. |
-| `dds.dcps:take-samples` (`dr &key states where`) | `DataReader::take` — like `read-samples` but **removes** the returned samples from the cache. |
+| `dds.dcps:read-samples` (`dr &key states view-states instance-states where`) | `DataReader::read` (DDS 1.4 §2.2.2.5.3.1) — return the cached samples matching the **three DDS state masks** — `states` (sample_state, default `+any-sample-states+`), `view-states` (default `+any-view-states+`), `instance-states` (default `+any-instance-states+`) — and satisfying `where`, **without** removing them; each is marked `:read` and has its `view_state` + `instance_state` stamped from the reader's **current** per-instance state (DDS 1.4 §2.2.2.5.4: the SampleInfo fields are computed when the samples are *returned*, not frozen at delivery — so a sample received while its instance was ALIVE reports NOT_ALIVE_DISPOSED once the instance is disposed). Every mask defaults to its `ANY_*_STATE`, so the default call selects everything. |
+| `dds.dcps:take-samples` (`dr &key states view-states instance-states where`) | `DataReader::take` — like `read-samples` (same three state masks) but **removes** the returned samples from the cache. |
 | `dds.dcps:samples-available` (`dr`) | Drain newly-received samples into the cache and return the cache size, **without** marking anything `:read` — for polling before a read/take. |
 | `dds.dcps:lookup-instance` (`endpoint key-holder`) | `DataWriter/DataReader::lookup_instance` (DDS 1.4 §2.2.2.4.2.13 / §2.2.2.5.2.14, WP-DCPS-API-COMPLETION S5) — the 16-octet handle the middleware associates with the instance keyed by `key-holder`, or `+instance-handle-nil+` when the endpoint knows no such instance (registered/written on a writer, delivered on a reader). |
 | `dds.dcps:get-key-value` (`endpoint handle`) | `DataWriter/DataReader::get_key_value` (§2.2.2.4.2.12 / §2.2.2.5.2.13, S5) — a representative sample carrying the **key fields** of the instance named by `handle`, or `NIL` (BAD_PARAMETER) when unknown. The handle is a one-way keyhash, so the key holder is the sample the writer registered/wrote or the reader's retained per-instance key sample. |
@@ -250,7 +250,7 @@ A **latent reliability/memory bug** was found + fixed in the course of this work
 | `dds.dcps:wait-set` | A set of conditions to wait on (condvar-driven). |
 | `dds.dcps:make-guard-condition` () | Create a `GuardCondition`. |
 | `dds.dcps:set-trigger-value` (`gc value`) | `GuardCondition::set_trigger_value` — set the trigger and wake any waiting WaitSet. |
-| `dds.dcps:create-readcondition` (`reader &key states`) | `DataReader::create_readcondition` — triggers when samples matching `states` (default `(:not-read)`) exist. |
+| `dds.dcps:create-readcondition` (`reader &key states view-states instance-states`) | `DataReader::create_readcondition` (DDS 1.4 §2.2.2.5.8) — triggers when the reader holds a sample matching all **three** state masks (`states` default `(:not-read)`; the view/instance masks default to `ANY`). `read_w_condition` / `take_w_condition` select with the same three masks. |
 | `dds.dcps:create-querycondition` (`reader &key states query expression parameters`) | `DataReader::create_querycondition`. With `:expression` (a DDS Annex B query) + `:parameters`, compiles against the topic type; otherwise `:query` is a Lisp predicate over the deserialized sample. |
 | `dds.dcps:qc-query-fn` (`qc`) | The compiled query predicate of a `query-condition`. |
 | `dds.dcps:make-status-condition` (`entity &key mask`) | A `StatusCondition` for `entity` enabled for the statuses in `mask` (default `(:data-available)`). |
@@ -316,7 +316,7 @@ no listener up the chain is enabled, the bit stays set and no callback fires. Re
 | `dds.dcps:get-listener` (`entity`) | `Entity::get_listener` — the installed listener object (or `nil`), on all six kinds. |
 | `dds.dcps:set-reader-listener` / `set-writer-listener` / `set-topic-listener` (`entity listener mask`) | The endpoint/topic-specific setters (retained; equivalent to `set-listener` on those kinds). |
 | `dds.dcps:on-data-on-readers` (`l subscriber`) | SubscriberListener callback (dds_rtf2_dcps.idl §248) — fires when a Subscriber/Participant listener is enabled for `:data-on-readers`; handling it **suppresses** the readers' `on_data_available` (precedence, DDS 1.4 §2.2.4.1). |
-| `dds.dcps:get-datareaders` (`subscriber &key sample-states`) | `Subscriber::get_datareaders` (§993) — the readers holding a sample whose `sample_state` is in `sample-states` (default `(:not-read)`). |
+| `dds.dcps:get-datareaders` (`subscriber &key sample-states view-states instance-states`) | `Subscriber::get_datareaders` (§993, DDS 1.4 §2.2.2.5.2.7) — the readers holding a sample matching all **three** state masks: `sample_state` in `sample-states` (default `(:not-read)`), `view_state` in `view-states`, `instance_state` in `instance-states` (both default `ANY`). |
 | `dds.dcps:notify-datareaders` (`subscriber`) | `Subscriber::notify_datareaders` (§998) — fire `on_data_available` on each reader with new data (call from `on_data_on_readers`). |
 | `dds.dcps:on-data-available` (`l reader`) | DataReaderListener callback — fires from the receiver thread on new user data (unless a `on_data_on_readers` handled DATA_ON_READERS first). |
 | `dds.dcps:on-subscription-matched` / `on-requested-incompatible-qos` / `on-sample-rejected` / `on-liveliness-changed` (`l reader status`) | DataReaderListener callbacks that fire in v1. `on-liveliness-changed` fires from the announce cadence when a matched remote writer's liveliness goes stale/fresh (RTPS 2.5 §8.4.13). |
@@ -440,6 +440,30 @@ reader takes it. (Adapted from `run-dcps-entity-test`.)
 A keyed type (`color` is the `@key`) groups samples into instances. `read-samples` is
 non-destructive and marks samples `:read`, transitioning the per-instance view-state from
 `:new` to `:not-new`; `take-samples` removes them. (Adapted from `run-dcps-instance-test`.)
+
+**The three state masks.** Every selection operation — `read`/`take` (and the `_instance` /
+`_next_instance` / `_next_sample` variants), `get_datareaders`, and Read/QueryConditions — takes the full
+DDS triple. A mask is a *list of kinds*, not a bitmask; `member` is the test:
+
+| Mask | Kinds | ANY (the default) |
+|---|---|---|
+| `:states` (sample_state) | `:read` `:not-read` | `dds.dcps:+any-sample-states+` |
+| `:view-states` | `:new` `:not-new` | `dds.dcps:+any-view-states+` |
+| `:instance-states` | `:alive` `:not-alive-disposed` `:not-alive-no-writers` | `dds.dcps:+any-instance-states+` |
+
+```lisp
+;; every sample of a live instance that the app has not read yet
+(dds.dcps:read-samples dr :states '(:not-read) :instance-states '(:alive))
+
+;; the readers of this Subscriber that hold a sample of a DISPOSED instance
+(dds.dcps:get-datareaders sub :sample-states dds.dcps:+any-sample-states+
+                              :instance-states '(:not-alive-disposed))
+```
+
+`view_state` and `instance_state` are properties of the **instance**, not of the sample, and DDS 1.4
+§2.2.2.5.4 computes the `SampleInfo` fields when the samples are *returned*. So both are snapshot at
+read time: a sample received while its instance was ALIVE reports `:not-alive-disposed` if it is read
+after the instance was disposed.
 
 ```lisp
 (dds.gen:define-dds-type shape-type (:extensibility :final)

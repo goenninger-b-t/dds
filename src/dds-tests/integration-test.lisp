@@ -3789,6 +3789,96 @@
       (dds.dcps:delete-participant p)))
   t)
 
+(defun* run-dcps-state-masks-test ()
+    (function () t)
+  "The DDS 1.4 THREE-MASK sample selection (§2.2.2.5.3 / §2.2.2.5.2.7 / §2.2.2.5.8): sample_states +
+   view_states + instance_states, closing the v1 sample-state-only deferral (ADR 0053 §2.4). Covers the
+   whole state-mask surface on ONE staged reader — read/take, get_datareaders, and ReadConditions:
+   (a) the ANY masks (the defaults) select everything, so the pre-existing behaviour is unchanged;
+   (b) view_states (:new) selects an instance's samples only until that instance has been accessed —
+       a later sample of the SAME instance is NOT_NEW (the view state is per-INSTANCE, snapshot at read);
+   (c) instance_states (:alive) excludes a DISPOSED instance's samples, and (:not-alive-disposed)
+       selects exactly those;
+   (d) get_datareaders honours the same three masks (it used to filter sample_state only);
+   (e) a ReadCondition carrying view/instance masks triggers only when a matching sample exists."
+  (let* ((ts (dds.types:find-type-support "shape-type"))
+         (fa (dds.types:type-support-field-accessors ts))
+         (p (dds.dcps:create-participant :domain (test-domain))))
+    (flet ((color (cs) (funcall (cdr (assoc "color" fa :test #'string-equal))
+                                (dds.dcps:cached-sample-data cs)))
+           (istate (cs) (dds.dcps:sample-info-instance-state (dds.dcps:cached-sample-info cs)))
+           (vstate (cs) (dds.dcps:sample-info-view-state (dds.dcps:cached-sample-info cs))))
+      (unwind-protect
+           (let* ((tp (dds.dcps:create-topic p "Square" "shape-type" ts))
+                  (sub (dds.dcps:create-subscriber p))
+                  (dr (dds.dcps:create-datareader sub tp
+                        :qos (dds.qos:make-reader-qos :history-kind :keep-all)))
+                  (node (dds.dcps::dp-node p))
+                  (blue (make-shape-type :color "BLUE" :x 1 :y 1 :shapesize 10))
+                  (red (make-shape-type :color "RED" :x 2 :y 2 :shapesize 20))
+                  (hb (funcall (dds.types:type-support-key-hash ts) blue))
+                  (hr (funcall (dds.types:type-support-key-hash ts) red))
+                  (wid #x00000102))
+             ;; BLUE (alive) ; RED (alive) ; RED disposed -> the RED instance goes NOT_ALIVE_DISPOSED.
+             (%stage-data-sn node 1 hb (dds.dcps::%serialize-sample ts blue) wid)
+             (%stage-data-sn node 2 hr (dds.dcps::%serialize-sample ts red) wid)
+             (%stage-lifecycle-sn node 3 :dispose hr wid)
+             ;; (a) the ANY defaults select everything (behaviour unchanged).
+             (let ((all (dds.dcps:read-samples dr)))
+               (%check :sm-any-default (= 3 (length all))
+                       "the default ANY masks select every sample (sample-state-only behaviour preserved)"))
+             ;; (c) instance_states — the disposed RED instance vs the alive BLUE one.
+             (let ((alive (dds.dcps:read-samples dr :instance-states '(:alive)))
+                   (disposed (dds.dcps:read-samples dr :instance-states '(:not-alive-disposed))))
+               (%check :sm-alive
+                       (and (plusp (length alive))
+                            (every (lambda (cs) (eq :alive (istate cs))) alive)
+                            (every (lambda (cs) (string= "BLUE" (color cs))) alive))
+                       "instance_states (:alive) selects only the ALIVE instance's samples")
+               (%check :sm-disposed
+                       (and (plusp (length disposed))
+                            (every (lambda (cs) (eq :not-alive-disposed (istate cs))) disposed))
+                       "instance_states (:not-alive-disposed) selects exactly the DISPOSED instance's samples")
+               (%check :sm-partition (= 3 (+ (length alive) (length disposed)))
+                       "the two instance_state masks partition the cache (no sample lost, none double-counted)"))
+             ;; (d) get_datareaders honours the masks: a mask no sample matches selects NO reader.
+             (%check :sm-getdr-any
+                     (member dr (dds.dcps:get-datareaders sub :sample-states '(:read :not-read))
+                             :test #'eq)
+                     "get_datareaders with ANY masks includes the reader holding samples")
+             (%check :sm-getdr-instance
+                     (null (dds.dcps:get-datareaders
+                            sub :sample-states '(:read :not-read)
+                                :instance-states '(:not-alive-no-writers)))
+                     "get_datareaders honours instance_states — no sample is NOT_ALIVE_NO_WRITERS, so no reader is returned")
+             ;; (b) view_states — every instance has now been accessed by the reads above, so a NEW sample
+             ;; of an ALREADY-ACCESSED instance is NOT_NEW; a sample of a brand-new instance is NEW.
+             (let ((green (make-shape-type :color "GREEN" :x 3 :y 3 :shapesize 30)))
+               (%stage-data-sn node 4 hb (dds.dcps::%serialize-sample ts
+                                          (make-shape-type :color "BLUE" :x 7 :y 7 :shapesize 10)) wid)
+               (%stage-data-sn node 5 (funcall (dds.types:type-support-key-hash ts) green)
+                               (dds.dcps::%serialize-sample ts green) wid)
+               (let ((new (dds.dcps:read-samples dr :states '(:not-read) :view-states '(:new)))
+                     (not-new (dds.dcps:read-samples dr :states '(:not-read) :view-states '(:not-new))))
+                 (%check :sm-view-new
+                         (and (= 1 (length new)) (string= "GREEN" (color (first new)))
+                              (eq :new (vstate (first new))))
+                         "view_states (:new) selects only the sample of the not-yet-accessed instance")
+                 (%check :sm-view-not-new
+                         (and (= 1 (length not-new)) (string= "BLUE" (color (first not-new))))
+                         "view_states (:not-new) selects the new sample of an ALREADY-accessed instance")))
+             ;; (e) a ReadCondition carrying the masks.
+             (let ((c-none (dds.dcps:create-readcondition
+                            dr :states '(:read :not-read) :instance-states '(:not-alive-no-writers)))
+                   (c-some (dds.dcps:create-readcondition
+                            dr :states '(:read :not-read) :instance-states '(:not-alive-disposed))))
+               (%check :sm-cond-off (not (dds.dcps:condition-trigger-value c-none))
+                       "a ReadCondition whose instance_states match no sample does NOT trigger")
+               (%check :sm-cond-on (dds.dcps:condition-trigger-value c-some)
+                       "a ReadCondition whose instance_states match the disposed instance DOES trigger")))
+        (dds.dcps:delete-participant p))))
+  t)
+
 ;;; Builtin-topic readers (M3 #5, FR-DCPS-6): DCPSParticipant / DCPSPublication /
 ;;; DCPSSubscription / DCPSTopic surface the discovered participants + endpoints.
 

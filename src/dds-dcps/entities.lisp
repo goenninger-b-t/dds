@@ -2588,28 +2588,69 @@
             (cached-sample-loan cs) nil)))
   t)
 
-(defun* %select-samples (dr states where handle max take-p)
+(defun* %snapshot-view-state (dr info)
+    (function (data-reader sample-info) (member :new :not-new))
+  "The VIEW_STATE of INFO's instance as DR sees it right now (DDS 1.4 §2.2.2.5.1.4): NEW until the
+   application has accessed that instance (via a read/take), NOT_NEW afterwards. Read from DR-INSTANCES,
+   which %select-samples marks only AFTER its selection pass — so every sample of a not-yet-accessed
+   instance reads NEW within one call (the DDS snapshot semantics). The single definition of the view
+   state: both the view_states FILTER and the view-state STAMPED on a returned sample use it."
+  (if (gethash (sample-info-instance-handle info) (dr-instances dr)) :not-new :new))
+
+(defun* %snapshot-instance-state (dr info)
+    (function (data-reader sample-info) (member :alive :not-alive-disposed :not-alive-no-writers))
+  "The INSTANCE_STATE of INFO's instance as DR sees it right now (DDS 1.4 §2.2.2.5.1.3), read from the
+   live per-instance record. Like the view state, this is a property of the INSTANCE and not of the
+   sample: DDS 1.4 §2.2.2.5.4 computes the SampleInfo fields when the samples are RETURNED, so a sample
+   that was received while its instance was ALIVE and is read AFTER the instance was disposed must report
+   NOT_ALIVE_DISPOSED. (Before the three-mask work each sample kept the state frozen at delivery, so such
+   a sample reported ALIVE forever.) Falls back to the delivery-time stamp when the instance has no record
+   — an already-purged instance, whose samples keep the state they were delivered with. The single
+   definition: both the instance_states FILTER and the state STAMPED on a returned sample use it."
+  (let ((rec (gethash (sample-info-instance-handle info) (dr-instance-recs dr))))
+    (if rec (instance-rec-state rec) (sample-info-instance-state info))))
+
+(defun* %state-mask-match-p (dr info sample-states view-states instance-states)
+    (function (data-reader sample-info list list list) t)
+  "The DDS 1.4 THREE-MASK sample selection predicate (§2.2.2.5.3): T iff INFO's sample_state,
+   view_state, and instance_state each fall in the corresponding mask. The masks are lists of keywords;
+   the ANY_*_STATE defaults (+any-sample-states+ / +any-view-states+ / +any-instance-states+) admit
+   everything, so a caller that passes them is byte-identical to the pre-three-mask sample-state-only
+   selection. Shared by read/take (+ the _instance / _next_* variants), get_datareaders, and the
+   Read/QueryCondition trigger — ONE definition of what a state mask means (ADR 0053 §2.4)."
+  (and (member (sample-info-sample-state info) sample-states)
+       (member (%snapshot-view-state dr info) view-states)
+       (member (%snapshot-instance-state dr info) instance-states)
+       t))
+
+(defun* %select-samples (dr states where handle max take-p
+                         &optional (view-states +any-view-states+)
+                                   (instance-states +any-instance-states+))
     (function (data-reader list function (or null (simple-array (unsigned-byte 8) (16)))
-              (or null (integer 0)) boolean) list)
+              (or null (integer 0)) boolean &optional list list) list)
   "The shared read/take core (DDS 1.4 §2.2.2.5.3). Assumes DR is already drained. Selects the cached
-   samples whose sample-state is in STATES, that satisfy WHERE (the query predicate over the deserialized
-   sample), that belong to HANDLE (when non-NIL — the read/take_instance filter), up to MAX (when non-NIL
-   — read/take_next_sample), in cache (arrival) order. Marks each selected sample READ + sets its view-
-   state (NEW on the first access of its instance, else NOT_NEW); a secured decode loan is released per
-   returned sample. TAKE-P removes the selected samples from the cache; otherwise they stay. Returns the
-   selected cached-samples in order."
+   samples matching the THREE state masks — sample_state in STATES, view_state in VIEW-STATES,
+   instance_state in INSTANCE-STATES (%state-mask-match-p; both default to ANY, so omitting them is the
+   pre-three-mask behaviour) — that satisfy WHERE (the query predicate over the deserialized sample), that
+   belong to HANDLE (when non-NIL — the read/take_instance filter), up to MAX (when non-NIL —
+   read/take_next_sample), in cache (arrival) order. Marks each selected sample READ and stamps its two
+   INSTANCE-level SampleInfo fields — view_state + instance_state — from the reader's CURRENT per-instance
+   state, as DDS 1.4 §2.2.2.5.4 requires (they are computed when the samples are returned, not frozen at
+   delivery); a secured decode loan is released per returned sample. TAKE-P removes the selected samples
+   from the cache; otherwise they stay. Returns the selected cached-samples in order."
   (let ((out '()) (keep '()) (touched '()) (n 0)
         (node (dp-node (sub-participant (dr-subscriber dr)))))
     (dolist (cs (dr-cache dr))
       (let* ((info (cached-sample-info cs))
-             (sel (and (member (sample-info-sample-state info) states)
+             (sel (and (%state-mask-match-p dr info states view-states instance-states)
                        (or (null max) (< n max))
                        (or (null handle) (equalp handle (sample-info-instance-handle info)))
                        (funcall where (cached-sample-data cs)))))
         (cond
           (sel
            (let ((h (sample-info-instance-handle info)))
-             (setf (sample-info-view-state info) (if (gethash h (dr-instances dr)) :not-new :new))
+             (setf (sample-info-view-state info) (%snapshot-view-state dr info))
+             (setf (sample-info-instance-state info) (%snapshot-instance-state dr info))
              (pushnew h touched :test #'equalp))
            (setf (sample-info-sample-state info) :read)
            (%release-secured-copy-loan dr node cs)   ; release the secured decode loan (data struct is independent); FlatData view untouched
@@ -2620,29 +2661,42 @@
     (when take-p (setf (dr-cache dr) (nreverse keep)))
     (nreverse out)))
 
-(defun* read-samples (dr &key (states '(:read :not-read)) (where #'%where-any))
-    (function (data-reader &key (:states list) (:where function)) (or list (member :not-enabled)))
-  "DataReader::read — the cached samples whose sample-state is in STATES (default ANY_SAMPLE_STATE) and
-   whose data satisfies WHERE (the read_w_condition query predicate; %where-any by default) WITHOUT
-   removing them; each is marked READ with its view-state set. Returns a list of cached-sample. A DISABLED
-   DataReader refuses with :not-enabled (DDS 1.4 §2.2.2.1.1.7, S2.T3)."
+(defun* read-samples (dr &key (states +any-sample-states+) (where #'%where-any)
+                              (view-states +any-view-states+)
+                              (instance-states +any-instance-states+))
+    (function (data-reader &key (:states list) (:where function) (:view-states list)
+                    (:instance-states list))
+              (or list (member :not-enabled)))
+  "DataReader::read (DDS 1.4 §2.2.2.5.3.1) — the cached samples matching the THREE state masks and
+   satisfying WHERE (the read_w_condition query predicate; %where-any by default), WITHOUT removing them;
+   each is marked READ with its view-state stamped. STATES / VIEW-STATES / INSTANCE-STATES are the DDS
+   sample_states / view_states / instance_states masks, each a list of kinds and each defaulting to its
+   ANY_*_STATE (so the defaults select everything). Returns a list of cached-sample. A DISABLED DataReader
+   refuses with :not-enabled (DDS 1.4 §2.2.2.1.1.7, S2.T3)."
   (unless (entity-enabled-p dr) (return-from read-samples +retcode-not-enabled+))
   (%drain dr)
-  (%select-samples dr states where nil nil nil))
+  (%select-samples dr states where nil nil nil view-states instance-states))
 
-(defun* take-samples (dr &key (states '(:read :not-read)) (where #'%where-any))
-    (function (data-reader &key (:states list) (:where function)) (or list (member :not-enabled)))
-  "DataReader::take — like read-samples but REMOVES the returned samples from the cache. A DISABLED
-   DataReader refuses with :not-enabled (DDS 1.4 §2.2.2.1.1.7, S2.T3)."
+(defun* take-samples (dr &key (states +any-sample-states+) (where #'%where-any)
+                              (view-states +any-view-states+)
+                              (instance-states +any-instance-states+))
+    (function (data-reader &key (:states list) (:where function) (:view-states list)
+                    (:instance-states list))
+              (or list (member :not-enabled)))
+  "DataReader::take (DDS 1.4 §2.2.2.5.3.8) — like read-samples (same three state masks + WHERE) but
+   REMOVES the returned samples from the cache. A DISABLED DataReader refuses with :not-enabled."
   (unless (entity-enabled-p dr) (return-from take-samples +retcode-not-enabled+))
   (%drain dr)
-  (%select-samples dr states where nil nil t))
+  (%select-samples dr states where nil nil t view-states instance-states))
 
-;;; ---- Instance / next sample-access (S5.T2, DDS 1.4 §2.2.2.5.3). The three-mask (sample/view/instance
-;;;      state) signature is v1-simplified to the sample-state STATES list, as the base read/take are. ----
+;;; ---- Instance / next sample-access (S5.T2, DDS 1.4 §2.2.2.5.3). Each carries the FULL DDS three-mask
+;;;      (sample_states + view_states + instance_states) signature, as the base read/take do. ----
 
-(defun* read-instance (dr handle &key (states '(:read :not-read)) (where #'%where-any))
-    (function (data-reader (simple-array (unsigned-byte 8) (16)) &key (:states list) (:where function))
+(defun* read-instance (dr handle &key (states +any-sample-states+) (where #'%where-any)
+                            (view-states +any-view-states+)
+                            (instance-states +any-instance-states+))
+    (function (data-reader (simple-array (unsigned-byte 8) (16)) &key (:states list) (:where function)
+                    (:view-states list) (:instance-states list))
               (or list (member :not-enabled :bad-parameter)))
   "DataReader::read_instance (DDS 1.4 §2.2.2.5.3.4) — read (without removing) only the samples of the
    instance named by HANDLE. BAD_PARAMETER when HANDLE names no known instance; :not-enabled on a disabled
@@ -2651,10 +2705,13 @@
   (%drain dr)
   (unless (nth-value 1 (gethash handle (dr-instance-recs dr)))
     (return-from read-instance +retcode-bad-parameter+))
-  (%select-samples dr states where handle nil nil))
+  (%select-samples dr states where handle nil nil view-states instance-states))
 
-(defun* take-instance (dr handle &key (states '(:read :not-read)) (where #'%where-any))
-    (function (data-reader (simple-array (unsigned-byte 8) (16)) &key (:states list) (:where function))
+(defun* take-instance (dr handle &key (states +any-sample-states+) (where #'%where-any)
+                            (view-states +any-view-states+)
+                            (instance-states +any-instance-states+))
+    (function (data-reader (simple-array (unsigned-byte 8) (16)) &key (:states list) (:where function)
+                    (:view-states list) (:instance-states list))
               (or list (member :not-enabled :bad-parameter)))
   "DataReader::take_instance (DDS 1.4 §2.2.2.5.3.5) — take (removing) only the samples of the instance
    named by HANDLE. BAD_PARAMETER when HANDLE names no known instance."
@@ -2662,7 +2719,7 @@
   (%drain dr)
   (unless (nth-value 1 (gethash handle (dr-instance-recs dr)))
     (return-from take-instance +retcode-bad-parameter+))
-  (%select-samples dr states where handle nil t))
+  (%select-samples dr states where handle nil t view-states instance-states))
 
 (defun* %handle< (a b)
     (function ((simple-array (unsigned-byte 8) (16)) (simple-array (unsigned-byte 8) (16))) boolean)
@@ -2685,8 +2742,11 @@
              (dr-instance-recs dr))
     best))
 
-(defun* read-next-instance (dr previous-handle &key (states '(:read :not-read)) (where #'%where-any))
-    (function (data-reader (simple-array (unsigned-byte 8) (16)) &key (:states list) (:where function))
+(defun* read-next-instance (dr previous-handle &key (states +any-sample-states+) (where #'%where-any)
+                                     (view-states +any-view-states+)
+                                     (instance-states +any-instance-states+))
+    (function (data-reader (simple-array (unsigned-byte 8) (16)) &key (:states list) (:where function)
+                    (:view-states list) (:instance-states list))
               (or list (member :not-enabled)))
   "DataReader::read_next_instance (DDS 1.4 §2.2.2.5.3.6) — read the samples of the next instance after
    PREVIOUS-HANDLE in the reader's instance order (HANDLE_NIL = the first instance); an empty list when no
@@ -2694,17 +2754,20 @@
   (unless (entity-enabled-p dr) (return-from read-next-instance +retcode-not-enabled+))
   (%drain dr)
   (let ((h (%next-instance-handle dr previous-handle)))
-    (if h (%select-samples dr states where h nil nil) '())))
+    (if h (%select-samples dr states where h nil nil view-states instance-states) '())))
 
-(defun* take-next-instance (dr previous-handle &key (states '(:read :not-read)) (where #'%where-any))
-    (function (data-reader (simple-array (unsigned-byte 8) (16)) &key (:states list) (:where function))
+(defun* take-next-instance (dr previous-handle &key (states +any-sample-states+) (where #'%where-any)
+                                     (view-states +any-view-states+)
+                                     (instance-states +any-instance-states+))
+    (function (data-reader (simple-array (unsigned-byte 8) (16)) &key (:states list) (:where function)
+                    (:view-states list) (:instance-states list))
               (or list (member :not-enabled)))
   "DataReader::take_next_instance (DDS 1.4 §2.2.2.5.3.7) — take the samples of the next instance after
    PREVIOUS-HANDLE; an empty list when no next instance exists."
   (unless (entity-enabled-p dr) (return-from take-next-instance +retcode-not-enabled+))
   (%drain dr)
   (let ((h (%next-instance-handle dr previous-handle)))
-    (if h (%select-samples dr states where h nil t) '())))
+    (if h (%select-samples dr states where h nil t view-states instance-states) '())))
 
 (defun* read-next-sample (dr)
     (function (data-reader) (or null cached-sample (member :not-enabled)))
@@ -2904,14 +2967,18 @@
   (%deliver-data-on-readers p)
   t)
 
-(defun* get-datareaders (subscriber &key (sample-states '(:not-read)))
-    (function (subscriber &key (:sample-states list)) list)
+(defun* get-datareaders (subscriber &key (sample-states '(:not-read))
+                                         (view-states +any-view-states+)
+                                         (instance-states +any-instance-states+))
+    (function (subscriber &key (:sample-states list) (:view-states list) (:instance-states list)) list)
   "DDS Subscriber::get_datareaders (dds_rtf2_dcps.idl §993, DDS 1.4 §2.2.2.5.2.7): the list of
-   SUBSCRIBER's DataReaders that hold at least one sample whose sample_state is in SAMPLE-STATES
-   (default (:not-read) — readers with NEW data). Runs on the app thread and drains each reader's
-   newly-received samples first (via %count-matching), so a reader that just received data is
-   included. The DDS view_state / instance_state filters are v1-deferred (sample_state only)."
-  (remove-if-not (lambda (dr) (plusp (%count-matching dr sample-states)))
+   SUBSCRIBER's DataReaders that hold at least one sample matching ALL THREE state masks —
+   sample_state in SAMPLE-STATES (default (:not-read) — readers with NEW data), view_state in
+   VIEW-STATES, and instance_state in INSTANCE-STATES (both defaulting to their ANY_*_STATE, i.e. no
+   further restriction, so the default call is the pre-three-mask behaviour). Runs on the app thread and
+   drains each reader's newly-received samples first (via %count-matching), so a reader that just
+   received data is included."
+  (remove-if-not (lambda (dr) (plusp (%count-matching dr sample-states view-states instance-states)))
                  (sub-readers subscriber)))
 
 (defun* notify-datareaders (subscriber)
