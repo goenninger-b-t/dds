@@ -493,7 +493,11 @@ silently disable verification, unlike the torn-tail-recoverable `epochs.dat`).
      (`%read-epochs-mac` signals on a bad version/length/crc) until the corrupt `.mac` is manually
      DELETED — absent ⇒ the store opens clean (running-chain protection only) and the next clean close
      re-seals it.
-   - **Forward requirement (binds the epoch-table-retirement follow-on).** The no-invalidate design rests
+   - **Forward requirement (binds the epoch-table-retirement follow-on). — Cannot be discharged early (the seal
+     deliberately cannot tell an authorized shrink from rollback tampering), so as of ADR 0059 the `:truncated`
+     ERROR MESSAGE ITSELF now names this obligation: it states the counts, says this is tampering UNLESS you are
+     implementing retirement, tells that WP to rework the seal lifecycle, and says explicitly not to relax the
+     check to make retirement pass.** The no-invalidate design rests
      on the premise that `epochs.dat` never authorized-shrinks. The queued **epoch-table-retirement**
      follow-on BREAKS that premise — retirement IS an authorized shrink, and prefix-containment would
      `:truncated`-brick a retired table — so that WP **MUST rework the seal lifecycle** (e.g.

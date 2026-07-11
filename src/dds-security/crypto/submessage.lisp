@@ -203,36 +203,33 @@
    operating contract §4). A torn read (any discriminant field stale) fails the match and re-derives — the
    deterministic HMAC makes a benign concurrent same-value miss harmless, and a wrong key can never forge a valid
    GMAC, so the WORST case is a spurious re-derive or a fail-closed drop, never an origin-auth bypass (mirrors
-   %km-session-key-at's tear model). The derived key + the cached master-key discriminant copy are EPHEMERAL plain
+   %km-session-key-at's tear model — which ADR 0059 has since made IMPOSSIBLE: the four discriminant/key fields are
+   now ONE immutable session-cache object published by a single store, so no reader can observe them torn apart).
+   The derived key + the cached master-key discriminant copy are EPHEMERAL plain
    GC-HEAP vectors (re-derivable, GC-reclaimed, not secrets-at-rest — a foreign-static copy per session_id would
    leak un-wiped keys on session_id rotation; ADR-0034). FAIL-CLOSED: a zeroized KM signals
    KEY-MATERIAL-ZEROIZED-ERROR before touching the freed master_salt (a single flag check off the zero-alloc hit
    path)."
   (when (key-material-zeroized km) (error 'key-material-zeroized-error))
   (assert (<= (+ session-id-off 4) (length session-id-vec)))
-  (let ((ckid (key-material-cached-recv-key-id km))
-        (cmk  (key-material-cached-recv-master-key km))
-        (csid (key-material-cached-recv-session-id km)))
-    (if (and ckid cmk csid
-             (%recv-key-id-eq-at recv-key-id 0 ckid)
-             (equalp cmk recv-master-key)
-             (= (length csid) 4)
-             (= (aref csid 0) (aref session-id-vec session-id-off))
-             (= (aref csid 1) (aref session-id-vec (+ session-id-off 1)))
-             (= (aref csid 2) (aref session-id-vec (+ session-id-off 2)))
-             (= (aref csid 3) (aref session-id-vec (+ session-id-off 3))))
+  (let ((sc (key-material-cached-recv-session km)))   ; ONE load of the published (discriminant, key) object (ADR 0059)
+    (if (and sc
+             (%recv-key-id-eq-at recv-key-id 0 (session-cache-recv-key-id sc))
+             (equalp (session-cache-recv-master-key sc) recv-master-key)
+             (%session-id-eq-at (session-cache-id sc) session-id-vec session-id-off))
         (progn
-          ;; Acquire fence: the key load must see the release that published it (operating contract §4).
+          ;; Acquire fence: the object's fields must be seen as the release-publishing thread wrote them.
           (dds.pal:fence :acquire)
-          (key-material-cached-recv-session-key km))
+          (session-cache-key sc))
         (let* ((sid (subseq session-id-vec session-id-off (+ session-id-off 4)))
-               (k   (derive-receiver-specific-session-key recv-master-key (key-material-master-salt km) sid)))  ; ephemeral GC-heap key
-          (setf (key-material-cached-recv-session-key km) k)
-          ;; Release fence: the key store is visible before the session_id + master_key + key_id stores (the gate).
+               (k   (derive-receiver-specific-session-key recv-master-key (key-material-master-salt km) sid))  ; ephemeral GC-heap key
+               (new (%make-session-cache                                  ; fully built BEFORE publication
+                     sid k
+                     (subseq recv-key-id 0 (length recv-key-id))              ; GC-heap discriminant copies
+                     (subseq recv-master-key 0 (length recv-master-key)))))
+          ;; Release fence: the object's fields are visible before the pointer that publishes them.
           (dds.pal:fence :release)
-          (setf (key-material-cached-recv-session-id km) sid)
-          (setf (key-material-cached-recv-master-key km) (subseq recv-master-key 0 (length recv-master-key)))  ; GC-heap discriminant copy
-          (setf (key-material-cached-recv-key-id km) (subseq recv-key-id 0 (length recv-key-id)))
+          (setf (key-material-cached-recv-session km) new)   ; ONE store: the FOUR discriminant/key fields can no longer be observed torn apart
           k))))
 
 (defun* compute-receiver-specific-mac (recv-session-key nonce common-mac)

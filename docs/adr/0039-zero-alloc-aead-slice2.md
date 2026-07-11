@@ -330,10 +330,14 @@ re-resolvable box and an image-restart hook (`%dare-reresolve-foreign-pointers`,
 **RESOLVED (WP-PAL-ATOMICS, ADR 0041):** now implemented on both impls over a PAL `atomic-cell`, and the
 send-refcount stays writer-lock-guarded by informed decision (every access site already holds the lock, so
 lock-free wins nothing and would open a releasable-check TOCTOU — see ADR 0041). Also carried from
-ADR 0038 Residual (a): when a future `rtps_protection` **rekeying** (session_id rotation) lands, it must confirm the
+ADR 0038 Residual (a): ~~when a future `rtps_protection` **rekeying** (session_id rotation) lands, it must confirm the
 decode receiver stays single-threaded per km OR harden `%km-session-key-at`'s two-slot publish against a
-concurrent-different-session_id tear (the fence protocol is tear-safe only while session_id is effectively constant
-per km).
+concurrent-different-session_id tear~~ — **CLOSED 2026-07-11 (ADR 0059), and the premise was FALSE:** the decode
+receiver is *not* single-threaded (up to THREE receiver threads — unicast UDP + multicast UDP + SHMEM — all feed
+`%handle-datagram` and can decode from the same peer under the same KM), and `session_id` comes off the WIRE, so the
+tear was reachable TODAY with no rekeying at all (fail-closed — a wrong key drops the datagram — hence unnoticed).
+Fixed by construction: the discriminant and the key are now ONE immutable object published by a single store, for
+both the send-side and the four-field origin-auth cache. A future rekeying WP inherits a tear-free cache.
 
 ---
 

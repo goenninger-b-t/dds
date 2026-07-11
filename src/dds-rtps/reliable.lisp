@@ -553,6 +553,16 @@
   (proxies  (make-hash-table :test 'equalp) :type hash-table)   ; writer key (opaque, equalp) -> writer-proxy
   (dedup-map (make-hash-table :test 'equalp) :type hash-table)) ; original-GUID[16] -> dedup-origin
 
+(defun* writer-proxy-armed-p (reader writer-id)
+    (function (rtps-reader t) boolean)
+  "T iff a WriterProxy for WRITER-ID already EXISTS on READER — i.e. the reader-side durability baseline for
+   that writer has been ARMED (init-writer-proxy-durability creates the proxy at match time, before the first
+   HEARTBEAT). Does NOT create one, so it is a pure test. Lets the disc layer detect the ADR 0043 residual
+   window — a HEARTBEAT for a writer that is already MATCHED but whose baseline is not yet armed — instead of
+   silently lazily-creating a proxy with skip-history NIL and pulling a retaining writer's pre-match history
+   into a VOLATILE reader (ADR 0059)."
+  (and (nth-value 1 (gethash writer-id (rtps-reader-proxies reader))) t))
+
 (defun* get-writer-proxy (reader writer-id)
     (function (rtps-reader t) writer-proxy)
   "The WriterProxy for the matched writer named by the opaque per-endpoint key WRITER-ID, created on

@@ -1366,8 +1366,8 @@
                                           (dds.rtps.reliable:get-writer-proxy reader guid))))
                      "after the threshold the tampered SN is marked GAP-irrelevant (suppressed)")
              (%check :dfs-counter-cleared
-                     (let ((inner (gethash guid (dds.disc::disc-node-decode-fail-counts node))))
-                       (or (null inner) (null (gethash 1 inner))))
+                     (let ((entry (gethash guid (dds.disc::disc-node-decode-fail-counts node))))   ; (km-key-id . SN-table), ADR 0059
+                       (or (null entry) (null (gethash 1 (cdr entry)))))
                      "the failure counter for a suppressed SN is dropped (bounded memory)")
              ;; a subsequent GOOD higher SN still decodes + delivers -> no head-of-line wedge
              (dds.disc::%deliver-user-sample node wid 2 secured src guid 2)
@@ -1394,7 +1394,7 @@
                (loop for sn from 1 to (* 4 cap)   ; 4x the cap of DISTINCT one-shot failing SNs
                      do (dds.disc::%deliver-user-sample node wid sn tampered src guid sn))
                (%check :dfs-track-capped
-                       (<= (hash-table-count (gethash guid (dds.disc::disc-node-decode-fail-counts node))) cap)
+                       (<= (hash-table-count (cdr (gethash guid (dds.disc::disc-node-decode-fail-counts node)))) cap)
                        (format nil "the per-writer failure-counter map must stay <= *decode-fail-track-limit* (~d)" cap))))
         (dds.disc:stop-node node))))
   t)
@@ -2976,7 +2976,7 @@
         (%check :km-sesskey-heap (not (dds.pal:static-vector-p sk))
                 "derived session key must be GC-heap (not foreign-static) — no per-session_id foreign leak"))
       (%check :km-sesskey-real (notevery #'zerop sk) "derived session key must be non-zero"))
-    (%check :km-cache-populated (not (null (dds.security::key-material-cached-session-key km)))
+    (%check :km-cache-populated (not (null (dds.security::key-material-cached-send-session km)))
             "session-key cache populated after derive (pre-wipe)")
     ;; (b) SESSION_ID-ROTATION NO-LEAK: many DISTINCT session_ids -> every derived key GC-heap, never static
     (dotimes (i 8)
@@ -2991,13 +2991,17 @@
           (%check :km-rot-recv-heap (not (dds.pal:static-vector-p rk))
                   "each rotated receiver session key is GC-heap (not foreign-static)")
           (%check :km-rot-recv-mkey-heap
-                  (not (dds.pal:static-vector-p (dds.security::key-material-cached-recv-master-key km)))
-                  "cached-recv-master-key discriminant is GC-heap (not foreign-static)"))))
+                  (not (dds.pal:static-vector-p
+                        (dds.security::session-cache-recv-master-key
+                         (dds.security::key-material-cached-recv-session km))))
+                  "the recv session-cache's master-key discriminant is GC-heap (not foreign-static)"))))
     ;; after rotation the cache slot still holds ONE heap vector (bounded single slot, GC-reclaimable — no leak)
     (when sbcl
       (%check :km-cache-slot-heap
-              (not (dds.pal:static-vector-p (dds.security::key-material-cached-session-key km)))
-              "session-key cache slot is a single GC-heap vector after rotation (bounded, no foreign leak)"))
+              (not (dds.pal:static-vector-p
+                    (dds.security::session-cache-key
+                     (dds.security::key-material-cached-send-session km))))
+              "the session-cache holds a single GC-heap key after rotation (bounded, no foreign leak)"))
     ;; (c) zeroize-on-teardown wipes MASTER secrets + drops the caches + marks the KM unusable
     (%check :km-not-yet-zeroized (not (dds.security:key-material-zeroized km))
             "KM must not be marked zeroized before the choke (non-vacuous)")
@@ -3006,9 +3010,9 @@
     (%check :km-zeroized-flag (dds.security:key-material-zeroized km)
             "zeroize-key-material sets the fail-closed KEY-MATERIAL-ZEROIZED marker")
     ;; UAF-safe on both impls: the caches (which held real key bytes) are dropped in the same wipe block
-    (%check :km-cache-nulled (null (dds.security::key-material-cached-session-key km))
+    (%check :km-cache-nulled (null (dds.security::key-material-cached-send-session km))
             "derived session-key cache dropped after the choke")
-    (%check :km-recv-cache-nulled (null (dds.security::key-material-cached-recv-master-key km))
+    (%check :km-recv-cache-nulled (null (dds.security::key-material-cached-recv-session km))
             "receiver-key cache dropped after the choke")
     ;; direct read-back byte-wipe proof is Clasp-only (recycle-safe); SBCL frees the whole object (post-free = UAF)
     (when (eq (dds.pal:pal-impl-name) :clasp)

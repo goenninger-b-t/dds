@@ -803,8 +803,18 @@
     (let* ((n     (%get-u32-le signed-stored 1))
            (table (%load-epoch-table dir)))
       (when (< (hash-table-count table) n)
-        (error "dds.durability: epochs.mac prefix-containment FAILED in ~a (:truncated — fewer epochs than ~
-                sealed, rollback/truncation; refusing to open; ADR 0045 §7.2)" dir))
+        ;; FORWARD REQUIREMENT, named in the error itself (ADR 0045 §7.2 / ADR 0059): the no-invalidate seal
+        ;; design rests on epochs.dat never AUTHORIZED-shrinking. Epoch-table RETIREMENT is exactly such a
+        ;; shrink, and would land here looking like an attack. Whoever hits this while implementing retirement
+        ;; must rework the seal lifecycle (invalidate-before-shrink + re-seal at clean close, tail-anchor style)
+        ;; — not weaken this check.
+        (error "dds.durability: epochs.mac prefix-containment FAILED in ~a (:truncated — the table has ~d ~
+                epochs but ~d were sealed; refusing to open; ADR 0045 §7.2). This is rollback/truncation ~
+                tampering UNLESS you are implementing the epoch-table-RETIREMENT follow-on: retirement is an ~
+                AUTHORIZED shrink, which this seal deliberately cannot distinguish from an attack, so that WP ~
+                MUST rework the seal lifecycle (invalidate-before-shrink + re-seal at clean close) as part of ~
+                its scope — do NOT relax this check to make retirement pass."
+               dir (hash-table-count table) n))
       (let* ((sorted     (%epoch-table->sorted table))
              (prefix     (subseq sorted 0 n))
              (recomputed (%assemble-epochs-signed prefix)))

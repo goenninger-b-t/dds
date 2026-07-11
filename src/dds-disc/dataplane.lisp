@@ -2882,21 +2882,47 @@
    failure count so it never counts toward a future unrelated suppression and frees a track-limit slot. Called on
    the accept path under the node lock, GATED on a non-empty table so the steady-state (zero-failure) zero-alloc
    secured receive arm is untouched (the guard is one hash-table-count, no gethash/cons). Zero-cons."
-  (let ((inner (gethash guid (disc-node-decode-fail-counts node))))   ; no auto-create
-    (when inner (remhash sn inner)))
+  (let ((entry (gethash guid (disc-node-decode-fail-counts node))))   ; no auto-create; value = (km-key-id . SN-table)
+    (when entry (remhash sn (cdr entry))))
   t)
 
-(defun* %secured-decode-fail (node guid sn)
-    (function (disc-node (simple-array (unsigned-byte 8) (16)) integer) t)
+(defun* %decode-fail-inner (node guid km)
+    (function (disc-node (simple-array (unsigned-byte 8) (16)) t) hash-table)
+  "The per-writer SN->failure-count table for GUID, STAMPED with the identity of the KM the failures were
+   classified under (its §9.5.2 sender_key_id) — and RESET whenever that identity changes (ADR 0059).
+
+   WHY THE STAMP. A count here means 'this SN failed to decode while its KM was PRESENT', which %secured-decode-fail
+   reads as tamper-or-permanent-mismatch and eventually SUPPRESSES (stops the reliable repair). That classification
+   is only sound while a live writer's KeyMaterial is never REPLACED with samples in flight. If a future rekeying WP
+   rotates a writer's KM, samples encoded under the NEW key would keep counting against the STALE classification,
+   cross the threshold, be suppressed — and then be silently LOST when the retransmit finally becomes decodable (the
+   SN is already GAP-irrelevant). ADR 0031 lim.1 recorded that as a FORWARD REQUIREMENT on the rekey WP; stamping the
+   table discharges it HERE instead, so a future rotation cannot inherit the bug by forgetting: a new key id is a new
+   classification, and the stale counts are dropped. Costs one 4-octet compare on a path that only runs when a decode
+   has ALREADY failed (never on the steady-state zero-alloc receive arm). CALLER HOLDS the node lock."
+  (let* ((outer (disc-node-decode-fail-counts node))
+         (entry (gethash guid outer))
+         (kid   (and km (dds.security:key-material-sender-key-id km))))
+    (if (and entry (equalp (car entry) kid))
+        (cdr entry)
+        (let ((fresh (make-hash-table :test 'eql)))   ; no entry, or the KM identity changed -> a FRESH classification
+          (setf (gethash (copy-seq guid) outer) (cons kid fresh))
+          fresh))))
+
+(defun* %secured-decode-fail (node guid sn km)
+    (function (disc-node (simple-array (unsigned-byte 8) (16)) integer t) t)
   "ADR 0031 lim.1 (RTPS 2.5 §8.3.5 / §8.4): record ONE KM-PRESENT decode failure of (GUID, SN) and, once it has
    failed *decode-fail-suppress-threshold* times, SUPPRESS the SN (reader-suppress-sn marks it GAP-irrelevant) so
    the reliable writer stops retransmitting a sample that can never decode. Called ONLY from the KM-present decode
    branches of %deliver-user-sample (the missing-KM branch returns earlier, uncounted — the key race self-heals).
+   KM is the KeyMaterial the failed decode was attempted under: its identity STAMPS the counter table, so a future
+   KM rotation resets the classification instead of suppressing samples encoded under the new key (%decode-fail-inner,
+   ADR 0059 — discharging the ADR 0031 lim.1 forward requirement).
    Bounded: an existing counter always progresses to suppression; a NEW SN is tracked only below
    *decode-fail-track-limit* (else it keeps retransmitting — bounded churn over unbounded memory). Node-lock
    guarded (the counter table is also pruned under that lock by %lease-sweep). Receiver-thread call."
   (dds.pal:with-lock ((disc-node-lock node))
-    (let ((inner (%inner-table (disc-node-decode-fail-counts node) guid)))
+    (let ((inner (%decode-fail-inner node guid km)))
       (multiple-value-bind (cur present) (gethash sn inner)
         (let ((n (1+ (if present (the fixnum cur) 0))))
           (declare (type fixnum n))
@@ -2977,7 +3003,7 @@
                         (progn (incf (disc-node-decode-pool-rejects node))
                                (return-from %deliver-user-sample t))
                         (let ((plain (dds.security:decode-serialized-payload km vec)))
-                          (unless plain (%secured-decode-fail node guid sn) (return-from %deliver-user-sample t))   ; ADR 0031 lim.1: KM present, decode failed -> bounded suppression
+                          (unless plain (%secured-decode-fail node guid sn km) (return-from %deliver-user-sample t))   ; ADR 0031 lim.1: KM present, decode failed -> bounded suppression
                           (setf stored plain)))
                     ;; T5d: acquire buffer + pooled handle together (paired 1:1 capacity -> the handle acquire
                     ;; succeeds whenever a buffer was free; the defensive release keeps it never-crash/never-GC)
@@ -3000,13 +3026,13 @@
                                 (progn (dds.pal:with-lock ((disc-node-decode-pool-lock node))
                                          (dds.core.arena:pool-release pool buf)
                                          (%secured-handle-recycle node h))
-                                       (%secured-decode-fail node guid sn)   ; ADR 0031 lim.1: KM present, decode failed (pool-lock released first: node-lock is OUTER)
+                                       (%secured-decode-fail node guid sn km)   ; ADR 0031 lim.1: KM present, decode failed (pool-lock released first: node-lock is OUTER)
                                        (return-from %deliver-user-sample t))
                                 (progn (%secured-handle-fill h buf plen guid sn)
                                        (setf stored h loan h))))))))
               ;; non-loan secured path: allocating decode -> bare vec (byte-identical to the shipped path)
               (let ((plain (dds.security:decode-serialized-payload km vec)))
-                (unless plain (%secured-decode-fail node guid sn) (return-from %deliver-user-sample t))   ; ADR 0031 lim.1: KM present, decode failed -> bounded suppression
+                (unless plain (%secured-decode-fail node guid sn km) (return-from %deliver-user-sample t))   ; ADR 0031 lim.1: KM present, decode failed -> bounded suppression
                 (setf stored plain))))))
     ;; reader-on-data ALWAYS (keeps reliable NACK/HEARTBEAT state correct for relay proxy too); the loan path feeds
     ;; the proxy an EMPTY payload (the plaintext lives in the loaned buffer, not the proxy) — mirrors %deliver-user-marker.
@@ -3108,9 +3134,21 @@
     (declare (ignore rid count finalp livep))
     (when (and (disc-node-user-reader node) (%user-writer-entityid-p wid))
       (let ((wguid (%source-guid src-prefix wid)))
-        ;; RESIDUAL (ADR 0043): safe only while SEDP is unicast — match-commit and this HEARTBEAT serialize on
-        ;; ONE rx thread; multicast-SEDP/split-metatraffic must arm the reader baseline with %record-match first
-        (when (%guid-matched-p node wguid)   ; match gate: process/answer only a MATCHED writer's HEARTBEAT (§8.4.10.1)
+        ;; ADR 0043 RESIDUAL -> now FAIL-SAFE, not merely documented (ADR 0059). The match gate below admits a
+        ;; MATCHED writer's HEARTBEAT; the reader-side durability baseline is armed just AFTER %record-match
+        ;; (%fire-match -> %reader-durability-init -> init-writer-proxy-durability, which CREATES the WriterProxy).
+        ;; Between those two, a HEARTBEAT would lazily create a proxy with skip-history NIL and NACK the writer's
+        ;; whole pre-match range — a VOLATILE reader silently pulling a retaining writer's history (a DURABILITY
+        ;; violation). That window is unreachable today ONLY because SEDP and user HEARTBEATs both ride the ONE
+        ;; unicast rx thread (discovery/HEARTBEAT/ACKNACK never leave UDP), so it cannot be an accident of a future
+        ;; WP that adds user-data multicast / splits metatraffic: require the baseline to be ARMED (the proxy to
+        ;; EXIST) as well as matched. Unarmed-but-matched -> DROP + count (disc-node-hb-unarmed-drops) and the
+        ;; writer's next periodic HEARTBEAT re-arrives post-arm — the same recovery the match gate already relies
+        ;; on. Byte-identical today (the condition never fires); a future reopening is loud, never silent.
+        (when (and (%guid-matched-p node wguid)   ; match gate: process/answer only a MATCHED writer's HEARTBEAT (§8.4.10.1)
+                   (or (not (disc-node-durability-gate-active node))   ; a bare dds.disc node never arms a baseline by design -> the guard does not apply (byte-identical)
+                       (dds.rtps.reliable:writer-proxy-armed-p (disc-node-user-reader node) wguid)
+                       (progn (incf (disc-node-hb-unarmed-drops node)) nil)))
           ;; WP-N-ENDPOINT-S2/2C1 (ADR 0048): apply the HEARTBEAT to + compute the ACKNACK from the CANONICAL reader
           ;; matched to this writer, then EMIT the ACKNACK stamped with EACH matched local reader's EntityId (a
           ;; remote ReaderProxy is keyed by the reader GUID it matched — the ACKNACK must carry THAT reader's id,

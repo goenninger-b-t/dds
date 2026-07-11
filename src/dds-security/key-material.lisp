@@ -20,6 +20,31 @@
   "CryptoTransformKeyMaterial.master_receiver_specific_key width: 32 octets (§9.5.2 Table 65).
    All-zeros when receiver_specific_key_id is zero (participant-level protection, no per-receiver key).")
 
+(defstruct* (session-cache (:constructor %make-session-cache (id key &optional recv-key-id recv-master-key)))
+  "One derived session key TOGETHER WITH the full discriminant it was derived for — published as a SINGLE
+   IMMUTABLE object (ADR 0059).
+
+   WHY ONE OBJECT. These caches are read lock-free on the hot AEAD path and re-derived on a miss. Publishing the
+   discriminant and the key in SEPARATE slots is not tear-safe: two threads missing concurrently with DIFFERENT
+   session_ids can interleave their stores so the KM ends up advertising id S1 alongside key(S2) — a subsequent
+   hit on S1 then returns the WRONG key. Fail-closed (a wrong key cannot forge a GCM tag; the datagram is
+   dropped), but a silent drop nonetheless, and it is REACHABLE: start-node runs up to THREE receiver threads
+   (unicast UDP + multicast UDP + SHMEM) that all feed %handle-datagram and can decode datagrams from the SAME
+   peer under the SAME participant KM, while session_id comes off the WIRE (a peer — or an attacker — may vary it
+   per datagram). The prior design was safe only by the accident that conformant peers use a fixed session_id.
+   With one object the reader sees either the old pair or the new pair, never a mix, so the tear is IMPOSSIBLE by
+   construction — which also discharges the ADR 0038(a)/0039(d) forward requirement that a future rtps_protection
+   REKEYING (session_id rotation) would otherwise have had to harden.
+
+   ID is the 4-octet session_id. KEY is the derived 32-octet session key. RECV-KEY-ID / RECV-MASTER-KEY are the
+   two extra discriminant fields of the receiver-specific (origin-auth) cache and are NIL on the send-side cache
+   — the master key is part of the discriminant because the SAME key_id may be presented with DIFFERENT master
+   keys (a wrong-key origin-auth probe), and the derived key depends on it. Never mutated after construction."
+  (id nil :type (or null (simple-array (unsigned-byte 8) (*))))
+  (key nil :type (or null (simple-array (unsigned-byte 8) (32))))
+  (recv-key-id nil :type (or null (simple-array (unsigned-byte 8) (*))))
+  (recv-master-key nil :type (or null (simple-array (unsigned-byte 8) (*)))))
+
 (defstruct* (key-material (:constructor %make-key-material))
   "DDS-Security 1.1 §9.5.2 CryptoTransformKeyMaterial_DH — the key bundle used by
    encode-serialized-payload / decode-serialized-payload. The three MASTER secret slots (master_salt,
@@ -27,7 +52,7 @@
    SAP-addressable) memory and WIPED-then-freed on teardown via ZEROIZE-KEY-MATERIAL — a moving GC cannot
    copy them, freed heap cannot linger with key bytes, and they can be reliably wiped (operating contract
    NFR-MEM / CNSA-2.0 data-at-rest; ADR-0034 master-slot hardening). The derived session-key caches
-   (cached-session-key, cached-recv-session-key, cached-recv-master-key) are EPHEMERAL plain GC-HEAP vectors —
+   (the session-cache objects' KEY + discriminant copies) are EPHEMERAL plain GC-HEAP vectors —
    re-derivable per session from the master secrets, short-lived, GC-reclaimed (NOT long-lived
    secrets-at-rest): a fresh foreign-static copy per session_id would UNBOUNDEDLY leak un-wiped key bytes on
    session_id rotation (reachable pre-auth, before the GCM auth check), and free-on-replace would be a
@@ -67,21 +92,11 @@
   ;; Nonce-uniqueness state: iv-counter is the only mutable field; must be incremented atomically.
   (iv-counter 0 :type (unsigned-byte 64))
   (iv-counter-lock (dds.pal:make-lock "km-iv") :type t)
-  ;; §9.5.3.3.4.2 session-key cache: derived once per (master_sender_key, master_salt, session_id) triplet.
-  ;; Ephemeral plain GC-heap (re-derivable, GC-reclaimed, not a secret-at-rest — see the struct docstring).
-  (cached-session-id  nil :type (or null (simple-array (unsigned-byte 8) (*))))
-  (cached-session-key nil :type (or null (simple-array (unsigned-byte 8) (32))))
-  ;; §9.5.3.3.4.3 receiver-specific session-key cache (origin authentication): derived once per
-  ;; (receiver_specific_key_id, master_receiver_specific_key, session_id) — the parallel of the common
-  ;; session-key cache above, closing the ADR-0039 residual (a) allocating fallback. The MASTER key is part of
-  ;; the discriminant (not just the key_id): the SAME key_id may be presented with DIFFERENT master keys (a
-  ;; wrong-key origin-auth probe), and the derived key depends on the master key — keying by key_id alone would
-  ;; return a stale key and bypass the gate. Single-slot + fence-published like %km-session-key-at (a torn read
-  ;; re-derives or fail-closes, never a wrong-key bypass); read/written by %km-receiver-session-key-at.
-  (cached-recv-key-id      nil :type (or null (simple-array (unsigned-byte 8) (*))))
-  (cached-recv-master-key  nil :type (or null (simple-array (unsigned-byte 8) (*))))
-  (cached-recv-session-id  nil :type (or null (simple-array (unsigned-byte 8) (*))))
-  (cached-recv-session-key nil :type (or null (simple-array (unsigned-byte 8) (32))))
+  ;; §9.5.3.3.4.2 / §9.5.3.3.4.3 session-key caches — ONE session-cache object each (see the session-cache
+  ;; docstring: discriminant + key are published together, so a concurrent re-derive can never be observed TORN).
+  ;; The cached key is an ephemeral plain GC-heap vector (re-derivable, GC-reclaimed, not a secret-at-rest).
+  (cached-send-session nil :type (or null session-cache))
+  (cached-recv-session nil :type (or null session-cache))
   ;; §9.5.3.3.4.3 origin-auth receiver-descriptor cache: the (list (cons receiver_specific_key_id .
   ;; master_receiver_specific_key)) the live per-datagram origin-auth resolvers return — built once from the
   ;; IMMUTABLE receiver fields and reused, so the resolver conses nothing per datagram (km-receiver-descriptor{-list}).
@@ -146,7 +161,7 @@
    hygiene (ADR-0034; operating contract NFR-MEM / CNSA-2.0 data-at-rest). Wipes then releases the foreign-static
    master_salt, master_sender_key, master_receiver_specific_key via dds.dare:free-secret-octets (fill-0 then
    free-static; SBCL frees, Clasp recycles zeroed), then DROPS the derived §9.5.3.3.4.2/.4.3 session-key caches
-   (cached-session-key, cached-recv-session-key, cached-recv-master-key) and the memoized origin-auth
+   (the two session-cache objects) and the memoized origin-auth
    receiver-descriptor cons. The derived caches are EPHEMERAL plain GC-HEAP vectors (re-derivable, not
    secrets-at-rest), so dropping the references suffices — GC reclaims them; NO wipe/free is done or needed
    (free-secret-octets on a heap vector would be wrong, and free-on-replace would UAF the lock-free hit path).
@@ -161,9 +176,8 @@
     (dds.dare:free-secret-octets (key-material-master-sender-key km))
     (dds.dare:free-secret-octets (key-material-master-receiver-specific-key km))
     ;; derived caches are plain GC-heap (ephemeral, re-derivable) — drop the references; no wipe/free (GC reclaims)
-    (setf (key-material-cached-session-key km) nil
-          (key-material-cached-recv-session-key km) nil
-          (key-material-cached-recv-master-key km) nil
+    (setf (key-material-cached-send-session km) nil
+          (key-material-cached-recv-session km) nil
           (key-material-cached-receiver-descriptor-list km) nil))
   nil)
 
@@ -187,11 +201,22 @@
       (when s (fill s 0))
       (when k (fill k 0))
       (when r (fill r 0)))
-    (setf (key-material-cached-session-key km) nil
-          (key-material-cached-recv-session-key km) nil
-          (key-material-cached-recv-master-key km) nil
+    (setf (key-material-cached-send-session km) nil
+          (key-material-cached-recv-session km) nil
           (key-material-cached-receiver-descriptor-list km) nil))
   nil)
+
+(defun* %session-id-eq-at (cached-id vec off)
+    (function ((or null (simple-array (unsigned-byte 8) (*))) (simple-array (unsigned-byte 8) (*)) fixnum) t)
+  "T iff CACHED-ID is the 4-octet session_id sitting at VEC[OFF..OFF+4) — the session-cache hit test, in one
+   place for both the send-side and the receiver-specific cache (DRY). Zero-alloc: four AREF compares, no
+   subseq. A NIL CACHED-ID (an empty cache) never matches."
+  (and cached-id (= (length cached-id) 4)
+       (= (aref cached-id 0) (aref vec off))
+       (= (aref cached-id 1) (aref vec (+ off 1)))
+       (= (aref cached-id 2) (aref vec (+ off 2)))
+       (= (aref cached-id 3) (aref vec (+ off 3)))
+       t))
 
 (defun* %km-session-key-at (km session-id-vec session-id-off)
     (function (key-material (simple-array (unsigned-byte 8) (*)) fixnum) (simple-array (unsigned-byte 8) (32)))
@@ -209,23 +234,19 @@
    harmless — both missers derive the identical deterministic key."
   (when (key-material-zeroized km) (error 'key-material-zeroized-error))
   (assert (<= (+ session-id-off 4) (length session-id-vec)))
-  (let ((cid (key-material-cached-session-id km)))
-    (if (and cid (= (length cid) 4)
-             (= (aref cid 0) (aref session-id-vec session-id-off))
-             (= (aref cid 1) (aref session-id-vec (+ session-id-off 1)))
-             (= (aref cid 2) (aref session-id-vec (+ session-id-off 2)))
-             (= (aref cid 3) (aref session-id-vec (+ session-id-off 3))))
+  (let ((sc (key-material-cached-send-session km)))   ; ONE load of the published pair (ADR 0059) — id + key cannot disagree
+    (if (and sc (%session-id-eq-at (session-cache-id sc) session-id-vec session-id-off))
         (progn
-          ;; Acquire fence: key load must see the release that published it (operating contract §4).
+          ;; Acquire fence: the object's fields must be seen as the release-publishing thread wrote them.
           (dds.pal:fence :acquire)
-          (key-material-cached-session-key km))
+          (session-cache-key sc))
         (let* ((sid (subseq session-id-vec session-id-off (+ session-id-off 4)))
                (k   (derive-session-key (key-material-master-sender-key km)
-                                        (key-material-master-salt km) sid)))  ; ephemeral GC-heap key, GC-reclaimed
-          (setf (key-material-cached-session-key km) k)
-          ;; Release fence: key store visible before the id store (the gate); operating contract §4.
+                                        (key-material-master-salt km) sid))   ; ephemeral GC-heap key, GC-reclaimed
+               (new (%make-session-cache sid k)))                             ; fully built BEFORE publication
+          ;; Release fence: the object's fields are visible before the pointer that publishes them.
           (dds.pal:fence :release)
-          (setf (key-material-cached-session-id km) sid)
+          (setf (key-material-cached-send-session km) new)   ; ONE store: a concurrent reader sees the OLD or the NEW pair, never a mix
           k))))
 
 (defun* %km-origin-auth-p (km)

@@ -39,7 +39,18 @@ Two receive-/match-time changes; no new wire message, no changed emission format
 - **Gate `%on-user-data` on match** (drop pre-match DATA): rejected — larger blast radius on the per-sample path, and the writer-side pre-arm removes the source of the unsolicited pre-join push instead.
 - **Reorder `%fire-match` before `%record-match`** to close the writer-side window: rejected — `%record-match`'s atomic check-and-set is the once-only-fire authority across the ≤3 receiver threads; splitting it risks double-firing SUBSCRIPTION/PUBLICATION_MATCHED. The future-only pre-arm closes the window without touching the match commit's once-ness.
 
-## Residual — NOT closed (forward requirement)
+## Residual — the requirement STANDS, but it can no longer reopen SILENTLY (ADR 0059, 2026-07-11)
+
+> **Update.** The window below is now **fail-safe**: the HEARTBEAT gate requires the reader-side baseline to be
+> ARMED (the WriterProxy to exist) as well as matched, and a matched-but-unarmed HEARTBEAT is DROPPED and COUNTED
+> (`disc-node-hb-unarmed-drops`, which MUST stay 0). A WP that reopens the window pays one HEARTBEAT period of
+> latency and trips a visible counter — it can no longer ship a silent DURABILITY violation. The forward
+> requirement itself (arm the baseline atomically with `%record-match`) still stands; it is now *enforced* rather
+> than merely *recorded*. NOTE (ADR 0059 §4): the naive form of this guard — "matched ⇒ proxy must exist" — is
+> WRONG and broke `repair-delivered`; a bare `dds.disc` node never arms a baseline by design, so the guard is
+> conditioned on `disc-node-durability-gate-active` (set by the DCPS `create-datareader`).
+
+## Residual — original text (forward requirement)
 
 The READER-side arming is asymmetric to the writer-side pre-arm: `skip-history` is armed
 AFTER `%record-match` (in `%fire-match` → `%reader-durability-init`), so a user HEARTBEAT

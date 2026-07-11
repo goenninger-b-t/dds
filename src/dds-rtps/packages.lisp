@@ -110,7 +110,7 @@
            #:reader-acknack #:reader-on-gap #:reader-suppress-sn #:reader-complete-p #:init-writer-proxy-durability
            #:reader-dedup-accept-p #:rtps-reader-dedup-map
            #:get-writer-proxy #:writer-proxy #:writer-proxy-received #:writer-proxy-last-sn #:writer-proxy-first-sn
-           #:writer-proxy-skip-history
+           #:writer-proxy-skip-history #:writer-proxy-armed-p
            #:*fragment-size* #:*max-reassembly-bytes* #:*max-reassembly-fragments* #:*max-gap-range*
            #:reader-on-data-frag #:reader-frag-acknack
            #:writer-frag-plan #:writer-frag-plan-for

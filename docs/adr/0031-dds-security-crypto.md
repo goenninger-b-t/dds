@@ -307,7 +307,10 @@ The `interop/security-crypto/README.md` records this honestly.
    Regression: `run-decode-fail-suppress-test` (three arms: missing-KM heals with zero counting;
    persistent tamper suppresses at the threshold with later SNs flowing; the counter table is
    capped), both impls.
-   - **PRECONDITION (forward requirement on any future KM-rotation/rekey WP):** the "KM-present
+   - **PRECONDITION — DISCHARGED 2026-07-11 (ADR 0059): the counter table is now STAMPED with the KM's
+     `sender_key_id` and RESET when that identity changes, so a rotation cannot suppress samples encoded
+     under the new key. A future rekey WP inherits this and need do nothing. Original text below.**
+   - **(forward requirement on any future KM-rotation/rekey WP):** the "KM-present
      failure = tamper or permanent mismatch" classification holds only while a live writer-GUID's
      KeyMaterial is never rotated/replaced with samples in flight (true today: single static
      per-endpoint KM, `session_id` fixed). If rekeying lands, a sample encoded under a NEW key

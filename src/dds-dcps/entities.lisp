@@ -973,6 +973,7 @@
                                          :keyed (%topic-keyed-p topic)
                                          :qos qos :type-information (%topic-type-information topic))))
     (%set-user-metadata-protection node ah (topic-name topic) :reader)   ; ADR 0046 §9.4.1.2.4: the READER's own protection tiers
+    (setf (dds.disc:disc-node-durability-gate-active node) t)   ; ADR 0059: DCPS owns the reader-side durability baseline from here on, so a MATCHED-but-UNARMED writer HEARTBEAT is the ADR 0043 window, not the bare-disc norm — arm the fail-safe guard
     (dds.disc:enable-subscriber node)
     ;; WP-FLATDATA-ZC-LOAN wiring (FR-PF-3/4, R6, ADR 0017): a :flatdata-topic reader, with ZC armed, is
     ;; loan-capable — the receiver thread defers ZC resolution (holds the slot) and the loan API owns the slot

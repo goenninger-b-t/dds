@@ -1576,6 +1576,70 @@
         (dds.dcps:delete-participant p))))
   t)
 
+(defun* run-km-session-cache-tear-test ()
+    (function () t)
+  "ADR 0059 — the KM session-key caches are TEAR-FREE by construction, so a concurrent re-derive can never
+   publish one session_id alongside another session_id's key.
+   THE HAZARD (real, not merely a forward requirement): the caches are read lock-free on the hot AEAD path.
+   Published as SEPARATE slots (id then key), two threads missing concurrently with DIFFERENT session_ids can
+   interleave their stores and leave the KM advertising id S1 with key(S2) — a later hit on S1 then returns the
+   WRONG key. It is fail-closed (a wrong key cannot forge a GCM tag; the datagram drops) but it is a SILENT DROP,
+   and it is REACHABLE: start-node runs up to THREE receiver threads (unicast UDP + multicast UDP + SHMEM) that
+   all feed %handle-datagram and can decode from the SAME peer under the SAME participant KM, while session_id
+   comes off the WIRE. The old design was safe only by the accident that conformant peers use a fixed session_id.
+   ADR 0059 publishes (discriminant, key) as ONE immutable session-cache object with a single store.
+   Asserts: (a) every lookup returns the key for the session_id it ASKED FOR, never a neighbour's; (b) every
+   PUBLISHED cache object is SELF-CONSISTENT — its key is exactly what its own id derives (a torn pair shows up
+   here as a mismatch); (c) the same for the receiver-specific (origin-auth) cache, whose discriminant is FOUR
+   fields. Hammered from 4 threads x 6 interleaved distinct session_ids."
+  (let* ((km   (dds.security:make-test-key-material :kind :encrypt))
+         (rkid (dds.security:key-material-receiver-specific-key-id km))
+         (rkey (dds.security:key-material-master-receiver-specific-key km))
+         (salt (dds.security:key-material-master-salt km))
+         (mkey (dds.security:key-material-master-sender-key km))
+         (threads 4)
+         (rounds 400)
+         (bad (dds.pal:make-atomic-cell))
+         (bad2 (dds.pal:make-atomic-cell))
+         (sids (loop for i from 1 to 6
+                     collect (make-array 4 :element-type '(unsigned-byte 8)
+                                           :initial-contents (list 0 0 0 i)))))
+    (flet ((hammer-send (tix)
+             (lambda ()
+               (dotimes (r rounds)
+                 (let* ((sid (nth (mod (+ r tix) (length sids)) sids))
+                        (k   (dds.security::%km-session-key-at km sid 0)))
+                   ;; (a) the key returned must be the one THIS session_id derives (deterministic KDF)
+                   (unless (equalp k (dds.security::derive-session-key mkey salt sid))
+                     (dds.pal:atomic-incf bad 1))
+                   ;; (b) the PUBLISHED object must be self-consistent: key == KDF(its own id)
+                   (let ((sc (dds.security::key-material-cached-send-session km)))
+                     (when sc
+                       (unless (equalp (dds.security::session-cache-key sc)
+                                       (dds.security::derive-session-key
+                                        mkey salt (dds.security::session-cache-id sc)))
+                         (dds.pal:atomic-incf bad 1))))))))
+           (hammer-recv (tix)
+             (lambda ()
+               (dotimes (r rounds)
+                 (let* ((sid (nth (mod (+ r tix) (length sids)) sids))
+                        (k   (dds.security::%km-receiver-session-key-at km rkid rkey sid 0)))
+                   (unless (equalp k (dds.security::derive-receiver-specific-session-key rkey salt sid))
+                     (dds.pal:atomic-incf bad2 1)))))))
+      (let ((ths (loop for tix from 0 below threads
+                       collect (dds.pal:spawn (hammer-send tix) :name "km-tear"))))
+        (dolist (th ths) (dds.pal:join th)))
+      (%check :kmt-send-consistent
+              (zerop (dds.pal:atomic-cell-value bad))
+              "SEND cache: every lookup returns the key of the session_id it asked for, and every published cache object is self-consistent (id,key) — no tear under 4 threads x 6 interleaved session_ids")
+      (let ((ths (loop for tix from 0 below threads
+                       collect (dds.pal:spawn (hammer-recv tix) :name "km-tear-recv"))))
+        (dolist (th ths) (dds.pal:join th)))
+      (%check :kmt-recv-consistent
+              (zerop (dds.pal:atomic-cell-value bad2))
+              "RECV (origin-auth) cache: every lookup returns the key for the (key_id, master_key, session_id) it asked for — the four-field discriminant cannot be observed torn from its key")))
+  t)
+
 (defun* run-security-dn-match-test ()
     (function () t)
   "ADR-0036/0037 carry (DDS-Security 1.1 §9.4.1.3 subject-name binding; RFC2253 §2.1-2.4): the serialization-
