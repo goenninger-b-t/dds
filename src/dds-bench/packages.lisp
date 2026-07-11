@@ -12,6 +12,9 @@
     ZC-vs-SHMEM-vs-UDP comparison (WP-ZEROCOPY/FR-PF-3, NOT cleared for ship — counsel R6);
     run-bench-smoke / run-bench-shmem-smoke / run-bench-zerocopy-smoke are tiny suite-friendly
     self-checks.")
-  (:export #:run-latency #:run-throughput #:run-bench #:run-bench-shmem #:run-bench-zerocopy
+  (:export ;; WP-CONFORMANCE-AND-PARITY WP-1: the cross-stack (ours / Connext / Fast DDS) parity harness
+           #:run-echo-responder #:run-echo-pinger #:run-echo-ladder
+           #:perf-data #:make-perf-data
+           #:run-latency #:run-throughput #:run-bench #:run-bench-shmem #:run-bench-zerocopy
            #:run-bench-smoke #:run-bench-shmem-smoke #:run-bench-zerocopy-smoke
            #:run-keeplast-bench #:run-keeplast-bench-smoke))

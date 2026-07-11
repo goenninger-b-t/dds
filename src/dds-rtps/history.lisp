@@ -112,6 +112,15 @@
   (changes (make-hash-table :test 'eql) :type hash-table)
   (instances (make-hash-table :test 'equalp) :type hash-table)                   ; keyhash -> SNs oldest-first (per-instance KEEP_LAST, §2.2.3.18)
   (count 0 :type (integer 0))
+  ;; WP-PERF: the stored SN extent, maintained INCREMENTALLY at the two chokepoints (%hc-store / %hc-remove-change)
+  ;; so hc-min-seq / hc-max-seq are O(1) reads instead of a full maphash SCAN of the change table. They are read on
+  ;; the WRITE path (the reliable writer's firstSN/lastSN for every HEARTBEAT), so the scan made a write O(stored) —
+  ;; quadratic for any writer whose history is non-trivial (a slow/bursty reader, KEEP_ALL, a repair backlog). A
+  ;; profile of write-sample put 80% of its CPU in these two functions. SNs are FIXNUM-typed here (RTPS 2.5 §8.3.5.4
+  ;; SequenceNumber_t is 64-bit; a 62-bit fixnum bounds it at 4.6e18 — 146,000 years at 1M samples/s), which also
+  ;; takes the comparisons off SBCL's generic-arithmetic path (TWO-ARG-< / TWO-ARG-> dominated the profile's SELF time).
+  (min-seq 0 :type fixnum)          ; 0 = empty (a valid SN is >= 1, RTPS 2.5 §8.3.5.4)
+  (max-seq 0 :type fixnum)
   (payload-pool nil :type (or null dds.core.arena:buffer-pool))                   ; T5a: data_protection secured-payload pool (NIL = no pooling, byte-identical); buffers acquired+released ONLY under the owning writer's lock
   (zc-release-fn nil :type (or null function)))                                   ; WP-ACKED-SLOT-PINNING (ADR 0044): opaque (lambda (slot generation)) the disc layer installs to %zc-release a pinned change's TX slot at the change-removal choke; NIL = no pinning (layering: history must not depend on dds.xport.zerocopy, so the release is a funcall'd closure, mirroring payload-pool)
 
@@ -250,6 +259,8 @@
              (cache-change-zc-slot change) (cache-change-zc-generation change)))
   t)
 
+(declaim (ftype (function (history-cache fixnum) t) %hc-extent-dropped))   ; defined below; the removal choke maintains the O(1) SN extent
+
 (defun* %hc-remove-change (hc seqnum)
     (function (history-cache integer) t)
   "The single change-removal path: drop SEQNUM from BOTH the change table and its per-instance
@@ -264,6 +275,7 @@
       (remhash seqnum (history-cache-changes hc))
       (%hc-index-drop hc seqnum change)
       (decf (history-cache-count hc))
+      (%hc-extent-dropped hc (the fixnum seqnum))   ; O(1) unless the removed SN WAS an endpoint (then one rescan)
       (setf (cache-change-evicted change) t)   ; gate the (possibly deferred) pooled-buffer release
       (hc-try-release-pooled hc change)         ; release NOW if releasable, else defer to the last send-ref drop (T5a)
       (hc-try-release-pinned hc change)         ; WP-ACKED-SLOT-PINNING: release the TX pin hold on a pinned change (one-shot, ADR 0044)
@@ -287,23 +299,48 @@
     (dolist (sn removed (length removed))
       (%hc-remove-change hc sn))))
 
+(defun* %hc-rescan-extent (hc)
+    (function (history-cache) t)
+  "Recompute the stored-SN extent by a full scan — the SLOW path, taken ONLY when the change just removed
+   was itself the current min or max (so the extent genuinely has to be re-derived). Every other removal,
+   and every insert, keeps the extent in O(1). An empty cache resets to 0/0."
+  (let ((min 0) (max 0))
+    (declare (type fixnum min max))
+    (maphash (lambda (sn ch)
+               (declare (ignore ch) (type fixnum sn))
+               (when (or (zerop min) (< sn min)) (setf min sn))
+               (when (> sn max) (setf max sn)))
+             (history-cache-changes hc))
+    (setf (history-cache-min-seq hc) min
+          (history-cache-max-seq hc) max))
+  t)
+
+(defun* %hc-extent-dropped (hc sn)
+    (function (history-cache fixnum) t)
+  "Maintain the stored-SN extent after SN was removed. O(1) in the common case: a purge removes the LOWEST
+   SNs (hc-purge-below) and KEEP_LAST evicts the oldest, so the removed SN is usually the min — and the new
+   min is not knowable without a scan, so we rescan only then. A removal from the interior touches neither
+   endpoint and costs nothing."
+  (cond ((zerop (history-cache-count hc))            ; emptied
+         (setf (history-cache-min-seq hc) 0 (history-cache-max-seq hc) 0))
+        ((or (= sn (history-cache-min-seq hc))
+             (= sn (history-cache-max-seq hc)))
+         (%hc-rescan-extent hc)))
+  t)
+
 (defun* hc-min-seq (hc)
     (function (history-cache) t)
-  "Lowest sequence number present, or NIL if empty."
-  (let ((min nil))
-    (maphash (lambda (sn ch) (declare (ignore ch))
-               (when (or (null min) (< sn min)) (setf min sn)))
-             (history-cache-changes hc))
-    min))
+  "Lowest sequence number present, or NIL if empty. O(1) — read from the incrementally-maintained extent
+   (was a full maphash scan; it is called on the WRITE path for every HEARTBEAT's firstSN)."
+  (let ((n (history-cache-min-seq hc)))
+    (if (zerop n) nil n)))
 
 (defun* hc-max-seq (hc)
     (function (history-cache) t)
-  "Highest sequence number present, or NIL if empty."
-  (let ((max nil))
-    (maphash (lambda (sn ch) (declare (ignore ch))
-               (when (or (null max) (> sn max)) (setf max sn)))
-             (history-cache-changes hc))
-    max))
+  "Highest sequence number present, or NIL if empty. O(1) — read from the incrementally-maintained extent
+   (was a full maphash scan; it is called on the WRITE path for every HEARTBEAT's lastSN)."
+  (let ((n (history-cache-max-seq hc)))
+    (if (zerop n) nil n)))
 
 (defun* %hc-store (hc sn change)
     (function (history-cache integer cache-change) (integer 0))
@@ -312,6 +349,11 @@
    the new count."
   (setf (gethash sn (history-cache-changes hc)) change)
   (%hc-index-append hc sn change)
+  (let ((n (the fixnum sn)))                       ; O(1) extent maintenance (see the min-seq/max-seq slot comment)
+    (when (or (zerop (history-cache-min-seq hc)) (< n (history-cache-min-seq hc)))
+      (setf (history-cache-min-seq hc) n))
+    (when (> n (history-cache-max-seq hc))
+      (setf (history-cache-max-seq hc) n)))
   (incf (history-cache-count hc)))
 
 (defun* hc-add-change (hc change)
