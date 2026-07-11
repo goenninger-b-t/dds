@@ -24,7 +24,7 @@
            #:disc-node-on-incompatible-qos #:disc-node-on-sample #:disc-node-on-sample-lost
            #:disc-node-on-inconsistent-topic
            #:disc-node-type-gate #:resume-parked-matches #:disc-node-parked-count
-           #:add-local-writer #:add-local-reader
+           #:add-local-writer #:add-local-reader #:enable-local-endpoint
            #:remove-local-writer #:remove-local-reader
            #:disc-node-user-writer-id #:disc-node-user-reader-id
            ;; WP-N-ENDPOINT-S3 (ADR 0048): per-endpoint enumeration + protection-kind resolvers (crypto-manager consumers)

@@ -3879,6 +3879,64 @@
         (dds.dcps:delete-participant p))))
   t)
 
+(defun* run-dcps-disabled-endpoint-silent-test ()
+    (function () t)
+  "ADR 0060 (DDS 1.4 §2.2.2.1.1.7: 'a disabled entity does not communicate') — a DataWriter/DataReader created
+   DISABLED (its factory's ENTITY_FACTORY autoenable_created_entities is FALSE) must be INVISIBLE on the wire:
+   not SEDP-announced, and never matched. It is still registered with the engine at create (ADR 0052 kept eager
+   registration), so before this fix the announce simply advertised it.
+   RED before: two AUTONOMOUS participants, each with a DISABLED endpoint, MATCHED anyway (matched=1 both sides)
+   — the announcer thread announces the local endpoint set, and a disabled endpoint was in it. ADR 0052 had
+   deferred true deferred-registration on the argument that 'discovery is spin-driven, so a disabled endpoint
+   that is never spun never announces' — WP-DCPS-API-COMPLETION S7 (the autonomous announcer) invalidated that
+   premise: the participant now spins ITSELF. (A spin-driven app that spins for its OTHER endpoints hit it too.)
+   Asserts: (a) while DISABLED, neither side matches — the endpoints are silent on the wire; (b) enable() RELEASES
+   them: the same endpoints then match and data flows, so the fix withholds rather than strands them."
+  (let* ((ts (dds.types:find-type-support "shape-type"))
+         (fa (dds.types:type-support-field-accessors ts))
+         (p1 (dds.dcps:create-participant :domain (test-domain) :autonomous t))
+         (p2 (dds.dcps:create-participant :domain (test-domain) :autonomous t)))
+    (flet ((color (s) (funcall (cdr (assoc "color" fa :test #'string-equal)) s)))
+      (unwind-protect
+           (let* ((t1 (dds.dcps:create-topic p1 "DisabledTop" "shape-type" ts))
+                  (t2 (dds.dcps:create-topic p2 "DisabledTop" "shape-type" ts))
+                  (pub (dds.dcps:create-publisher p1))
+                  (sub (dds.dcps:create-subscriber p2)))
+             (setf (dds.dcps:entity-autoenable-created-entities pub) nil)   ; children created DISABLED
+             (setf (dds.dcps:entity-autoenable-created-entities sub) nil)
+             (let ((dw (dds.dcps:create-datawriter pub t1))
+                   (dr (dds.dcps:create-datareader sub t2
+                         :qos (dds.qos:make-reader-qos :reliability :reliable))))
+               (%check :dis-created-disabled
+                       (and (not (dds.dcps::entity-enabled-p dw)) (not (dds.dcps::entity-enabled-p dr)))
+                       "the endpoints are created DISABLED (non-vacuous: the factory autoenable flag is off)")
+               ;; (a) DISABLED -> silent. Give the announcers ample time to announce (they run at ~1 s).
+               (sleep 2.5)
+               (%check :dis-not-matched
+                       (and (zerop (dds.dcps:matched-count p1)) (zerop (dds.dcps:matched-count p2)))
+                       "a DISABLED endpoint is NOT announced and NOT matched — it does not communicate (RED before ADR 0060: matched=1 both sides)")
+               ;; (b) enable() releases them onto the wire: they match and data flows.
+               (dds.dcps:enable dw)
+               (dds.dcps:enable dr)
+               (loop repeat 400
+                     until (and (plusp (dds.dcps:matched-count p1)) (plusp (dds.dcps:matched-count p2)))
+                     do (sleep 0.025))
+               (%check :dis-enable-releases
+                       (and (plusp (dds.dcps:matched-count p1)) (plusp (dds.dcps:matched-count p2)))
+                       "enable() RELEASES the endpoints onto the wire — they match (the fix WITHHOLDS, it does not strand)")
+               (dds.dcps:write-sample dw (make-shape-type :color "RED" :x 4 :y 5 :shapesize 6))
+               (let ((got nil))
+                 (loop repeat 400 until got
+                       do (dolist (cs (dds.dcps:take-samples dr))
+                            (setf got (dds.dcps:cached-sample-data cs)))
+                          (sleep 0.025))
+                 (%check :dis-enable-data
+                         (and got (string= "RED" (color got)))
+                         "data flows once enabled — the released endpoints are fully functional"))))
+        (dds.dcps:delete-participant p1)
+        (dds.dcps:delete-participant p2))))
+  t)
+
 ;;; Builtin-topic readers (M3 #5, FR-DCPS-6): DCPSParticipant / DCPSPublication /
 ;;; DCPSSubscription / DCPSTopic surface the discovered participants + endpoints.
 

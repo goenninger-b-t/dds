@@ -2921,17 +2921,28 @@
    Bounded: an existing counter always progresses to suppression; a NEW SN is tracked only below
    *decode-fail-track-limit* (else it keeps retransmitting — bounded churn over unbounded memory). Node-lock
    guarded (the counter table is also pruned under that lock by %lease-sweep). Receiver-thread call."
-  (dds.pal:with-lock ((disc-node-lock node))
-    (let ((inner (%decode-fail-inner node guid km)))
-      (multiple-value-bind (cur present) (gethash sn inner)
-        (let ((n (1+ (if present (the fixnum cur) 0))))
-          (declare (type fixnum n))
-          (cond
-            ((>= n *decode-fail-suppress-threshold*)
-             (dds.rtps.reliable:reader-suppress-sn (disc-node-user-reader node) guid sn)   ; persistent KM-present failure -> stop the NACK/repair of this SN
-             (remhash sn inner))
-            ((or present (< (hash-table-count inner) *decode-fail-track-limit*))
-             (setf (gethash sn inner) n)))))))   ; below cap / already tracked: keep counting (retransmit continues, still recoverable)
+  (let ((suppressed nil))
+    (dds.pal:with-lock ((disc-node-lock node))
+      (let ((inner (%decode-fail-inner node guid km)))
+        (multiple-value-bind (cur present) (gethash sn inner)
+          (let ((n (1+ (if present (the fixnum cur) 0))))
+            (declare (type fixnum n))
+            (cond
+              ((>= n *decode-fail-suppress-threshold*)
+               (dds.rtps.reliable:reader-suppress-sn (disc-node-user-reader node) guid sn)   ; persistent KM-present failure -> stop the NACK/repair of this SN
+               (remhash sn inner)
+               (setf suppressed t))                                                          ; ADR 0060: the sample is now permanently gone -> SAMPLE_LOST (fired OUTSIDE the lock)
+              ((or present (< (hash-table-count inner) *decode-fail-track-limit*))
+               (setf (gethash sn inner) n)))))))   ; below cap / already tracked: keep counting (retransmit continues, still recoverable)
+    ;; ADR 0060 (DDS 1.4 §2.2.4.1): a SUPPRESSED SN will never be delivered — the reader stops NACKing it, so no
+    ;; retransmit can ever recover it. That is precisely a LOST sample, so raise SAMPLE_LOST on the DataReader(s)
+    ;; routed from this writer, exactly as the irrecoverable-GAP path does (%on-user-gap). ADR 0054 left this
+    ;; uncounted in v1 ("reader-suppress-sn not counted as SAMPLE_LOST"), which under-reported a real loss: the
+    ;; application saw the sample silently vanish with no status. Fired OUTSIDE the node lock (the hook re-enters
+    ;; DCPS, which takes its own locks — the %fire-unmatch / on-participant-lost discipline).
+    (when (and suppressed (disc-node-on-sample-lost node))
+      (dolist (rr (%reader-routes-for node guid))
+        (funcall (disc-node-on-sample-lost node) (car rr) 1))))
   t)
 
 (defun* %deliver-user-sample (node writer-id sn vec src-prefix effective-guid effective-sn

@@ -170,6 +170,11 @@
   (discovered-readers (make-hash-table :test 'equalp) :type hash-table) ; all remote subscriptions
   (local-writers '() :type list)
   (local-readers '() :type list)
+  ;; ADR 0060: local endpoints that are REGISTERED with the engine but NOT YET ENABLED (DDS 1.4 §2.2.2.1.1.7:
+  ;; "a disabled entity does not communicate"). Endpoint EntityId -> T. announce-endpoints does not SEDP-announce
+  ;; them and %match-remote-endpoint does not match them, so a created-disabled endpoint is invisible on the wire
+  ;; until enable(). Empty in the default (autoenable) path -> byte-identical announce/match.
+  (unenabled-endpoints (make-hash-table :test 'eql) :type hash-table)
   (lock (dds.pal:make-lock "disc-node") :type t)
   (tx-payload nil :type (or null dds.core.buffer:octet-buffer))
   (tx-msg nil :type (or null dds.core.buffer:octet-buffer))
@@ -1196,8 +1201,8 @@
 
 (defun* add-local-writer (node &key (topic "") (type "")
                                    (reliability dds.rtps.discovery:+reliability-reliable+)
-                                   (key nil) qos type-information (keyed t))
-    (function (disc-node &key (:topic string) (:type string) (:reliability integer) (:key (or null (unsigned-byte 8))) (:qos t) (:type-information t) (:keyed t)) dds.rtps.discovery:endpoint-data)
+                                   (key nil) qos type-information (keyed t) (enabled t))
+    (function (disc-node &key (:topic string) (:type string) (:reliability integer) (:key (or null (unsigned-byte 8))) (:qos t) (:type-information t) (:keyed t) (:enabled t)) dds.rtps.discovery:endpoint-data)
   "Register a local publication (writer endpoint) on NODE with QOS (or a QoS derived from
    the legacy :reliability constant). TYPE-INFORMATION is the opaque serialized XTypes
    TypeInformation for PID_TYPE_INFORMATION. announce-endpoints sends it via SEDP. KEYED
@@ -1224,13 +1229,16 @@
                 :qos wqos)))
       (setf (disc-node-user-writer-id node) (logior (ash key 8) kind))
       (%refine-user-protection node topic :writer)   ; ADR 0046 §9.4.1.2.4: cache the WRITER's OWN per-topic metadata + data protection (cross-role downgrade fix)
+      (unless enabled   ; ADR 0060: created-disabled -> registered but NOT announced/matched until enable-local-endpoint
+        (setf (gethash (%guid-entityid (dds.rtps.discovery:endpoint-data-guid ep))
+                       (disc-node-unenabled-endpoints node)) t))
       (push ep (disc-node-local-writers node))
       ep)))
 
 (defun* add-local-reader (node &key (topic "") (type "")
                                    (reliability dds.rtps.discovery:+reliability-best-effort+)
-                                   (key nil) qos type-information (keyed t))
-    (function (disc-node &key (:topic string) (:type string) (:reliability integer) (:key (or null (unsigned-byte 8))) (:qos t) (:type-information t) (:keyed t)) dds.rtps.discovery:endpoint-data)
+                                   (key nil) qos type-information (keyed t) (enabled t))
+    (function (disc-node &key (:topic string) (:type string) (:reliability integer) (:key (or null (unsigned-byte 8))) (:qos t) (:type-information t) (:keyed t) (:enabled t)) dds.rtps.discovery:endpoint-data)
   "Register a local subscription (reader endpoint) on NODE with QOS (or a QoS derived from
    the legacy :reliability constant). TYPE-INFORMATION is the opaque serialized XTypes
    TypeInformation for PID_TYPE_INFORMATION. announce-endpoints sends it via SEDP. KEYED
@@ -1261,6 +1269,9 @@
               :qos (or qos (%qos-from-reliability reliability)))))
     (setf (disc-node-user-reader-id node) (logior (ash key 8) kind))
     (%refine-user-protection node topic :reader)   ; ADR 0046 §9.4.1.2.4: cache the READER's OWN per-topic metadata + data protection (cross-role downgrade fix)
+    (unless enabled   ; ADR 0060: created-disabled -> registered but NOT announced/matched until enable-local-endpoint
+      (setf (gethash (%guid-entityid (dds.rtps.discovery:endpoint-data-guid ep))
+                     (disc-node-unenabled-endpoints node)) t))
     (push ep (disc-node-local-readers node))
     ep))
 
@@ -1434,6 +1445,23 @@
         (%send-acknack node (disc-node-rx-tx-msg node) rid wid base numbits bitmap count
                        t (car hp) (cdr hp))))))
 
+(defun* %endpoint-enabled-p (node ep)
+    (function (disc-node dds.rtps.discovery:endpoint-data) boolean)
+  "T iff local endpoint EP is ENABLED, i.e. it may communicate (DDS 1.4 §2.2.2.1.1.7). An endpoint created under
+   a factory whose ENTITY_FACTORY autoenable_created_entities is FALSE is registered with the engine but stays
+   UNENABLED until enable() — it must not be SEDP-announced and must not match a remote, or a disabled entity
+   would communicate. Default (autoenable on) -> the table is empty -> T for everything, byte-identical."
+  (not (gethash (%guid-entityid (dds.rtps.discovery:endpoint-data-guid ep))
+                (disc-node-unenabled-endpoints node))))
+
+(defun* enable-local-endpoint (node entity-id)
+    (function (disc-node (unsigned-byte 32)) (eql t))
+  "Mark the local endpoint ENTITY-ID ENABLED (DDS 1.4 §2.2.2.1.1.7) — from now on announce-endpoints SEDP-
+   announces it and %match-remote-endpoint may match it. Called by the DCPS enable() on a DataWriter/DataReader
+   that was created disabled. Idempotent; enabling is monotonic (DDS has no disable)."
+  (remhash entity-id (disc-node-unenabled-endpoints node))
+  t)
+
 (defun* announce-endpoints (node)
     (function (disc-node) (eql t))
   "Send NODE's local publications (SEDP publications writer) and subscriptions
@@ -1455,15 +1483,22 @@
   ;; discovery protection (the predicate is NIL) PLAIN-WRITERS/READERS are the full add-order lists -> the
   ;; plain SEDP announce is byte-identical to today. Each SEDP writer's SN space is its OWN subset's 1-based
   ;; index, so the protected/unprotected split keeps every per-writer SN stable (RTPS 2.5 §8.5.4).
+  ;; ADR 0060: a created-DISABLED endpoint is registered with the engine but must NOT be announced — a disabled
+  ;; entity does not communicate (DDS 1.4 §2.2.2.1.1.7). Filter FIRST, so both the plain and the secure SEDP
+  ;; announce see the enabled set. Empty unenabled-table (the autoenable default) -> the full add-order lists.
   (let* ((protp (disc-node-discovery-protected-topic-p node))
+         (enabled-writers (remove-if-not (lambda (w) (%endpoint-enabled-p node w))
+                                         (reverse (disc-node-local-writers node))))
+         (enabled-readers (remove-if-not (lambda (r) (%endpoint-enabled-p node r))
+                                         (reverse (disc-node-local-readers node))))
          (plain-writers (if protp
                             (remove-if (lambda (w) (funcall protp (dds.rtps.discovery:endpoint-data-topic-name w)))
-                                       (reverse (disc-node-local-writers node)))
-                            (reverse (disc-node-local-writers node))))
+                                       enabled-writers)
+                            enabled-writers))
          (plain-readers (if protp
                             (remove-if (lambda (r) (funcall protp (dds.rtps.discovery:endpoint-data-topic-name r)))
-                                       (reverse (disc-node-local-readers node)))
-                            (reverse (disc-node-local-readers node)))))
+                                       enabled-readers)
+                            enabled-readers)))
   (dolist (p (%discovered-participants node))
     (let ((loc (dds.rtps.discovery:usable-udpv4-locator
                 (dds.rtps.discovery:spdp-data-metatraffic-unicast-locators p))))
@@ -1900,7 +1935,8 @@
    fires INDEPENDENTLY of INCOMPATIBLE_QOS (F1: a remote with both a QoS-incompatible same-type sibling and a
    type-inconsistent sibling fires BOTH statuses — they are separate DDS 1.4 §2.2.4.1 statuses on different entities)."
   (let ((incompats nil) (inconsistent nil) (parked nil) (writer-p (eq direction :remote-writer)))
-    (dolist (local (if writer-p (disc-node-local-readers node) (disc-node-local-writers node)))
+    (dolist (local (remove-if-not (lambda (l) (%endpoint-enabled-p node l))   ; ADR 0060: a DISABLED local endpoint must not match a remote (DDS 1.4 §2.2.2.1.1.7)
+                                  (if writer-p (disc-node-local-readers node) (disc-node-local-writers node))))
       (multiple-value-bind (ok bad)
           (if writer-p
               ;; endpoint-match-p wants writer-data first: REMOTE is the writer here

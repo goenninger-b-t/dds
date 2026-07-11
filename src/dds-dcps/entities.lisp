@@ -937,6 +937,9 @@
              (topic-name topic)))
     (let ((ep (dds.disc:add-local-writer node :topic (topic-name topic) :type (topic-type-name topic)
                                          :keyed (%topic-keyed-p topic)
+                                         ;; ADR 0060: a created-DISABLED writer registers with the engine but is NOT
+                                         ;; SEDP-announced and cannot match until enable() (DDS 1.4 §2.2.2.1.1.7).
+                                         :enabled (%child-created-enabled-p pub)
                                          :qos qos :type-information (%topic-type-information topic))))
     (%set-user-metadata-protection node ah (topic-name topic) :writer)   ; ADR 0046 §9.4.1.2.4: the WRITER's own protection tiers
     (dds.disc:enable-publisher node :history-kind (dds.qos:qos-history-kind qos)
@@ -971,6 +974,9 @@
              (topic-name topic)))
     (let ((ep (dds.disc:add-local-reader node :topic (topic-name topic) :type (topic-type-name topic)
                                          :keyed (%topic-keyed-p topic)
+                                         ;; ADR 0060: a created-DISABLED reader registers with the engine but is NOT
+                                         ;; SEDP-announced and cannot match until enable() (DDS 1.4 §2.2.2.1.1.7).
+                                         :enabled (%child-created-enabled-p sub)
                                          :qos qos :type-information (%topic-type-information topic))))
     (%set-user-metadata-protection node ah (topic-name topic) :reader)   ; ADR 0046 §9.4.1.2.4: the READER's own protection tiers
     (setf (dds.disc:disc-node-durability-gate-active node) t)   ; ADR 0059: DCPS owns the reader-side durability baseline from here on, so a MATCHED-but-UNARMED writer HEARTBEAT is the ADR 0043 window, not the bare-disc norm — arm the fail-safe guard
@@ -1157,6 +1163,14 @@
   (unless (%entity-factory-parent-enabled-p entity)
     (return-from enable +retcode-precondition-not-met+))
   (setf (entity-enabled-p entity) t)
+  ;; ADR 0060: a DataWriter/DataReader created DISABLED is registered with the engine but withheld from SEDP +
+  ;; matching; enabling it releases it onto the wire (DDS 1.4 §2.2.2.1.1.7 — only now may it communicate).
+  (typecase entity
+    (data-writer (dds.disc:enable-local-endpoint (dp-node (pub-participant (dw-publisher entity)))
+                                                 (dw-entity-id entity)))
+    (data-reader (dds.disc:enable-local-endpoint (dp-node (sub-participant (dr-subscriber entity)))
+                                                 (dr-entity-id entity)))
+    (t nil))
   (when (typep entity 'domain-participant) (%start-auto-announcer entity))   ; WP-DCPS-API-COMPLETION S7: start the announcer now the participant is enabled (idempotent; no-op unless autonomous)
   +retcode-ok+)
 

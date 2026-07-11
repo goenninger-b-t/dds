@@ -129,9 +129,15 @@ mixed `dp-children`), `publisher-datawriters`, `subscriber-datareaders` — each
   `remove-local-writer` OUTSIDE the node lock (the barrier must not hold it — no lock-order inversion with
   the scheduler's emit path). The node keeps its flow-controller association and its OTHER writers untouched.
 - **Deferred engine registration is not done.** A created-disabled endpoint still eagerly registers with
-  the engine at create (the disabled state is enforced at the DCPS data ops). Since discovery is
-  `spin`-driven, a disabled endpoint that is never spun never announces; true deferred-registration is a
-  follow-on.
+  the engine at create (the disabled state is enforced at the DCPS data ops). ~~Since discovery is
+  `spin`-driven, a disabled endpoint that is never spun never announces~~ — **THIS SAFETY ARGUMENT IS
+  RETRACTED (ADR 0060, 2026-07-11).** It was already thin (an app that spins for its OTHER endpoints
+  announces the disabled one too) and S7's autonomous announcer (ADR 0056) killed it outright: the
+  participant now spins ITSELF. A disabled endpoint WAS being SEDP-announced and MATCHED — a DDS 1.4
+  §2.2.2.1.1.7 violation ("a disabled entity does not communicate"), measured. **Fixed in ADR 0060:**
+  registration stays eager, but a not-yet-enabled endpoint is withheld from the SEDP announce AND from
+  matching until `enable()` releases it. Lesson recorded: a deferral justified by "nothing currently
+  exercises this path" is only as durable as the reason nothing exercises it.
 
 ## 4. Consumers / API surface (all additive; no existing symbol's contract changes)
 

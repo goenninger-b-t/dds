@@ -3886,6 +3886,7 @@
                  ("dcps-autonomous-lease-expiry" . run-dcps-autonomous-lease-expiry-test)
                  ("dcps-type-gate-legacy-reader" . run-dcps-type-gate-legacy-reader-test)
                  ("dcps-state-masks"         . run-dcps-state-masks-test)
+                 ("dcps-disabled-endpoint-silent" . run-dcps-disabled-endpoint-silent-test)
                  ("dcps-builtin-topics"      . run-dcps-builtin-topics-test)
                  ("dcps-type-compat"         . run-dcps-type-compat-test)
                  ("dcps-large-frag"          . run-dcps-large-test)

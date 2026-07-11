@@ -88,10 +88,17 @@ GAP is a genuine purge/eviction and the count is exact. Should writer-side filte
 filtered-flag (`+gap-flag-filtered+`, currently parsed-but-unused) must gate the count; recorded as a
 forward requirement.
 
-**Deliberate v1 non-trigger.** The secure receive path's `reader-suppress-sn` (a bounded run of
-KM-present AES-GCM decode failures marks one SN locally `:gap`, ADR 0031) is a genuine loss but is
-**not** counted as SAMPLE_LOST in v1 — it has its own decode-fail accounting and firing it here would
-entangle the security-suppression semantics; recorded as a possible follow-on.
+**Deliberate v1 non-trigger — CLOSED 2026-07-11 (ADR 0060): it now DOES fire.** The secure receive path's
+`reader-suppress-sn` (a bounded run of KM-present AES-GCM decode failures marks one SN locally `:gap`,
+ADR 0031) ~~is a genuine loss but is **not** counted as SAMPLE_LOST in v1 — it has its own decode-fail
+accounting and firing it here would entangle the security-suppression semantics~~. On reflection the v1
+call was wrong: the ADR itself concedes the sample is "a genuine loss", and suppression makes it
+**permanent** (the reader stops NACKing the SN, so no retransmit can ever recover it). Not counting it
+meant a real, irrecoverable loss reached the application with **no status at all** —
+`SAMPLE_LOST.total_count` stayed 0 while the sample simply never arrived, which is exactly what DDS 1.4
+§2.2.4.1 says SAMPLE_LOST is for. Suppression now raises SAMPLE_LOST on the routed DataReader(s), through
+the same hook and route fan-out as the irrecoverable-GAP path. "It has its own accounting" was not a
+reason to withhold the status the application actually watches.
 
 ### 2.3 The fire path is unchanged plumbing
 

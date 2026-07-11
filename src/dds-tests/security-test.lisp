@@ -1343,8 +1343,11 @@
                                             :domain (test-domain +td-decode-fail-suppress+)
                                             :host "127.0.0.1" :port 0 :multicast nil :crypto-transform km))))
       (unwind-protect
-           (let ((guid (dds.disc::%source-guid src wid))
-                 (thresh dds.disc:*decode-fail-suppress-threshold*))
+           (let* ((guid (dds.disc::%source-guid src wid))
+                  (thresh dds.disc:*decode-fail-suppress-threshold*)
+                  (lost-count 0))
+             (setf (dds.disc:disc-node-on-sample-lost node)   ; ADR 0060: SAMPLE_LOST on suppression (DDS 1.4 §2.2.4.1)
+                   (lambda (rid n) (declare (ignore rid)) (incf lost-count n)))
              (dds.disc:enable-subscriber node)
              (let ((reader (dds.disc::disc-node-user-reader node)))
              (dds.rtps.reliable:reader-on-heartbeat reader guid 1 2)   ; the writer advertises [1,2]
@@ -1369,6 +1372,11 @@
                      (let ((entry (gethash guid (dds.disc::disc-node-decode-fail-counts node))))   ; (km-key-id . SN-table), ADR 0059
                        (or (null entry) (null (gethash 1 (cdr entry)))))
                      "the failure counter for a suppressed SN is dropped (bounded memory)")
+             ;; ADR 0060: a suppressed SN can never be recovered (the reader stops NACKing it) -> SAMPLE_LOST.
+             ;; ADR 0054 left this uncounted in v1, so a real loss reached the app with NO status.
+             (%check :dfs-sample-lost-fired
+                     (plusp lost-count)
+                     "suppressing a permanently-undecodable SN raises SAMPLE_LOST on the matched DataReader (ADR 0060; RED before: the loss was silent)")
              ;; a subsequent GOOD higher SN still decodes + delivers -> no head-of-line wedge
              (dds.disc::%deliver-user-sample node wid 2 secured src guid 2)
              (%check :dfs-later-sn-flows
