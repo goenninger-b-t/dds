@@ -638,11 +638,14 @@
    entry in place (byte-identical to the pre-S0 enable-subscriber engine-reader clobber), keeping the primary ref
    current if that id IS the primary. A NEW distinct id ADDS an N-th local reader (each with its own EntityId +
    engine rtps-reader; the receive-hook demux + the %drain source-GUID filter route delivery per reader).
-   WP-N-ENDPOINT-S4 (ADR 0048): the secured/ZC-loan-capable fence is LIFTED — a 2nd loan-capable reader now
-   registers. The SAME-topic fence in add-local-reader STAYS (the UAF-guarding invariant): the two loan-capable
-   readers are therefore always on DIFFERENT topics -> disjoint source-GUIDs -> they never share a (guid,SN) slot
-   or ZC marker, so the ADR-0017 cross-reader use-after-free precondition is structurally unreachable. The
-   per-reader decode tier (%deliver-user-sample) + per-reader dr-secured-loans keep delivery + release isolated."
+   WP-N-ENDPOINT-S4/2C3 (ADR 0048): the secured/ZC-loan-capable fence is LIFTED — a 2nd loan-capable reader now
+   registers, AND (2C3) the SAME-topic fence in add-local-reader is ALSO lifted: two SAME-topic loan-capable
+   readers match the SAME remote writer, so they DO share one (guid,SN) store slot / ZC marker. The cross-reader
+   use-after-free is then prevented not by disjointness but by explicit refcounting: the secured decode handle's
+   return-count = route length (purge/free only on the LAST reader's return) and the ZC slot's join-watermark +
+   %count-eligible-drainers demux bump. Per-reader delivery (%deliver-user-sample source-GUID + per-reader
+   dr-drained high-water) + per-reader dr-secured-loans keep delivery + release isolated. Verified end-to-end at
+   the DCPS layer by run-dcps-same-topic-secured-readers-test (WP-DCPS-API-COMPLETION S6.T1)."
   (let ((cell (assoc entity-id (disc-node-user-readers node) :test #'eql)))
     (cond (cell (let ((was-primary (eq (cdr cell) (disc-node-primary-user-reader node))))
                   (setf (cdr cell) reader)
@@ -1303,7 +1306,7 @@
 (declaim (ftype (function ((unsigned-byte 32)) t) %user-writer-entityid-p))
 
 ;; WP-N-ENDPOINT-S2: %guid-entityid / node-secured-reader-p are defined in dataplane.lisp (loaded after this file);
-;; forward-declared so %match-remote-endpoint (route-add) and %register-user-reader (fail-fast) reach them clean.
+;; forward-declared so %match-remote-endpoint (route-add) and %register-user-reader (route-add-all; no same-topic fail-fast — S6) reach them clean.
 (declaim (ftype (function ((simple-array (unsigned-byte 8) (16))) (unsigned-byte 32)) %guid-entityid))
 (declaim (ftype (function (disc-node) boolean) node-secured-reader-p))
 

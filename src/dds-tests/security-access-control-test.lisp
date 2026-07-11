@@ -1453,6 +1453,62 @@
           (dds.dcps:delete-participant p)))))
   t)
 
+(defun* run-zc-overlay-per-endpoint-km-test ()
+    (function () t)
+  "WP-DCPS-API-COMPLETION S6.T3: the ZC-SHMEM-secured OVERLAY (%zc-overlay-km, ADR 0051) now resolves the
+   EMITTING writer's EntityCrypto km PER-ENDPOINT (via %emit-wid / an explicit WEID), so two SAME-topic
+   secured-ZC writers seal their in-slot data_protection SecuredPayload under their OWN key (distinct
+   sender_key_id). RED before the S6.T3 one-line fix: %zc-overlay-km keyed off disc-node-user-writer-id
+   (the PRIMARY), so writer-2's overlay collapsed to writer-1's key. Manager-level — the key crux needs no
+   SHMEM/OpenSSL (mirrors the run-security-n-secured-writer-test distinct-km assertions, which also run
+   unconditionally). Two SAME-topic ENCRYPT (Circle) writers; assert %zc-overlay-km discriminates by WEID."
+  (let ((gov (dds.security:make-governance
+              :discovery-protection-kind :none :liveliness-protection-kind :none :rtps-protection-kind :none
+              :topic-rules (list (dds.security:make-topic-rule
+                                  :topic-expr "Circle" :metadata-protection-kind :none :data-protection-kind :encrypt))))
+        (p (dds.dcps:create-participant :domain (test-domain +td-collect+))))
+    (let ((node (dds.dcps::dp-node p)))
+      (unwind-protect
+           (progn
+             (setf (dds.dcps::dp-auth-state p)
+                   (dds.dcps::%make-auth-manager-state :identity (dds.security::%make-identity-handle)))
+             (dds.dcps::%install-access-control p (dds.security:make-access-handle :governance gov))
+             (dds.disc:add-local-writer node :topic "Circle" :type "ShapeType")   ; two SAME-topic ENCRYPT writers
+             (dds.disc:enable-publisher node :history-kind :keep-all)
+             (dds.disc:add-local-writer node :topic "Circle" :type "ShapeType")
+             (dds.disc:enable-publisher node :history-kind :keep-all)
+             (let* ((wids (dds.disc::%all-user-writer-ids node))
+                    (e1 (first wids)) (e2 (second wids)))
+               (%check :zopk-two-writers (and (= 2 (length wids)) e1 e2 (/= e1 e2))
+                       "two SAME-topic secured (Circle=ENCRYPT) writers register with distinct EntityIds")
+               (let ((cm (dds.dcps::make-crypto-manager)))
+                 (dolist (e (dds.dcps::%cm-local-token-entities node))
+                   (dds.dcps::cm-register-local-entity
+                    cm (car e) :kind (dds.dcps::%cm-entity-protection-kind node (car e))))
+                 (setf (dds.disc::disc-node-crypto-transform node) (dds.dcps::cm-encode-keys cm))
+                 (let* ((primary (dds.disc::disc-node-user-writer-id node))       ; the node-single/primary writer
+                        (other (find-if (lambda (w) (/= w primary)) wids))        ; the non-primary same-topic writer
+                        (km1 (dds.disc::%zc-overlay-km node e1))
+                        (km2 (dds.disc::%zc-overlay-km node e2))
+                        (km-primary (dds.disc::%zc-overlay-km node primary))
+                        (km-other (dds.disc::%zc-overlay-km node other))
+                        (km-default (dds.disc::%zc-overlay-km node)))             ; no writer emitting -> %emit-wid = primary
+                   (%check :zopk-distinct
+                           (and km1 km2
+                                (not (equalp (dds.security:key-material-sender-key-id km1)
+                                             (dds.security:key-material-sender-key-id km2))))
+                           "the two SAME-topic writers resolve DISTINCT overlay kms (per-endpoint sender_key_id)")
+                   (%check :zopk-default-is-primary
+                           (equalp (dds.security:key-material-sender-key-id km-default)
+                                   (dds.security:key-material-sender-key-id km-primary))
+                           "the default (no writer emitting) resolves the PRIMARY writer's km — backward-compatible")
+                   (%check :zopk-other-not-primary
+                           (not (equalp (dds.security:key-material-sender-key-id km-other)
+                                        (dds.security:key-material-sender-key-id km-default)))
+                           "the non-primary same-topic writer's overlay km is NOT the primary's — the pre-S6 N=1 collapse is FIXED (RED: pre-fix km-other == km-default)")))))
+        (dds.dcps:delete-participant p))))
+  t)
+
 (defun* run-security-dn-match-test ()
     (function () t)
   "ADR-0036/0037 carry (DDS-Security 1.1 §9.4.1.3 subject-name binding; RFC2253 §2.1-2.4): the serialization-

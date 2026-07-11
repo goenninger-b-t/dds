@@ -916,18 +916,21 @@
   (or (not (eq (disc-node-rtps-protection-kind node) :none))
       (not (eq (disc-node-user-submessage-protection-kind node) :none))))
 
-(defun* %zc-overlay-km (node)
-    (function (disc-node) (or null dds.security:key-material))
-  "WP-SECURITY-ZC-SHMEM-OVERLAY (ADR 0051): resolve THIS node's primary user writer's EntityCrypto KeyMaterial
-   for the in-slot data_protection SecuredPayload overlay. Mirrors the publish-time resolution (publish-sample):
-   a crypto-keys resolver -> the writer's EntityCrypto km by its own GUID; a raw key-material -> itself (Slice-1 /
-   test config). NIL when no crypto-transform is installed (fail-closed). N=1 (the MVP): the primary user-writer
-   id; multi-writer overlay keys per-endpoint as a follow-on (ADR 0051)."
+(defun* %zc-overlay-km (node &optional (weid (%emit-wid node)))
+    (function (disc-node &optional (unsigned-byte 32)) (or null dds.security:key-material))
+  "WP-SECURITY-ZC-SHMEM-OVERLAY (ADR 0051; S6.T3 per-endpoint): resolve the EMITTING writer's EntityCrypto
+   KeyMaterial for the in-slot data_protection SecuredPayload overlay. WEID defaults to %emit-wid — the
+   writer whose change is being sealed (the SAME per-endpoint identity publish-sample resolves by, WP-N-
+   ENDPOINT-S1) — so N SAME-topic secured-ZC writers each seal under their OWN EntityCrypto km (distinct
+   sender_key_id), NOT the node-primary's key (the pre-S6 N=1 collapse). %emit-wid falls back to the
+   primary user-writer id when no writer is emitting, so the eligibility check and the non-send path are
+   byte-identical. A crypto-keys resolver -> the writer's km by its own GUID; a raw key-material -> itself
+   (Slice-1 / test config). NIL when no crypto-transform is installed (fail-closed)."
   (let ((ct (disc-node-crypto-transform node)))
     (and ct
          (if (typep ct 'dds.security:crypto-keys)
              (funcall (dds.security:crypto-keys-encode-key-fn ct)
-                      (%local-writer-guid-vec node (disc-node-user-writer-id node)))
+                      (%local-writer-guid-vec node weid))
              ct))))
 
 (defun* %zc-overlay-eligible-p (node)

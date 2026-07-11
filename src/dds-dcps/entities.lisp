@@ -2070,15 +2070,18 @@
 
 ;;; WP-N-ENDPOINT-S5 (ADR 0048): per-endpoint disc->DCPS dispatch. A status/listener/wake event
 ;;; resolves the LOCAL entity it is ABOUT — by the remote's TOPIC (match/unmatch/incompatible) or by
-;;; the remote writer GUID's S2 delivery route (liveliness) — never a participant-wide back-ref. A
-;;; different-topic participant has <=1 endpoint per topic (same-topic is fail-fast-deferred); an event
+;;; the remote writer GUID's S2 delivery route (liveliness) — never a participant-wide back-ref. Dispatch
+;;; is primarily by local EntityId (%participant-{reader,writer}-by-entity-id); the topic-based lookups
+;;; below are a NIL-eid fallback (S6: same-topic is supported, keyed per-EntityId — no fence); an event
 ;;; with no matching local entity is DROPPED, never mis-delivered to another endpoint.
 
 (defun* %participant-reader-for-topic (p topic-name)
     (function (domain-participant string) (or null data-reader))
-  "The local DataReader in P bound to TOPIC-NAME, or NIL (WP-N-ENDPOINT-S5): the per-endpoint
-   match/unmatch/incompatible dispatch key. <=1 reader per topic (same-topic deferred), so the first
-   match IS the reader; NIL -> the caller drops the event (never mis-delivers to another endpoint)."
+  "The FIRST local DataReader in P bound to TOPIC-NAME, or NIL (WP-N-ENDPOINT-S5): the NIL-eid FALLBACK
+   for the per-endpoint match/unmatch/incompatible dispatch (the primary path keys by local EntityId via
+   %participant-reader-by-entity-id; this is used only when the event carries no local-eid). With same-topic
+   readers (S6) it returns the first — callers thread the EntityId to disambiguate; NIL -> the caller drops
+   the event (never mis-delivers to another endpoint)."
   (find topic-name (%participant-readers p)
         :key (lambda (dr) (topic-name (dr-topic dr))) :test #'string=))
 
@@ -2106,8 +2109,8 @@
 (defun* %participant-readers-for-writer-guid (p guid)
     (function (domain-participant (simple-array (unsigned-byte 8) (16))) list)
   "The local DataReader(s) matched to remote writer GUID (WP-N-ENDPOINT-S5): reuse the S2 delivery
-   route (%reader-routes-for) -> reader-EntityId(s) -> DCPS reader by dr-entity-id. <=1 today
-   (same-topic fence). NOTE: %reader-routes-for falls back to the PRIMARY reader on an empty route
+   route (%reader-routes-for) -> reader-EntityId(s) -> DCPS reader by dr-entity-id. Returns ALL matched
+   same-topic readers (S6 — the route is a list of EntityIds). NOTE: %reader-routes-for falls back to the PRIMARY reader on an empty route
    (not NIL), so at N=1 this returns the sole reader (byte-identical). This is only called for a
    MATCHED remote writer (liveliness/lifecycle fire only after %reader-route-add at the match), so at
    N>=2 the route is always non-empty and resolves the correct matched reader — the primary fallback
@@ -2811,7 +2814,8 @@
    §8.4.13). Bump the local DataReader's LIVELINESS_CHANGED status (DDS 1.4 §2.2.4.1) and
    fire on_liveliness_changed. WP-N-ENDPOINT-S5 (ADR 0048): the reader(s) matched to REMOTE-WRITER-GUID
    are resolved via the S2 delivery route (%participant-readers-for-writer-guid), so at N>=2 the status
-   lands on the RIGHT reader; <=1 today (same-topic fence). N=1 == the sole reader (route fallback)."
+   lands on the RIGHT reader(s), INCLUDING same-topic readers (S6 — the route is a list; the dolist below
+   fires each). N=1 == the sole reader (route fallback)."
   (dolist (dr (%participant-readers-for-writer-guid p remote-writer-guid))
     (%reader-liveliness-changed dr (copy-seq remote-writer-guid) alive-p)
     ;; A not-alive writer loses ownership (DDS 1.4 §2.2.3.9.2 cause (c)) -> remaining writer takes over.
