@@ -44,7 +44,7 @@
    ;; libraries (dds.dare EVP re-resolution; ADR 0038/0039 saved-image residual)
    #:register-image-restart-hook
    ;; clock
-   #:monotonic-ns
+   #:monotonic-ns #:realtime-ns
    ;; UDPv4 sockets (native, FR-XPORT-1)
    #:udp-open #:udp-local-port #:udp-send-to #:udp-recv #:udp-close
    #:udp-set-reuse-port #:udp-join-multicast

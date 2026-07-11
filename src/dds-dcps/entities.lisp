@@ -1285,7 +1285,7 @@
                                                 (%writer-tx-rep dw))
                         kh nil 0 nil
                         (dw-entity-id dw)   ; WP-N-ENDPOINT-S1: publish into THIS writer's own HistoryCache
-                        source-timestamp))  ; S5.T4: NIL (plain write) -> no INFO_TS, byte-identical; ns -> INFO_TS before the DATA
+                        (or source-timestamp (dds.pal:realtime-ns))))  ; ADR 0055: a plain write stamps the CURRENT wall-clock (DDS 1.4 §2.2.2.4.2.11 write = write_w_timestamp(now)); write_w_timestamp -> the explicit ns; either way an INFO_TS precedes the DATA
       (return-from write-sample +retcode-timeout+))   ; full bounded cache, max_blocking_time elapsed
     (assert-liveliness dw)
     (%deadline-touch-writer dw kh sample)   ; WP-DCPS-API-COMPLETION S4: (re)arm this instance's offered DEADLINE (no-op + 0-alloc when DEADLINE is INFINITE; reuses the KEEP_LAST keyhash)
@@ -1578,7 +1578,7 @@
   (unless (entity-enabled-p dw) (return-from dispose-instance +retcode-not-enabled+))
   (let ((handle (%resolve-handle dw sample-or-handle))
         (node (dp-node (pub-participant (dw-publisher dw)))))
-    (when (eq :timeout (dds.disc:dispose-instance node handle (or source-timestamp 0)))   ; S5.T4
+    (when (eq :timeout (dds.disc:dispose-instance node handle (or source-timestamp (dds.pal:realtime-ns))))   ; ADR 0055: current wall-clock on a plain dispose
       (return-from dispose-instance +retcode-timeout+))
     (assert-liveliness dw)
     handle))
@@ -1606,7 +1606,7 @@
   (let ((handle (%resolve-handle dw sample-or-handle))
         (node (dp-node (pub-participant (dw-publisher dw)))))
     (when (eq :timeout (dds.disc:unregister-instance node handle (%writer-autodispose-p dw)
-                                                      (or source-timestamp 0)))   ; S5.T4
+                                                      (or source-timestamp (dds.pal:realtime-ns))))   ; ADR 0055: current wall-clock on a plain unregister
       (return-from unregister-instance +retcode-timeout+))
     (dds.pal:with-lock ((dw-status-lock dw))
       (remhash handle (dw-instances dw)))

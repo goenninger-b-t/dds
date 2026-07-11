@@ -7,6 +7,24 @@
 
 (in-package #:dds.pal)
 
+;;; ---- wall clock (source_timestamp) ----
+;; clock_gettime is impl-agnostic via CFFI (loaded for both SBCL + Clasp). CLOCK_REALTIME = 0 and struct
+;; timespec { time_t tv_sec; long tv_nsec } is 16 octets (tv_sec@0, tv_nsec@8) on both Linux x86-64 and
+;; macOS arm64 — the two 64-bit targets — so there is no per-impl divergence to confine.
+
+(cffi:defcfun ("clock_gettime" %clock-gettime) :int (clk-id :int) (tp :pointer))
+
+(defun* realtime-ns ()
+    (function () integer)
+  "Wall-clock time in NANOSECONDS since the Unix epoch (clock_gettime CLOCK_REALTIME) — the DDS
+   source_timestamp source (DDS 1.4 Time_t; RTPS 2.5 §9.3.2.1 / §9.4.5.9 INFO_TS). Reads the 16-octet
+   struct timespec (tv_sec@0, tv_nsec@8, both 64-bit on the supported targets). Falls back to the
+   1-second (get-universal-time) clock if the syscall fails, so it never signals."
+  (cffi:with-foreign-object (tp :uint8 16)
+    (if (zerop (%clock-gettime 0 tp))
+        (+ (* (cffi:mem-ref tp :int64 0) 1000000000) (cffi:mem-ref tp :int64 8))
+        (* (- (get-universal-time) 2208988800) 1000000000))))
+
 (defun* %parse-ipv4 (host)
     (function (string) (simple-array (unsigned-byte 8) (4)))
   "Parse a dotted-quad string into a 4-octet address vector."

@@ -40,11 +40,20 @@ unused `source-timestamp` slot, so retransmits carry it too); the dispose/unregi
 through `dispose-instance` / `unregister-instance` → `%dispose-or-unregister` →
 `writer-lifecycle-change` → `make-cache-change`. In `%data-builder`, a change whose
 `source-timestamp` is **non-zero** emits a 12-octet INFO_TS before its DATA (its packable SIZE grows
-by 12); a change with source-timestamp 0 — **every plain write / dispose / unregister** — emits
-nothing, so the default wire is **byte-identical** (no corpus / interop regression). This is the
-deliberate scope: the stack does not (yet) prefix plain writes with a current-time INFO_TS; that is a
-recorded follow-on. `writedispose` is a Connext-compatible extension (not in `dds_rtf2_dcps.idl`),
-implemented as write-then-dispose, additive on top of the standard API.
+by 12); a change with source-timestamp 0 emits nothing.
+
+**Amendment (2026-07-11, closing the §3 follow-on).** A **plain** DCPS `write-sample` / `dispose` /
+`unregister` now stamps the **current wall-clock** (`dds.pal:realtime-ns` — a new PAL primitive over
+`clock_gettime(CLOCK_REALTIME)`, nanoseconds since the Unix epoch) as its source_timestamp, per DDS 1.4
+§2.2.2.4.2.11 (`write` ≡ `write_w_timestamp(now)`). So **every DCPS DATA now carries an INFO_TS** and a
+reader always sees a populated `SampleInfo.source_timestamp` — full DDS coverage, matching Connext /
+Fast DDS which prefix every DATA with one. This reverses the original "byte-identical default wire"
+scope: the DCPS write path is intentionally no longer byte-identical (it gains a 12-octet INFO_TS per
+DATA). No corpus regression (the XCDR corpus tests payload serialization, not RTPS framing; the RTPS
+byte-exact tests exercise `write-data` directly). No interop regression — validated live (§3). The
+low-level `dds.disc:publish-sample` still defaults source-timestamp NIL (no INFO_TS) so the engine
+bench / raw disc-API path is unchanged; only the DCPS layer stamps `now`. `writedispose` is a
+Connext-compatible extension (not in `dds_rtf2_dcps.idl`), implemented as write-then-dispose, additive.
 
 ### 2.3 RX — parse INFO_TS whenever present
 
@@ -60,22 +69,30 @@ INFO_TS**, so this populates `source_timestamp` on all cross-vendor traffic — 
 
 ## 3. Consequences
 
-- **No default-wire change.** A plain write is byte-identical (source-timestamp 0 → no INFO_TS). The
-  only new wire output is an INFO_TS before a `_w_timestamp` write/dispose/unregister's DATA. The only
-  new receive behaviour is populating a previously-always-NIL SampleInfo field.
-- **Cross-vendor interop validated (2026-07-11).** Our-to-our `write_w_timestamp` → `source_timestamp`
-  round-trips within the 2^-32 fraction granularity (test `dcps-timestamped-write`, both impls,
-  551/551). Live RX: our reader parses **Connext 7.3.1** and **Fast DDS** INFO_TS correctly — 2026
-  wall-clock `source_timestamp`s, incrementing at each peer's publish cadence (interop/deadline harness,
-  `make deadline-sub` now prints source_timestamp).
+- **DCPS default wire now carries INFO_TS (per the amendment).** Every DCPS write/dispose/unregister
+  emits a 12-octet INFO_TS (current wall-clock, or the explicit `_w_timestamp` value); a reader always
+  sees a populated `SampleInfo.source_timestamp`. The engine bench / raw `dds.disc:publish-sample` path
+  is unchanged (source-timestamp NIL → no INFO_TS). The clock cost is one `clock_gettime` per DCPS
+  write on the control-plane wrapper (not the measured engine hot path; gate-hotpath green).
+- **Cross-vendor interop validated (2026-07-11).** Our-to-our round-trip: `write_w_timestamp` →
+  `source_timestamp` within the 2^-32 fraction granularity, AND a plain write → the reader sees the
+  current wall-clock (test `dcps-timestamped-write`, both impls, 551/551). **RX** (validated): our reader
+  parses live **Connext 7.3.1** and **Fast DDS** INFO_TS correctly — 2026 wall-clock `source_timestamp`s
+  at each peer's publish cadence (`make deadline-sub` prints source_timestamp). **TX** (validated): with
+  every DCPS DATA now carrying INFO_TS, **RTI Connext's `rtiddsspy` receives and processes our DCPS
+  writer's Square/ShapeType samples** (New data → Modified instance) — Connext accepts our INFO_TS-carrying
+  RTPS messages, no regression. (A peer-side *display* of the exact extracted timestamp value was not
+  obtained this session — `rtiddsspy`'s output mode does not print source_timestamp and a single-host
+  loopback tshark capture did not yield RTPS frames — but the TX byte format is pinned by the symmetric
+  codec + the live RX parse of the identical Connext/Fast DDS format.)
 - **Representation.** `source_timestamp` is nanoseconds (a single integer) in `SampleInfo` and on the
-  DCPS API (`write_w_timestamp` takes DDS `Time_t` sec/nanosec, converted via `%time->ns`). The
+  DCPS API (`write_w_timestamp` takes DDS `Time_t` sec/nanosec, converted via `%time->ns`); the plain-write
+  clock is `dds.pal:realtime-ns` (ns since the Unix epoch, `clock_gettime(CLOCK_REALTIME)`). The
   wire↔nanosecond fraction conversion is lossy below ~0.23 ns (the 2^-32 granularity) — exact for whole
   and half seconds, sub-ns-approximate otherwise; the round-trip test asserts within 1 µs.
-- **Follow-ons (recorded):** prefix plain writes with a current-time INFO_TS for full source_timestamp
-  coverage (currently only `_w_timestamp` writes carry one); a TX-direction interop capture (our
-  `write_w_timestamp` → a Connext/Fast DDS reader's rti/eprosima-reported source timestamp) to complement
-  the validated RX direction.
+- **Follow-ons (recorded):** a direct peer-side capture of the extracted source_timestamp *value* (a
+  Connext/Fast DDS tool or tshark RTPS-dissector readout of our INFO_TS on the wire), to complement the
+  format-validated TX above.
 
 ## 4. Alternatives considered
 
