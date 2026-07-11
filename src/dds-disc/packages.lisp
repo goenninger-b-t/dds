@@ -16,7 +16,7 @@
   (:export #:disc-node #:disc-node-p #:make-disc-node
            #:disc-node-guid-prefix #:disc-node-peers #:disc-node-port
            #:disc-node-discovered-count #:disc-node-discovered-prefixes
-           #:disc-node-matched-count #:disc-node-matched-topics
+           #:disc-node-matched-count #:disc-node-matched-topics #:disc-node-matched-endpoints-for
            #:disc-node-on-match #:disc-node-on-unmatch
            #:disc-node-on-participant-lost
            #:disc-node-on-liveliness-changed #:%liveliness-sweep

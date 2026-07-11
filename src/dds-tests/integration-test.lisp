@@ -3307,6 +3307,166 @@
       (dds.dcps:delete-participant p))
     t))
 
+;;; WP-DCPS-API-COMPLETION S5 — instance & sample-access ops + matched-entity introspection
+;;; (DDS 1.4 §2.2.2.4.2 / §2.2.2.5.2). Deterministic (staged SNs / offline register), no lossy UDP.
+
+(defun* run-dcps-instance-lookup-test ()
+    (function () t)
+  "S5.T1 — get_key_value + lookup_instance on DataWriter + DataReader (DDS 1.4 §2.2.2.4.2.12/.13,
+   §2.2.2.5.2.13/.14). Writer: a write auto-registers the instance, so lookup_instance(key) returns the
+   handle (= the keyhash) and get_key_value(handle) recovers a sample carrying the key fields; an
+   un-written key returns HANDLE_NIL; register_instance also tracks the key. Reader: after a sample is
+   delivered, lookup_instance(key) returns the handle and get_key_value recovers the key."
+  (let* ((ts (dds.types:find-type-support "shape-type"))
+         (fa (dds.types:type-support-field-accessors ts))
+         (p (dds.dcps:create-participant :domain (test-domain))))
+    (flet ((color (s) (funcall (cdr (assoc "color" fa :test #'string-equal)) s)))
+      (unwind-protect
+           (let* ((tp (dds.dcps:create-topic p "Square" "shape-type" ts))
+                  (pub (dds.dcps:create-publisher p))
+                  (dw (dds.dcps:create-datawriter pub tp))
+                  (sub (dds.dcps:create-subscriber p))
+                  (dr (dds.dcps:create-datareader sub tp))
+                  (node (dds.dcps::dp-node p))
+                  (blue (make-shape-type :color "BLUE" :x 10 :y 20 :shapesize 30))
+                  (h-blue (funcall (dds.types:type-support-key-hash ts) blue))
+                  (red (make-shape-type :color "RED" :x 1 :y 2 :shapesize 3)))
+             ;; writer: write auto-registers -> lookup_instance + get_key_value.
+             (dds.dcps:write-sample dw blue)
+             (%check :wr-lookup (equalp h-blue (dds.dcps:lookup-instance dw blue))
+                     "writer lookup_instance(key) returns the instance handle after a write")
+             (%check :wr-getkey (let ((kv (dds.dcps:get-key-value dw h-blue)))
+                                  (and kv (string= "BLUE" (color kv))))
+                     "writer get_key_value(handle) recovers the key fields")
+             (%check :wr-lookup-unknown
+                     (equalp dds.dcps:+instance-handle-nil+ (dds.dcps:lookup-instance dw red))
+                     "writer lookup_instance of an un-written key returns HANDLE_NIL")
+             (dds.dcps:register-instance dw red)
+             (%check :wr-register-lookup
+                     (equalp (funcall (dds.types:type-support-key-hash ts) red)
+                             (dds.dcps:lookup-instance dw red))
+                     "register_instance makes lookup_instance find the key")
+             ;; reader: stage a BLUE sample, drain, then lookup + get_key_value.
+             (%stage-data-sn node 1 h-blue (dds.dcps::%serialize-sample ts blue) #x00000102)
+             (dds.dcps:read-samples dr)
+             (%check :rd-lookup (equalp h-blue (dds.dcps:lookup-instance dr blue))
+                     "reader lookup_instance(key) returns the handle after delivery")
+             (%check :rd-getkey (let ((kv (dds.dcps:get-key-value dr h-blue)))
+                                  (and kv (string= "BLUE" (color kv))))
+                     "reader get_key_value(handle) recovers the key"))
+        (dds.dcps:delete-participant p)))
+    t))
+
+(defun* run-dcps-instance-reads-test ()
+    (function () t)
+  "S5.T2 — read/take_instance, read/take_next_instance, read/take_next_sample (DDS 1.4 §2.2.2.5.3).
+   Stage samples for two instances (BLUE×2, RED×1), then: read_next_sample walks the samples in order
+   then returns NIL; read_next_instance walks the two instances; read_instance filters to one instance
+   (BAD_PARAMETER on an unknown handle); take_instance removes an instance's samples; take_next_sample
+   removes the next unread sample."
+  (let* ((ts (dds.types:find-type-support "shape-type"))
+         (fa (dds.types:type-support-field-accessors ts))
+         (p (dds.dcps:create-participant :domain (test-domain))))
+    (flet ((color (cs) (funcall (cdr (assoc "color" fa :test #'string-equal))
+                                (dds.dcps:cached-sample-data cs)))
+           (hnd (cs) (dds.dcps:sample-info-instance-handle (dds.dcps:cached-sample-info cs))))
+      (unwind-protect
+           (let* ((tp (dds.dcps:create-topic p "Square" "shape-type" ts))
+                  (sub (dds.dcps:create-subscriber p))
+                  (dr (dds.dcps:create-datareader sub tp
+                        :qos (dds.qos:make-reader-qos :history-kind :keep-all)))   ; retain both BLUE samples
+                  (node (dds.dcps::dp-node p))
+                  (blue (make-shape-type :color "BLUE" :x 1 :y 1 :shapesize 10))
+                  (red (make-shape-type :color "RED" :x 2 :y 2 :shapesize 20))
+                  (hb (funcall (dds.types:type-support-key-hash ts) blue))
+                  (hr (funcall (dds.types:type-support-key-hash ts) red))
+                  (wid #x00000102))
+             (%stage-data-sn node 1 hb (dds.dcps::%serialize-sample ts blue) wid)
+             (%stage-data-sn node 2 hr (dds.dcps::%serialize-sample ts red) wid)
+             (%stage-data-sn node 3 hb (dds.dcps::%serialize-sample ts
+                                        (make-shape-type :color "BLUE" :x 9 :y 9 :shapesize 10)) wid)
+             ;; (A) read_next_sample walks the 3 staged samples in SN order, then NIL.
+             (let ((s1 (dds.dcps:read-next-sample dr)) (s2 (dds.dcps:read-next-sample dr))
+                   (s3 (dds.dcps:read-next-sample dr)) (s4 (dds.dcps:read-next-sample dr)))
+               (%check :rns-walk (and s1 s2 s3 (null s4)
+                                      (string= "BLUE" (color s1)) (string= "RED" (color s2))
+                                      (string= "BLUE" (color s3)))
+                       "read_next_sample walks the 3 samples in order then returns NIL"))
+             ;; (B) read_next_instance walks the two known instances then returns empty.
+             (let* ((w1 (dds.dcps:read-next-instance dr dds.dcps:+instance-handle-nil+))
+                    (h1 (hnd (first w1)))
+                    (w2 (dds.dcps:read-next-instance dr h1))
+                    (h2 (hnd (first w2)))
+                    (w3 (dds.dcps:read-next-instance dr h2)))
+               (%check :rni-walk (and w1 w2 (null w3) (not (equalp h1 h2))
+                                      (equalp (sort (list (color (first w1)) (color (first w2))) #'string<)
+                                              '("BLUE" "RED")))
+                       "read_next_instance walks both instances (BLUE, RED) in order then empties"))
+             ;; (C) read_instance filters to one instance; unknown handle -> BAD_PARAMETER.
+             (%check :ri-blue (= 2 (length (dds.dcps:read-instance dr hb)))
+                     "read_instance(BLUE) returns the 2 BLUE samples only")
+             (%check :ri-badparam
+                     (eq dds.dcps:+retcode-bad-parameter+
+                         (dds.dcps:read-instance
+                          dr (make-array 16 :element-type '(unsigned-byte 8) :initial-element 255)))
+                     "read_instance of an unknown handle returns BAD_PARAMETER")
+             ;; (D) take_instance removes the RED sample; a second take finds none.
+             (%check :ti-red (= 1 (length (dds.dcps:take-instance dr hr)))
+                     "take_instance(RED) removes the RED sample")
+             (%check :ti-red-empty (null (dds.dcps:take-instance dr hr))
+                     "the RED instance has no samples left after take")
+             ;; (E) take_next_sample removes the next unread sample (a freshly staged GREEN).
+             (%stage-data-sn node 4 (funcall (dds.types:type-support-key-hash ts)
+                                             (make-shape-type :color "GREEN" :x 3 :y 3 :shapesize 5))
+                             (dds.dcps::%serialize-sample ts
+                              (make-shape-type :color "GREEN" :x 3 :y 3 :shapesize 5)) wid)
+             (let ((g (dds.dcps:take-next-sample dr)))
+               (%check :tns (and g (string= "GREEN" (color g)) (null (dds.dcps:take-next-sample dr)))
+                       "take_next_sample removes the one unread GREEN sample then returns NIL")))
+        (dds.dcps:delete-participant p)))
+    t))
+
+(defun* run-dcps-matched-entities-test ()
+    (function () t)
+  "S5.T3 — get_matched_publications/subscriptions (+ _data) (DDS 1.4 §2.2.2.4.2.10-11 / §2.2.2.5.2.10-11).
+   A writer on one participant and a reader on another match over loopback; the writer then lists the
+   reader's subscription handle + its SubscriptionBuiltinTopicData, the reader lists the writer's
+   publication handle + PublicationBuiltinTopicData; an unmatched handle returns NIL."
+  (let ((ts (dds.types:find-type-support "shape-type"))
+        (p1 (dds.dcps:create-participant :domain (test-domain)))
+        (p2 (dds.dcps:create-participant :domain (test-domain))))
+    (unwind-protect
+         (let* ((tw (dds.dcps:create-topic p1 "S5Match" "shape-type" ts))
+                (tr (dds.dcps:create-topic p2 "S5Match" "shape-type" ts))
+                (pub (dds.dcps:create-publisher p1)) (sub (dds.dcps:create-subscriber p2))
+                (dw (dds.dcps:create-datawriter pub tw))
+                (dr (dds.dcps:create-datareader sub tr
+                      :qos (dds.qos:make-reader-qos :reliability :reliable))))
+           (loop repeat 200
+                 until (and (plusp (dds.dcps:matched-count p1)) (plusp (dds.dcps:matched-count p2)))
+                 do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+           (let ((subs (dds.dcps:get-matched-subscriptions dw))
+                 (pubs (dds.dcps:get-matched-publications dr)))
+             (%check :me-subs (= 1 (length subs))
+                     "writer get_matched_subscriptions lists the 1 matched reader")
+             (%check :me-pubs (= 1 (length pubs))
+                     "reader get_matched_publications lists the 1 matched writer")
+             (let ((sd (dds.dcps:get-matched-subscription-data dw (first subs)))
+                   (pd (dds.dcps:get-matched-publication-data dr (first pubs))))
+               (%check :me-sd
+                       (and sd (string= "S5Match" (dds.dcps:subscription-builtin-topic-data-topic-name sd)))
+                       "get_matched_subscription_data returns the matched reader's topic")
+               (%check :me-pd
+                       (and pd (string= "S5Match" (dds.dcps:publication-builtin-topic-data-topic-name pd)))
+                       "get_matched_publication_data returns the matched writer's topic"))
+             (%check :me-badparam
+                     (null (dds.dcps:get-matched-subscription-data
+                            dw (make-array 16 :element-type '(unsigned-byte 8) :initial-element 1)))
+                     "get_matched_subscription_data of an unmatched handle returns NIL")))
+      (dds.dcps:delete-participant p1)
+      (dds.dcps:delete-participant p2))
+    t))
+
 ;;; Builtin-topic readers (M3 #5, FR-DCPS-6): DCPSParticipant / DCPSPublication /
 ;;; DCPSSubscription / DCPSTopic surface the discovered participants + endpoints.
 

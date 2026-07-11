@@ -386,7 +386,8 @@
   (writers '() :type list)
   (owner-guid nil :type (or null (simple-array (unsigned-byte 8) (16))))
   (owner-strength 0 :type integer)
-  (not-alive-since nil :type (or null (integer 0))))
+  (not-alive-since nil :type (or null (integer 0)))
+  (key-sample nil :type t))   ; S5.T1: a representative delivered sample carrying this instance's key fields (get_key_value); the handle is a one-way hash so the key is retained here
 
 ;;; ---- type-support serialization helpers (PLAIN_CDR(2)_LE SerializedPayload) ----
 
@@ -1047,6 +1048,11 @@
    set (§2.2.2.1.1.7 — set_qos, get_qos, enable, get_statuscondition, set_listener) was called on a
    still-disabled entity. Represented as the keyword :not-enabled; the operation had no effect.")
 
+(defparameter +retcode-bad-parameter+ :bad-parameter
+  "DDS 1.4 ReturnCode_t RETCODE_BAD_PARAMETER (§2.2.4.4): an illegal parameter value — e.g. an instance
+   handle passed to read_instance/take_instance that names no known instance (§2.2.2.5.2.4). Represented
+   as the keyword :bad-parameter; the operation had no effect.")
+
 (defparameter +retcode-precondition-not-met+ :precondition-not-met
   "DDS 1.4 ReturnCode_t RETCODE_PRECONDITION_NOT_MET (§2.2.4.4): a precondition for the operation
    was not met — enable() on an entity whose factory-parent is still disabled (§2.2.2.1.1.7), or
@@ -1282,6 +1288,9 @@
       (return-from write-sample +retcode-timeout+))   ; full bounded cache, max_blocking_time elapsed
     (assert-liveliness dw)
     (%deadline-touch-writer dw kh sample)   ; WP-DCPS-API-COMPLETION S4: (re)arm this instance's offered DEADLINE (no-op + 0-alloc when DEADLINE is INFINITE; reuses the KEEP_LAST keyhash)
+    (let ((h (or kh (%instance-handle (topic-type-support (dw-topic dw)) sample))))   ; S5.T1: write auto-registers the instance (DDS 1.4 §2.2.2.4.2.2)
+      (unless (gethash h (dw-instances dw))                                            ; first write of this instance -> record its key holder (get_key_value); steady state is a lock-free gethash
+        (dds.pal:with-lock ((dw-status-lock dw)) (setf (gethash h (dw-instances dw)) sample))))
     +retcode-ok+))
 
 ;;;; ---- WP-FLATDATA-LOAN-WRITE zero-copy TX loan API (FR-PF-4, R6, ADR 0042) ----
@@ -1509,7 +1518,7 @@
   (unless (entity-enabled-p dw) (return-from register-instance +retcode-not-enabled+))
   (let ((handle (%instance-handle (topic-type-support (dw-topic dw)) sample)))
     (dds.pal:with-lock ((dw-status-lock dw))
-      (setf (gethash handle (dw-instances dw)) :alive))
+      (setf (gethash handle (dw-instances dw)) sample))   ; S5.T1: the value is the key holder (get_key_value); presence = registered
     handle))
 
 (defun* dispose-instance (dw sample-or-handle)
@@ -1556,6 +1565,38 @@
       (remhash handle (dw-instances dw)))
     (assert-liveliness dw)
     handle))
+
+(defun* %endpoint-type-support (endpoint)
+    (function (t) t)
+  "The topic type-support of ENDPOINT (a DataWriter or DataReader) — the keyhash/key-field machinery
+   shared by lookup_instance / get_key_value across both entity kinds."
+  (typecase endpoint
+    (data-writer (topic-type-support (dw-topic endpoint)))
+    (data-reader (topic-type-support (dr-topic endpoint)))))
+
+(defun* lookup-instance (endpoint key-holder)
+    (function (t t) (simple-array (unsigned-byte 8) (16)))
+  "DataWriter/DataReader::lookup_instance (DDS 1.4 §2.2.2.4.2.13 / §2.2.2.5.2.14) — the 16-octet handle
+   the middleware associates with the instance whose key matches KEY-HOLDER, or HANDLE_NIL when ENDPOINT
+   knows no such instance. The handle is the type-support keyhash; 'known' means the instance has been
+   registered/written (writer, dw-instances) or delivered (reader, dr-instance-recs)."
+  (let ((handle (%instance-handle (%endpoint-type-support endpoint) key-holder)))
+    (if (typecase endpoint
+          (data-writer (nth-value 1 (gethash handle (dw-instances endpoint))))
+          (data-reader (nth-value 1 (gethash handle (dr-instance-recs endpoint)))))
+        handle
+        +instance-handle-nil+)))
+
+(defun* get-key-value (endpoint handle)
+    (function (t (simple-array (unsigned-byte 8) (16))) t)
+  "DataWriter/DataReader::get_key_value (DDS 1.4 §2.2.2.4.2.12 / §2.2.2.5.2.13) — a representative sample
+   carrying the KEY FIELDS of the instance named by HANDLE, or NIL when ENDPOINT knows no such instance
+   (the caller's BAD_PARAMETER). The handle is a one-way keyhash, so the key holder is the sample the
+   writer registered/wrote (dw-instances value) or the reader's retained per-instance key sample."
+  (typecase endpoint
+    (data-writer (values (gethash handle (dw-instances endpoint))))
+    (data-reader (let ((rec (gethash handle (dr-instance-recs endpoint))))
+                   (and rec (instance-rec-key-sample rec))))))
 
 (defun* %resource-reject-reason (dr handle)
     (function (data-reader t) symbol)
@@ -2360,6 +2401,7 @@
               (t
                 (let ((rec (%reader-revive-instance dr handle (dds.disc:node-sample-writer node key)))
                       (depth (%reader-keeplast-depth dr)))
+                  (unless (instance-rec-key-sample rec) (setf (instance-rec-key-sample rec) data))   ; S5.T1: retain the key holder for get_key_value
                   (%deadline-touch dr handle)   ; WP-DCPS-API-COMPLETION S4: (re)arm this instance's requested DEADLINE on delivery (no-op + 0-alloc when INFINITE)
                   (when depth (%reader-keeplast-drop-oldest dr handle depth))   ; KEEP_LAST per-instance drop (DDS 1.4 §2.2.3.18) before append
                   (setf (dr-cache dr)
@@ -2459,65 +2501,139 @@
             (cached-sample-loan cs) nil)))
   t)
 
-(defun* read-samples (dr &key (states '(:read :not-read)) (where #'%where-any))
-    (function (data-reader &key (:states list) (:where function)) (or list (member :not-enabled)))
-  "DataReader::read — return the cached samples whose sample-state is in STATES
-   (default ANY_SAMPLE_STATE, both read + not-read, per DDS 1.4) and whose data
-   satisfies WHERE (a predicate over the deserialized sample; %where-any by default —
-   the query-condition filter for read_w_condition) WITHOUT removing them; mark each
-   READ and set its SampleInfo view-state (NEW the first time the instance is accessed,
-   else NOT_NEW). Returns a list of cached-sample (data + info). WP-DCPS-SECURED-TAKE-LOAN
-   (ADR 0038 (i)): a returned secured sample's decode loan is released here (release-after-snapshot,
-   %release-secured-copy-loan) — the sample STAYS in the cache (its DATA struct is independent + still
-   readable), so a secured copy-API reader recycles the pooled buffer per sample instead of pinning it.
-   A DISABLED DataReader refuses the read with :not-enabled (outside the NOT_ENABLED-safe set,
-   DDS 1.4 §2.2.2.1.1.7, S2.T3)."
-  (unless (entity-enabled-p dr) (return-from read-samples +retcode-not-enabled+))
-  (%drain dr)
-  (let ((out '()) (touched '())
+(defun* %select-samples (dr states where handle max take-p)
+    (function (data-reader list function (or null (simple-array (unsigned-byte 8) (16)))
+              (or null (integer 0)) boolean) list)
+  "The shared read/take core (DDS 1.4 §2.2.2.5.3). Assumes DR is already drained. Selects the cached
+   samples whose sample-state is in STATES, that satisfy WHERE (the query predicate over the deserialized
+   sample), that belong to HANDLE (when non-NIL — the read/take_instance filter), up to MAX (when non-NIL
+   — read/take_next_sample), in cache (arrival) order. Marks each selected sample READ + sets its view-
+   state (NEW on the first access of its instance, else NOT_NEW); a secured decode loan is released per
+   returned sample. TAKE-P removes the selected samples from the cache; otherwise they stay. Returns the
+   selected cached-samples in order."
+  (let ((out '()) (keep '()) (touched '()) (n 0)
         (node (dp-node (sub-participant (dr-subscriber dr)))))
     (dolist (cs (dr-cache dr))
-      (let ((info (cached-sample-info cs)))
-        (when (and (member (sample-info-sample-state info) states)
-                   (funcall where (cached-sample-data cs)))
-          (let ((handle (sample-info-instance-handle info)))
-            (setf (sample-info-view-state info)
-                  (if (gethash handle (dr-instances dr)) :not-new :new))
-            (pushnew handle touched :test #'equalp))
-          (setf (sample-info-sample-state info) :read)
-          (%release-secured-copy-loan dr node cs)   ; release the secured decode loan (data struct is independent); FlatData view untouched
-          (push cs out))))
+      (let* ((info (cached-sample-info cs))
+             (sel (and (member (sample-info-sample-state info) states)
+                       (or (null max) (< n max))
+                       (or (null handle) (equalp handle (sample-info-instance-handle info)))
+                       (funcall where (cached-sample-data cs)))))
+        (cond
+          (sel
+           (let ((h (sample-info-instance-handle info)))
+             (setf (sample-info-view-state info) (if (gethash h (dr-instances dr)) :not-new :new))
+             (pushnew h touched :test #'equalp))
+           (setf (sample-info-sample-state info) :read)
+           (%release-secured-copy-loan dr node cs)   ; release the secured decode loan (data struct is independent); FlatData view untouched
+           (incf n)
+           (push cs out))
+          (t (when take-p (push cs keep))))))     ; take keeps only the UN-selected; read leaves the cache intact
     (dolist (h touched) (setf (gethash h (dr-instances dr)) t))   ; mark accessed after snapshot
+    (when take-p (setf (dr-cache dr) (nreverse keep)))
     (nreverse out)))
+
+(defun* read-samples (dr &key (states '(:read :not-read)) (where #'%where-any))
+    (function (data-reader &key (:states list) (:where function)) (or list (member :not-enabled)))
+  "DataReader::read — the cached samples whose sample-state is in STATES (default ANY_SAMPLE_STATE) and
+   whose data satisfies WHERE (the read_w_condition query predicate; %where-any by default) WITHOUT
+   removing them; each is marked READ with its view-state set. Returns a list of cached-sample. A DISABLED
+   DataReader refuses with :not-enabled (DDS 1.4 §2.2.2.1.1.7, S2.T3)."
+  (unless (entity-enabled-p dr) (return-from read-samples +retcode-not-enabled+))
+  (%drain dr)
+  (%select-samples dr states where nil nil nil))
 
 (defun* take-samples (dr &key (states '(:read :not-read)) (where #'%where-any))
     (function (data-reader &key (:states list) (:where function)) (or list (member :not-enabled)))
-  "DataReader::take — like read-samples but REMOVE the returned samples from the
-   cache (default takes both read and unread). WHERE is the same optional query
-   predicate (take_w_condition filter). Returns a list of cached-sample. WP-DCPS-SECURED-TAKE-LOAN
-   (ADR 0038 (i)): a TAKEN secured sample's decode loan is released here (%release-secured-copy-loan) —
-   the returned DATA struct is independent, so the pooled buffer is recycled per take instead of pinned.
-   A DISABLED DataReader refuses the take with :not-enabled (outside the NOT_ENABLED-safe set,
-   DDS 1.4 §2.2.2.1.1.7, S2.T3)."
+  "DataReader::take — like read-samples but REMOVES the returned samples from the cache. A DISABLED
+   DataReader refuses with :not-enabled (DDS 1.4 §2.2.2.1.1.7, S2.T3)."
   (unless (entity-enabled-p dr) (return-from take-samples +retcode-not-enabled+))
   (%drain dr)
-  (let ((keep '()) (out '()) (touched '())
-        (node (dp-node (sub-participant (dr-subscriber dr)))))
-    (dolist (cs (dr-cache dr))
-      (let ((info (cached-sample-info cs)))
-        (if (and (member (sample-info-sample-state info) states)
-                 (funcall where (cached-sample-data cs)))
-            (progn
-              (let ((handle (sample-info-instance-handle info)))
-                (setf (sample-info-view-state info)
-                      (if (gethash handle (dr-instances dr)) :not-new :new))
-                (pushnew handle touched :test #'equalp))
-              (%release-secured-copy-loan dr node cs)   ; taken -> release the secured decode loan (data struct is independent); FlatData view untouched
-              (push cs out))
-            (push cs keep))))
-    (dolist (h touched) (setf (gethash h (dr-instances dr)) t))
-    (setf (dr-cache dr) (nreverse keep))
-    (nreverse out)))
+  (%select-samples dr states where nil nil t))
+
+;;; ---- Instance / next sample-access (S5.T2, DDS 1.4 §2.2.2.5.3). The three-mask (sample/view/instance
+;;;      state) signature is v1-simplified to the sample-state STATES list, as the base read/take are. ----
+
+(defun* read-instance (dr handle &key (states '(:read :not-read)) (where #'%where-any))
+    (function (data-reader (simple-array (unsigned-byte 8) (16)) &key (:states list) (:where function))
+              (or list (member :not-enabled :bad-parameter)))
+  "DataReader::read_instance (DDS 1.4 §2.2.2.5.3.4) — read (without removing) only the samples of the
+   instance named by HANDLE. BAD_PARAMETER when HANDLE names no known instance; :not-enabled on a disabled
+   reader."
+  (unless (entity-enabled-p dr) (return-from read-instance +retcode-not-enabled+))
+  (%drain dr)
+  (unless (nth-value 1 (gethash handle (dr-instance-recs dr)))
+    (return-from read-instance +retcode-bad-parameter+))
+  (%select-samples dr states where handle nil nil))
+
+(defun* take-instance (dr handle &key (states '(:read :not-read)) (where #'%where-any))
+    (function (data-reader (simple-array (unsigned-byte 8) (16)) &key (:states list) (:where function))
+              (or list (member :not-enabled :bad-parameter)))
+  "DataReader::take_instance (DDS 1.4 §2.2.2.5.3.5) — take (removing) only the samples of the instance
+   named by HANDLE. BAD_PARAMETER when HANDLE names no known instance."
+  (unless (entity-enabled-p dr) (return-from take-instance +retcode-not-enabled+))
+  (%drain dr)
+  (unless (nth-value 1 (gethash handle (dr-instance-recs dr)))
+    (return-from take-instance +retcode-bad-parameter+))
+  (%select-samples dr states where handle nil t))
+
+(defun* %handle< (a b)
+    (function ((simple-array (unsigned-byte 8) (16)) (simple-array (unsigned-byte 8) (16))) boolean)
+  "Strict octet-lexicographic order on two 16-octet instance handles — the reader's stable total instance
+   iteration order (DDS 1.4 §2.2.2.5.8 leaves the order middleware-defined but requires it be consistent)."
+  (dotimes (i 16 nil)
+    (let ((x (aref a i)) (y (aref b i)))
+      (cond ((< x y) (return t)) ((> x y) (return nil))))))
+
+(defun* %next-instance-handle (dr previous-handle)
+    (function (data-reader (simple-array (unsigned-byte 8) (16)))
+              (or null (simple-array (unsigned-byte 8) (16))))
+  "The smallest known instance handle strictly greater than PREVIOUS-HANDLE in octet order, or NIL when
+   none remains — the read/take_next_instance cursor. PREVIOUS-HANDLE = HANDLE_NIL selects the FIRST
+   (smallest) keyed instance (an unkeyed reader's single HANDLE_NIL instance is reached via plain read)."
+  (let ((best nil))
+    (maphash (lambda (h v) (declare (ignore v))
+               (when (and (%handle< previous-handle h) (or (null best) (%handle< h best)))
+                 (setf best h)))
+             (dr-instance-recs dr))
+    best))
+
+(defun* read-next-instance (dr previous-handle &key (states '(:read :not-read)) (where #'%where-any))
+    (function (data-reader (simple-array (unsigned-byte 8) (16)) &key (:states list) (:where function))
+              (or list (member :not-enabled)))
+  "DataReader::read_next_instance (DDS 1.4 §2.2.2.5.3.6) — read the samples of the next instance after
+   PREVIOUS-HANDLE in the reader's instance order (HANDLE_NIL = the first instance); an empty list when no
+   next instance exists."
+  (unless (entity-enabled-p dr) (return-from read-next-instance +retcode-not-enabled+))
+  (%drain dr)
+  (let ((h (%next-instance-handle dr previous-handle)))
+    (if h (%select-samples dr states where h nil nil) '())))
+
+(defun* take-next-instance (dr previous-handle &key (states '(:read :not-read)) (where #'%where-any))
+    (function (data-reader (simple-array (unsigned-byte 8) (16)) &key (:states list) (:where function))
+              (or list (member :not-enabled)))
+  "DataReader::take_next_instance (DDS 1.4 §2.2.2.5.3.7) — take the samples of the next instance after
+   PREVIOUS-HANDLE; an empty list when no next instance exists."
+  (unless (entity-enabled-p dr) (return-from take-next-instance +retcode-not-enabled+))
+  (%drain dr)
+  (let ((h (%next-instance-handle dr previous-handle)))
+    (if h (%select-samples dr states where h nil t) '())))
+
+(defun* read-next-sample (dr)
+    (function (data-reader) (or null cached-sample (member :not-enabled)))
+  "DataReader::read_next_sample (DDS 1.4 §2.2.2.5.3.2) — the next NOT_READ sample in order (any instance),
+   read (marked READ) and returned, or NIL when none (NO_DATA)."
+  (unless (entity-enabled-p dr) (return-from read-next-sample +retcode-not-enabled+))
+  (%drain dr)
+  (first (%select-samples dr '(:not-read) #'%where-any nil 1 nil)))
+
+(defun* take-next-sample (dr)
+    (function (data-reader) (or null cached-sample (member :not-enabled)))
+  "DataReader::take_next_sample (DDS 1.4 §2.2.2.5.3.3) — the next NOT_READ sample in order, taken
+   (removed) and returned, or NIL when none (NO_DATA)."
+  (unless (entity-enabled-p dr) (return-from take-next-sample +retcode-not-enabled+))
+  (%drain dr)
+  (first (%select-samples dr '(:not-read) #'%where-any nil 1 t)))
 
 (defun* samples-available (dr)
     (function (data-reader) (integer 0))

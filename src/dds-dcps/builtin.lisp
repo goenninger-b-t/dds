@@ -89,6 +89,49 @@
   "DCPSSubscription builtin reader (FR-DCPS-6): one entry per discovered remote reader."
   (mapcar #'%endpoint->subscription (dds.disc:disc-node-discovered-readers-list (dp-node p))))
 
+;;; ---- Matched-entity introspection (S5.T3, DDS 1.4 §2.2.2.4.2.10-11 / §2.2.2.5.2.10-11): the MATCHED
+;;;      subset (RxO-compatible) of the discovered endpoints, per local endpoint, via the disc match tables.
+
+(defun* get-matched-subscriptions (dw)
+    (function (data-writer) list)
+  "DataWriter::get_matched_subscriptions (DDS 1.4 §2.2.2.4.2.10) — the 16-octet instance handles (remote
+   GUIDs) of the DataReaders currently matched to DW (a writer matches only readers)."
+  (mapcar (lambda (ep) (copy-seq (dds.rtps.discovery:endpoint-data-guid ep)))
+          (dds.disc:disc-node-matched-endpoints-for
+           (dp-node (pub-participant (dw-publisher dw))) (dw-entity-id dw))))
+
+(defun* get-matched-publications (dr)
+    (function (data-reader) list)
+  "DataReader::get_matched_publications (DDS 1.4 §2.2.2.5.2.10) — the 16-octet instance handles (remote
+   GUIDs) of the DataWriters currently matched to DR (a reader matches only writers)."
+  (mapcar (lambda (ep) (copy-seq (dds.rtps.discovery:endpoint-data-guid ep)))
+          (dds.disc:disc-node-matched-endpoints-for
+           (dp-node (sub-participant (dr-subscriber dr))) (dr-entity-id dr))))
+
+(defun* %matched-endpoint-for (node local-eid handle)
+    (function (t (unsigned-byte 32) (simple-array (unsigned-byte 8) (16)))
+              (or null dds.rtps.discovery:endpoint-data))
+  "The matched remote endpoint-data of the local endpoint LOCAL-EID whose GUID equals HANDLE, or NIL when
+   HANDLE names no currently-matched remote (the caller's BAD_PARAMETER)."
+  (find handle (dds.disc:disc-node-matched-endpoints-for node local-eid)
+        :key #'dds.rtps.discovery:endpoint-data-guid :test #'equalp))
+
+(defun* get-matched-subscription-data (dw handle)
+    (function (data-writer (simple-array (unsigned-byte 8) (16)))
+              (or null subscription-builtin-topic-data))
+  "DataWriter::get_matched_subscription_data (DDS 1.4 §2.2.2.4.2.11) — the SubscriptionBuiltinTopicData of
+   the matched DataReader named by HANDLE, or NIL when HANDLE names no matched reader (BAD_PARAMETER)."
+  (let ((ep (%matched-endpoint-for (dp-node (pub-participant (dw-publisher dw))) (dw-entity-id dw) handle)))
+    (and ep (%endpoint->subscription ep))))
+
+(defun* get-matched-publication-data (dr handle)
+    (function (data-reader (simple-array (unsigned-byte 8) (16)))
+              (or null publication-builtin-topic-data))
+  "DataReader::get_matched_publication_data (DDS 1.4 §2.2.2.5.2.11) — the PublicationBuiltinTopicData of the
+   matched DataWriter named by HANDLE, or NIL when HANDLE names no matched writer (BAD_PARAMETER)."
+  (let ((ep (%matched-endpoint-for (dp-node (sub-participant (dr-subscriber dr))) (dr-entity-id dr) handle)))
+    (and ep (%endpoint->publication ep))))
+
 (defun* get-builtin-topic-data (p)
     (function (domain-participant) list)
   "DCPSTopic builtin reader (FR-DCPS-6): one entry per distinct (topic, type) discovered."

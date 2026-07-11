@@ -2559,6 +2559,22 @@
     (loop for v being the hash-values of (disc-node-matches node)
           collect (dds.rtps.discovery:endpoint-data-topic-name v))))
 
+(defun* disc-node-matched-endpoints-for (node local-entity-id)
+    (function (disc-node (unsigned-byte 32)) list)
+  "The endpoint-data of every remote endpoint currently MATCHED to NODE's LOCAL user endpoint named by
+   LOCAL-ENTITY-ID (RTPS 2.5 §9.3.1.2) — walk the per-(LOCAL,REMOTE) match-pairs, keep the remotes whose
+   matched-local set contains LOCAL-ENTITY-ID, and return their endpoint-data from disc-node-matches. The
+   introspection source for DDS get_matched_publications/subscriptions (DDS 1.4 §2.2.2.4.2.10 /
+   §2.2.2.5.2.10): a local writer's matches are all remote readers, a local reader's all remote writers."
+  (let ((out '()))
+    (dds.pal:with-lock ((disc-node-lock node))
+      (maphash (lambda (remote-guid local-eids)
+                 (when (member local-entity-id local-eids)
+                   (let ((ep (gethash remote-guid (disc-node-matches node))))
+                     (when ep (push ep out)))))
+               (disc-node-match-pairs node)))
+    out))
+
 (defun* %disc-node-matched-count-for-prefix (node prefix)
     (function (disc-node (simple-array (unsigned-byte 8) (12))) (integer 0))
   "TEST-SUPPORT: how many of NODE's matched remote endpoints carry PREFIX as their

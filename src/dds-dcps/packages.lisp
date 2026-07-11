@@ -32,13 +32,16 @@
            #:delete-datawriter #:delete-datareader #:delete-publisher #:delete-subscriber
            #:delete-topic #:delete-contained-entities
            #:write-sample #:read-samples #:take-samples #:samples-available
+           #:read-instance #:take-instance #:read-next-instance #:take-next-instance
+           #:read-next-sample #:take-next-sample
            ;; WP-FLATDATA-ZC-LOAN literal-0-copy loan API (FR-PF-3/4, R6, ADR 0017)
            #:take-loaned #:read-loaned #:return-loan #:return-all-loans
            ;; WP-FLATDATA-LOAN-WRITE zero-copy TX loan API (FR-PF-4, R6, ADR 0042)
            #:loan-sample #:write-loaned #:discard-loan #:writer-loan #:writer-loan-p
            #:writer-loan-sample #:discard-all-loans
            #:register-instance #:dispose-instance #:unregister-instance
-           #:+retcode-ok+ #:+retcode-timeout+
+           #:lookup-instance #:get-key-value #:+instance-handle-nil+
+           #:+retcode-ok+ #:+retcode-timeout+ #:+retcode-bad-parameter+
            ;; WP-DCPS-API-COMPLETION S1.T3: get_qos/set_qos + IMMUTABLE/INCONSISTENT return codes
            #:get-qos #:set-qos
            #:+retcode-immutable-policy+ #:+retcode-inconsistent-policy+
@@ -171,4 +174,6 @@
            #:subscription-builtin-topic-data-reliability #:subscription-builtin-topic-data-durability
            #:topic-builtin-topic-data-name #:topic-builtin-topic-data-type-name
            #:get-builtin-participant-data #:get-builtin-publication-data
-           #:get-builtin-subscription-data #:get-builtin-topic-data))
+           #:get-builtin-subscription-data #:get-builtin-topic-data
+           #:get-matched-subscriptions #:get-matched-publications
+           #:get-matched-subscription-data #:get-matched-publication-data))
