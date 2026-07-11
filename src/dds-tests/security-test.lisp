@@ -1100,6 +1100,73 @@
         (dds.dcps:delete-participant p3))))
   t)
 
+(defun* run-dcps-same-topic-secured-readers-test ()
+    (function () t)
+  "WP-DCPS-API-COMPLETION S6.T1: the DCPS end-to-end verification that TWO SAME-TOPIC SECURED DataReaders
+   on ONE participant each decode a SHARED secured sample — the same-topic multi-reader fence is genuinely
+   lifted at the DCPS layer (previously only disc-model coverage existed). Both readers create with distinct
+   EntityIds (node-user-reader-count 2), are routed to ONE remote secured writer (so the shared secured
+   decode handle's return-count = 2), and each take-loaned's the ONE stored handle: both deserialize the
+   plaintext (no sample-loss), reader-1's early return DEFERS (the shared handle buffer + (guid,SN) survive
+   for reader-2), and only reader-2's return (the last, count -> 0) purges the slot + frees the pooled buffer
+   (2C3 return-count purge-defer — no leak, no double-free/UAF). OpenSSL-gated; Clasp FIRST."
+  (handler-case (dds.dare:dare-available-p)
+    (dds.dare:dare-unavailable (c)
+      (format t "~&  [dcps-same-topic-secured-readers] SKIP — OpenSSL >= 3.5 not available: ~a~%"
+              (dds.dare:dare-unavailable-reason c))
+      (return-from run-dcps-same-topic-secured-readers-test t)))
+  (let* ((km (dds.security:make-test-key-material))
+         (ts (dds.types:find-type-support "shape-type"))
+         (sample (make-shape-type :color "BLUE" :x 100 :y 150 :shapesize 30))
+         (pt (dds.dcps::%serialize-sample ts sample :xcdr2))
+         (secured (dds.security:encode-serialized-payload km pt))
+         (src (%make-test-prefix #xA5))
+         (wid #x00000102)
+         (wguid (dds.disc::%source-guid src wid))
+         (p (dds.dcps:create-participant :domain (test-domain +td-dcps-secured-take-loan+))))
+    (unwind-protect
+         (let ((node (dds.dcps::dp-node p)))
+           (setf (dds.disc:disc-node-crypto-transform node) km)   ; data_protection ON -> node-secured-reader-p
+           (let* ((sub (dds.dcps:create-subscriber p))
+                  (topic (dds.dcps:create-topic p "SecSquare" "shape-type" ts))
+                  (dr1 (dds.dcps:create-datareader sub topic))    ; two SAME-topic secured readers
+                  (dr2 (dds.dcps:create-datareader sub topic)))
+             (%check :sts-two-registered
+                     (and (/= (dds.dcps::dr-entity-id dr1) (dds.dcps::dr-entity-id dr2))
+                          (= 2 (dds.disc:node-user-reader-count node))
+                          (dds.disc:disc-node-secured-loan-capable node))
+                     "two SAME-topic secured readers register with DISTINCT EntityIds + secured-loan-capable (fence lifted)")
+             ;; route BOTH readers to the one remote writer BEFORE the sample (offline: no live SEDP) so
+             ;; %deliver-user-sample sets the shared handle's return-count = 2 (route length).
+             (dds.disc::%reader-route-add node wguid (dds.dcps::dr-entity-id dr1))
+             (dds.disc::%reader-route-add node wguid (dds.dcps::dr-entity-id dr2))
+             (dds.disc::%deliver-user-sample node wid 1 secured src wguid 1)
+             (multiple-value-bind (d1 l1) (dds.dcps:take-loaned dr1)
+               (%check :sts-r1-decodes
+                       (and (= 1 (length d1)) (= 1 (length l1))
+                            (string= "BLUE" (shape-type-color (first d1))) (= 100 (shape-type-x (first d1))))
+                       "reader-1 take-loaned decodes the shared secured sample -> plaintext BLUE")
+               (multiple-value-bind (d2 l2) (dds.dcps:take-loaned dr2)
+                 (%check :sts-r2-decodes
+                         (and (= 1 (length d2)) (= 1 (length l2))
+                              (string= "BLUE" (shape-type-color (first d2))) (= 150 (shape-type-y (first d2))))
+                         "reader-2 ALSO decodes the SAME shared secured sample -> plaintext BLUE (no sample-loss)")
+                 (%check :sts-shared-handle (eq (first l1) (first l2))
+                         "both readers hold the SAME shared secured-loan-handle (one decode, K=2 drainers)")
+                 (dds.dcps:return-loan dr1 l1)   ; reader-1 returns FIRST -> must DEFER
+                 (%check :sts-defer
+                         (and (dds.disc:secured-loan-handle-buffer (first l2))
+                              (dds.disc:node-sample node (cons wguid 1)))
+                         "reader-1's early return DEFERS: the shared buffer + (guid,SN) survive for reader-2 (2C3)")
+                 (dds.dcps:return-loan dr2 l2)   ; reader-2 returns LAST -> purge + free
+                 (%check :sts-purge
+                         (and (null (dds.disc:secured-loan-handle-buffer (first l1)))
+                              (zerop (dds.core.arena:pool-in-use (dds.disc:disc-node-decode-pool node)))
+                              (zerop (dds.disc:node-sample-count node)))
+                         "reader-2's return (the last) purges the shared handle + store slot + frees the buffer (no leak/double-free)")))))
+      (dds.dcps:delete-participant p)))
+  t)
+
 (defun* %secured-store-table-entries (outer)
     (function (hash-table) (integer 0))
   "WP-SECURED-STORE-GROWTH: total (GUID,SN) entries across a 2-level per-(guid,sn) store table OUTER (sum of the

@@ -4063,6 +4063,7 @@
                  ("secured-decode-loan-alloc"    . run-secured-decode-loan-alloc-test)
                  ("secured-decode-loan-dup"      . run-secured-decode-loan-dup-test)
                  ("dcps-secured-take-loan"       . run-dcps-secured-take-loan-test)
+                 ("dcps-same-topic-secured-readers" . run-dcps-same-topic-secured-readers-test)
                  ("secured-store-growth"         . run-secured-store-growth-test)
                  ("decode-fail-suppress"         . run-decode-fail-suppress-test)
                  ("secured-live-zeroalloc"       . run-secured-live-zeroalloc-test)
