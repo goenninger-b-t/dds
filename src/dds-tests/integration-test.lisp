@@ -3467,6 +3467,55 @@
       (dds.dcps:delete-participant p2))
     t))
 
+(defun* run-dcps-timestamped-write-test ()
+    (function () t)
+  "S5.T4 — write_w_timestamp carries source_timestamp on the wire via INFO_TS (RTPS 2.5 §9.4.5.9): a
+   writer write_w_timestamp's a sample with an explicit Time_t; the matched reader's
+   SampleInfo.source_timestamp reflects it (round-trip within the 2^-32 fraction granularity). A plain
+   write leaves source_timestamp NIL (reception order, the pre-S5 behaviour)."
+  (let* ((tsup (dds.types:find-type-support "shape-type"))
+         (fa (dds.types:type-support-field-accessors tsup))
+         (p1 (dds.dcps:create-participant :domain (test-domain)))
+         (p2 (dds.dcps:create-participant :domain (test-domain))))
+    (flet ((color (cs) (funcall (cdr (assoc "color" fa :test #'string-equal))
+                                (dds.dcps:cached-sample-data cs))))
+      (unwind-protect
+           (let* ((tw (dds.dcps:create-topic p1 "S5Ts" "shape-type" tsup))
+                  (tr (dds.dcps:create-topic p2 "S5Ts" "shape-type" tsup))
+                  (pub (dds.dcps:create-publisher p1)) (sub (dds.dcps:create-subscriber p2))
+                  (dw (dds.dcps:create-datawriter pub tw))
+                  (dr (dds.dcps:create-datareader sub tr
+                        :qos (dds.qos:make-reader-qos :reliability :reliable)))
+                  (want (+ (* 7 1000000000) 500000000))   ; 7.5 s (0.5 s = 2^31 fraction, exactly representable)
+                  (blue-ts nil) (red-ts :unset))
+             (loop repeat 250
+                   until (and (plusp (dds.dcps:matched-count p1)) (plusp (dds.dcps:matched-count p2)))
+                   do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+             (dds.dcps:write-w-timestamp dw (make-shape-type :color "BLUE" :x 1 :y 1 :shapesize 10)
+                                         7 500000000)
+             (loop repeat 250 until blue-ts
+                   do (dds.dcps:spin p2)
+                      (dolist (cs (dds.dcps:take-samples dr))
+                        (when (string= "BLUE" (color cs))
+                          (setf blue-ts (dds.dcps:sample-info-source-timestamp
+                                         (dds.dcps:cached-sample-info cs)))))
+                      (sleep 0.02))
+             (%check :tsw-received (and blue-ts (< (abs (- blue-ts want)) 1000))
+                     "write_w_timestamp -> the reader's SampleInfo.source_timestamp reflects the value")
+             (dds.dcps:write-sample dw (make-shape-type :color "RED" :x 2 :y 2 :shapesize 20))
+             (loop repeat 250 while (eq red-ts :unset)
+                   do (dds.dcps:spin p2)
+                      (dolist (cs (dds.dcps:take-samples dr))
+                        (when (string= "RED" (color cs))
+                          (setf red-ts (dds.dcps:sample-info-source-timestamp
+                                        (dds.dcps:cached-sample-info cs)))))
+                      (sleep 0.02))
+             (%check :tsw-plain-nil (null red-ts)
+                     "a plain write leaves the reader's source_timestamp NIL (reception order)"))
+        (dds.dcps:delete-participant p1)
+        (dds.dcps:delete-participant p2)))
+    t))
+
 ;;; Builtin-topic readers (M3 #5, FR-DCPS-6): DCPSParticipant / DCPSPublication /
 ;;; DCPSSubscription / DCPSTopic surface the discovered participants + endpoints.
 

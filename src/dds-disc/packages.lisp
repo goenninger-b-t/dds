@@ -60,7 +60,7 @@
            #:zc-loan-marker #:zc-loan-marker-p #:zc-loan-marker-pool-sap
            #:zc-loan-marker-slot-index #:zc-loan-marker-generation #:zc-loan-marker-len
            #:node-sample-count #:node-sample #:node-sample-sns
-           #:node-sample-writer #:node-sample-writer-guid #:node-sample-origin-guid #:node-sample-origin-sn #:node-sample-key-hash #:node-sample-key-sn #:node-sample-by-sn #:matched-writer-ownership
+           #:node-sample-writer #:node-sample-writer-guid #:node-sample-origin-guid #:node-sample-origin-sn #:node-sample-key-hash #:node-sample-timestamp #:node-sample-key-sn #:node-sample-by-sn #:matched-writer-ownership
            #:node-reader-join-watermark
            #:node-user-reader-count #:node-reader-matches-writer-p
            #:dispose-instance #:unregister-instance

@@ -261,6 +261,7 @@
   (secured-take-vec nil :type (or null simple-vector))
   (decode-pool-rejects 0 :type (integer 0))
   (sample-key-hashes (make-hash-table :test 'equalp) :type hash-table) ; src GUID -> SN -> 16-octet wire key-hash of the :data sample (RTPS 2.5 §9.6.4.8), absent when not captured
+  (sample-timestamps (make-hash-table :test 'equalp) :type hash-table) ; S5.T4: src GUID -> SN -> source_timestamp (nanoseconds) from the preceding INFO_TS (RTPS 2.5 §9.4.5.9), absent when the DATA carried none
   (lifecycle-changes (make-hash-table :test 'equalp) :type hash-table) ; 2-level: 16-octet src GUID (equalp) -> SN (eql) -> (kind key-hash status writer-id source-guid) (§8.3.5.4: SN is per-writer; no per-change composite-key alloc)
   (ack-count 0 :type integer)
   (acks-in 0 :type integer)
@@ -2132,6 +2133,13 @@
                         (disc-node-key-id-rx-pool node) pool))   ; set the pool LAST — the double-checked-carve flag
               (error () nil))))))   ; arena-exhausted / static-alloc failure -> leave NIL -> allocating fallback
 
+(defvar *rx-source-timestamp* nil
+  "S5.T4: the source_timestamp (nanoseconds) applied to the DATA currently being received, set from the
+   INFO_TS submessage that preceded it in the datagram (RTPS 2.5 §9.4.5.9 / §8.3.7.9) and read at the store
+   (%deliver-user-sample -> %record-sample-timestamp -> the drain's SampleInfo.source_timestamp). Bound
+   per datagram in %handle-datagram; NIL (no INFO_TS) stores no timestamp — SampleInfo.source_timestamp
+   stays NIL, the pre-S5 reception-order behaviour. Receiver-thread dynamic extent.")
+
 (defun* %handle-datagram (node buf size &optional rtps-unwrapped)
     (function (disc-node dds.core.buffer:octet-buffer (integer 0) &optional t) t)
   "Dispatch an inbound datagram (bounded by SIZE). DATA is routed by writerId: SPDP
@@ -2217,7 +2225,8 @@
                       (replace vec stream :start1 20)
                       (%handle-datagram node buf (+ 20 (length stream)) t)))))))
         (return-from %handle-datagram t)))   ; SRTPS datagram: decoded+re-dispatched, or dropped (fail-closed)
-    (dds.rtps.message:dispatch-message
+    (let ((*rx-source-timestamp* nil))   ; S5.T4: per-datagram INFO_TS source_timestamp (ns), set by the INFO_TS clause + read at the store (%deliver-user-sample); reset each datagram
+     (dds.rtps.message:dispatch-message
      cursor
      (lambda (id flags c body-len)
        (cond
@@ -2289,6 +2298,17 @@
                    ;; call reader-on-data unconditionally for RTPS reliable NACK/HEARTBEAT correctness.
                    (funcall (disc-node-on-data node) wtr sn buf poff plen src-prefix
                             orig-guid orig-sn key-hash)))))))
+         ((= id dds.rtps.message:+submsg-info-ts+)
+          ;; S5.T4 (RTPS 2.5 §9.4.5.9 / §8.3.7.9): an INFO_TS sets the source_timestamp applied to the
+          ;; DATA submessage(s) that FOLLOW it in this datagram (I flag / short body -> parse-info-ts NIL
+          ;; -> clear it). Stored (in *rx-source-timestamp*, read by %deliver-user-sample) as nanoseconds
+          ;; (sec*1e9 + the 2^-32 fraction converted via the shared discovery codec). Connext / Fast DDS
+          ;; prefix every user DATA with one, so this populates the reader's SampleInfo source_timestamp on
+          ;; cross-vendor traffic too.
+          (multiple-value-bind (sec fraction) (dds.rtps.message:parse-info-ts c flags)
+            (setf *rx-source-timestamp* (when sec
+                                          (+ (* sec 1000000000)
+                                             (dds.qos:wire-fraction->duration-nanosec fraction))))))
          ((= id dds.security:+submessage-sec-prefix+)
           ;; DDS-Security 1.1 §8.5.1.7 / §7.4.5: a SEC_PREFIX...SEC_POSTFIX submessage-protection bracket. The
           ;; SAME id now carries the reliable PVMS crypto-token exchange (T7), the secure SEDP
@@ -2378,7 +2398,7 @@
           (funcall (disc-node-on-heartbeat-frag node) c flags src-prefix))
          ((and (= id dds.rtps.message:+submsg-nack-frag+) (disc-node-on-nack-frag node) (not enforce-rtps))
           (funcall (disc-node-on-nack-frag node) c flags))))
-     size)
+     size))
     t))
 
 (defun* start-node (node)

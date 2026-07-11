@@ -1004,10 +1004,11 @@
                  (let ((info (dds.dcps:cached-sample-info cs)))
                    (when (dds.dcps:sample-info-valid-data info)
                      (incf seen)
-                     (format t "~&[deadline-sub] sample #~d: color=~a x=~a y=~a~%"
+                     (format t "~&[deadline-sub] sample #~d: color=~a x=~a y=~a source_timestamp=~a~%"
                              seen (field (dds.dcps:cached-sample-data cs) "color")
                              (field (dds.dcps:cached-sample-data cs) "x")
-                             (field (dds.dcps:cached-sample-data cs) "y")))))
+                             (field (dds.dcps:cached-sample-data cs) "y")
+                             (dds.dcps:sample-info-source-timestamp info)))))   ; S5.T4: the peer's INFO_TS source_timestamp (ns), NIL if none
                (let ((ms (dds.dcps:matched-count p)))
                  (when (/= ms last-matched)
                    (format t "~&[deadline-sub] MATCHED ~d -> ~d remote writer(s) (DEADLINE RxO compatible).~%"

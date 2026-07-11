@@ -1258,8 +1258,8 @@
   (when (%writer-keeplast-p dw)
     (%instance-handle (topic-type-support (dw-topic dw)) sample)))
 
-(defun* write-sample (dw sample)
-    (function (data-writer t) (member :ok :timeout :not-enabled))
+(defun* write-sample (dw sample &optional source-timestamp)
+    (function (data-writer t &optional (or null integer)) (member :ok :timeout :not-enabled))
   "DataWriter::write — serialize SAMPLE via the topic type-support and publish it reliably over the engine
    to all matched/discovered readers. Returns the DDS ReturnCode_t +RETCODE-OK+ (:ok) normally, or
    +RETCODE-TIMEOUT+ (:timeout) if the writer's HistoryCache was full and RELIABILITY.max_blocking_time
@@ -1284,7 +1284,8 @@
                         node (%serialize-sample (topic-type-support (dw-topic dw)) sample
                                                 (%writer-tx-rep dw))
                         kh nil 0 nil
-                        (dw-entity-id dw)))   ; WP-N-ENDPOINT-S1: publish into THIS writer's own HistoryCache
+                        (dw-entity-id dw)   ; WP-N-ENDPOINT-S1: publish into THIS writer's own HistoryCache
+                        source-timestamp))  ; S5.T4: NIL (plain write) -> no INFO_TS, byte-identical; ns -> INFO_TS before the DATA
       (return-from write-sample +retcode-timeout+))   ; full bounded cache, max_blocking_time elapsed
     (assert-liveliness dw)
     (%deadline-touch-writer dw kh sample)   ; WP-DCPS-API-COMPLETION S4: (re)arm this instance's offered DEADLINE (no-op + 0-alloc when DEADLINE is INFINITE; reuses the KEEP_LAST keyhash)
@@ -1292,6 +1293,51 @@
       (unless (gethash h (dw-instances dw))                                            ; first write of this instance -> record its key holder (get_key_value); steady state is a lock-free gethash
         (dds.pal:with-lock ((dw-status-lock dw)) (setf (gethash h (dw-instances dw)) sample))))
     +retcode-ok+))
+
+;;; ---- Timestamped writes (S5.T4, DDS 1.4 §2.2.2.4.2.11/§2.2.2.4.2.9/§2.2.2.4.2.8): supply the
+;;;      source_timestamp explicitly instead of the reception time. It rides an INFO_TIMESTAMP submessage
+;;;      before the DATA (RTPS 2.5 §9.4.5.9) so a matched reader's SampleInfo.source_timestamp reflects it.
+
+(defun* %time->ns (sec nanosec)
+    (function (integer (unsigned-byte 32)) integer)
+  "A DDS Time_t (SEC, NANOSEC) as a single nanosecond count — the internal source_timestamp form threaded
+   to the wire (INFO_TS) and surfaced in SampleInfo.source_timestamp."
+  (+ (* sec 1000000000) nanosec))
+
+(defun* write-w-timestamp (dw sample sec nanosec)
+    (function (data-writer t integer (unsigned-byte 32)) (member :ok :timeout :not-enabled))
+  "DataWriter::write_w_timestamp (DDS 1.4 §2.2.2.4.2.11) — write SAMPLE stamped with the given
+   source_timestamp (Time_t SEC/NANOSEC) rather than the reception time; an INFO_TS carries it before the
+   DATA on the wire (RTPS 2.5 §9.4.5.9). The instance is derived from SAMPLE (auto-registered), as for write."
+  (write-sample dw sample (%time->ns sec nanosec)))
+
+(defun* dispose-w-timestamp (dw sample-or-handle sec nanosec)
+    (function (data-writer t integer (unsigned-byte 32))
+              (or (simple-array (unsigned-byte 8) (16)) (member :timeout :not-enabled)))
+  "DataWriter::dispose_w_timestamp (DDS 1.4 §2.2.2.4.2.9) — dispose the instance with the given
+   source_timestamp; the lifecycle DATA is preceded by an INFO_TS."
+  (dispose-instance dw sample-or-handle (%time->ns sec nanosec)))
+
+(defun* unregister-instance-w-timestamp (dw sample-or-handle sec nanosec)
+    (function (data-writer t integer (unsigned-byte 32))
+              (or (simple-array (unsigned-byte 8) (16)) (member :timeout :not-enabled)))
+  "DataWriter::unregister_instance_w_timestamp (DDS 1.4 §2.2.2.4.2.8) — unregister the instance with the
+   given source_timestamp; the lifecycle DATA is preceded by an INFO_TS."
+  (unregister-instance dw sample-or-handle (%time->ns sec nanosec)))
+
+(defun* writedispose (dw sample &optional sec nanosec)
+    (function (data-writer t &optional (or null integer) (or null (unsigned-byte 32)))
+              (or (simple-array (unsigned-byte 8) (16)) (member :ok :timeout :not-enabled)))
+  "DataWriter::writedispose (a Connext-compatible extension, NOT in the OMG DCPS PSM — additive interop
+   behaviour on top of the standard API): write SAMPLE then dispose its instance in one call, so a reader
+   sees the value AND the NOT_ALIVE_DISPOSED transition. With SEC/NANOSEC both non-NIL the write + dispose
+   carry that source_timestamp (INFO_TS); otherwise the reception time is used. Returns the dispose handle,
+   or the write's non-:ok return code when the write itself failed."
+  (let* ((ts (and sec nanosec))
+         (rc (if ts (write-w-timestamp dw sample sec nanosec) (write-sample dw sample))))
+    (if (eq rc +retcode-ok+)
+        (if ts (dispose-w-timestamp dw sample sec nanosec) (dispose-instance dw sample))
+        rc)))
 
 ;;;; ---- WP-FLATDATA-LOAN-WRITE zero-copy TX loan API (FR-PF-4, R6, ADR 0042) ----
 ;;;; NOT cleared for ship — pending counsel (R6); see ADR 0042.
@@ -1521,8 +1567,8 @@
       (setf (gethash handle (dw-instances dw)) sample))   ; S5.T1: the value is the key holder (get_key_value); presence = registered
     handle))
 
-(defun* dispose-instance (dw sample-or-handle)
-    (function (data-writer t) (or (simple-array (unsigned-byte 8) (16)) (member :timeout :not-enabled)))
+(defun* dispose-instance (dw sample-or-handle &optional source-timestamp)
+    (function (data-writer t &optional (or null integer)) (or (simple-array (unsigned-byte 8) (16)) (member :timeout :not-enabled)))
   "DataWriter::dispose (DDS 1.4 §2.2.2.4.2.10) — dispose the instance named by SAMPLE-OR-HANDLE
    (a sample or a registered handle): emit a no-payload dispose DATA (StatusInfo Disposed, RTPS 2.5
    §9.6.4.9) over the reliable engine so matched readers see NOT_ALIVE_DISPOSED. Returns the handle, or
@@ -1532,7 +1578,7 @@
   (unless (entity-enabled-p dw) (return-from dispose-instance +retcode-not-enabled+))
   (let ((handle (%resolve-handle dw sample-or-handle))
         (node (dp-node (pub-participant (dw-publisher dw)))))
-    (when (eq :timeout (dds.disc:dispose-instance node handle))
+    (when (eq :timeout (dds.disc:dispose-instance node handle (or source-timestamp 0)))   ; S5.T4
       (return-from dispose-instance +retcode-timeout+))
     (assert-liveliness dw)
     handle))
@@ -1544,8 +1590,8 @@
   (let ((qos (entity-qos dw)))
     (if (typep qos 'dds.qos:qos) (dds.qos:qos-autodispose-unregistered-instances qos) t)))
 
-(defun* unregister-instance (dw sample-or-handle)
-    (function (data-writer t) (or (simple-array (unsigned-byte 8) (16)) (member :timeout :not-enabled)))
+(defun* unregister-instance (dw sample-or-handle &optional source-timestamp)
+    (function (data-writer t &optional (or null integer)) (or (simple-array (unsigned-byte 8) (16)) (member :timeout :not-enabled)))
   "DataWriter::unregister_instance (DDS 1.4 §2.2.2.4.2.7) — unregister the instance named by
    SAMPLE-OR-HANDLE: emit a no-payload unregister DATA over the reliable engine, relinquishing this
    writer's ownership of the instance. Per WRITER_DATA_LIFECYCLE (DDS 1.4 §2.2.3.21,
@@ -1559,7 +1605,8 @@
   (unless (entity-enabled-p dw) (return-from unregister-instance +retcode-not-enabled+))
   (let ((handle (%resolve-handle dw sample-or-handle))
         (node (dp-node (pub-participant (dw-publisher dw)))))
-    (when (eq :timeout (dds.disc:unregister-instance node handle (%writer-autodispose-p dw)))
+    (when (eq :timeout (dds.disc:unregister-instance node handle (%writer-autodispose-p dw)
+                                                      (or source-timestamp 0)))   ; S5.T4
       (return-from unregister-instance +retcode-timeout+))
     (dds.pal:with-lock ((dw-status-lock dw))
       (remhash handle (dw-instances dw)))
@@ -2194,6 +2241,8 @@
                                      :sample-state :not-read :view-state :new
                                      :instance-state (instance-rec-state rec) :valid-data t
                                      :instance-handle handle :sequence-number sn
+                                     :source-timestamp (dds.disc:node-sample-timestamp   ; S5.T4
+                                                        (dp-node (sub-participant (dr-subscriber dr))) key)
                                      :disposed-generation-count (instance-rec-disposed-gen-count rec)
                                      :no-writers-generation-count (instance-rec-no-writers-gen-count rec)))))))))
     (when sguid                                                    ; advance the per-writer watermark (best-effort: ACKed, never retransmit)
@@ -2236,6 +2285,7 @@
                                :sample-state :not-read :view-state :new
                                :instance-state (instance-rec-state rec) :valid-data t
                                :instance-handle handle :sequence-number sn
+                               :source-timestamp (dds.disc:node-sample-timestamp node key)   ; S5.T4
                                :disposed-generation-count (instance-rec-disposed-gen-count rec)
                                :no-writers-generation-count (instance-rec-no-writers-gen-count rec)))))))
   (when sguid
@@ -2412,6 +2462,7 @@
                                              :sample-state :not-read :view-state :new
                                              :instance-state (instance-rec-state rec) :valid-data t
                                              :instance-handle handle :sequence-number sn
+                                             :source-timestamp (dds.disc:node-sample-timestamp node key)   ; S5.T4
                                              :disposed-generation-count (instance-rec-disposed-gen-count rec)
                                              :no-writers-generation-count (instance-rec-no-writers-gen-count rec))))))))))))))
     (when (and sguid advance)

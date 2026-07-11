@@ -41,6 +41,7 @@
            #:writer-loan-sample #:discard-all-loans
            #:register-instance #:dispose-instance #:unregister-instance
            #:lookup-instance #:get-key-value #:+instance-handle-nil+
+           #:write-w-timestamp #:dispose-w-timestamp #:unregister-instance-w-timestamp #:writedispose
            #:+retcode-ok+ #:+retcode-timeout+ #:+retcode-bad-parameter+
            ;; WP-DCPS-API-COMPLETION S1.T3: get_qos/set_qos + IMMUTABLE/INCONSISTENT return codes
            #:get-qos #:set-qos

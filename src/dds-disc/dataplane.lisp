@@ -845,30 +845,48 @@
       (<= (dds.rtps.history:cache-change-payload-len change)   ; TRUE length (a secured change's payload is an oversized pooled vec, T5a)
           dds.rtps.reliable:*fragment-size*)))
 
+(defun* %ns->rtps-time (ns)
+    (function (integer) (values (unsigned-byte 32) (unsigned-byte 32)))
+  "Split a nanosecond source_timestamp into the RTPS Time_t (seconds, 2^-32 fraction) for an INFO_TS
+   (RTPS 2.5 §9.4.5.9 / §9.3.2.1), reusing the shared discovery Duration fraction codec (no hardcoded 2^32)."
+  (multiple-value-bind (sec nsec) (floor ns 1000000000)
+    (values (logand sec #xffffffff) (dds.qos:duration-nanosec->wire-fraction nsec))))
+
 (defun* %data-builder (node change)
     (function (disc-node dds.rtps.history:cache-change) cons)
   "A (SIZE . BUILD-FN) packable item for the SMALL CHANGE (for %send-packed), dispatching on KIND (RTPS
    2.5 §9.4.5.4): a :data change writes one DATA (write-data, D-flag, inline-qos from the change's slot
    when non-nil — byte-identical to before when nil), SIZE = 4 + 20 + iq-len + payload; a :dispose/:unregister
    writes one no-payload DATA (write-data-dispose, flags E+Q, inlineQos PID_KEY_HASH + PID_STATUS_INFO,
-   §9.6.4.9), SIZE = 4 + 52. SIZE is the exact submessage length — the fit bound %send-packed checks
-   before writing so the datagram never overflows the buffer."
-  (let ((sn (dds.rtps.history:cache-change-sn change))
-        (wid (%emit-wid node)))
-    (if (eq (dds.rtps.history:cache-change-kind change) :data)
-        (let* ((pl (dds.rtps.history:cache-change-serialized-payload change))
-               (len (dds.rtps.history:cache-change-payload-len change))   ; TRUE length, not the oversized pooled vec (T5a)
-               (iq (dds.rtps.history:cache-change-inline-qos change))
-               (iq-len (if iq (length iq) 0)))
-          (cons (+ 24 iq-len len)
-                (lambda (mc) (dds.rtps.message:write-data
-                              mc dds.rtps.message:+entityid-unknown+ wid sn pl 0 len
-                              :inline-qos iq))))
-        (let ((kh (dds.rtps.history:cache-change-instance-key-hash change))
-              (si (dds.rtps.history:cache-change-status-info change)))
-          (cons 56
-                (lambda (mc) (dds.rtps.message:write-data-dispose
-                              mc dds.rtps.message:+entityid-unknown+ wid sn kh si)))))))
+   §9.6.4.9), SIZE = 4 + 52. S5.T4: when the change carries a non-zero source_timestamp (a _w_timestamp
+   write/dispose/unregister), an INFO_TS submessage (12 octets) is emitted BEFORE the DATA (RTPS 2.5
+   §9.4.5.9 / §8.3.7.9); a plain write carries source_timestamp 0 -> no INFO_TS -> byte-identical. SIZE is
+   the exact submessage length(s) — the fit bound %send-packed checks before writing so the datagram never
+   overflows the buffer."
+  (let* ((sn (dds.rtps.history:cache-change-sn change))
+         (wid (%emit-wid node))
+         (ts (dds.rtps.history:cache-change-source-timestamp change))
+         (ts-size (if (plusp ts) 12 0)))
+    (flet ((%emit-info-ts (mc)
+             (when (plusp ts)
+               (multiple-value-bind (sec frac) (%ns->rtps-time ts)
+                 (dds.rtps.message:write-info-ts mc sec frac)))))
+      (if (eq (dds.rtps.history:cache-change-kind change) :data)
+          (let* ((pl (dds.rtps.history:cache-change-serialized-payload change))
+                 (len (dds.rtps.history:cache-change-payload-len change))   ; TRUE length, not the oversized pooled vec (T5a)
+                 (iq (dds.rtps.history:cache-change-inline-qos change))
+                 (iq-len (if iq (length iq) 0)))
+            (cons (+ 24 iq-len len ts-size)
+                  (lambda (mc) (%emit-info-ts mc)
+                    (dds.rtps.message:write-data
+                     mc dds.rtps.message:+entityid-unknown+ wid sn pl 0 len
+                     :inline-qos iq))))
+          (let ((kh (dds.rtps.history:cache-change-instance-key-hash change))
+                (si (dds.rtps.history:cache-change-status-info change)))
+            (cons (+ 56 ts-size)
+                  (lambda (mc) (%emit-info-ts mc)
+                    (dds.rtps.message:write-data-dispose
+                     mc dds.rtps.message:+entityid-unknown+ wid sn kh si))))))))
 
 (defun* %heartbeat-builder (node first last count)
     (function (disc-node integer integer integer) cons)
@@ -1956,10 +1974,10 @@
             (aref g 15) (ldb (byte 8  0) id)))
     g))
 
-(defun* publish-sample (node payload &optional (key-hash nil) (zc-slot nil) (zc-gen 0) (zc-len nil) (writer-id nil))
+(defun* publish-sample (node payload &optional (key-hash nil) (zc-slot nil) (zc-gen 0) (zc-len nil) (writer-id nil) (source-timestamp nil))
     (function (disc-node (or null (simple-array (unsigned-byte 8) (*)))
                &optional (or null (array (unsigned-byte 8) (*))) (or null (integer 0)) (unsigned-byte 32)
-                         (or null (integer 0)) (or null (unsigned-byte 32)))
+                         (or null (integer 0)) (or null (unsigned-byte 32)) (or null integer))
               (or (eql t) (eql :timeout)))
   "Publish PAYLOAD (an opaque SerializedPayload) on the node's user writer: add it to the writer
    HistoryCache, then push DATA + HEARTBEAT to peers (FR-RTPS-8). Returns T normally, or the :timeout
@@ -2077,6 +2095,8 @@
           (dds.xport.zerocopy::%zc-release (disc-node-zc-pool-sap node) zc-slot zc-gen)
           (dds.pal:atomic-incf (disc-node-zc-pin-count node) -1))
         (return-from publish-sample :timeout))  ; full bounded cache, max_blocking_time elapsed: nothing added, nothing to push
+      (when (and change source-timestamp)   ; S5.T4: carry the source_timestamp (ns) so %data-builder emits INFO_TS before this DATA (retransmits carry it too)
+        (setf (dds.rtps.history:cache-change-source-timestamp change) source-timestamp))
       (when (and zc-slot change)   ; ADR 0042: register the armed change for the post-push-pass / teardown leak sweep
         (dds.pal:with-lock ((disc-node-lock node))
           (push change (disc-node-zc-armed-changes node))))))
@@ -2163,8 +2183,8 @@
       (t (%push-data node)))
     t))
 
-(defun* %dispose-or-unregister (node key-hash status-flags)
-    (function (disc-node (simple-array (unsigned-byte 8) (16)) (unsigned-byte 8)) (or integer (eql :timeout)))
+(defun* %dispose-or-unregister (node key-hash status-flags &optional (source-timestamp 0))
+    (function (disc-node (simple-array (unsigned-byte 8) (16)) (unsigned-byte 8) &optional integer) (or integer (eql :timeout)))
   "Writer side: add a dispose/unregister change for the instance named by KEY-HASH (16 octets)
    to the user writer's HistoryCache (writer-lifecycle-change, deriving the KIND from
    STATUS-FLAGS), then push DATA + HEARTBEAT to peers exactly like publish-sample — so the
@@ -2177,7 +2197,8 @@
    SN order, so a dispose never overtakes its instance's batched samples). With a flow-controller associated
    (WP-ASYNC-FLOW, ADR 0016) it goes through the same paced async path as publish-sample — the lifecycle
    DATA is rate-shaped with the writer's data, in SN order, by the controller thread."
-  (let ((sn (dds.rtps.reliable:writer-lifecycle-change (disc-node-user-writer node) key-hash status-flags)))
+  (let ((sn (dds.rtps.reliable:writer-lifecycle-change (disc-node-user-writer node) key-hash status-flags
+                                                       nil source-timestamp)))   ; S5.T4: source_timestamp (ns, 0 = none)
     (when (eq sn :timeout) (return-from %dispose-or-unregister :timeout))   ; full bounded cache: nothing added, nothing to push
     (setf (disc-node-batch-pending node) 0)   ; the push flushes the pending batch too (data SN < dispose SN)
     (cond
@@ -2187,17 +2208,18 @@
       (t (%push-data node)))
     sn))
 
-(defun* dispose-instance (node key-hash)
-    (function (disc-node (simple-array (unsigned-byte 8) (16))) (or integer (eql :timeout)))
+(defun* dispose-instance (node key-hash &optional (source-timestamp 0))
+    (function (disc-node (simple-array (unsigned-byte 8) (16)) &optional integer) (or integer (eql :timeout)))
   "Dispose the instance named by KEY-HASH on NODE's user writer (DDS 1.4 §2.2.2.4.2.10): emit a
    no-payload dispose DATA (StatusInfo Disposed, RTPS 2.5 §9.6.4.9) over the reliable engine.
    Returns the change SN, or :timeout (RETCODE_TIMEOUT) under the same block-up-to-max_blocking_time
    backpressure as publish-sample (ADR 0016 §Backpressure; only with a finite bounded cache). Mirrors
-   publish-sample so the dispose is reliably repairable."
-  (%dispose-or-unregister node key-hash dds.rtps.message:+statusinfo-disposed+))
+   publish-sample so the dispose is reliably repairable. SOURCE-TIMESTAMP (ns, 0 = none, S5.T4): a
+   dispose_w_timestamp emits an INFO_TS before the lifecycle DATA."
+  (%dispose-or-unregister node key-hash dds.rtps.message:+statusinfo-disposed+ source-timestamp))
 
-(defun* unregister-instance (node key-hash &optional (autodispose t))
-    (function (disc-node (simple-array (unsigned-byte 8) (16)) &optional t) (or integer (eql :timeout)))
+(defun* unregister-instance (node key-hash &optional (autodispose t) (source-timestamp 0))
+    (function (disc-node (simple-array (unsigned-byte 8) (16)) &optional t integer) (or integer (eql :timeout)))
   "Unregister the instance named by KEY-HASH on NODE's user writer (DDS 1.4 §2.2.2.4.2.7): emit a
    no-payload unregister DATA over the reliable engine. When AUTODISPOSE is true (the
    WRITER_DATA_LIFECYCLE default, DDS 1.4 §2.2.3.21) the StatusInfo is Disposed|Unregistered (the
@@ -2210,7 +2232,8 @@
    node key-hash
    (if autodispose
        (logior dds.rtps.message:+statusinfo-unregistered+ dds.rtps.message:+statusinfo-disposed+)
-       dds.rtps.message:+statusinfo-unregistered+)))
+       dds.rtps.message:+statusinfo-unregistered+)
+   source-timestamp))
 
 (defun* %source-guid (src-prefix writer-id)
     (function ((simple-array (unsigned-byte 8) (12)) (unsigned-byte 32)) (simple-array (unsigned-byte 8) (16)))
@@ -2357,6 +2380,25 @@
    (ADR 0029)."
   (dds.pal:with-lock ((disc-node-lock node))
     (let ((inner (gethash (car key) (disc-node-sample-key-hashes node))))
+      (and inner (gethash (cdr key) inner)))))
+
+(defun* %record-sample-timestamp (node wire-guid sn source-timestamp)
+    (function (disc-node (simple-array (unsigned-byte 8) (16)) integer (or null integer)) t)
+  "Record the source_timestamp (nanoseconds, from the INFO_TS preceding this DATA — RTPS 2.5 §9.4.5.9) of
+   the :data sample stored under (WIRE-GUID, SN), when one was present. NIL -> store nothing (the reader's
+   SampleInfo source_timestamp stays NIL — reception order, the pre-S5 behaviour). Caller holds the node
+   lock. Control plane (the store is per-sample metadata, like the key-hash)."
+  (when source-timestamp
+    (setf (gethash sn (%inner-table (disc-node-sample-timestamps node) wire-guid)) source-timestamp))
+  t)
+
+(defun* node-sample-timestamp (node key)
+    (function (disc-node cons) (or null integer))
+  "The source_timestamp (nanoseconds) of the :data sample at composite KEY (a (GUID . SN) cons), from the
+   INFO_TS that preceded it (RTPS 2.5 §9.4.5.9 / §8.3.7.9), or NIL when the DATA carried no timestamp. The
+   drain copies THIS into the delivered SampleInfo's source_timestamp (DDS 1.4 §2.2.2.5.4)."
+  (dds.pal:with-lock ((disc-node-lock node))
+    (let ((inner (gethash (car key) (disc-node-sample-timestamps node))))
       (and inner (gethash (cdr key) inner)))))
 
 ;;;; NOT cleared for ship — pending counsel (R6); see ADR 0017.
@@ -2676,7 +2718,8 @@
     (drop disc-node-sample-writers)
     (drop disc-node-sample-writer-guids)
     (drop disc-node-sample-origins)
-    (drop disc-node-sample-key-hashes))
+    (drop disc-node-sample-key-hashes)
+    (drop disc-node-sample-timestamps))   ; S5.T4
   t)
 
 (defun* %secured-loan-release (node handle)
@@ -2969,6 +3012,7 @@
                (gethash sn (%inner-table (disc-node-sample-writer-guids node) guid)) guid)
          (%record-sample-origin node guid sn effective-guid effective-sn)
          (%record-sample-key-hash node guid sn key-hash)
+         (%record-sample-timestamp node guid sn *rx-source-timestamp*)   ; S5.T4: the INFO_TS source_timestamp (ns) preceding this DATA (NIL default = none)
          (when (plusp (hash-table-count (disc-node-decode-fail-counts node)))   ; ADR 0031 lim.1: gated -> steady-state (no failures) keeps the zero-alloc secured arm untouched
            (%decode-fail-clear node guid sn))
          (when loan

@@ -41,6 +41,10 @@
   "SubmessageKind GAP (RTPS 2.5 §9.4.5.1.1).")
 (defconstant +submsg-info-ts+        #x09
   "SubmessageKind INFO_TS / InfoTimestamp (RTPS 2.5 §9.4.5.1.1).")
+(defconstant +info-ts-flag-invalidate+ #x02
+  "INFO_TS InvalidateFlag (I): when set, the submessage carries NO Timestamp body and INVALIDATES the
+   current source timestamp for subsequent submessages (RTPS 2.5 §9.4.5.9). Bit 1, alongside the E flag
+   (bit 0).")
 (defconstant +submsg-info-src+       #x0c
   "SubmessageKind INFO_SRC / InfoSource (RTPS 2.5 §9.4.5.1.1).")
 (defconstant +submsg-info-reply-ip4+ #x0d
@@ -431,6 +435,30 @@
     (multiple-value-bind (base numbits bitmap) (read-sequence-number-set cursor)
       (when (null base) (return-from parse-gap-body nil))
       (values reader-id writer-id gap-start base numbits bitmap))))
+
+;;; ---- INFO_TIMESTAMP submessage (§9.4.5.9 / §8.3.7.9): a source Timestamp applied to the SUBSEQUENT
+;;; entity submessages (DATA/DATA_FRAG) in the same datagram, until the next INFO_TS. Body (I flag clear)
+;;; = Time_t{ seconds(u32); fraction(u32) } (§9.3.2.1) where fraction is in units of sec/2^32. ----
+
+(defun* write-info-ts (cursor seconds fraction)
+    (function (dds.core.buffer:cursor (unsigned-byte 32) (unsigned-byte 32)) fixnum)
+  "Write an INFO_TS submessage carrying a source Timestamp (RTPS 2.5 §9.4.5.9): header (INFO_TS, E flag,
+   Invalidate clear) + Time_t{seconds; fraction} = body 8. FRACTION is the RTPS 2^-32 wire fraction (the
+   caller converts a DDS nanosec via dds.qos:duration-nanosec->wire-fraction — the same encoding as the
+   discovery Duration_t). Applies to the DATA submessage(s) that follow it in the datagram."
+  (write-submessage-header cursor +submsg-info-ts+ (%e-flag cursor) 8)
+  (dds.core.buffer:put-u32 cursor seconds)
+  (dds.core.buffer:put-u32 cursor fraction)
+  (dds.core.buffer:cursor-position cursor))
+
+(defun* parse-info-ts (cursor flags)
+    (function (dds.core.buffer:cursor (unsigned-byte 8)) t)
+  "Parse an INFO_TS body (RTPS 2.5 §9.4.5.9): (values seconds fraction) when a Timestamp is present, or
+   NIL when the Invalidate (I) flag is set (no body — clear the current timestamp) or the body is short
+   (bounds-checked, NFR-SEC-POSTURE). Cursor endianness must match the E flag."
+  (when (logtest flags +info-ts-flag-invalidate+) (return-from parse-info-ts nil))
+  (when (< (%remaining cursor) 8) (return-from parse-info-ts nil))
+  (values (dds.core.buffer:get-u32 cursor) (dds.core.buffer:get-u32 cursor)))
 
 ;;; ---- HEARTBEAT_FRAG submessage (§9.4.5.8): readerId(4) + writerId(4) + writerSN(8) +
 ;;; lastFragmentNum(4) + count(4) = 24 octets; only the E flag (§9.4.5.8). ----

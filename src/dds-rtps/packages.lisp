@@ -60,6 +60,7 @@
            #:write-heartbeat #:parse-heartbeat-body
            #:write-acknack #:parse-acknack-body
            #:write-gap #:parse-gap-body
+           #:write-info-ts #:parse-info-ts #:+info-ts-flag-invalidate+
            #:write-heartbeat-frag #:parse-heartbeat-frag-body
            #:write-nack-frag #:parse-nack-frag-body
            #:+data-flag-inline-qos+ #:+data-flag-data+ #:+data-flag-key+

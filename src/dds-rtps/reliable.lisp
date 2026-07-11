@@ -211,9 +211,9 @@
     (and (eq (dds.rtps.history:cache-change-zc-state change) :armed)
          (progn (setf (dds.rtps.history:cache-change-zc-state change) :released) t))))
 
-(defun* writer-lifecycle-change (writer key-hash status-flags &optional (inline-qos nil))
+(defun* writer-lifecycle-change (writer key-hash status-flags &optional (inline-qos nil) (source-timestamp 0))
     (function (rtps-writer (simple-array (unsigned-byte 8) (*)) (unsigned-byte 8)
-               &optional (or null (simple-array (unsigned-byte 8) (*))))
+               &optional (or null (simple-array (unsigned-byte 8) (*))) integer)
               (or integer (eql :timeout)))
   "Add a dispose/unregister change for the instance named by KEY-HASH (16 octets) to the
    writer's HistoryCache and return its sequence number (RTPS 2.5 §9.6.4.9), OR the :timeout sentinel
@@ -231,7 +231,7 @@
    writer (lambda (sn) (dds.rtps.history:make-cache-change
                         :sn sn :kind (dds.rtps.message:status-info->kind status-flags)
                         :instance-key-hash key-hash :status-info status-flags
-                        :inline-qos inline-qos))))
+                        :inline-qos inline-qos :source-timestamp source-timestamp))))   ; S5.T4: INFO_TS on dispose/unregister_w_timestamp
 
 (defun* writer-heartbeat (writer)
     (function (rtps-writer) (values integer integer integer))
