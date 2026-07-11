@@ -1987,10 +1987,11 @@
             (aref g 15) (ldb (byte 8  0) id)))
     g))
 
-(defun* publish-sample (node payload &optional (key-hash nil) (zc-slot nil) (zc-gen 0) (zc-len nil) (writer-id nil) (source-timestamp nil))
+(defun* publish-sample (node payload &optional (key-hash nil) (zc-slot nil) (zc-gen 0) (zc-len nil) (writer-id nil) (source-timestamp nil) (in-pooled nil) (in-plen nil))
     (function (disc-node (or null (simple-array (unsigned-byte 8) (*)))
                &optional (or null (array (unsigned-byte 8) (*))) (or null (integer 0)) (unsigned-byte 32)
-                         (or null (integer 0)) (or null (unsigned-byte 32)) (or null integer))
+                         (or null (integer 0)) (or null (unsigned-byte 32)) (or null integer)
+                         t (or null (integer 0)))
               (or (eql t) (eql :timeout)))
   "Publish PAYLOAD (an opaque SerializedPayload) on the node's user writer: add it to the writer
    HistoryCache, then push DATA + HEARTBEAT to peers (FR-RTPS-8). Returns T normally, or the :timeout
@@ -2044,7 +2045,11 @@
               (%build-key-hash-iq (coerce key-hash '(simple-array (unsigned-byte 8) (16))))))
         (writer (%resolve-user-writer node writer-id))   ; WP-N-ENDPOINT-S1: write into THIS DataWriter's own HistoryCache/SN space; NIL/unregistered -> primary (N=1 byte-identical)
         (pin-granted nil)          ; ADR 0044: T iff the TX pin was reserved + %zc-pin'd for this write
-        (pooled nil) (plen nil))   ; T5a: the acquired pool buffer + its TRUE secured-payload length (NIL = non-pooled path)
+        ;; T5a: the acquired pool buffer + its TRUE payload length (NIL = non-pooled path). WP-PERF: a caller
+        ;; that already SERIALIZED INTO a pool buffer (publish-sample-into — the zero-alloc DCPS TX path) hands
+        ;; it in here, so the change OWNS it and the pool reclaims it at the eviction/ref-drop gate exactly as a
+        ;; secured payload does. The secured branch below overrides both (it re-encodes into its own buffer).
+        (pooled in-pooled) (plen in-plen))
     ;; WP-ACKED-SLOT-PINNING (ADR 0044): a pin request (a committed slot + NO retained payload). Reserve a pin
     ;; budget slot + %zc-pin (a SECOND, distinct refcount hold, ADR 0044 §4.1); at budget / a stale slot, resolve
     ;; the retained payload on demand from the still-armed slot and publish as a normal change (the fallback).
@@ -2068,6 +2073,9 @@
     (let* ((weid (dds.rtps.reliable:rtps-writer-entityid writer))   ; WP-N-ENDPOINT-S3: the ACTUAL publishing writer's EntityId (the send crux)
            (wdk  (nth-value 0 (%user-endpoint-kinds node weid)))    ; THIS writer's OWN data_protection kind (per-endpoint, never the node-single slot)
            (ct   (and (not (eq wdk :none)) (disc-node-crypto-transform node))))   ; ADR 0046/0048: the WRITER's OWN kind (never a shared slot a reader/other writer could downgrade)
+      (when (and ct pooled)   ; WP-PERF: a secured writer re-encodes below into its OWN pool buffer; return the caller's pre-serialized one or it leaks a slot (publish-sample-into gates this case out, so this is belt-and-braces)
+        (dds.rtps.reliable:writer-release-payload-buffer writer pooled)
+        (setf pooled nil plen nil))
       (when ct
         (let ((km (if (typep ct 'dds.security:crypto-keys)
                       (funcall (dds.security:crypto-keys-encode-key-fn ct) (%local-writer-guid-vec node weid))   ; resolve THIS writer's EntityCrypto km by its OWN EntityId
@@ -3329,6 +3337,14 @@
               (dds.rtps.reliable:writer-release-change-ref w ch)))))))   ; release after the DATA_FRAG retransmits are emitted (copied)
   t)
 
+(defparameter *plain-payload-max-bytes* 16384
+  "WP-PERF (NFR-MEM / NFR-PERF-8): the maximum SerializedPayload octet length the ZERO-ALLOC plain TX path
+   (publish-sample-into) sizes its arena-pooled buffers for. A sample whose serialized form exceeds it does not
+   fail — it DEGRADES to the allocating path (byte-identical wire), so raising this knob is a PERFORMANCE
+   decision, not a correctness one. Sized to match *secured-payload-max-bytes* so a writer's one pool serves the
+   plain and the secured shape alike (the pool's element size, (+ 44 *secured-payload-max-bytes* 3), already
+   bounds any plain payload of this length). Read when a writer's pool is carved, i.e. at its first publish.")
+
 (defparameter *secured-payload-max-bytes* 16384
   "WP-DDS-SECURITY-ZEROALLOC-AEAD T5a: the maximum PLAINTEXT octet length the data_protection encode pool sizes
    each buffer for; the pool's fixed element size is (+ 44 *secured-payload-max-bytes* 3) — the SecuredPayload
@@ -3363,6 +3379,70 @@
            ((eq kind :keep-last) (max depth *secured-pool-capacity*))
            (t *secured-pool-capacity*))
      *secured-pool-headroom*))
+
+(defun* %writer-secured-p (node writer)
+    (function (disc-node t) t)
+  "T iff WRITER publishes a data_protection-transformed payload (its OWN per-endpoint kind is non-NONE and a
+   crypto-transform is installed) — i.e. publish-sample will re-encode its payload into a pool buffer of its
+   own. Such a writer is NOT eligible for the zero-alloc pre-serialized path (publish-sample-into), which
+   would otherwise hand it a buffer it immediately discards."
+  (let ((wdk (nth-value 0 (%user-endpoint-kinds node (dds.rtps.reliable:rtps-writer-entityid writer)))))
+    (and (not (eq wdk :none)) (disc-node-crypto-transform node) t)))
+
+(defun* publish-sample-into (node serialize-fn &optional (key-hash nil) (writer-id nil) (source-timestamp nil))
+    (function (disc-node function &optional (or null (array (unsigned-byte 8) (*)))
+                                            (or null (unsigned-byte 32)) (or null integer))
+              (or (eql t) (eql :timeout)))
+  "WP-PERF (NFR-MEM / NFR-PERF-8) — the ZERO-ALLOC publish path. SERIALIZE-FN is (lambda (octet-buffer) ->
+   LENGTH): it writes the SerializedPayload straight into a buffer drawn from the writer's arena-backed
+   payload pool and returns the octet length. The change then OWNS that pool buffer and the pool reclaims it
+   at the eviction / send-ref-drop gate (hc-try-release-pooled) — exactly as a secured payload does (T5a).
+   Steady state therefore allocates ZERO bytes per sample on the TX path.
+
+   This replaces the previous DCPS TX shape, which per sample did: make-octet-buffer (a foreign/static alloc
+   + zero) -> serialize -> make-array (a fresh GC-HEAP vector) -> memcpy -> free-static. Two allocations, a
+   zeroing, a copy and a free, on every write — the inverse of the operating contract's static-arena rule,
+   and (via GC) the source of the p99.99 tail.
+
+   FAIL-SAFE, never a silent regression: if no pool can be carved OR the pool is EXHAUSTED, this falls back
+   to the allocating path (serialize into a fresh buffer, then publish-sample) — byte-identical on the wire.
+   Pool exhaustion is therefore NOT a data-loss path; it is a performance degradation, and the arena's
+   RESOURCE_LIMITS backpressure still governs the cache itself.
+   A SECURED writer is routed to the allocating path too: publish-sample re-encodes its payload into a pool
+   buffer of its own, so pre-serializing into one would just be discarded."
+  (let ((writer (%resolve-user-writer node writer-id)))
+    (labels ((allocating ()   ; the byte-identical fallback: serialize into a fresh buffer, publish as before
+               (let* ((cap (+ 4 *plain-payload-max-bytes* 8))
+                      (buf (dds.core.buffer:make-octet-buffer cap)))
+                 (unwind-protect
+                      (let* ((len (funcall serialize-fn buf))
+                             (out (make-array len :element-type '(unsigned-byte 8))))
+                        (replace out (dds.core.buffer:octet-buffer-vec buf) :end1 len)
+                        (publish-sample node out key-hash nil 0 nil writer-id source-timestamp))
+                   (dds.pal:free-static (dds.core.buffer:octet-buffer-vec buf))))))
+      (if (%writer-secured-p node writer)
+          (allocating)
+          (progn
+            (unless (dds.rtps.history:history-cache-payload-pool (dds.rtps.reliable:rtps-writer-hc writer))
+              (%ensure-secured-payload-pool node writer))   ; the SAME carve serves the plain path (DRY): its element size already bounds any plain payload
+            (let ((buf (and (dds.rtps.history:history-cache-payload-pool
+                             (dds.rtps.reliable:rtps-writer-hc writer))
+                            (dds.rtps.reliable:writer-acquire-payload-buffer writer))))
+              (if (null buf)
+                  (allocating)                       ; no pool / exhausted -> degrade to allocating, never drop
+                  (let ((committed nil))
+                    (unwind-protect
+                         (handler-case
+                             (let ((len (funcall serialize-fn buf)))
+                               (setf committed t)
+                               (publish-sample node (dds.core.buffer:octet-buffer-vec buf)
+                                               key-hash nil 0 nil writer-id source-timestamp buf len))
+                           (dds.core.buffer:buffer-overflow ()   ; payload > element-bytes: degrade, never a wire change
+                             (setf committed t)
+                             (dds.rtps.reliable:writer-release-payload-buffer writer buf)
+                             (allocating)))
+                      (unless committed   ; non-local exit before the change took ownership: return the slot
+                        (dds.rtps.reliable:writer-release-payload-buffer writer buf)))))))))))
 
 (defun* %ensure-secured-payload-pool (node writer)
     (function (disc-node dds.rtps.reliable:rtps-writer) t)

@@ -448,6 +448,37 @@
         (dds.pal:free-static (dds.core.buffer:octet-buffer-vec buf))
         out))))
 
+(defun* %sample-serializer-into (ts sample rep)
+    (function (t t symbol) function)
+  "WP-PERF (NFR-MEM / NFR-PERF-8): a closure (lambda (octet-buffer) -> LENGTH) that writes SAMPLE's
+   SerializedPayload — encapsulation header + body + finalized options — DIRECTLY into a caller-supplied
+   buffer, and returns the octet length. Framing is byte-identical to %serialize-sample (same %rep->codec,
+   same header, same finalize); the ONLY difference is that the buffer is supplied, not allocated.
+
+   That difference is the point: %serialize-sample allocated a static octet-buffer (alloc + ZERO), serialized,
+   allocated a FRESH GC-HEAP vector, memcpy'd into it and freed the static buffer — two allocations, a zeroing,
+   a copy and a free, on EVERY write. This closure lets dds.disc:publish-sample-into serialize straight into an
+   arena-pooled buffer the CacheChange then owns, so steady state conses ZERO bytes per sample on TX.
+
+   A FlatData type with a non-XCDR2 offered rep still needs the transcoding builder (which allocates), so that
+   case is not eligible — the caller (write-sample) routes it to the allocating path."
+  (multiple-value-bind (mode encap) (%rep->codec rep)
+    (let ((ser (dds.types:type-support-serialize ts)))
+      (lambda (buf)
+        (let ((wc (dds.core.buffer:cursor buf :endianness :little)))
+          (dds.cdr:make-encapsulation-header wc encap)
+          (funcall ser sample wc mode)
+          (dds.cdr:finalize-encapsulation-options wc encap)
+          (dds.core.buffer:cursor-position wc))))))
+
+(defun* %flatdata-transcoding-p (ts rep)
+    (function (t symbol) t)
+  "T iff serializing under REP needs the FlatData TX transcoding builder (a FlatData type whose OFFERED rep is
+   not XCDR2) — the one shape that cannot serialize straight into a supplied buffer, so it stays on the
+   allocating path (R6, off the measured hot path anyway)."
+  (and (dds.types:type-support-flatdata-builder ts)
+       (not (eq (nth-value 0 (%rep->codec rep)) :xcdr2))))
+
 (defun* %encap->codec (encap)
     (function (symbol) (values dds.cdr:cdr-mode (member :little :big)))
   "Map a parsed SerializedPayload encapsulation id (a +representation-ids+ key, DDS-XTypes 1.3
@@ -1328,13 +1359,20 @@
   (unless (entity-enabled-p dw) (return-from write-sample +retcode-not-enabled+))
   (let ((node (dp-node (pub-participant (dw-publisher dw))))
         (kh (%write-key-hash dw sample)))   ; WP-DCPS-API-COMPLETION S4: reused for both publish + offered-deadline arm (no extra keyhash cons)
-    (when (eq :timeout (dds.disc:publish-sample
-                        node (%serialize-sample (topic-type-support (dw-topic dw)) sample
-                                                (%writer-tx-rep dw))
-                        kh nil 0 nil
-                        (dw-entity-id dw)   ; WP-N-ENDPOINT-S1: publish into THIS writer's own HistoryCache
-                        (or source-timestamp (dds.pal:realtime-ns))))  ; ADR 0055: a plain write stamps the CURRENT wall-clock (DDS 1.4 §2.2.2.4.2.11 write = write_w_timestamp(now)); write_w_timestamp -> the explicit ns; either way an INFO_TS precedes the DATA
-      (return-from write-sample +retcode-timeout+))   ; full bounded cache, max_blocking_time elapsed
+    (let* ((ts (topic-type-support (dw-topic dw)))
+           (rep (%writer-tx-rep dw))
+           (ts-ns (or source-timestamp (dds.pal:realtime-ns)))   ; ADR 0055: a plain write stamps the CURRENT wall-clock (DDS 1.4 §2.2.2.4.2.11 write = write_w_timestamp(now))
+           (rc (if (%flatdata-transcoding-p ts rep)
+                   ;; FlatData under a non-XCDR2 offered rep: the transcoding builder allocates -> allocating path.
+                   (dds.disc:publish-sample node (%serialize-sample ts sample rep) kh nil 0 nil
+                                            (dw-entity-id dw) ts-ns)
+                   ;; WP-PERF: serialize STRAIGHT INTO the writer's arena-pooled buffer — 0 bytes/sample on TX.
+                   ;; Degrades to the allocating path by itself if no pool can be carved / the pool is exhausted.
+                   (dds.disc:publish-sample-into node (%sample-serializer-into ts sample rep) kh
+                                                 (dw-entity-id dw)   ; WP-N-ENDPOINT-S1: THIS writer's own HistoryCache
+                                                 ts-ns))))
+      (when (eq :timeout rc)
+        (return-from write-sample +retcode-timeout+)))   ; full bounded cache, max_blocking_time elapsed
     (assert-liveliness dw)
     (%deadline-touch-writer dw kh sample)   ; WP-DCPS-API-COMPLETION S4: (re)arm this instance's offered DEADLINE (no-op + 0-alloc when DEADLINE is INFINITE; reuses the KEEP_LAST keyhash)
     (let ((h (or kh (%instance-handle (topic-type-support (dw-topic dw)) sample))))   ; S5.T1: write auto-registers the instance (DDS 1.4 §2.2.2.4.2.2)

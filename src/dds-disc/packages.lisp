@@ -33,7 +33,8 @@
            #:announce-participant #:announce-endpoints
            #:enable-publisher #:enable-subscriber
            #:%writer-durability-init #:%reader-durability-init #:finalize-writer-durability
-           #:publish-sample #:publish-relay-sample #:publish-relay-lifecycle #:flush-batch #:disc-node-batch-max-samples #:enable-async
+           #:publish-sample #:publish-sample-into #:*plain-payload-max-bytes*
+           #:publish-relay-sample #:publish-relay-lifecycle #:flush-batch #:disc-node-batch-max-samples #:enable-async
            #:disc-node-lease-duration-seconds #:disc-node-lease-duration-nanosec
            #:disc-node-hb-unarmed-drops #:disc-node-durability-gate-active
            #:flow-token-bucket #:flow-token-bucket-p #:make-flow-token-bucket
