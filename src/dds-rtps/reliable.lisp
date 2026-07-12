@@ -5,7 +5,7 @@
 ;;;; testable; the byte/transport wiring is a later increment. CLOS-free; the
 ;;;; consing here (per-reader proxies, resend lists) is a documented v1 concern.
 
-(defparameter *fragment-size* 1024
+(defparameter *fragment-size* 63000
   "Outbound RTPS fragmentSize in octets (uint16, <=65535; RTPS 2.5 §9.4.5.5 DATA_FRAG). A sample whose serialized size exceeds this is sent as DATA_FRAG submessages.")
 
 (defparameter *max-reassembly-bytes* (* 4 1024 1024)

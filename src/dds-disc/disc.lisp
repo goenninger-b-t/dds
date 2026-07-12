@@ -25,6 +25,21 @@
 
 ;;;; WP-DDS-SECURITY-ZEROALLOC-AEAD T3 (ZA-2): whole-RTPS (rtps_protection / SRTPS) zero-alloc dataplane sizing.
 
+(defparameter *max-datagram-bytes* 65507
+  "STEP-1 PROBE: the capacity of the node's tx-msg / rx-tx-msg send buffers. Default 2048 = the pre-change
+   hardcoded value, so this step is semantically a NO-OP.")
+
+(defparameter *metatraffic-payload-bytes* 512
+  "STEP-3 PROBE: the capacity of the node's tx-payload buffer (discovery ParameterList scratch).")
+
+(defparameter *srtps-scratch-datagram-bytes* nil
+  "STEP-4 PROBE: NIL => follow *max-datagram-bytes* (what the SRTPS pools must be able to wrap).")
+
+(defun* srtps-scratch-datagram-bytes ()
+    (function () (integer 1))
+  "Effective SRTPS scratch datagram size."
+  (or *srtps-scratch-datagram-bytes* *max-datagram-bytes*))
+
 (defconstant +srtps-scratch-datagram-bytes+ 2048
   "WP-DDS-SECURITY-ZEROALLOC-AEAD T3: the datagram byte size the SRTPS send-scratch pool buffers and the SECURE-RX-POOL
    RX buffers are sized to — the node's message-buffer size (tx-msg / rx-tx-msg / async-tx-msg, all 2048). A wrapped
@@ -956,9 +971,9 @@
                                            (dds.xport.shmem:make-shmem-transport
                                             :participant-guid guid-prefix :host-uuid host-uuid
                                             :lane-count +shmem-default-lane-count+ :capacity +shmem-default-capacity+))
-                                  :tx-payload (dds.core.buffer:make-octet-buffer 512)
-                                  :tx-msg (dds.core.buffer:make-octet-buffer 2048)
-                                  :rx-tx-msg (dds.core.buffer:make-octet-buffer 2048))))
+                                  :tx-payload (dds.core.buffer:make-octet-buffer *metatraffic-payload-bytes*)
+                                  :tx-msg (dds.core.buffer:make-octet-buffer *max-datagram-bytes*)
+                                  :rx-tx-msg (dds.core.buffer:make-octet-buffer *max-datagram-bytes*))))
       (when multicast
         (let ((ms (dds.pal:udp-open :host "0.0.0.0"
                                     :port (dds.rtps.message:spdp-multicast-port domain)
@@ -2110,7 +2125,7 @@
       (dds.pal:with-lock ((disc-node-secure-rx-lock node))
         (or (disc-node-secure-rx-pool node)
             (handler-case
-                (let* ((eb    +srtps-scratch-datagram-bytes+)
+                (let* ((eb    (srtps-scratch-datagram-bytes))
                        (cap   *srtps-send-scratch-capacity*)
                        (arena (dds.core.arena:init-arena :bytes (* eb (1+ cap))))   ; +1 slot slack
                        (pool  (dds.core.arena:make-buffer-pool arena eb cap)))
@@ -2151,7 +2166,7 @@
       (dds.pal:with-lock ((disc-node-bracket-rx-lock node))
         (or (disc-node-bracket-rx-pool node)
             (handler-case
-                (let* ((eb    +srtps-scratch-datagram-bytes+)
+                (let* ((eb    (srtps-scratch-datagram-bytes))
                        (cap   *srtps-send-scratch-capacity*)
                        (arena (dds.core.arena:init-arena :bytes (* eb (1+ cap))))   ; +1 slot slack
                        (pool  (dds.core.arena:make-buffer-pool arena eb cap)))

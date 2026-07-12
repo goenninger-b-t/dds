@@ -103,7 +103,7 @@
       (dds.pal:with-lock ((disc-node-send-scratch-lock node))
         (or (disc-node-send-scratch-pool node)
             (handler-case
-                (let* ((eb    (+ +srtps-scratch-datagram-bytes+ +srtps-scratch-overhead+))
+                (let* ((eb    (+ (srtps-scratch-datagram-bytes) +srtps-scratch-overhead+))
                        (cap   *srtps-send-scratch-capacity*)
                        (arena (dds.core.arena:init-arena :bytes (* eb (1+ cap))))   ; +1 slot slack
                        (pool  (dds.core.arena:make-buffer-pool arena eb cap)))
@@ -143,7 +143,7 @@
       (dds.pal:with-lock ((disc-node-submsg-scratch-lock node))
         (or (disc-node-submsg-scratch-pool node)
             (handler-case
-                (let* ((eb    (+ +srtps-scratch-datagram-bytes+ +submsg-scratch-overhead+))
+                (let* ((eb    (+ (srtps-scratch-datagram-bytes) +submsg-scratch-overhead+))
                        (cap   *srtps-send-scratch-capacity*)
                        (arena (dds.core.arena:init-arena :bytes (* eb (1+ cap))))   ; +1 slot slack
                        (pool  (dds.core.arena:make-buffer-pool arena eb cap)))
@@ -1954,7 +1954,7 @@
    async on, publish/dispose SIGNAL the sender (the flush-all is adaptive batching); batch-max-samples is
    superseded."
   (unless (disc-node-async-thread node)
-    (setf (disc-node-async-tx-msg node) (dds.core.buffer:make-octet-buffer 2048)
+    (setf (disc-node-async-tx-msg node) (dds.core.buffer:make-octet-buffer *max-datagram-bytes*)
           (disc-node-async-stop node) nil
           (disc-node-async-pending node) nil
           (disc-node-async-thread node)

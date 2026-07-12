@@ -7788,9 +7788,14 @@
    the fault, publish a small sample; assert the writer RESUMES (the best-effort reader receives it) — a dead
    scheduler thread could neither stabilise nor resume."
   (when (eq (uiop:implementation-type) :clasp) (return-from run-flow-emit-fault-no-spin-multi-test t))   ; timing-flaky on Clasp (mirrors the other flow tests)
-  (let* ((slack 8)
+  ;; This test's PREMISE is fragmentation: the >=3-entry plan it needs exists only if the 4000-octet sample is
+  ;; split into a DATA_FRAG series. So PIN the fragment size it depends on rather than inherit the global default
+  ;; — that default is a deployment/performance policy (WP-PERF raised it to 63000 so a large sample rides as ONE
+  ;; datagram, as Connext does), and a test must not silently depend on it.
+  (let* ((dds.rtps.reliable:*fragment-size* 1024)
+         (slack 8)
          (big (let ((v (make-array 4000 :element-type '(unsigned-byte 8))))
-                (dotimes (i 4000 v) (setf (aref v i) (logand (* i 7) #xff)))))   ; 4000 octets > *fragment-size* (1024) ⇒ DATA_FRAG series
+                (dotimes (i 4000 v) (setf (aref v i) (logand (* i 7) #xff)))))   ; 4000 octets > the pinned *fragment-size* (1024) ⇒ DATA_FRAG series
          (w (dds.disc:make-disc-node :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element #x98) :host "127.0.0.1" :port 0))
          (r (dds.disc:make-disc-node :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element #xA8) :host "127.0.0.1" :port 0))
          (lock (dds.pal:make-lock "no-spin-multi-fired"))

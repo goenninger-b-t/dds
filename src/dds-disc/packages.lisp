@@ -49,6 +49,12 @@
            #:*decode-fail-suppress-threshold* #:*decode-fail-track-limit*
            ;; WP-DDS-SECURITY-ZEROALLOC-AEAD T3 (ZA-2): whole-RTPS (rtps_protection / SRTPS) send-scratch pool capacity knob
            #:*srtps-send-scratch-capacity*
+           ;; WP-PERF (owner directive): the send-path buffer sizes, fully configurable. *max-datagram-bytes* is the
+           ;; largest RTPS datagram this node can EMIT (tx-msg / rx-tx-msg / async-tx-msg / the flow scheduler's
+           ;; scratch / the SRTPS pools derive from it) and so, with dds.rtps.reliable:*fragment-size*, the largest
+           ;; sample it can send UNFRAGMENTED. Rebind BEFORE create-participant / make-disc-node (read once per node).
+           #:*max-datagram-bytes* #:*metatraffic-payload-bytes*
+           #:*srtps-scratch-datagram-bytes* #:srtps-scratch-datagram-bytes
            ;; WP-DDS-SECURITY-ZEROALLOC-AEAD T5b: data_protection DECODE loan (zero-alloc secured receive via the loan registry)
            #:set-secured-loan-capable #:disc-node-secured-loan-capable #:disc-node-decode-pool #:disc-node-decode-pool-rejects
            #:secured-loan-handle #:secured-loan-handle-p #:secured-loan-handle-len

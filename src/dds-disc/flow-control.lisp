@@ -434,7 +434,7 @@
                       :bucket (make-flow-token-bucket :tokens-per-period tokens-per-period :period period
                                                       :max-burst max-burst :clock-fn clock-fn)
                       :policy-fn policy-fn :scheduling scheduling
-                      :scratch (dds.core.buffer:make-octet-buffer 2048))))
+                      :scratch (dds.core.buffer:make-octet-buffer *max-datagram-bytes*))))
     (setf (flow-controller-thread controller)
           (dds.pal:spawn (lambda () (%flow-scheduler-loop controller)) :name "dds-flow-scheduler"))
     controller))
