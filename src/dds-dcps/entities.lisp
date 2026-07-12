@@ -2555,7 +2555,16 @@
                                              :disposed-generation-count (instance-rec-disposed-gen-count rec)
                                              :no-writers-generation-count (instance-rec-no-writers-gen-count rec))))))))))))))
     (when (and sguid advance)
-      (%reader-advance-drained dr sguid sn)))
+      (%reader-advance-drained dr sguid sn)
+      ;; WP-PERF: the sample has been COPIED OUT (%deserialize-sample built an independent struct), so its bytes
+      ;; are dead — drop them from the shared node store. Nothing purged the plain (copy-path) store before, so
+      ;; every sample a participant ever received was retained FOREVER: an unbounded leak, and — because %drain
+      ;; rebuilds its pending-key list from the WHOLE store on EVERY take-samples — a QUADRATIC receive path.
+      ;; Gated on node-sole-consumer-p: with two SAME-topic readers the store is shared, so purging on the first
+      ;; reader's drain would delete the sample out from under the second (silent loss). The loan paths return
+      ;; earlier and own their own store-entry lifetime (node-return-loan / %secured-loan-release).
+      (when (dds.disc:node-sole-consumer-p node sguid)
+        (dds.disc:node-consume-sample node sguid sn))))
   t)
 
 (defun* %drain (dr)

@@ -3937,6 +3937,53 @@
         (dds.dcps:delete-participant p2))))
   t)
 
+(defun* run-dcps-rx-store-bounded-test ()
+    (function () t)
+  "WP-PERF regression — the received-sample store must stay BOUNDED, and the drain must NOT be O(stored).
+   Nothing ever purged a plain (copy-path) sample from disc-node-samples: every sample a participant had ever
+   received was retained FOREVER. That was (a) an unbounded memory LEAK and (b), far worse, a QUADRATIC receive
+   path — %drain rebuilds its pending-key list from the WHOLE store on EVERY take-samples, so the cost of a take
+   grew linearly with the number of samples ever received. Measured before the fix: an EMPTY take-samples cost
+   54 us / 5.9 KB at 200 stored samples and 278 us / 32 KB at 1000. A long-running reader got monotonically
+   slower, forever. (The SECURED loan path already purged at this exact choke — WP-SECURED-STORE-GROWTH found
+   the same leak class for a never-drained secured stream; the plain path simply never did.)
+   Asserts: after draining 4x as many samples, the store is NOT 4x bigger — it stays bounded, i.e. a drained
+   sample is dropped (node-consume-sample) once its sole reader has copied it out."
+  (let* ((ts (dds.types:find-type-support "shape-type"))
+         (p (dds.dcps:create-participant :domain (test-domain))))
+    (unwind-protect
+         (let* ((tp (dds.dcps:create-topic p "RxBound" "shape-type" ts))
+                (sub (dds.dcps:create-subscriber p))
+                (dr (dds.dcps:create-datareader sub tp))
+                (node (dds.dcps::dp-node p))
+                (wid #x00000102)
+                (kh (funcall (dds.types:type-support-key-hash ts)
+                             (make-shape-type :color "BLUE" :x 1 :y 1 :shapesize 1)))
+                (sizes '())
+                (sn 0))
+           (flet ((round-trip (n)   ; SNs strictly increase across phases (a replayed SN is filtered as already-drained)
+                    (dotimes (i n)
+                      (%stage-data-sn node (incf sn) kh
+                                      (dds.dcps::%serialize-sample
+                                       ts (make-shape-type :color "BLUE" :x i :y i :shapesize 1))
+                                      wid)
+                      (dds.dcps:take-samples dr))
+                    (dds.disc:node-sample-count node)))
+             ;; drain 100, then 400 more: the store must NOT grow in proportion to what has been drained.
+             (push (round-trip 100) sizes)
+             (push (round-trip 400) sizes))
+           (let ((after-100 (second sizes)) (after-500 (first sizes)))
+             (%check :rxb-bounded
+                     (< after-500 (* 2 (max 1 after-100)))
+                     (format nil "the received-sample store must stay BOUNDED as samples are drained (was ~d after 100, ~d after 500 — a leak would grow ~~5x)"
+                             after-100 after-500))
+             (%check :rxb-small
+                     (< after-500 100)
+                     (format nil "a drained sample is dropped from the shared node store once its sole reader copied it out (store held ~d after 500 drained samples)"
+                             after-500))))
+      (dds.dcps:delete-participant p)))
+  t)
+
 ;;; Builtin-topic readers (M3 #5, FR-DCPS-6): DCPSParticipant / DCPSPublication /
 ;;; DCPSSubscription / DCPSTopic surface the discovered participants + endpoints.
 

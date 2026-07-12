@@ -2743,6 +2743,41 @@
     (drop disc-node-sample-timestamps))   ; S5.T4
   t)
 
+(defun* node-sole-consumer-p (node guid)
+    (function (disc-node (simple-array (unsigned-byte 8) (16))) t)
+  "T iff AT MOST ONE local user reader is matched to remote writer GUID (its reader-route holds <= 1 id), so a
+   sample from that writer has exactly ONE consumer and may be dropped from the shared node store the moment that
+   reader has copied it out (node-consume-sample).
+
+   This gate is the correctness crux of the purge: disc-node-samples is SHARED by all of a participant's readers,
+   so with TWO same-topic readers (WP-N-ENDPOINT-2C1) purging on the FIRST reader's drain would delete the sample
+   out from under the SECOND — silent data loss. When the route holds >= 2 readers the sample is therefore LEFT in
+   the store (the pre-existing behaviour: it leaks, and the drain stays O(stored) for that reader set — recorded as
+   the follow-on; a per-sample remaining-consumers refcount, like the ZC %zc-bump, is the general fix). Zero-cons."
+  (let ((ids (gethash guid (disc-node-reader-routes node))))
+    (or (null ids) (null (cdr ids)))))
+
+(defun* node-consume-sample (node guid sn)
+    (function (disc-node (simple-array (unsigned-byte 8) (16)) integer) t)
+  "WP-PERF (the RX leak + the quadratic drain): drop the received sample (GUID, SN) from the node's store and
+   every parallel per-(guid,sn) table, once the DCPS reader that owns it has COPIED it out (%drain-one-sample).
+
+   WHY THIS HAS TO EXIST. Nothing ever removed a plain (copy-path) sample from disc-node-samples: every sample a
+   participant ever received was retained FOREVER. That is (a) an unbounded memory leak, and (b) far worse, a
+   QUADRATIC receive path — %drain rebuilds its pending-key list from the WHOLE store on EVERY take-samples, so
+   the cost of a take grew linearly with the number of samples ever received (measured: an EMPTY take-samples
+   cost 54 us / 5.9 KB at 200 stored samples and 278 us / 32 KB at 1000 — ~278 ns and ~32 B per stored sample,
+   per call). A long-running reader got monotonically slower forever. The SECURED loan path already purged at
+   this exact choke (%purge-secured-sample, WP-SECURED-STORE-GROWTH, which found the same leak class for a
+   never-drained secured stream); the plain path simply never did.
+
+   Safe for the loan paths: a loan-capable reader does NOT come here — its sample is invalidated by
+   node-return-loan / %secured-loan-release (which own the buffer lifetime), so the store entry is dropped
+   exactly once, by exactly one owner. Zero-cons (gethash + remhash only). Takes the node lock."
+  (dds.pal:with-lock ((disc-node-lock node))
+    (%purge-secured-sample node guid sn))
+  t)
+
 (defun* %secured-loan-release (node handle)
     (function (disc-node secured-loan-handle) t)
   "WP-DDS-SECURITY-ZEROALLOC-AEAD T5b/T5d: release HANDLE — invalidate its dangling store entry (WP-SECURED-STORE-GROWTH:
