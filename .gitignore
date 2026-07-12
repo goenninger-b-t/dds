@@ -25,3 +25,11 @@ __pycache__/
 
 # ASDF/Quicklisp system index (build artifact)
 system-index.txt
+
+# WP-1 parity harness: rtiddsgen output + binaries (clean-room: generated locally, never checked in)
+interop/perftest/connext/PerfData*.hpp
+interop/perftest/connext/PerfData*.cxx
+interop/perftest/connext/*.o
+interop/perftest/connext/.gen.stamp
+interop/perftest/connext/perf_pinger
+interop/perftest/connext/perf_responder

@@ -1,0 +1,26 @@
+// The cross-stack parity type (WP-CONFORMANCE-AND-PARITY WP-1).
+//
+// Must match THIS stack's dds.bench perf-data EXACTLY, or the comparison is not
+// apples-to-apples:
+//   (dds.gen:define-dds-type perf-data (:extensibility :final)
+//     (id :i32 :key t)
+//     (data (:sequence :u8)))
+//
+//   - @final extensibility (our define-dds-type uses :final)
+//   - @key on id
+//   - data is a sequence<octet> bounded at 65536: ONE type serves the whole payload ladder
+//     (32 B .. 64 KB), and the serialized shape (4-byte length prefix + N octets) is
+//     identical in both stacks, so neither side is advantaged by the type's framing.
+//     WHY AN EXPLICIT BOUND: our Lisp type is UNBOUNDED, but rtiddsgen silently bounds an
+//     unbounded sequence at 100 elements (a 256-byte payload then throws
+//     "bounded_sequence would go over its MaxLength" at write()). The bound changes the
+//     TypeObject, NOT the wire — the serialized payload is length-prefixed either way — so
+//     the parity comparison is unaffected. (Same rtiddsgen-bounds-what-you-left-unbounded
+//     behaviour that ADR 0009 documents for `string`.)
+//   - default @autoid(SEQUENTIAL) -> member ids 0,1 (matches our decl-index ids)
+
+@final
+struct PerfData {
+    @key long id;
+    sequence<octet, 65536> data;
+};
