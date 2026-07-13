@@ -14,11 +14,35 @@ make build         # load all systems (default LISP = Clasp; override LISP=./scr
 make test          # run the unit/integration suite once
 make build-all     # build on both landed impls (Clasp + SBCL)
 make test-all      # test on both
+make gate-build    # THE build gate: clean-cache rebuild + a falsification self-test (see below)
 make gate-types    # every defun has a single-line ftype declaim (FR-LANG-8)
 make gate-hotpath  # no CLOS dispatch / per-sample allocation in hot-path files (NFR-CLOS)
 make mem           # measured 0 bytes/sample serialize + deserialize (NFR-PERF-8)
 make wire          # validate emitted RTPS against the tshark RTPS dissector (FR-TOOL-3)
 ```
+
+### `make gate-build` — and why `make build` alone is not enough
+
+`build` and `test` are *incremental*: ASDF skips any file whose fasl is newer than its source. That makes
+them fast, but it also means **they can pass on a tree that does not compile** — a stale
+`~/.cache/common-lisp` will happily satisfy a load whose sources no longer build. That is not theoretical:
+it let a wrong-arity call sit in `main` for two days while `make test` reported 563/563.
+
+`make gate-build` is the gate that can actually fail. It (1) **clears the fasl cache** and rebuilds from
+scratch, and (2) **falsifies itself** first — it compiles a synthetic system containing a deliberate
+wrong-arity call and aborts if the build machinery *fails to reject it*. A gate never proven able to fail
+proves nothing, so the gate proves it on every run. Run it on both impls before calling work done:
+
+```sh
+make gate-build LISP=./scripts/with-clasp.sh
+make gate-build LISP=./scripts/with-sbcl.sh
+```
+
+> **Never load our systems with `ql:quickload`.** It wraps the load in
+> `ql-impl-util:call-with-quiet-compilation`, i.e. `(handler-bind ((warning #'muffle-warning)) ...)`, so
+> `compile-file`'s `failure-p` never reaches ASDF and **no compile warning can fail the build**. Use
+> `asdf:load-system`, which honours `*compile-file-failure-behaviour*`. Quicklisp is still what provides
+> the dependencies — it just must not be what *gates* our code.
 
 From a REPL:
 

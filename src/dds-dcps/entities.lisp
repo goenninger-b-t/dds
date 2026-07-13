@@ -211,7 +211,7 @@
 (declaim (ftype (function (t) t) %notify-condition))
 ;; conditions.lisp: forward-declared so get_datareaders (S3.T3) can drain+count a reader's
 ;; newly-received samples on the app thread without a compile-time undefined-function warning.
-(declaim (ftype (function (data-reader list) (integer 0)) %count-matching))
+(declaim (ftype (function (data-reader list &optional list list) (integer 0)) %count-matching))
 
 ;;; ---- WP-DCPS-API-COMPLETION S0: per-entity status-changes bitmask + introspection ----
 

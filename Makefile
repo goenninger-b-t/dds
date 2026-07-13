@@ -80,11 +80,19 @@ hooks:
 	git config core.hooksPath scripts/git-hooks
 	@echo "hooks active (core.hooksPath=scripts/git-hooks): SBOM regenerated before each commit."
 
+# ASDF, NOT ql:quickload. quickload wraps the whole load in ql-impl-util:call-with-quiet-compilation,
+# which does (handler-bind ((warning #'muffle-warning)) ...) — so compile-file's failure-p never reaches
+# ASDF and NO compile WARNING can ever fail these gates. That is the exact opposite of the operating
+# contract §6 ("fail on any warning promoted to error"), and it green-lit a wrong-arg-count call
+# (%count-matching, 4 args vs a 2-arg declaim) for two days: `make test` reported 563/563 while
+# `asdf:load-system :dds-dcps` could not compile the tree at all. asdf:load-system honors
+# *compile-file-failure-behaviour* (:error), builds the Quicklisp-provided dependencies on demand
+# exactly as before, and FAILS on a full WARNING in our own code. Proven to fail: scripts/gate-build.sh.
 build:
-	$(LISP) --eval '(ql:quickload :dds :silent t)' --eval '(uiop:quit 0)'
+	$(LISP) --eval '(asdf:load-system :dds)' --eval '(uiop:quit 0)'
 
 test:
-	$(LISP) --eval '(ql:quickload :dds-tests :silent t)' \
+	$(LISP) --eval '(asdf:load-system :dds-tests)' \
 	        --eval '(handler-case (progn (asdf:test-system :dds-tests) (uiop:quit 0)) (error (e) (format t "~&~a~%" e) (uiop:quit 1)))'
 
 build-clasp: ; $(MAKE) build LISP=$(CLASP)
@@ -98,6 +106,10 @@ gate-hotpath:
 	./scripts/gate-hotpath.sh
 
 gate-types: ; ./scripts/gate-types.sh
+
+# The REAL build gate (operating contract §6): clean-cache rebuild + a falsification self-test.
+# `build` above is the incremental convenience load; THIS is the one that can actually fail.
+gate-build: ; ./scripts/gate-build.sh $(LISP)
 
 # FR-CDR-8: our codec MUST reproduce, byte for byte, the SerializedPayloads RTI Connext puts ON THE WIRE.
 # The vectors in corpus/xcdr2/ are captured from a live Connext writer (scripts/capture-corpus.sh); this
