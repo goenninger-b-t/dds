@@ -1634,6 +1634,13 @@
                    (dds.xport.zerocopy::%zc-loan sap pl 0 (dds.rtps.history:cache-change-payload-len change) n)
                  (if slot (values slot gen) (values nil 0)))))))))
 
+(defparameter +no-shared-zc-refs+ (make-hash-table :test 'eq :size 1)
+  "The IMMUTABLE empty shared-ZC-ref table returned by %shared-zc-refs when no destination group is
+   ZC-eligible (Zero-Copy off, or no ZC-capable peer — the common case). Callers only GETHASH the table, and
+   an entry can only be added for a change reaching >=2 ZC-eligible groups, which cannot exist here — so
+   returning this constant instead of consing a fresh pair of hash tables on EVERY send pass is
+   observationally identical. NEVER write to it.")
+
 (defun* %shared-zc-refs (node writer groups)
     (function (disc-node dds.rtps.reliable:rtps-writer list) hash-table)
   "WP-ZC-MULTI-DEST-REFCOUNT (FR-PF-4, R6, ADR 0047; NOT cleared for ship — pending counsel). The pool-economy
@@ -1647,6 +1654,15 @@
    per-group path (byte-identical to today); a lost claim / failed loan / failed bump adds no entry (per-group
    fresh-loan fallback). Runs BEFORE the per-group emit, over the frozen captured GROUPS, so the count is exact.
    WRITER scopes the ZC refcounting to ONE local writer's captured groups (WP-N-ENDPOINT-S1 fan-out)."
+  ;; WP-PERF (NFR-MEM): fast-out when NO group is ZC-eligible — the overwhelmingly common case (Zero-Copy off,
+  ;; or no ZC-capable destination). This built TWO hash tables on EVERY send pass regardless, ~1.6 KB/write for
+  ;; a feature that was not in use: 46% of the write path's allocation in the sb-sprof :mode :alloc profile,
+  ;; and that garbage is what drives the peer's GC — the pause that IS our 15-60x tail deficit
+  ;; (bench/report/2026-07-13-the-tail-is-the-peers-gc.md). Callers only GETHASH the result, so the shared
+  ;; empty table is indistinguishable from a freshly-consed one; it is never mutated on this path (a mutation
+  ;; requires a >=2-group ZC-eligible change, which cannot exist when no group is ZC-eligible).
+  (unless (some (lambda (g) (plusp (%zc-push-group-zc-count g))) groups)
+    (return-from %shared-zc-refs +no-shared-zc-refs+))
   (let ((table (make-hash-table :test 'eq))
         (counts (make-hash-table :test 'eq)))
     (dolist (g groups)   ; count ZC-eligible emitter groups per shareable change (endpoints NEVER, groups)
