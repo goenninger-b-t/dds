@@ -1631,11 +1631,18 @@
        '((fd-sig-a-fd fd-sig-a-fd 7) (fd-sig-b-fd fd-sig-b-fd -123456789)
          (fd-sig-c-fd fd-sig-c-fd -1234567890123456789)))
       (dds.pal:free-static (dds.core.buffer:octet-buffer-vec b)))
-    ;; case 3: non-4-aligned tail (u32 + u8) — body 5, payload 9, OPTIONS pad 3 (MUST-FIX false-REJECT)
+    ;; case 3: non-4-aligned tail (u32 + u8) — body 5, PAD 3, payload 12, OPTIONS pad bits = 3.
+    ;; WIRE CONFORMANCE (2026-07-13): the pad octets ARE part of the SerializedPayload and ARE emitted.
+    ;; This asserted 9 (unpadded) on the belief that the pad is "carried in the OPTIONS field, not as body
+    ;; octets". That belief was wrong: DDS-XTypes 1.3 §7.6.3.1.2's OPTIONS bits COUNT padding that is
+    ;; PRESENT, so a conformant receiver derives the data end as (payload_length - pad). RTI Connext does —
+    ;; and rejected EVERY sample whose body was not 4-aligned until we emitted the pad. The engine now emits
+    ;; 12 octets for this type, so the FlatData constant must be 12 to match it byte-for-byte.
     (let ((b (make-fd-tail-flatdata)))
-      (%check :fd-tail-size (= +fd-tail-flatdata-size+ 9)
-              (format nil "+fd-tail-flatdata-size+ must be 9 (4 encap + 5 unpadded body), got ~d — a tail-padded ~
-                12 would false-REJECT the engine's own 9-octet payload" +fd-tail-flatdata-size+))
+      (%check :fd-tail-size (= +fd-tail-flatdata-size+ 12)
+              (format nil "+fd-tail-flatdata-size+ must be 12 (4 encap + 5 body + 3 emitted pad), got ~d — ~
+                the engine's payload for this type is 12 octets; an unpadded 9 is what Connext rejected"
+                      +fd-tail-flatdata-size+))
       (%flatdata-byte-exact
        b +fd-tail-flatdata-size+ #'serialize-fd-tail
        (make-fd-tail :a #x11223344 :b #xAB)
@@ -1651,11 +1658,11 @@
        (make-fd-disc :a #xDEADBEEF :b #x0123456789ABCDEF)
        '((fd-disc-a-fd fd-disc-a-fd #xDEADBEEF) (fd-disc-b-fd fd-disc-b-fd #x0123456789ABCDEF)))
       (dds.pal:free-static (dds.core.buffer:octet-buffer-vec b)))
-    ;; case 5: narrow widths (u16/i16/bool/i8) with a negative i16/i8 and bool t — body 6, payload 10
+    ;; case 5: narrow widths (u16/i16/bool/i8) with a negative i16/i8 and bool t — body 6, PAD 2, payload 12
     ;; (NB: all scratch + FlatData buffers are PAL-static make-octet-buffer, freed per case via free-static)
     (let ((b (make-fd-narrow-flatdata)))
-      (%check :fd-narrow-size (= +fd-narrow-flatdata-size+ 10)
-              (format nil "+fd-narrow-flatdata-size+ must be 10 (4 encap + 6 unpadded body), got ~d"
+      (%check :fd-narrow-size (= +fd-narrow-flatdata-size+ 12)
+              (format nil "+fd-narrow-flatdata-size+ must be 12 (4 encap + 6 body + 2 emitted pad), got ~d"
                       +fd-narrow-flatdata-size+))
       (%flatdata-byte-exact
        b +fd-narrow-flatdata-size+ #'serialize-fd-narrow

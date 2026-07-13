@@ -97,12 +97,23 @@
    padding bytes needed'). The clause is universal — its normative example sets the bits
    on PLAIN_CDR (XCDR1) — so this applies to ALL CDR representations, not only XCDR2; only
    the non-CDR XML representation is skipped. Assumes the header occupies buffer offsets
-   0..3 and the body starts at offset 4. Hot path: allocation-free one-octet in-place patch."
+   0..3 and the body starts at offset 4. Hot path: allocation-free.
+
+   THE PADDING BYTES ARE PART OF THE SERIALIZED PAYLOAD AND MUST BE EMITTED. This wrote the pad COUNT into
+   the options bits but never appended the pad BYTES, so we advertised 'N bytes of trailing padding' and then
+   sent a payload that did not contain them. A conformant receiver derives the data end as
+   (payload_length - pad) — RTI Connext does — and therefore read SHORT by exactly N octets, so EVERY sample
+   whose body length was not a multiple of 4 was malformed on the wire. Our own reader ignores the bits and
+   is driven by the members, so the defect was invisible in-process: unit tests and ours<->ours echo passed
+   at every length. It surfaced only against a foreign vendor — live Connext interop failed for EVERY payload
+   length not a multiple of 4 (len mod 4 in {1,2,3}) and passed for every multiple of 4. THE WIRE IS THE
+   ORACLE (operating contract §4)."
   (unless (eq representation :xml)
     (let* ((body-len (- (dds.core.buffer:cursor-position cursor) 4))
            (pad (mod (- 4 (mod body-len 4)) 4))
            (vec (dds.core.buffer:octet-buffer-vec (dds.core.buffer:cursor-buffer cursor))))
-      (setf (aref vec 3) (logior (logandc2 (aref vec 3) 3) pad))))
+      (setf (aref vec 3) (logior (logandc2 (aref vec 3) 3) pad))
+      (dotimes (i pad) (dds.core.buffer:put-u8 cursor 0))))   ; emit the pad octets the options bits promise
   cursor)
 
 (defun* encode-zc-reference (cursor slot-index generation slot-bytes &optional (overlay 0))

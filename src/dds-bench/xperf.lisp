@@ -25,7 +25,12 @@
 ;;; the foreign peers are generated from is interop/perftest/PerfData.idl — keep the two in lockstep.
 (dds.gen:define-dds-type perf-data (:extensibility :final)
   (id :i32 :key t)
-  (data (:sequence :u8)))
+  ;; :OCTET, not :U8 — they are DIFFERENT XTypes kinds (TK_BYTE vs TK_UINT8) and are NOT assignable.
+  ;; PerfData.idl declares `sequence<octet, 65536>`, so :u8 here made our type genuinely incompatible with
+  ;; the Connext peer's: the type gate rejected the match (correctly), and every ours<->Connext leg of this
+  ;; harness silently failed to match. Same wire bytes, different declared type — which is exactly the
+  ;; distinction the gate exists to enforce.
+  (data (:sequence :octet)))
 
 (defstruct* (echo-rv (:constructor %make-echo-rv))
   "Single-in-flight PING/PONG handoff between the pinger's main thread (waits) and the receiver thread that

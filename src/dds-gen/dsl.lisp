@@ -326,14 +326,19 @@
                    out))))
          ;;;; NOT cleared for ship — pending counsel (R6); see ADR 0015.
          ,@(when flatp
-             (let ((fd-total (+ 4 fd-body)))
+             (let* ((fd-pad (mod (- 4 (mod fd-body 4)) 4))
+                    (fd-total (+ 4 fd-body fd-pad)))
                `((defconstant ,fd-size-sym ,fd-total
                    ,(format nil "WP-FLATDATA total SerializedPayload size for ~a = 4 (XCDR2 encap header) ~
-                     + ~d (unpadded fixed XCDR2-LE body); equals the engine's SerializedPayload length for ~
-                     this type (%serialize-sample / serialize-~a). The FINAL body is NOT tail-padded — any ~
-                     trailing pad to the next 4-byte boundary is carried in the encapsulation OPTIONS field, ~
-                     not as body octets (FR-PF-4, ADR 0015; R6)."
-                            tname fd-body tname))
+                     + ~d (fixed XCDR2-LE body) + ~d (trailing pad to the next 4-byte boundary); equals the ~
+                     engine's SerializedPayload length for this type (%serialize-sample / serialize-~a).~%~
+                     THE TRAILING PAD OCTETS ARE PART OF THE PAYLOAD AND ARE EMITTED. This constant ~
+                     previously excluded them, on the belief that the pad is 'carried in the OPTIONS field, ~
+                     not as body octets' — that belief was WRONG and it was a wire-conformance bug: ~
+                     DDS-XTypes 1.3 SS7.6.3.1.2 has the OPTIONS bits COUNT padding that is present, so a ~
+                     conformant receiver derives the data end as (payload_length - pad). RTI Connext does, ~
+                     and rejected every sample whose body was not 4-aligned (FR-PF-4, ADR 0015; R6)."
+                            tname fd-body fd-pad tname))
                  ,@(loop for m in parsed
                          for off = (cdr (assoc (getf m :slot) fd-offs))
                          for base = (+ 4 off)
@@ -419,7 +424,10 @@
                    (let* ((buf (dds.core.buffer:make-octet-buffer ,fd-size-sym))
                           (wc (dds.core.buffer:cursor buf :endianness :little)))
                      (dds.cdr:make-encapsulation-header wc :plain-cdr2-le)
-                     (dds.core.buffer:cursor-set-position wc ,fd-size-sym)
+                     ;; Position at the UNPADDED body end, then let finalize set the OPTIONS pad bits AND
+                     ;; emit the pad octets — byte-identical to %serialize-sample. (The buffer is sized to
+                     ;; include the pad; see the FLATDATA-SIZE constant.)
+                     (dds.core.buffer:cursor-set-position wc ,(+ 4 fd-body))
                      (dds.cdr:finalize-encapsulation-options wc :plain-cdr2-le)
                      buf))
                  (declaim (ftype (function (dds.core.buffer:octet-buffer dds.core.buffer:cursor &optional symbol)
