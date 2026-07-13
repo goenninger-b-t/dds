@@ -5,7 +5,7 @@
 
 ;; PROTOCOL_RTPS: ProtocolId_t[4] = 'R','T','P','S' (RTPS 2.5 §8 / §9.4.4).
 (defparameter +protocol-id+
-  (make-array 4 :element-type '(unsigned-byte 8)
+  (make-array 4 :element-type '(unsigned-byte 8)   ; HOTPATH-ALLOC(LOAD-TIME): +protocol-id+ initform, evaluated once at load
                 :initial-contents (list (char-code #\R) (char-code #\T)
                                         (char-code #\P) (char-code #\S)))
   "The 4-octet RTPS message magic 'R','T','P','S' (RTPS 2.5 §9.4.4).")
@@ -175,7 +175,7 @@
    or NIL if fewer than 20 octets remain or the magic is wrong. Bounds-checked;
    never reads OOB (NFR-SEC-POSTURE). ALLOCATES the returned 12-octet guid-prefix — on the per-datagram
    receive path use SKIP-HEADER (which allocates nothing) unless you actually need the prefix."
-  (%parse-header-into cursor (make-array 12 :element-type '(unsigned-byte 8))))
+  (%parse-header-into cursor (make-array 12 :element-type '(unsigned-byte 8))))   ; HOTPATH-ALLOC(COLD): the ALLOCATING header parse. The per-datagram caller uses SKIP-HEADER (no alloc); this variant survives for callers that genuinely need the prefix (tests).
 
 ;;; ---- SubmessageHeader (§9.4.5.1): submessageId, flags, octetsToNextHeader ----
 
@@ -281,7 +281,7 @@
          (hi (reduce #'max sns))
          (numbits (1+ (- hi lo))))
     (assert (<= numbits +seqnum-set-max-bits+))
-    (let ((bitmap (make-array (max 1 (%seqnum-set-words numbits))
+    (let ((bitmap (make-array (max 1 (%seqnum-set-words numbits))   ; HOTPATH-ALLOC(TRACKED): SequenceNumberSet bitmap, per ACKNACK/GAP BUILD (ADR 0062)
                               :element-type '(unsigned-byte 32) :initial-element 0)))
       (dolist (sn sns) (seqnum-set-bit bitmap (- sn lo)))
       (values lo numbits bitmap))))
@@ -309,7 +309,7 @@
     (let ((m (%seqnum-set-words numbits)))
       (when (< (%remaining cursor) (* m 4))
         (return-from read-sequence-number-set nil))
-      (let ((bitmap (make-array (max 1 m) :element-type '(unsigned-byte 32) :initial-element 0)))
+      (let ((bitmap (make-array (max 1 m) :element-type '(unsigned-byte 32) :initial-element 0)))   ; HOTPATH-ALLOC(TRACKED): SequenceNumberSet bitmap, per inbound ACKNACK/GAP (ADR 0062)
         (dotimes (i m) (setf (aref bitmap i) (dds.core.buffer:get-u32 cursor)))
         (values base numbits bitmap)))))
 
@@ -349,7 +349,7 @@
     (when (> numbits +seqnum-set-max-bits+) (return-from read-fragment-number-set nil))
     (let ((m (%seqnum-set-words numbits)))
       (when (< (%remaining cursor) (* m 4)) (return-from read-fragment-number-set nil))
-      (let ((bitmap (make-array (max 1 m) :element-type '(unsigned-byte 32) :initial-element 0)))
+      (let ((bitmap (make-array (max 1 m) :element-type '(unsigned-byte 32) :initial-element 0)))   ; HOTPATH-ALLOC(TRACKED): FragmentNumberSet bitmap, per inbound NACK_FRAG (ADR 0062)
         (dotimes (i m) (setf (aref bitmap i) (dds.core.buffer:get-u32 cursor)))
         (values base numbits bitmap)))))
 
@@ -579,7 +579,7 @@
    16-octet KEY-HASH, RTPS 2.5 §9.6.4.8) + PID_STATUS_INFO (StatusInfo_t octet[4], the
    STATUS-FLAGS in the last octet, §9.6.4.9) + PID_SENTINEL. Reuses write-parameter so the
    4-byte alignment + sentinel rules stay in one place (§9.4.2.11). Returns the new position."
-  (let ((si (make-array 4 :element-type '(unsigned-byte 8) :initial-element 0)))
+  (let ((si (make-array 4 :element-type '(unsigned-byte 8) :initial-element 0)))   ; HOTPATH-ALLOC(TRACKED): 4-octet StatusInfo scratch, per DATA write carrying inline QoS (ADR 0062)
     (setf (aref si 3) status-flags)                ; StatusInfo_t flags occupy the last octet
     (write-parameter cursor +pid-key-hash+ key-hash 0 16)
     (write-parameter cursor +pid-status-info+ si 0 4)
@@ -611,7 +611,7 @@
             (return (values key-hash status-flags nil original-guid original-sn)))
           (cond
             ((and capture-key-hash (= pid +pid-key-hash+) (= plen 16))
-             (let ((kh (make-array 16 :element-type '(unsigned-byte 8))))
+             (let ((kh (make-array 16 :element-type '(unsigned-byte 8))))   ; HOTPATH-ALLOC(TRACKED): 16-octet KeyHash, per inbound DATA with inline QoS (ADR 0062)
                (dds.core.buffer:get-octets cursor kh 0 16)
                (setf key-hash kh)))
             ((and (= pid +pid-status-info+) (= plen 4))
@@ -876,7 +876,7 @@
     (function ((simple-array (unsigned-byte 8) (16)) (integer 0)) (simple-array (unsigned-byte 8) (24)))
   "Encode a 24-octet OriginalWriterInfo body LE: bytes 0-15 = GUID verbatim; bytes 16-19 = SN.high (i32 LE);
    bytes 20-23 = SN.low (u32 LE). RTPS 2.5 §8.3.5.4 / Table 9.12."
-  (let ((body (make-array 24 :element-type '(unsigned-byte 8) :initial-element 0))
+  (let ((body (make-array 24 :element-type '(unsigned-byte 8) :initial-element 0))   ; HOTPATH-ALLOC(TRACKED): 24-octet OWI body, per republished sample (durability) (ADR 0062)
         (high (logand (ash sn -32) #xFFFFFFFF))
         (low  (logand sn #xFFFFFFFF)))
     (replace body guid :start1 0 :end1 16)
@@ -897,7 +897,7 @@
    Bounds-checked; never reads OOB (NFR-SEC-POSTURE). RTPS 2.5 §8.3.5.4 / Table 9.12."
   (when (or (/= len 24) (> (+ off 24) (length octets)))
     (return-from parse-original-writer-info (values nil nil)))
-  (let ((guid (make-array 16 :element-type '(unsigned-byte 8)))
+  (let ((guid (make-array 16 :element-type '(unsigned-byte 8)))   ; HOTPATH-ALLOC(TRACKED): 16-octet GUID, per inbound PID_ORIGINAL_WRITER_INFO (ADR 0062)
         (high 0)
         (low  0))
     (replace guid octets :start1 0 :end1 16 :start2 off :end2 (+ off 16))

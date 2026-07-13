@@ -558,7 +558,7 @@
    freed). A no-op (returns at once) if NODE is not registered here. Idempotent (NIL refs release nothing)."
   (dds.pal:with-lock ((flow-controller-lock controller))
     (setf (flow-controller-writers controller)   ; WP-N-ENDPOINT-S1B: drop ALL of NODE's per-writer selection entries
-          (remove-if (lambda (ws) (eq (dds.disc::flow-writer-state-node ws) node))
+          (remove-if (lambda (ws) (eq (dds.disc::flow-writer-state-node ws) node))   ; HOTPATH-ALLOC(COLD): teardown (flow-controller-unregister)
                      (flow-controller-writers controller)))
     (dolist (cell (dds.disc::disc-node-flow-writer-states node))   ; clear each writer's pending so RR/EDF/priority can never newly pick it
       (setf (dds.disc::flow-writer-state-pending (cdr cell)) nil))
@@ -620,7 +620,7 @@
     (let ((writers (dds.pal:with-lock ((flow-controller-lock controller))
                      (setf (flow-controller-stop controller) t)
                      (dds.pal:condvar-signal (flow-controller-cv controller))
-                     (copy-list (flow-controller-writers controller)))))
+                     (copy-list (flow-controller-writers controller)))))   ; HOTPATH-ALLOC(COLD): teardown (destroy-flow-controller)
       (dds.pal:join (flow-controller-thread controller))
       (setf (flow-controller-thread controller) nil)
       (dolist (ws writers) (%flow-unblock-writer-state ws))   ; WP-N-ENDPOINT-S1B: wake any publish blocked on a full bounded cache -> TIMEOUT (per-writer entries)

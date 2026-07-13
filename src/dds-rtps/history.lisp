@@ -109,8 +109,8 @@
   (depth 1 :type (integer 1))
   (max-samples nil :type (or null (integer 0)))                                  ; resource limit; nil = unlimited
   (type-support nil :type (or null dds.types:type-support))
-  (changes (make-hash-table :test 'eql) :type hash-table)
-  (instances (make-hash-table :test 'equalp) :type hash-table)                   ; keyhash -> SNs oldest-first (per-instance KEEP_LAST, §2.2.3.18)
+  (changes (make-hash-table :test 'eql) :type hash-table)   ; HOTPATH-ALLOC(COLD): defstruct initform — one table per HistoryCache, not per sample
+  (instances (make-hash-table :test 'equalp) :type hash-table)                   ; keyhash -> SNs oldest-first (per-instance KEEP_LAST, §2.2.3.18)   ; HOTPATH-ALLOC(COLD): defstruct initform — one table per HistoryCache, not per sample
   (count 0 :type (integer 0))
   ;; WP-PERF: the stored SN extent, maintained INCREMENTALLY at the two chokepoints (%hc-store / %hc-remove-change)
   ;; so hc-min-seq / hc-max-seq are O(1) reads instead of a full maphash SCAN of the change table. They are read on

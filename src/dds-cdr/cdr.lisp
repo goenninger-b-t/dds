@@ -31,7 +31,7 @@
     (function (symbol) t)
   "16-bit wire value for representation NAME (XTypes 1.3 §7.6 Table 60)."
   (or (cdr (assoc name +representation-ids+))
-      (error 'cdr-not-implemented :what (format nil "unknown representation ~s" name))))
+      (error 'cdr-not-implemented :what (format nil "unknown representation ~s" name))))   ; HOTPATH-ALLOC(ERROR-PATH): only on the way to signalling
 
 (defun* representation-id-name (value)
     (function (integer) t)
@@ -179,6 +179,6 @@
          (name (representation-id-name id)))
     (unless name
       (error 'cdr-not-implemented
-             :what (format nil "unknown representation id #x~4,'0x" id)))
+             :what (format nil "unknown representation id #x~4,'0x" id)))   ; HOTPATH-ALLOC(ERROR-PATH): only on the way to signalling
     (dds.core.buffer:cursor-set-origin cursor)
     (values name options pad)))

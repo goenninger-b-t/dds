@@ -16,7 +16,7 @@ make build-all     # build on both landed impls (Clasp + SBCL)
 make test-all      # test on both
 make gate-build    # THE build gate: clean-cache rebuild + a falsification self-test (see below)
 make gate-types    # every defun has a single-line ftype declaim (FR-LANG-8)
-make gate-hotpath  # no CLOS dispatch / per-sample allocation in hot-path files (NFR-CLOS)
+make gate-hotpath  # no CLOS dispatch (NFR-CLOS) + no UNJUSTIFIED allocation (NFR-MEM) in hot-path files
 make mem           # measured 0 bytes/sample serialize + deserialize (NFR-PERF-8)
 make wire          # validate emitted RTPS against the tshark RTPS dissector (FR-TOOL-3)
 ```
@@ -37,6 +37,26 @@ proves nothing, so the gate proves it on every run. Run it on both impls before 
 make gate-build LISP=./scripts/with-clasp.sh
 make gate-build LISP=./scripts/with-sbcl.sh
 ```
+
+### `make gate-hotpath` — CLOS purity *and* allocation purity
+
+It enforces two things over the designated hot-path files: no CLOS dispatch (NFR-CLOS), and **no
+unjustified heap allocation** (NFR-MEM). The second check is new: the gate used to scan for CLOS only,
+which is how `message.lisp` sat in the certified-clean list while `parse-header` allocated a 12-octet
+guidPrefix on *every* inbound datagram.
+
+Allocation is enforced by **annotation, not prohibition** — a hot-path file may allocate, but every
+allocating form must say why:
+
+```lisp
+(make-array 12 :element-type '(unsigned-byte 8))   ; HOTPATH-ALLOC(COLD): teardown only, not per sample
+```
+
+Classes: `LOAD-TIME`, `COLD`, `ERROR-PATH`, `TEST`, and `TRACKED` (a **real** per-sample allocation, known
+NFR-MEM debt, being driven to zero under ADR 0062). An **unmarked** allocating form fails the build — that
+is the regression guard. The gate **prints the outstanding `TRACKED` set on every run**, so the remaining
+debt is enumerated in the open rather than hiding in a profile nobody reruns. Like `gate-build`, it
+falsifies itself on every run.
 
 > **Never load our systems with `ql:quickload`.** It wraps the load in
 > `ql-impl-util:call-with-quiet-compilation`, i.e. `(handler-bind ((warning #'muffle-warning)) ...)`, so

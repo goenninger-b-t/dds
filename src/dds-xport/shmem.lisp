@@ -166,7 +166,7 @@
   (transport nil :type (or null dds.xport:transport))
   (segment nil :type t) (name "" :type string) (host-uuid 0 :type (unsigned-byte 64))
   (lane-count 8 :type (integer 1)) (capacity 65536 :type (integer 8)) (token 0 :type (unsigned-byte 64))
-  (attach-cache (make-hash-table :test 'equal) :type hash-table) (sink nil :type t) (rx-thread nil :type t))
+  (attach-cache (make-hash-table :test 'equal) :type hash-table) (sink nil :type t) (rx-thread nil :type t))   ; HOTPATH-ALLOC(COLD): defstruct initform — one table per transport, not per datagram
 
 (defun* %guid-token (guid)
     (function ((simple-array (unsigned-byte 8) (12))) (unsigned-byte 64))
@@ -176,7 +176,7 @@
 (defun* %seg-name (guid)
     (function ((simple-array (unsigned-byte 8) (12))) string)
   "Segment name '/dds' + 10 hex of the token (macOS ~31-char shm-name cap)."
-  (format nil "/dds~(~10,'0x~)" (%guid-token guid)))
+  (format nil "/dds~(~10,'0x~)" (%guid-token guid)))   ; HOTPATH-ALLOC(COLD): segment name, built once at segment create/open
 
 (defun* seg-name-for-guid (guid)
     (function ((simple-array (unsigned-byte 8) (12))) string)
@@ -277,7 +277,7 @@
 (defun* %test-guid (b)
     (function ((unsigned-byte 8)) (simple-array (unsigned-byte 8) (12)))
   "A 12-octet GUID-prefix of constant byte B (test fixture)."
-  (make-array 12 :element-type '(unsigned-byte 8) :initial-element b))
+  (make-array 12 :element-type '(unsigned-byte 8) :initial-element b))   ; HOTPATH-ALLOC(TEST): test fixture
 
 (defun* run-shmem-transport-test ()
     (function () (eql t))

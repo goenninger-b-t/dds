@@ -361,7 +361,7 @@
   (unwind-protect
        (let ((len (%zc-slot-payload-len sap slot-index generation)))
          (when len
-           (let ((vec (make-array len :element-type '(unsigned-byte 8)))
+           (let ((vec (make-array len :element-type '(unsigned-byte 8)))   ; HOTPATH-ALLOC(TRACKED): copy-on-read of a ZC slot, per resolved ZC sample (ADR 0062)
                  (b (%zc-slot-off sap slot-index)))
              (dotimes (k len vec) (setf (aref vec k) (cffi:mem-ref sap :uint8 (+ b +zc-slot-hdr+ k)))))))
     (dds.pal:pshared-unlock sap +zc-mutex-off+)))

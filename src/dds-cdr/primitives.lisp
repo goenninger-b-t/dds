@@ -113,7 +113,7 @@
     ;; LEN includes the NUL: exactly LEN octets follow (NFR-SEC-POSTURE)
     (dds.core.buffer:check-room c len)
     (let* ((n (max 0 (1- len)))
-           (s (make-string n)))
+           (s (make-string n)))   ; HOTPATH-ALLOC(TRACKED): decoded string, per string field. An RX DESERIALIZATION PRODUCT — pooling it collides with loan semantics (ADR 0062)
       (dotimes (i n) (setf (char s i) (code-char (dds.core.buffer:get-u8 c))))
       (dds.core.buffer:get-u8 c)
       s)))
@@ -158,7 +158,7 @@
   (cdr-align c 4 mode)
   (let ((n (dds.core.buffer:get-u32 c)))
     (dds.core.buffer:check-room c n)                    ; BEFORE the allocation (hostile count)
-    (let ((vec (make-array n :element-type '(unsigned-byte 8))))
+    (let ((vec (make-array n :element-type '(unsigned-byte 8))))   ; HOTPATH-ALLOC(TRACKED): decoded octet sequence (the PAYLOAD), per sample. RX deserialization product (ADR 0062)
       (dds.core.buffer:get-octets c vec 0 n)
       vec)))
 
@@ -169,7 +169,7 @@
    against the remaining buffer extent BEFORE the result vector is allocated, signalling
    buffer-overflow on a hostile count (NFR-SEC-POSTURE).
 
-   WP-PERF (NFR-MEM): ELEMENT-TYPE is what makes this cheap. An UNTYPED (make-array n) is a
+   WP-PERF (NFR-MEM): ELEMENT-TYPE is what makes this cheap. An UNTYPED make-array — no :element-type — is a
    simple-vector — ONE MACHINE WORD (8 B) PER ELEMENT whatever the element actually is — so a
    256-octet sequence<octet> cost 2 KB of heap to carry 256 B of data, 8x the payload it decodes, and
    the single largest allocation on the DCPS receive path. Specialized, the same sequence costs 256 B
@@ -179,7 +179,7 @@
   (let ((n (dds.core.buffer:get-u32 c)))
     ;; every CDR element serializes to >= 1 octet (NFR-SEC-POSTURE)
     (dds.core.buffer:check-room c n)
-    (let ((vec (make-array n :element-type element-type)))
+    (let ((vec (make-array n :element-type element-type)))   ; HOTPATH-ALLOC(TRACKED): decoded typed sequence, per sample. RX deserialization product (ADR 0062)
       (dotimes (i n) (setf (aref vec i) (funcall elem-reader c mode)))
       vec)))
 
