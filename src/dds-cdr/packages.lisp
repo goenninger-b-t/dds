@@ -25,7 +25,7 @@
            #:cdr-put-i32 #:cdr-get-i32 #:cdr-put-i64 #:cdr-get-i64
            #:cdr-put-bool #:cdr-get-bool #:cdr-put-enum #:cdr-get-enum
            #:cdr-put-string #:cdr-get-string
-           #:cdr-put-sequence #:cdr-get-sequence
+           #:cdr-put-sequence #:cdr-get-sequence #:cdr-get-sequence-typed
            ;; XCDR2 framing (FR-CDR-2, XTypes 1.3 §7.4.3.4)
            #:cdr-put-dheader #:cdr-get-dheader
            #:emheader1-encode #:emheader1-decode #:lc-for-length))

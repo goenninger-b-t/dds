@@ -43,13 +43,15 @@
          (unless row
            (error "define-dds-type: unsupported sequence element ~s in ~s" elt spec))
          (destructuring-bind (eltype default eput eget ealign esize) row
-           (declare (ignore eltype default))
+           (declare (ignore default))
            (when (eq esize :var)
              (error "define-dds-type: sequence of variable-size element ~s not supported in v1"
                     elt))
+           ;; WP-PERF: :elt-ltype is the element's LISP type — it makes the decoded sequence a
+           ;; SPECIALIZED vector instead of a simple-vector (8 B/element regardless of element type).
            (list :slot slot :kind :sequence :ltype 'vector :default '(vector)
                  :elt-put eput :elt-get eget :elt-align ealign :elt-size esize
-                 :elt-type elt :key (getf opts :key)))))
+                 :elt-type elt :elt-ltype eltype :key (getf opts :key)))))
       ((keywordp dds-type)
        (let ((row (cdr (assoc dds-type *dds-type-map*))))
          (unless row
@@ -228,8 +230,9 @@
                        (ecase (getf m :kind)
                          (:scalar `(,(getf m :slot) (,(getf m :get) cursor mode)))
                          (:sequence `(,(getf m :slot)
-                                      (dds.cdr:cdr-get-sequence
-                                       cursor (function ,(getf m :elt-get)) mode)))
+                                      (dds.cdr:cdr-get-sequence-typed
+                                       cursor (function ,(getf m :elt-get)) mode
+                                       ',(getf m :elt-ltype))))
                          (:nested `(,(getf m :slot) (,(getf m :des) cursor mode)))))
              (,ctor ,@(loop for m in parsed
                             append (list (intern (string (getf m :slot)) :keyword)
@@ -240,8 +243,9 @@
                    (ecase (getf m :kind)
                      (:scalar `(setf (,(acc m) sample) (,(getf m :get) cursor mode)))
                      (:sequence `(setf (,(acc m) sample)
-                                       (dds.cdr:cdr-get-sequence
-                                        cursor (function ,(getf m :elt-get)) mode)))
+                                       (dds.cdr:cdr-get-sequence-typed
+                                        cursor (function ,(getf m :elt-get)) mode
+                                        ',(getf m :elt-ltype))))
                      (:nested `(,(getf m :des-into) (,(acc m) sample) cursor mode))))
            sample)
          (declaim (ftype (function (,name (integer 0) &optional symbol) (integer 0)) ,sszi))

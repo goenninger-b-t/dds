@@ -128,20 +128,33 @@
     (dds.core.buffer:put-u32 c n)
     (dotimes (i n) (funcall elem-writer c (aref vec i) mode))
     n))
-(defun* cdr-get-sequence (c elem-reader mode)
-    (function (dds.core.buffer:cursor function cdr-mode) simple-vector)
-  "Read a sequence from cursor C: 4-byte element count + elements, each read via
-   (funcall ELEM-READER c mode) (FR-CDR-1). The wire count is pre-validated
-   against the remaining buffer extent BEFORE the result vector is allocated,
-   signalling buffer-overflow on a hostile count (NFR-SEC-POSTURE). Note:
-   allocates the result vector (see cdr-get-string)."
+(defun* cdr-get-sequence-typed (c elem-reader mode element-type)
+    (function (dds.core.buffer:cursor function cdr-mode t) vector)
+  "Read a sequence from cursor C into a vector SPECIALIZED to ELEMENT-TYPE: 4-byte element count +
+   elements, each read via (funcall ELEM-READER c mode) (FR-CDR-1). The wire count is pre-validated
+   against the remaining buffer extent BEFORE the result vector is allocated, signalling
+   buffer-overflow on a hostile count (NFR-SEC-POSTURE).
+
+   WP-PERF (NFR-MEM): ELEMENT-TYPE is what makes this cheap. An UNTYPED (make-array n) is a
+   simple-vector — ONE MACHINE WORD (8 B) PER ELEMENT whatever the element actually is — so a
+   256-octet sequence<octet> cost 2 KB of heap to carry 256 B of data, 8x the payload it decodes, and
+   the single largest allocation on the DCPS receive path. Specialized, the same sequence costs 256 B
+   + header. The generated codec passes the element's Lisp type (it knows it at macroexpansion from
+   the DSL type map), so the specialization is a compile-time constant at each call site."
   (cdr-align c 4 mode)
   (let ((n (dds.core.buffer:get-u32 c)))
     ;; every CDR element serializes to >= 1 octet (NFR-SEC-POSTURE)
     (dds.core.buffer:check-room c n)
-    (let ((vec (make-array n)))
+    (let ((vec (make-array n :element-type element-type)))
       (dotimes (i n) (setf (aref vec i) (funcall elem-reader c mode)))
       vec)))
+
+(defun* cdr-get-sequence (c elem-reader mode)
+    (function (dds.core.buffer:cursor function cdr-mode) simple-vector)
+  "Read a sequence from cursor C into an UNSPECIALIZED simple-vector (element-type T) — the generic
+   entry point, kept for callers with no static element type. Prefer cdr-get-sequence-typed on any
+   data path: this one costs 8 B per element regardless of element type (see that docstring)."
+  (cdr-get-sequence-typed c elem-reader mode t))
 
 ;;;; XCDR2 framing headers. DHEADER: XTypes 1.3 §7.4.3.4.1 (UInt32 serialized
 ;;;; size of the following object, 4-byte aligned, stream endianness). EMHEADER1

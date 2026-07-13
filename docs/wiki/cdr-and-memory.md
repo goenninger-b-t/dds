@@ -74,7 +74,8 @@ Mode-aware primitive encode/decode. Every op takes the trailing `mode` argument
 | Symbol | Description |
 |---|---|
 | `dds.cdr:cdr-put-string` / `cdr-get-string` | String as 4-byte length (**including** the NUL) + octets + NUL (FR-CDR-1). Latin-1 for M1; `cdr-put-string` signals `cdr-not-implemented` on non-Latin-1 input. `cdr-get-string` pre-validates the wire length against the remaining buffer extent **before** allocating the result string, signalling `dds.core.buffer:buffer-overflow` on a hostile length (NFR-SEC-POSTURE); the pooled zero-alloc deserialize path is a tracked follow-up. |
-| `dds.cdr:cdr-put-sequence` / `cdr-get-sequence` | Sequence as 4-byte element count + elements; each element is written/read via a supplied `elem-writer`/`elem-reader` closure called as `(funcall fn cursor element mode)` / `(funcall fn cursor mode)`. `cdr-get-sequence` pre-validates the wire count against the remaining buffer extent (every CDR element is at least 1 octet) **before** allocating the result vector, signalling `buffer-overflow` on a hostile count (NFR-SEC-POSTURE). |
+| `dds.cdr:cdr-put-sequence` / `cdr-get-sequence` | Sequence as 4-byte element count + elements; each element is written/read via a supplied `elem-writer`/`elem-reader` closure called as `(funcall fn cursor element mode)` / `(funcall fn cursor mode)`. `cdr-get-sequence` pre-validates the wire count against the remaining buffer extent (every CDR element is at least 1 octet) **before** allocating the result vector, signalling `buffer-overflow` on a hostile count (NFR-SEC-POSTURE). It allocates an **unspecialized** `simple-vector` (element-type `T`) — see the typed variant below, and prefer it on any data path. |
+| `dds.cdr:cdr-get-sequence-typed` *(c elem-reader mode element-type)* | As `cdr-get-sequence`, but allocates a vector **specialized to ELEMENT-TYPE**. This is what the generated codecs call: the DSL type map knows each element's Lisp type at macroexpansion, so the specialization is a compile-time constant at every call site. **Why it matters:** an untyped `(make-array n)` is one machine word (**8 B**) per element regardless of element type, so a 256-octet `sequence<octet>` cost ~2 KB of heap to carry 256 B of data (8× the payload), a 63 KB one cost ~504 KB. Specialized, they cost 272 B and 63 KB. This was the largest allocation on the DCPS receive path, and it is also an **8× memory-amplification** an attacker could drive: `check-room` bounds the element *count* against the buffer extent, but each counted element was costing 8 B (NFR-SEC-POSTURE). Amplification is now 1×. |
 
 ### XCDR2 framing (`dds.cdr`)
 
@@ -296,6 +297,10 @@ NameHash example: `MD5("color")[0:4]` = `70 dd a5 df`. (From `run-md5-test`.)
 - **Strings are Latin-1 for now.** `cdr-put-string` signals `cdr-not-implemented` on
   any character above code point 255; UTF-8 byte-exactness is pinned by the corpus as a
   follow-up (FR-CDR-8).
+- **A decoded sequence is SPECIALIZED to its element type** (`cdr-get-sequence-typed`, which the
+  generated codecs call). An untyped `simple-vector` costs 8 B per element whatever the element is —
+  8× amplification for an octet sequence, both as steady-state garbage and as an attacker-drivable
+  allocation multiplier. Never decode a sequence into an untyped vector on a data path.
 - **`cdr-get-string` / `cdr-get-sequence` allocate — but only after extent validation.**
   The deserialize side currently allocates the result string/vector, and the
   wire-supplied length/count is validated against the remaining buffer extent *before*
