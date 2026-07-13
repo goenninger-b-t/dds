@@ -1,5 +1,14 @@
 # The Connext parity ratio table — the evidence (WP-1 complete)
 
+> **CORRECTION (2026-07-12, WP-8.T3).** The **p99.99 rows below are NOT reproducible** and the "we beat Connext's
+> tail by 2.2×" conclusion drawn from them is **withdrawn pending re-measurement**. Re-running the identical 256 B
+> cross-process harness the same day gives a worst-sample of **9–14 ms**, not 53.5 µs — on BOTH this commit and the
+> `cb08d62` baseline, so it is not a regression, it is that the original figure did not hold. Note that at
+> `samples = 10000` the nearest-rank p99.99 *is* the max, so the two are one statistic, and it is milliseconds.
+> The p50/p99 rows are unaffected and have since improved (see `2026-07-12-rx-zero-cons-drain.md`). Re-establishing
+> a trustworthy tail number — with enough samples for p99.99 to be a percentile rather than the max, and with the
+> GC tail characterised — is tracked follow-on work. Read §"What the table says" point 1 with that in mind.
+
 2026-07-12. macOS arm64, UDPv4 loopback, **both stacks cross-process**, RELIABLE / KEEP_ALL / VOLATILE /
 XCDR2, single in-flight, one-way := RTT/2, listener-driven wait on both sides, nearest-rank percentiles
 computed by the identical rule. Ours = `dds.bench:run-echo-pinger` (DCPS path, `write-sample` → codec →

@@ -3675,6 +3675,49 @@
     (loop for inner being the hash-values of (disc-node-samples node)
           thereis (gethash sn inner))))
 
+(defun* node-collect-pending-samples (node pending-p out)
+    (function (disc-node function (array t (*))) (array t (*)))
+  "WP-PERF (NFR-MEM / NFR-PERF-8): push the composite (GUID . SN) key of every stored user sample the
+   caller still considers PENDING into OUT (a caller-owned adjustable vector, REUSED across calls), and
+   return OUT. PENDING-P is called as (GUID SN) — with the raw guid and sn, NOT a key — so the deciding
+   walk conses NOTHING; a key cons is created ONLY for a sample that is actually pending.
+
+   WHY. node-sample-sns builds a fresh key cons for EVERY sample in the store, and %drain called it on
+   EVERY take-samples, then filtered. So the drain consed O(STORED) per call while delivering O(PENDING)
+   samples — normally ONE. Measured: 3716 B/sample of GC garbage on the receive path, the single largest
+   remaining allocation there. This makes the drain O(pending) in both time and allocation.
+
+   DEADLOCK CONTRACT: PENDING-P RUNS UNDER THE NODE LOCK (unlike the old filter, which ran after
+   node-sample-sns had released it), and that lock is a plain NON-RECURSIVE mutex. A predicate that calls a
+   public lock-taking node accessor therefore SELF-DEADLOCKS the drain — and with it every take-samples on
+   the participant. Use the -UNLOCKED accessors: node-reader-matches-writer-p-unlocked,
+   node-reader-join-watermark-unlocked."
+  (setf (fill-pointer out) 0)
+  (dds.pal:with-lock ((disc-node-lock node))
+    (maphash (lambda (guid inner)
+               (loop for sn being the hash-keys of inner
+                     do (when (funcall pending-p guid sn)
+                          (vector-push-extend (cons guid sn) out))))
+             (disc-node-samples node)))
+  out)
+
+(defun* node-collect-pending-lifecycle (node pending-p out)
+    (function (disc-node function (array t (*))) (array t (*)))
+  "The lifecycle-change twin of node-collect-pending-samples: push the (GUID . SN) key of every stored
+   dispose/unregister change the caller still considers PENDING into the reused vector OUT. PENDING-P is
+   called as (GUID SN), so the walk conses nothing for an already-drained change. Replaces
+   node-lifecycle-sns + a SET-DIFFERENCE (which was O(stored x drained) with an EQUALP test, and consed
+   both lists) on the %drain path. Same DEADLOCK CONTRACT as node-collect-pending-samples: PENDING-P runs
+   under the non-recursive node lock — it must use the -UNLOCKED node accessors, never the public ones."
+  (setf (fill-pointer out) 0)
+  (dds.pal:with-lock ((disc-node-lock node))
+    (maphash (lambda (guid inner)
+               (loop for sn being the hash-keys of inner
+                     do (when (funcall pending-p guid sn)
+                          (vector-push-extend (cons guid sn) out))))
+             (disc-node-lifecycle-changes node)))
+  out)
+
 (defun* node-sample-sns (node)
     (function (disc-node) list)
   "Composite (GUID . SN) cons keys of the user samples received so far (unordered). Lets a subscriber

@@ -727,12 +727,13 @@
     (when inner (loop for sn being the hash-keys of inner do (when (> sn m) (setf m sn))))
     m))
 
-(defun* %node-reader-join-watermark-unlocked (node reader-entity-id writer-guid)
+(defun* node-reader-join-watermark-unlocked (node reader-entity-id writer-guid)
     (function (disc-node (unsigned-byte 32) (simple-array (unsigned-byte 8) (16))) integer)
   "WP-DDS-ZC-REFCOUNT-LEAK (ADR 0048 §17.7): the lock-free body of node-reader-join-watermark — the frozen ZC-joiner
    high-water for local reader READER-ENTITY-ID against remote writer WRITER-GUID (0 if not a frozen joiner). CALLER
    HOLDS THE NODE LOCK. Split out so the demux (%deliver-user-marker via %count-eligible-drainers, already under the
-   node lock) reads watermarks WITHOUT re-taking the lock — calling the public lock-taking accessor there would deadlock."
+   node lock) reads watermarks WITHOUT re-taking the lock — calling the public lock-taking accessor there would deadlock.
+   Exported (WP-PERF) because the %drain pending-predicate now runs INSIDE the node lock, under node-collect-pending-*."
   (let ((inner (gethash reader-entity-id (disc-node-reader-join-watermarks node))))
     (if inner (gethash writer-guid inner 0) 0)))
 
@@ -744,7 +745,7 @@
    mid-stream ZC joiner never drains a marker delivered before it joined (whose demux %zc-bump did not count it).
    Node-lock guarded."
   (dds.pal:with-lock ((disc-node-lock node))
-    (%node-reader-join-watermark-unlocked node reader-entity-id writer-guid)))
+    (node-reader-join-watermark-unlocked node reader-entity-id writer-guid)))
 
 (defun* %count-eligible-drainers (node writer-guid sn ids)
     (function (disc-node (simple-array (unsigned-byte 8) (16)) integer list) (integer 0))
@@ -763,7 +764,7 @@
    gate's W-term admits — no premature release. The strict `>` matches the drain gate: SN == watermark is NOT a drainer."
   (let ((n 0))
     (dolist (rid ids n)
-      (when (> sn (%node-reader-join-watermark-unlocked node rid writer-guid)) (incf n)))))
+      (when (> sn (node-reader-join-watermark-unlocked node rid writer-guid)) (incf n)))))
 
 (defun* node-user-reader-count (node)
     (function (disc-node) (integer 0))
@@ -771,13 +772,21 @@
    pass-through (byte-identical to pre-S2 single-reader delivery); N>=2 engages the source-GUID filter."
   (length (disc-node-user-readers node)))
 
+(defun* node-reader-matches-writer-p-unlocked (node reader-entity-id writer-guid)
+    (function (disc-node (unsigned-byte 32) (simple-array (unsigned-byte 8) (16))) boolean)
+  "The lock-free body of node-reader-matches-writer-p. CALLER HOLDS THE NODE LOCK. Same rationale as
+   node-reader-join-watermark-unlocked: the %drain pending-predicate runs INSIDE the node lock (under
+   node-collect-pending-*), and the node lock is a plain non-recursive mutex — calling the public lock-taking
+   accessor from there SELF-DEADLOCKS the drain (and with it every take-samples)."
+  (and (member reader-entity-id (gethash writer-guid (disc-node-reader-routes node)) :test #'eql) t))
+
 (defun* node-reader-matches-writer-p (node reader-entity-id writer-guid)
     (function (disc-node (unsigned-byte 32) (simple-array (unsigned-byte 8) (16))) boolean)
   "WP-N-ENDPOINT-S2 (ADR 0048): T iff local reader READER-ENTITY-ID is matched to remote writer WRITER-GUID (route
    membership, node-lock guarded). The %drain source-GUID filter (N>=2) keeps a stored sample for THIS reader only
    when this returns T — so a reader deserializes ONLY its own matched writers' bytes (no cross-topic corruption)."
   (dds.pal:with-lock ((disc-node-lock node))
-    (and (member reader-entity-id (gethash writer-guid (disc-node-reader-routes node)) :test #'eql) t)))
+    (node-reader-matches-writer-p-unlocked node reader-entity-id writer-guid)))
 
 (defun* %user-writer-for (node entity-id)
     (function (disc-node (unsigned-byte 32)) (or null dds.rtps.reliable:rtps-writer))
