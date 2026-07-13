@@ -245,10 +245,12 @@
     (function (rtps-writer integer) list)
   "The writer's HistoryCache CacheChanges with SN >= BASE, in SN order. The element is the
    CacheChange itself (carrying KIND, SN, payload, key-hash, status-info) so the send path
-   can dispatch :data vs :dispose/:unregister (RTPS 2.5 §8.4.2.2 / §9.6.4.9)."
-  (loop for ch in (dds.rtps.history:hc-changes-for-reader (rtps-writer-hc writer) nil)
-        when (>= (dds.rtps.history:cache-change-sn ch) base)
-          collect ch))
+   can dispatch :data vs :dispose/:unregister (RTPS 2.5 §8.4.2.2 / §9.6.4.9).
+
+   WP-PERF: asks the cache for the RANGE directly (hc-changes-from) instead of taking the whole sorted change
+   list and filtering it down to this suffix. The old form maphash'd + STABLE-SORTed the ENTIRE history cache
+   on every write — over half the measured send path — to then discard the ACKed prefix."
+  (dds.rtps.history:hc-changes-from (rtps-writer-hc writer) base))
 
 (defun* writer-data-list (writer reader-id)
     (function (rtps-writer t) list)

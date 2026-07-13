@@ -379,12 +379,40 @@
            :rejected-resource-limits
            (progn (%hc-store hc sn change) :ok))))))
 
+(defun* hc-changes-from (hc base)
+    (function (history-cache integer) list)
+  "The cache changes with SN >= BASE, in ascending SN order. THE SEND-PATH QUERY — this is what the reliable
+   writer actually asks for on every push (%changes-from), and it is O(changes-to-send), normally ONE.
+
+   WP-PERF: it replaces (a full maphash of the cache) + (a STABLE-SORT of the whole change list) + (a filter
+   down to the suffix), which ran on EVERY WRITE. The sampling profile of write-sample was unambiguous —
+   HC-CHANGES-FOR-READER 14% self, STABLE-SORT-LIST 52.8% CUMULATIVE, plus MERGE-LISTS*, generic < and
+   TWO-ARG-< — together over half the send path, sorting the entire history cache in order to take a suffix
+   of it. Under RELIABLE/KEEP_ALL the cache grows until the reader ACKs, so the sort grew with it: the same
+   class of defect as the receive-side quadratic drain (46aa047) — re-deriving sorted state from scratch on
+   every operation.
+
+   The changes are stored under a monotone SN (RTPS 2.5 SS8.3.5.4), and the [min-seq, max-seq] extent is
+   maintained incrementally, so ascending order needs no sort at all: walk the extent DOWNWARD from max-seq
+   and PUSH, which yields ascending order directly. Holes (KEEP_LAST eviction) cost one failed GETHASH each
+   and cons nothing. Starting at (max BASE min-seq) means an ACKed prefix is never even visited."
+  (let ((hi (history-cache-max-seq hc)))
+    (when (zerop hi) (return-from hc-changes-from '()))          ; empty cache (0 = empty; a valid SN is >= 1)
+    (let ((lo (max base (history-cache-min-seq hc)))
+          (tbl (history-cache-changes hc))
+          (out '()))
+      (loop for sn of-type fixnum from hi downto lo              ; downward + push => ascending, no sort
+            do (let ((ch (gethash sn tbl)))
+                 (when ch (push ch out))))
+      out)))
+
 (defun* hc-changes-for-reader (hc reader-proxy)
     (function (history-cache t) list)
-  "Return the cache changes in ascending SN order. v1 ignores READER-PROXY; the
-   per-reader changes-for-reader filtering lives in the reliable writer."
+  "ALL cache changes in ascending SN order. v1 ignores READER-PROXY; the per-reader changes-for-reader
+   filtering lives in the reliable writer.
+
+   NOT ON THE SEND PATH — the send path wants HC-CHANGES-FROM (a suffix), and using this for it meant sorting
+   the whole cache on every write. This whole-cache form is retained for the tests/tools that genuinely want
+   every change. Same result, expressed as the full-extent case of the range query (DRY, no second sort)."
   (declare (ignore reader-proxy))
-  (let ((changes '()))
-    (maphash (lambda (sn ch) (declare (ignore sn)) (push ch changes))
-             (history-cache-changes hc))
-    (sort changes #'< :key #'cache-change-sn)))
+  (hc-changes-from hc (let ((n (history-cache-min-seq hc))) (if (zerop n) 0 n))))

@@ -25,7 +25,7 @@
            #:history-cache-payload-pool #:hc-try-release-pooled
            #:history-cache-zc-release-fn #:hc-try-release-pinned
            #:hc-add-change #:hc-remove-change #:hc-purge-below #:hc-get-change
-           #:hc-min-seq #:hc-max-seq #:hc-changes-for-reader
+           #:hc-min-seq #:hc-max-seq #:hc-changes-for-reader #:hc-changes-from
            #:history-not-implemented))
 
 ;;;; dds.rtps.message is a HOT-PATH package: the submessage parser is the network
