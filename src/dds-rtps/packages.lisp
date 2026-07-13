@@ -46,7 +46,7 @@
            #:+submsg-info-dst+ #:+submsg-info-reply+ #:+submsg-nack-frag+
            #:+submsg-heartbeat-frag+ #:+submsg-data+ #:+submsg-data-frag+
            #:+flag-endianness+ #:+entityid-unknown+ #:+entityid-participant+
-           #:write-header #:write-header-into #:parse-header #:put-info-src-into
+           #:write-header #:write-header-into #:parse-header #:skip-header #:put-info-src-into
            #:write-submessage-header #:parse-submessage-header
            #:write-entity-id #:read-entity-id
            #:+sequence-number-unknown+ #:+seqnum-set-max-bits+

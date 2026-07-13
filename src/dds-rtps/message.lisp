@@ -136,25 +136,46 @@
   (replace vec guid-prefix :start1 (+ off 12) :end1 (+ off 24) :start2 0 :end2 12)
   24)
 
-(defun* parse-header (cursor)
-    (function (dds.core.buffer:cursor) t)
-  "Parse a 20-octet RTPS Header. Returns (values major minor vendor guid-prefix),
-   or NIL if fewer than 20 octets remain or the magic is wrong. Bounds-checked;
-   never reads OOB (NFR-SEC-POSTURE)."
+(defun* %parse-header-into (cursor prefix-out)
+    (function (dds.core.buffer:cursor (or null (simple-array (unsigned-byte 8) (12)))) t)
+  "Shared core of PARSE-HEADER and SKIP-HEADER (DRY): validate a 20-octet RTPS Header (§9.4.4) and
+   consume it. When PREFIX-OUT is a 12-octet buffer, the guidPrefix is read INTO it; when it is NIL the
+   guidPrefix is SKIPPED (cursor advanced, nothing allocated). Returns (values major minor vendor
+   prefix-out), or NIL if fewer than 20 octets remain or the magic is wrong. Bounds-checked; never reads
+   OOB (NFR-SEC-POSTURE) — the 20-octet check at entry covers the skip, and cursor-set-position is itself
+   bounds-checked against the buffer capacity."
   (when (< (%remaining cursor) 20)
-    (return-from parse-header nil))
+    (return-from %parse-header-into nil))
   (let ((m0 (dds.core.buffer:get-u8 cursor)) (m1 (dds.core.buffer:get-u8 cursor))
         (m2 (dds.core.buffer:get-u8 cursor)) (m3 (dds.core.buffer:get-u8 cursor)))
     (unless (and (= m0 (aref +protocol-id+ 0)) (= m1 (aref +protocol-id+ 1))
                  (= m2 (aref +protocol-id+ 2)) (= m3 (aref +protocol-id+ 3)))
-      (return-from parse-header nil))
+      (return-from %parse-header-into nil))
     (let* ((major (dds.core.buffer:get-u8 cursor))
            (minor (dds.core.buffer:get-u8 cursor))
            (vh (dds.core.buffer:get-u8 cursor))
-           (vl (dds.core.buffer:get-u8 cursor))
-           (prefix (make-array 12 :element-type '(unsigned-byte 8))))
-      (dds.core.buffer:get-octets cursor prefix 0 12)
-      (values major minor (logior (ash vh 8) vl) prefix))))
+           (vl (dds.core.buffer:get-u8 cursor)))
+      (if prefix-out
+          (dds.core.buffer:get-octets cursor prefix-out 0 12)
+          (dds.core.buffer:cursor-set-position cursor (+ (dds.core.buffer:cursor-position cursor) 12)))
+      (values major minor (logior (ash vh 8) vl) prefix-out))))
+
+(defun* skip-header (cursor)
+    (function (dds.core.buffer:cursor) t)
+  "Validate and consume a 20-octet RTPS Header WITHOUT materializing its guidPrefix — non-NIL if the
+   header is well-formed, NIL otherwise. NFR-MEM: DISPATCH-MESSAGE discards every value PARSE-HEADER
+   returns (it wants only the magic check and the 20-octet advance), yet PARSE-HEADER allocated a fresh
+   12-octet guidPrefix array — on EVERY inbound datagram, on the receiver thread, thrown away
+   immediately. Callers that need the prefix read it from the datagram themselves (DDS.DISC::%SOURCE-PREFIX)."
+  (%parse-header-into cursor nil))
+
+(defun* parse-header (cursor)
+    (function (dds.core.buffer:cursor) t)
+  "Parse a 20-octet RTPS Header. Returns (values major minor vendor guid-prefix),
+   or NIL if fewer than 20 octets remain or the magic is wrong. Bounds-checked;
+   never reads OOB (NFR-SEC-POSTURE). ALLOCATES the returned 12-octet guid-prefix — on the per-datagram
+   receive path use SKIP-HEADER (which allocates nothing) unless you actually need the prefix."
+  (%parse-header-into cursor (make-array 12 :element-type '(unsigned-byte 8))))
 
 ;;; ---- SubmessageHeader (§9.4.5.1): submessageId, flags, octetsToNextHeader ----
 
@@ -973,7 +994,7 @@
    capacity. Returns T on a well-formed message, NIL on bad magic / truncation."
   (let ((end (or msg-end
                  (dds.core.buffer:octet-buffer-capacity (dds.core.buffer:cursor-buffer cursor)))))
-    (unless (parse-header cursor) (return-from dispatch-message nil))
+    (unless (skip-header cursor) (return-from dispatch-message nil))
     (loop
       (when (< (- end (dds.core.buffer:cursor-position cursor)) 4) (return t))
       (multiple-value-bind (id flags octets le) (parse-submessage-header cursor)
