@@ -1,5 +1,11 @@
 # The Connext parity ratio table — the evidence (WP-1 complete)
 
+> **SUPERSEDED (2026-07-13) by `2026-07-13-connext-ratio-table-current.md`.** Every number below is stale.
+> Current: 256 B p50 **1.40x** (was 3.20x), 1 KB **1.34x** (was 15.2x), 4 KB **1.59x** (was 65x). The p99.99
+> rows below were already withdrawn; the truth is now measured and it is WORSE than withdrawn — our worst
+> sample is ~9-10 ms vs Connext's ~0.2 ms, i.e. **we lose the tail by 15-60x** (a GC pause). Read the current
+> table, not this one.
+
 > **CORRECTION (2026-07-12, WP-8.T3).** The **p99.99 rows below are NOT reproducible** and the "we beat Connext's
 > tail by 2.2×" conclusion drawn from them is **withdrawn pending re-measurement**. Re-running the identical 256 B
 > cross-process harness the same day gives a worst-sample of **9–14 ms**, not 53.5 µs — on BOTH this commit and the
