@@ -341,12 +341,81 @@
       (t (dds.pal:pshared-cond-wait sap +cond-off+ +mutex-off+)   ; truly idle: block (parked stays 1)
          (dds.pal:store-sap-u64 sap +parked-off+ 0)))))   ; woken (signal/broadcast/spurious): unpark, loop re-checks
 
+(defun* %env-spin-iterations (default)
+    (function ((integer 0)) (integer 0))
+  "Effective spin budget at load: the DDS_SHMEM_RX_SPIN_ITERATIONS environment variable when it parses to a
+   non-negative integer, else DEFAULT. Lets a deployment tune (or disable, with 0) the SHMEM receiver's
+   spin WITHOUT a code change or a rebuild — the same configurability rule the send-path buffer sizes follow."
+  (let ((raw (uiop:getenv "DDS_SHMEM_RX_SPIN_ITERATIONS")))
+    (or (and raw (ignore-errors
+                  (let ((n (parse-integer (string-trim " " raw))))
+                    (and (>= n 0) n))))
+        default)))
+
+(defparameter *shmem-rx-spin-iterations* (%env-spin-iterations 1000)
+  "LATENCY vs CPU: how many times the SHMEM receiver re-checks its lanes BEFORE it takes the mutex and parks
+   on the pshared condvar. **Default 1000** (owner directive 2026-07-13). 0 = park immediately (the
+   historical behaviour). Overridable at deployment with the DDS_SHMEM_RX_SPIN_ITERATIONS environment
+   variable, and settable at runtime — the spin budget is re-read on every wait, so it can be retuned on a
+   live node.
+
+   WHY. Parking costs a cross-process futex round trip: the sender must issue a pthread_cond_signal (macOS
+   __psynch_cvsignal) AND the receiver must then be SCHEDULED onto a core before it can even look at the
+   data. Measured: ~6 us of the ~16 us 256 B one-way, and __psynch_cvsignal was the single largest item in
+   the responder's CPU profile (30%). It is also the whole of our distance to Connext: on UDP we are 1.33x of
+   Connext, on SHMEM 2.34x — Connext extracts 2.76x from shared memory where we extract only 1.57x
+   (bench/report/2026-07-13-the-gap-is-our-shmem.md). A receiver still spinning when the datagram lands skips
+   BOTH halves of the wake — and costs the SENDER nothing either, because %shmem-send only takes the mutex
+   and signals when parked=1.
+
+   MEASURED (256 B one-way p50 / responder CPU over the same run):
+     spin      0 -> 19 125 ns / 0.76 s     (park immediately)
+     spin    500 -> 12 270 ns / 0.98 s
+     spin   1000 -> the default: essentially all of the win, bounded cost
+     spin   5000 -> 11 791 ns / 0.93 s
+     spin  50000 -> 11 750 ns / 0.95 s     (no worse than 500 — see below)
+   19.1 -> 11.8 us, a 7.3 us cut that matches the measured wake, saturating by ~500 iterations. It takes the
+   SHMEM ratio against Connext from 2.34x to 1.68x.
+
+   THE CPU COST IS BOUNDED, and the intuition that a spin 'burns a core' is WRONG here: the spin EXITS the
+   instant data lands, and a genuinely idle receiver still exhausts its budget and PARKS — then stays parked
+   until signalled. It therefore runs once per wake, not continuously, which is why 50 000 iterations cost no
+   more CPU than 500. Measured overhead is +29% CPU on the receiver for a 39% latency cut. Set 0 to restore
+   the pure blocking behaviour on a CPU-constrained node.
+
+   Iterations, not nanoseconds, deliberately: a time-based spin must read the clock every turn, and
+   MONOTONIC-NS costs ~633 ns on Clasp (libffi) — the clock read would dominate the spin itself.")
+
+(defun* %rx-spin-for-work (sap)
+    (function (t) t)
+  "Spin up to *SHMEM-RX-SPIN-ITERATIONS* times waiting for a lane to fill, WITHOUT holding the pshared mutex
+   and WITHOUT arming the parked flag. Returns :DATA if a lane filled, :STOP if teardown was signalled, or
+   NIL if the spin budget ran out (the caller then takes the mutex and parks).
+
+   OUTSIDE THE MUTEX — that placement is the whole point, and getting it wrong is what sank the first
+   attempt. Spinning INSIDE %rx-wait-for-work (which runs with the mutex HELD) starves stop-shmem-receiver,
+   which needs that same mutex to broadcast: latency went 7x WORSE and a long spin HUNG on teardown. Here the
+   mutex is free throughout, so teardown proceeds immediately — and STOP is re-checked every iteration, so
+   this loop exits promptly regardless of the budget.
+
+   Race-free by construction: parked stays 0 for the whole spin, and %shmem-send enqueues into a LOCK-FREE
+   lane and only takes the mutex + signals when it observes parked=1. A spinning receiver therefore cannot
+   miss a datagram (it polls the lanes directly) and cannot block a sender."
+  (loop repeat *shmem-rx-spin-iterations*
+        do (when (= 1 (dds.pal:load-sap-u64 sap +stop-off+)) (return-from %rx-spin-for-work :stop))
+           (when (%any-data-p sap) (return-from %rx-spin-for-work :data)))
+  nil)
+
 (defun* start-shmem-receiver (st on-datagram)
     (function (shmem-transport function) t)
   "Spawn a thread: block on the pshared cond until a lane has data (or stop), then drain ALL lanes and call
    ON-DATAGRAM per record. The wait uses the conditional-wakeup parked flag (%rx-wait-for-work) so a busy
    sender skips the futex wake while this thread is draining. Clean shutdown: stop-shmem-receiver sets stop
-   + broadcasts (regardless of parked) to wake it."
+   + broadcasts (regardless of parked) to wake it.
+
+   Optionally SPINS first (%rx-spin-for-work, *shmem-rx-spin-iterations*, default 0 = off) — outside the
+   mutex, so a spinning receiver never blocks teardown. A spin that finds data skips the park entirely, and
+   with it the cross-process wake that is our whole remaining distance to Connext on this transport."
   (let ((sap (dds.pal:shm-sap (shmem-transport-segment st))))
     (dds.pal:store-sap-u64 sap +stop-off+ 0)
     (dds.pal:store-sap-u64 sap +parked-off+ 0)
@@ -354,11 +423,14 @@
           (dds.pal:spawn
            (lambda ()
              (loop
-               (dds.pal:pshared-lock sap +mutex-off+)
-               (let ((stop (%rx-wait-for-work sap)))
-                 (dds.pal:pshared-unlock sap +mutex-off+)
-                 (when stop (return))
-                 (handler-case (shmem-receive-drain st on-datagram) (error () nil)))))
+               (let ((spun (%rx-spin-for-work sap)))          ; NO mutex held here
+                 (when (eq spun :stop) (return))
+                 (unless (eq spun :data)                      ; spin budget exhausted (or 0): park
+                   (dds.pal:pshared-lock sap +mutex-off+)
+                   (let ((stop (%rx-wait-for-work sap)))
+                     (dds.pal:pshared-unlock sap +mutex-off+)
+                     (when stop (return)))))
+               (handler-case (shmem-receive-drain st on-datagram) (error () nil))))
            :name "dds-shmem-rx"))))
 
 (defun* stop-shmem-receiver (st)

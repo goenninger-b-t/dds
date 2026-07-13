@@ -46,7 +46,7 @@
            #:shmem-locator-lane-count #:shmem-locator-capacity
            #:seg-name-for-guid
            #:shmem-receive-drain #:shmem-transport-close
-           #:start-shmem-receiver #:stop-shmem-receiver
+           #:*shmem-rx-spin-iterations* #:start-shmem-receiver #:stop-shmem-receiver
            #:shm-attach-by-name-reliable-p
            #:*debug-shmem-send-fault* #:shmem-send-test-fault
            #:run-shmem-transport-test #:run-shmem-receiver-test #:run-shmem-stress-test))
