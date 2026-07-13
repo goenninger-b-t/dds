@@ -77,7 +77,11 @@
    SPDP peer at 127.0.0.1:7410) — see interop/autodiscovery/README.md."
   (dds.dcps:create-participant :domain domain :autonomous t
                                :advertise-address advertise
-                               :peers (when (and peers (plusp (length peers))) peers)))
+                               ;; CREATE-PARTICIPANT's :PEERS is a LIST of (host . port); this passed the raw
+                               ;; STRING, so any run with PEERS set died with a TYPE-ERROR before discovery.
+                               ;; The cross-vendor peer path of this harness had therefore NEVER run — which
+                               ;; means the ours<->Connext interop the parity table claimed was never executed.
+                               :peers (dds.disc:parse-peers peers)))
 
 (defun* run-echo-responder (&key (domain 0) (seconds 60) (advertise-address "127.0.0.1") (peers nil)
                                  (data-representation :xcdr2) (history-kind :keep-all))

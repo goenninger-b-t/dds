@@ -924,6 +924,25 @@
    references when it can actually resolve them (fail-open). NOT cleared for ship — pending counsel (R6)."
   (and (disc-node-zc-pool node) t))
 
+(defun* parse-peers (peers)
+    (function ((or null string)) list)
+  "Parse a \"host:port[,host:port]...\" PEERS string into the ((host . port) ...) list MAKE-DISC-NODE expects
+   (FR-DISC-4 unicast announce targets). NIL or \"\" parses to NIL (multicast-only discovery). A malformed
+   entry (missing colon, empty host, non-numeric or out-of-range port) signals one uniform error.
+
+   Lives here, in the layer that OWNS the peer-list contract, so every caller that accepts a peers STRING
+   from a CLI/Makefile/harness converts it the one way (DRY). It was previously private to dds.shapes, which
+   meant the perf/interop harness (dds-bench, which cannot see dds.shapes) passed its peers string straight
+   into CREATE-PARTICIPANT's :PEERS — a LIST parameter. That is a type error, so the harness's cross-vendor
+   peer path could never have run: any ours<->foreign-vendor claim made with it was never actually executed."
+  (when (and peers (plusp (length peers)))
+    (loop for entry in (uiop:split-string peers :separator ",")
+          for colon = (position #\: entry :from-end t)
+          for port = (and colon (ignore-errors (parse-integer entry :start (1+ colon))))
+          unless (and colon (plusp colon) (typep port '(unsigned-byte 16)))
+            do (error "peer ~s is not host:port (port 0..65535)" entry)
+          collect (cons (subseq entry 0 colon) port))))
+
 (defun* make-disc-node (&key (guid-prefix (make-array 12 :element-type '(unsigned-byte 8)
                                                      :initial-element 0))
                             (domain 0) (host "127.0.0.1") (port 0) (peers '()) multicast

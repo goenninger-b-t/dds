@@ -144,17 +144,10 @@
 
 (defun* %parse-peers (peers)
     (function ((or null string)) list)
-  "Parse a \"host:port[,host:port]...\" PEERS string into the ((host . port) ...)
-   list make-disc-node expects (FR-DISC-4 unicast announce targets). NIL or \"\"
-   parses to NIL (multicast-only discovery). A malformed entry (missing colon,
-   empty host, non-numeric or out-of-range port) signals one uniform error."
-  (when (and peers (plusp (length peers)))
-    (loop for entry in (uiop:split-string peers :separator ",")
-          for colon = (position #\: entry :from-end t)
-          for port = (and colon (ignore-errors (parse-integer entry :start (1+ colon))))
-          unless (and colon (plusp colon) (typep port '(unsigned-byte 16)))
-            do (error "peer ~s is not host:port (port 0..65535)" entry)
-          collect (cons (subseq entry 0 colon) port))))
+  "Parse a \"host:port[,host:port]...\" PEERS string into the ((host . port) ...) list make-disc-node
+   expects. Delegates to DDS.DISC:PARSE-PEERS — the layer that owns the peer-list contract — so the shapes
+   CLI, the perf/interop harness and any future caller convert a peers string the ONE way (DRY)."
+  (dds.disc:parse-peers peers))
 
 (defun* run-publisher (&key (domain 0) (color "BLUE") (shapesize 30) (rate 30) (count 0)
                            (advertise-address "127.0.0.1") (type :tagged) (peers nil)
