@@ -128,6 +128,40 @@
     (dds.core.buffer:put-u32 c n)
     (dotimes (i n) (funcall elem-writer c (aref vec i) mode))
     n))
+(defun* cdr-put-octet-sequence (c vec mode)
+    (function (dds.core.buffer:cursor (simple-array (unsigned-byte 8) (*)) cdr-mode) (integer 0))
+  "Write an OCTET sequence (element :u8/:byte/:octet) as 4-byte element count + the octets, copied in BULK
+   (FR-CDR-1). Byte-identical on the wire to the generic per-element path: an octet has alignment 1, so no
+   inter-element padding exists to reproduce — only the count's 4-byte alignment, which is preserved.
+
+   WP-PERF: the generic cdr-put-sequence calls ELEM-WRITER once PER OCTET, each call re-doing cdr-align, a
+   bounds check and a cursor bump. Measured on the live receive path: ~12 ns PER OCTET, perfectly linear —
+   3166 ns to serialize a 256 B payload, 204 802 ns for 16 KB. That single loop was the dominant cost in the
+   entire DDS round trip and the whole of the large-payload latency. This is a memcpy (dds.core.buffer:
+   put-octets -> REPLACE), which is bounds-checked exactly once."
+  (cdr-align c 4 mode)
+  (let ((n (length vec)))
+    (dds.core.buffer:put-u32 c n)
+    (dds.core.buffer:put-octets c vec 0 n)
+    n))
+
+(defun* cdr-get-octet-sequence (c mode)
+    (function (dds.core.buffer:cursor cdr-mode) (simple-array (unsigned-byte 8) (*)))
+  "Read an OCTET sequence (element :u8/:byte/:octet): 4-byte element count + the octets, copied in BULK into
+   an exactly-sized specialized vector (FR-CDR-1). The bulk twin of cdr-put-octet-sequence; see that
+   docstring for the ~12 ns/octet the per-element loop was costing (deserialize measured ~7 ns/octet:
+   1983 ns for 256 B, 114 953 ns for 16 KB).
+
+   NFR-SEC-POSTURE is unchanged and still enforced BEFORE the result vector is allocated: the wire count is
+   validated against the remaining buffer extent (every octet is 1 octet on the wire), so a hostile
+   0xFFFFFFFF count signals buffer-overflow rather than attempting a 4 GB allocation."
+  (cdr-align c 4 mode)
+  (let ((n (dds.core.buffer:get-u32 c)))
+    (dds.core.buffer:check-room c n)                    ; BEFORE the allocation (hostile count)
+    (let ((vec (make-array n :element-type '(unsigned-byte 8))))
+      (dds.core.buffer:get-octets c vec 0 n)
+      vec)))
+
 (defun* cdr-get-sequence-typed (c elem-reader mode element-type)
     (function (dds.core.buffer:cursor function cdr-mode t) vector)
   "Read a sequence from cursor C into a vector SPECIALIZED to ELEMENT-TYPE: 4-byte element count +

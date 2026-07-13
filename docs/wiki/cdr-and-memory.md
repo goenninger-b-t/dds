@@ -297,10 +297,20 @@ NameHash example: `MD5("color")[0:4]` = `70 dd a5 df`. (From `run-md5-test`.)
 - **Strings are Latin-1 for now.** `cdr-put-string` signals `cdr-not-implemented` on
   any character above code point 255; UTF-8 byte-exactness is pinned by the corpus as a
   follow-up (FR-CDR-8).
+- **An OCTET sequence is copied in BULK, never element-by-element** (`cdr-put-octet-sequence` /
+  `cdr-get-octet-sequence`, which the generated codecs emit for `:u8`/`:byte`/`:octet`). The generic
+  per-element path funcalls a closure **once per octet** — measured **~12 ns/octet, perfectly linear**:
+  204 802 ns to serialize a 16 KB payload, versus **2 616 ns** in bulk. It was the dominant cost in the whole
+  DDS round trip. `:i8` keeps the generic path (signed elements need per-element two's-complement
+  conversion). Wire-identical: an octet has alignment 1, so there is no inter-element padding to reproduce.
+- **A sequence's serialized SIZE is computed in closed form, never by looping** (`define-dds-type` codegen).
+  The size function runs on **every write**; looping `cdr-size-align` once per element cost **~107 µs for a
+  16 KB sequence — to compute an integer**. Every supported element type has `(size MOD effective-align) = 0`,
+  so: align once, then add `n × size`. (Verified identical to the old loop over 64 000 combinations.)
 - **A decoded sequence is SPECIALIZED to its element type** (`cdr-get-sequence-typed`, which the
-  generated codecs call). An untyped `simple-vector` costs 8 B per element whatever the element is —
-  8× amplification for an octet sequence, both as steady-state garbage and as an attacker-drivable
-  allocation multiplier. Never decode a sequence into an untyped vector on a data path.
+  generated codecs call for non-octet elements). An untyped `simple-vector` costs 8 B per element whatever
+  the element is — 8× amplification for an octet sequence, both as steady-state garbage and as an
+  attacker-drivable allocation multiplier. Never decode a sequence into an untyped vector on a data path.
 - **`cdr-get-string` / `cdr-get-sequence` allocate — but only after extent validation.**
   The deserialize side currently allocates the result string/vector, and the
   wire-supplied length/count is validated against the remaining buffer extent *before*

@@ -72,6 +72,36 @@
                :key (getf opts :key))))
       (t (error "define-dds-type: unsupported member type ~s in ~s" dds-type spec)))))
 
+(defun* %octet-sequence-p (m)
+    (function (list) t)
+  "T iff sequence member M's element is an OCTET type (:u8 / :byte / :octet — the three one-octet UNSIGNED
+   kinds, which share the (unsigned-byte 8) Lisp representation and so can be bulk-copied to/from the wire).
+   NOT :i8: its (signed-byte 8) elements need two's-complement conversion per element, so it keeps the
+   generic path."
+  (member (getf m :elt-type) '(:u8 :byte :octet)))
+
+(defun* %seq-put-form (m acc-form)
+    (function (list t) t)
+  "Macro-time: the serialize form for sequence member M reading its value from ACC-FORM. An octet sequence
+   gets the BULK memcpy codec; anything else keeps the generic per-element closure loop.
+
+   WP-PERF: the per-element path costs ~12 ns PER OCTET (measured, perfectly linear: 3166 ns for a 256 B
+   payload, 204 802 ns for 16 KB) because it funcalls a closure for every single octet. The bulk path is one
+   REPLACE. Byte-identical on the wire — an octet has alignment 1, so there is no inter-element padding to
+   reproduce."
+  (if (%octet-sequence-p m)
+      `(dds.cdr:cdr-put-octet-sequence cursor ,acc-form mode)
+      `(dds.cdr:cdr-put-sequence cursor ,acc-form (function ,(getf m :elt-put)) mode)))
+
+(defun* %seq-get-form (m)
+    (function (list) t)
+  "Macro-time: the deserialize form for sequence member M — the bulk octet codec when eligible
+   (%octet-sequence-p), else the generic per-element loop into a vector specialized to the element's Lisp
+   type. See %seq-put-form for the measured cost of the per-element path."
+  (if (%octet-sequence-p m)
+      `(dds.cdr:cdr-get-octet-sequence cursor mode)
+      `(dds.cdr:cdr-get-sequence-typed cursor (function ,(getf m :elt-get)) mode ',(getf m :elt-ltype))))
+
 (defun* %key-max-size (keys)
     (function (list) t)
   "Maximum PLAIN_CDR2 (XCDR2, max alignment 4) serialized size of the key holder built
@@ -220,8 +250,7 @@
            ,@(loop for m in parsed collect
                    (ecase (getf m :kind)
                      (:scalar `(,(getf m :put) cursor (,(acc m) sample) mode))
-                     (:sequence `(dds.cdr:cdr-put-sequence
-                                  cursor (,(acc m) sample) (function ,(getf m :elt-put)) mode))
+                     (:sequence (%seq-put-form m `(,(acc m) sample)))
                      (:nested `(,(getf m :ser) (,(acc m) sample) cursor mode))))
            sample)
          (declaim (ftype (function (dds.core.buffer:cursor &optional symbol) ,name) ,des))
@@ -229,10 +258,7 @@
            (let ,(loop for m in parsed collect
                        (ecase (getf m :kind)
                          (:scalar `(,(getf m :slot) (,(getf m :get) cursor mode)))
-                         (:sequence `(,(getf m :slot)
-                                      (dds.cdr:cdr-get-sequence-typed
-                                       cursor (function ,(getf m :elt-get)) mode
-                                       ',(getf m :elt-ltype))))
+                         (:sequence `(,(getf m :slot) ,(%seq-get-form m)))
                          (:nested `(,(getf m :slot) (,(getf m :des) cursor mode)))))
              (,ctor ,@(loop for m in parsed
                             append (list (intern (string (getf m :slot)) :keyword)
@@ -242,10 +268,7 @@
            ,@(loop for m in parsed collect
                    (ecase (getf m :kind)
                      (:scalar `(setf (,(acc m) sample) (,(getf m :get) cursor mode)))
-                     (:sequence `(setf (,(acc m) sample)
-                                       (dds.cdr:cdr-get-sequence-typed
-                                        cursor (function ,(getf m :elt-get)) mode
-                                        ',(getf m :elt-ltype))))
+                     (:sequence `(setf (,(acc m) sample) ,(%seq-get-form m)))
                      (:nested `(,(getf m :des-into) (,(acc m) sample) cursor mode))))
            sample)
          (declaim (ftype (function (,name (integer 0) &optional symbol) (integer 0)) ,sszi))
@@ -260,11 +283,20 @@
                           `((setf pos (dds.cdr:cdr-size-align pos ,(getf m :align) mode))
                             (incf pos ,(getf m :size)))))
                      (:sequence
+                      ;; WP-PERF: CLOSED FORM, not a per-element loop. This runs on EVERY write, and it was
+                      ;; iterating once per ELEMENT — 16384 cdr-size-align calls (generic arithmetic) to
+                      ;; compute a NUMBER for a 16 KB octet sequence: measured ~107 us per write, the single
+                      ;; largest cost on the send path and ~90% of %serialize-sample.
+                      ;; Byte-exact: every supported element type has (size MOD effective-align) = 0 — u8 1/1,
+                      ;; u16 2/2, u32 4/4, u64 8/8 (and 8 MOD 4 = 0 under XCDR2's 4-byte alignment cap,
+                      ;; FR-CDR-2) — so once the FIRST element is aligned, every later element starts already
+                      ;; aligned and the loop can only add size each time. Align once, then add n*size.
                       `((setf pos (dds.cdr:cdr-size-align pos 4 mode))
                         (incf pos 4)
-                        (loop repeat (length (,(acc m) sample))
-                              do (setf pos (dds.cdr:cdr-size-align pos ,(getf m :elt-align) mode))
-                                 (incf pos ,(getf m :elt-size)))))
+                        (let ((n (length (,(acc m) sample))))
+                          (when (plusp n)
+                            (setf pos (dds.cdr:cdr-size-align pos ,(getf m :elt-align) mode))
+                            (incf pos (* n ,(getf m :elt-size)))))))
                      (:nested
                       `((setf pos (,(getf m :ssize) (,(acc m) sample) pos mode))))))
            pos)

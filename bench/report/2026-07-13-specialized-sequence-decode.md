@@ -42,8 +42,14 @@ less allocation, so the improvement is not a small-store artifact.)
 |---|---|---|
 | p50, 256 B | 21 500 / 22 000 ns | 22 000 / 22 000 ns — **unchanged** |
 | p99, 256 B | 54 500 / 29 000 ns | 56 500 / 47 000 ns — **unchanged (noisy both arms)** |
-| mean, 256 B | 7 760 ns | **5 968 ns (-23 %)** |
+| ~~mean, 256 B~~ **bytes/sample** | 7 760 **B** | **5 968 B (-23 %)** |
 | p50, 16 KB | 262 000 ns | 279 500 ns — **unchanged** |
+
+> **CORRECTION (2026-07-13).** The row above originally read "mean, 256 B: 7760 ns -> 5968 ns". That column of
+> the harness output is **`bytes-per-sample`, not mean latency** — I misread it. The number is real but it is
+> ALLOCATION (bytes consed per sample), which corroborates this commit's allocation work; it is NOT a latency
+> result. Nothing in this report's conclusion depended on it — the headline was that the allocation fix bought
+> **no latency**, and that stands.
 
 **Cutting the decoder's garbage by 5.6x (and ~8x at large payloads) moved the MEAN and nothing else.**
 
