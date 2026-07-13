@@ -69,6 +69,17 @@
    helpers (get-reader-proxy, %changes-from) run only inside a held lock."
   `(dds.pal:with-lock ((rtps-writer-lock ,writer)) ,@body))
 
+(defun* %writer-blockable-p (writer)
+    (function (rtps-writer) t)
+  "T iff a publisher CAN EVER be blocked on WRITER's SPACE-CV — i.e. the cache is a BOUNDED KEEP_ALL
+   (max_samples set) AND max_blocking_time is set. That is EXACTLY the condition under which
+   %writer-add-bounded condvar-waits; if it is false, no thread can be waiting on SPACE-CV, ever."
+  (let ((hc (rtps-writer-hc writer)))
+    (and (eq (dds.rtps.history:hc-kind hc) :keep-all)
+         (dds.rtps.history:hc-max-samples hc)
+         (rtps-writer-max-blocking-ns writer)
+         t)))
+
 (defun* %writer-signal-space (writer)
     (function (rtps-writer) t)
   "Broadcast WRITER's SPACE-CV under the writer LOCK — wake every writer-write/writer-lifecycle-change
@@ -77,10 +88,18 @@
    (writer-purge-acked — a KEEP_ALL cache shrinks only when the slowest reader ACKs, RTPS 2.5 §8.4.1) and
    controller teardown. condvar-BROADCAST (not signal): several publishers may be blocked, and one freed slot
    may admit exactly one — each re-checks the count on wake (a no-progress waker re-blocks until its
-   deadline). A no-op (signals nobody) when no writer is blocked. Safe to call when MAX-BLOCKING-NS is NIL
-   (no waiter ever exists)."
-  (%with-writer-lock (writer)
-    (dds.pal:condvar-broadcast (rtps-writer-space-cv writer)))
+   deadline).
+
+   WP-PERF: NO-OP unless a waiter can exist (%writer-blockable-p). This is called from the ACKNACK purge, so
+   it ran ONCE PER SAMPLE on the receiver thread — and on the DEFAULT (unlimited / KEEP_LAST) writer NOBODY
+   CAN EVER BE WAITING on SPACE-CV, so it was taking the writer lock and issuing a pthread_cond_broadcast per
+   sample to wake nobody. macOS traps into __psynch_cvsignal regardless of whether a waiter exists — that
+   symbol was the SINGLE LARGEST item in the responder's CPU profile under a live echo (30%). Guarding it
+   removes one lock round-trip and one kernel wake from every sample on the default path; the bounded-KEEP_ALL
+   backpressure path is unaffected (its waiters are exactly the case the guard admits)."
+  (when (%writer-blockable-p writer)
+    (%with-writer-lock (writer)
+      (dds.pal:condvar-broadcast (rtps-writer-space-cv writer))))
   t)
 
 (defun* %writer-add-bounded (writer make-change)
