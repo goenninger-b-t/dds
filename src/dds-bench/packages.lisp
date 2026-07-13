@@ -13,7 +13,7 @@
     run-bench-smoke / run-bench-shmem-smoke / run-bench-zerocopy-smoke are tiny suite-friendly
     self-checks.")
   (:export ;; WP-CONFORMANCE-AND-PARITY WP-1: the cross-stack (ours / Connext / Fast DDS) parity harness
-           #:run-echo-responder #:run-echo-pinger #:run-echo-ladder
+           #:run-echo-responder #:run-echo-pinger #:corpus-capture #:corpus-verify #:*corpus-dir* #:run-echo-ladder
            #:perf-data #:make-perf-data
            #:run-latency #:run-throughput #:run-bench #:run-bench-shmem #:run-bench-zerocopy
            #:run-bench-smoke #:run-bench-shmem-smoke #:run-bench-zerocopy-smoke

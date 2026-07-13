@@ -15,4 +15,5 @@
   :components ((:file "packages")
                (:file "perftest")
                (:file "keeplast-bench")
-               (:file "xperf")))
+               (:file "xperf")
+               (:file "corpus")))

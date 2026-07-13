@@ -99,8 +99,12 @@ gate-hotpath:
 
 gate-types: ; ./scripts/gate-types.sh
 
+# FR-CDR-8: our codec MUST reproduce, byte for byte, the SerializedPayloads RTI Connext puts ON THE WIRE.
+# The vectors in corpus/xcdr2/ are captured from a live Connext writer (scripts/capture-corpus.sh); this
+# target only VERIFIES them, so it needs no Connext install and runs anywhere.
 corpus:
-	@echo "corpus: byte-exact XCDR vectors — not yet implemented (M1, FR-CDR-8)"
+	$(LISP) --eval '(ql:quickload :dds-bench :silent t)' \
+	        --eval '(uiop:quit (if (zerop (dds.bench:corpus-verify)) 0 1))'
 
 fuzz:
 	$(LISP) --eval '(ql:quickload :dds-tests :silent t)' \
