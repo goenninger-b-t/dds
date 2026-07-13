@@ -17,6 +17,7 @@
    #:+pal-capabilities+ #:pal-impl-name
    ;; memory (off-heap, non-GC'd, raw-pointer-addressable)
    #:alloc-static #:free-static #:static-pointer #:static-length #:static-sap+
+   #:sap-copy-in #:sap-copy-out #:*memcpy-fp*
    #:static-vector-p
    #:mem-ref-u8 #:mem-set-u8
    ;; atomics: generic CAS / fetch-add over a PAL ATOMIC-CELL (M0 stub CLOSED, ADR 0041);

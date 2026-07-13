@@ -118,7 +118,7 @@
       (setf (cffi:mem-ref sap :uint32 (+ data pos)) +skip-marker+)
       (incf w tail) (setf pos 0))
     (setf (cffi:mem-ref sap :uint32 (+ data pos)) len)
-    (dotimes (i len) (setf (cffi:mem-ref sap :uint8 (+ data pos 4 i)) (aref payload (+ off i))))
+    (dds.pal:sap-copy-in sap (+ data pos 4) payload off len)   ; BULK memcpy, was one mem-ref per OCTET
     (dds.pal:fence :release)
     (dds.pal:store-sap-u64 sap (+ base +lane-off-write+) (+ w span))
     t))
@@ -145,7 +145,7 @@
             ((= len +skip-marker+) (incf r (- capacity pos)))
             ((or (> len maxr) (> (+ 4 len) (- capacity pos)) (> (%record-span len) (- w r)))
              (return-from %lane-drain t))
-            (t (dotimes (i len) (setf (aref vec i) (cffi:mem-ref sap :uint8 (+ data pos 4 i))))
+            (t (dds.pal:sap-copy-out sap (+ data pos 4) vec 0 len)   ; BULK memcpy, was one mem-ref per OCTET
                (funcall on-datagram sink len)
                (incf r (%record-span len))))))
       (dds.pal:store-sap-u64 sap (+ base +lane-off-read+) r)

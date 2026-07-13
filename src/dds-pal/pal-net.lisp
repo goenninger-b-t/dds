@@ -93,6 +93,43 @@
     (unwind-protect (let ((*thread-timespec* tp)) (funcall fn))
       (cffi:foreign-free tp))))
 
+;;; ---- bulk octet copy to/from a foreign SAP (shared-memory rings, syscall buffers) ----
+
+(defparameter *memcpy-fp*
+  (cffi:foreign-symbol-pointer "memcpy")
+  "The RESOLVED memcpy pointer, looked up ONCE at load. Cached for the same reason as *clock-gettime-fp*:
+   a by-NAME foreign call on Clasp re-resolves the symbol every call (~3.8 us of dlsym). Every hot foreign
+   call in this codebase goes through a cached pointer.")
+
+(defun* sap-copy-in (sap offset vec voff len)
+    (function (t (integer 0) (simple-array (unsigned-byte 8) (*)) (integer 0) (integer 0)) t)
+  "Copy LEN octets from VEC[VOFF..] into the foreign region at SAP+OFFSET, in BULK (memcpy) when VEC is
+   ALLOC-STATIC-backed (foreign, SAP-addressable), else element-wise.
+
+   WP-PERF: the SHMEM ring wrote its payload into shared memory ONE BYTE AT A TIME through
+   (setf (cffi:mem-ref sap :uint8 ...)) — ~11 ns/octet, the identical defect class the CDR codec had, in a
+   different file. That was ~2.8 us of every 256 B %shmem-send. The element-wise branch is retained only for
+   a GC-heap source vector (the unit tests pass one); every production payload is arena/static-backed, so it
+   takes the memcpy."
+  (if (static-vector-p vec)
+      (cffi:foreign-funcall-pointer
+       *memcpy-fp* () :pointer (cffi:inc-pointer sap offset)
+       :pointer (cffi:inc-pointer (static-pointer vec) voff) :size len :pointer)
+      (dotimes (i len) (setf (cffi:mem-ref sap :uint8 (+ offset i)) (aref vec (+ voff i)))))
+  t)
+
+(defun* sap-copy-out (sap offset vec voff len)
+    (function (t (integer 0) (simple-array (unsigned-byte 8) (*)) (integer 0) (integer 0)) t)
+  "Copy LEN octets from the foreign region at SAP+OFFSET into VEC[VOFF..], in BULK (memcpy) when VEC is
+   ALLOC-STATIC-backed, else element-wise. The receive twin of SAP-COPY-IN — the SHMEM drain read its
+   records out of shared memory one byte at a time for the same ~11 ns/octet."
+  (if (static-vector-p vec)
+      (cffi:foreign-funcall-pointer
+       *memcpy-fp* () :pointer (cffi:inc-pointer (static-pointer vec) voff)
+       :pointer (cffi:inc-pointer sap offset) :size len :pointer)
+      (dotimes (i len) (setf (aref vec (+ voff i)) (cffi:mem-ref sap :uint8 (+ offset i)))))
+  t)
+
 (defun* spawn (fn &key name)
     (function (function &key (:name (or null string))) t)
   "Spawn a thread running FN, named NAME (default \"dds\"). Returns the thread. Identical on both impls
