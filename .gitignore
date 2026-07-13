@@ -33,3 +33,7 @@ interop/perftest/connext/*.o
 interop/perftest/connext/.gen.stamp
 interop/perftest/connext/perf_pinger
 interop/perftest/connext/perf_responder
+
+# Fast DDS non-4-aligned interop leg: generated type support + binary (regenerate with `make gen`)
+interop/fastdds/perfdata/gen/
+interop/fastdds/perfdata/perf_sub
