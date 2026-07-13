@@ -237,11 +237,19 @@
   (let ((a (locator-address loc)))
     (logior (aref a 0) (ash (aref a 1) 8) (ash (aref a 2) 16) (ash (aref a 3) 24))))
 
+(defun* locator-unspecified-ipv4-p (loc)
+    (function (locator) t)
+  "T iff LOC's IPv4 address is the unspecified address 0.0.0.0 — i.e. address octets 12..15 are all
+   zero (RTPS 2.5 §9.3.2.4: Locator_t carries a 16-octet address with the IPv4 in the low 4 octets).
+   Tested on the OCTETS: the dotted-quad is a rendering of this address, never its identity."
+  (let ((a (locator-address loc)))
+    (and (zerop (aref a 12)) (zerop (aref a 13)) (zerop (aref a 14)) (zerop (aref a 15)))))
+
 (defun* locator-usable-udpv4-p (loc)
     (function (locator) t)
   "T iff LOC is a UDPv4 locator with a routable (non-0.0.0.0) address."
   (and (= (locator-kind loc) +locator-kind-udpv4+)
-       (not (string= (locator-ipv4-string loc) "0.0.0.0"))))
+       (not (locator-unspecified-ipv4-p loc))))
 
 (defun* usable-udpv4-locator (locators)
     (function (list) t)
@@ -256,7 +264,12 @@
   "SPDPdiscoveredParticipantData (RTPS 2.5 §8.5.3.2 / §9.6.2.2): the subset of
    ParticipantBuiltinTopicData carried as a ParameterList in the SPDP DATA — GUID
    prefix, protocol version, vendor id, default/metatraffic unicast locator lists,
-   lease duration, and the builtin-endpoint set."
+   lease duration, and the builtin-endpoint set.
+
+   USER-DEST is not wire data: it is an NFR-MEM memo of the user-plane (host . port) resolved from the
+   locator lists above (see DDS.DISC::%USABLE-DESTINATION), cached here so the per-sample send path stops
+   re-resolving it. :UNRESOLVED = not yet computed, NIL = no usable destination, a CONS = the destination.
+   Because a re-announce parses a FRESH spdp-data, the memo cannot outlive the record it describes."
   (guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element 0)
                :type (simple-array (unsigned-byte 8) (12)))
   (version-major 2 :type (unsigned-byte 8))
@@ -270,7 +283,12 @@
   ;; PID_SHMEM_HOST_UUID (vendor 0x8040, ADR 0013): 8-octet same-host UUID; 0 = none/absent.
   (host-uuid 0 :type (unsigned-byte 64))
   ;; PID_IDENTITY_TOKEN (0x1001, DDS-Security 1.1 §7.4.3.2): CDR-LE DataHolder octets; NIL = security OFF.
-  (identity-token-octets nil :type (or null (simple-array (unsigned-byte 8) (*)))))
+  (identity-token-octets nil :type (or null (simple-array (unsigned-byte 8) (*))))
+  ;; NFR-MEM memo of the resolved user-plane (host . port) — a PURE function of the locator lists above,
+  ;; so it is cached HERE rather than on the node: a re-announce parses a FRESH spdp-data, which carries a
+  ;; fresh (:unresolved) memo, so the cache cannot go stale. :UNRESOLVED = not yet computed; NIL = computed,
+  ;; no usable destination; a CONS = the destination. Resolved by DDS.DISC::%USABLE-DESTINATION.
+  (user-dest :unresolved :type t))
 
 (defun* %make-scratch (n)
     (function ((integer 0)) (values dds.core.buffer:cursor (simple-array (unsigned-byte 8) (*))))

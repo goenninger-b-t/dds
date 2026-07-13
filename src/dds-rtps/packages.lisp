@@ -172,7 +172,7 @@
            #:spdp-data-default-unicast-locators #:spdp-data-metatraffic-unicast-locators
            #:spdp-data-lease-duration-seconds #:spdp-data-lease-duration-nanosec
            #:spdp-data-builtin-endpoint-set
-           #:spdp-data-host-uuid #:spdp-data-identity-token-octets
+           #:spdp-data-host-uuid #:spdp-data-identity-token-octets #:spdp-data-user-dest
            #:serialize-spdp-data #:parse-spdp-data
            #:run-discovery-test
            #:+reliability-best-effort+ #:+reliability-reliable+

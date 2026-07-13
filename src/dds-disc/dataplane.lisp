@@ -572,14 +572,10 @@
   (dolist (group (%pack-plan items (%pack-budget buf)))
     (%send-raw-buf node buf (%build-packed-datagram node buf group) host port shmem-dest)))
 
-(defun* %usable-destination (p)
+(defun* %resolve-usable-destination (p)
     (function (dds.rtps.discovery:spdp-data) t)
-  "A sendable (host . port) for user traffic to participant P, selected from its
-   advertised locator LISTS: a routable UDPv4 default-unicast locator (host+port
-   from that locator); else — if every default-unicast locator is non-routable — a
-   routable metatraffic ADDRESS paired with a default-unicast PORT (same host, user
-   port). NIL if none is usable. Foreign stacks (RTI) advertise several locators
-   including 0.0.0.0 placeholders; this picks one that can actually be reached."
+  "Compute (uncached) a sendable (host . port) for user traffic to participant P — see %USABLE-DESTINATION,
+   which memoizes this. Allocates a dotted-quad string and a cons; called once per discovered SPDP record."
   (let* ((dlocs (dds.rtps.discovery:spdp-data-default-unicast-locators p))
          (mlocs (dds.rtps.discovery:spdp-data-metatraffic-unicast-locators p))
          (d (dds.rtps.discovery:usable-udpv4-locator dlocs))
@@ -591,6 +587,28 @@
        (cons (dds.rtps.discovery:locator-ipv4-string m)
              (%locator-port (dds.rtps.discovery:locator-port (first dlocs)))))
       (t nil))))
+
+(defun* %usable-destination (p)
+    (function (dds.rtps.discovery:spdp-data) t)
+  "A sendable (host . port) for user traffic to participant P, selected from its
+   advertised locator LISTS: a routable UDPv4 default-unicast locator (host+port
+   from that locator); else — if every default-unicast locator is non-routable — a
+   routable metatraffic ADDRESS paired with a default-unicast PORT (same host, user
+   port). NIL if none is usable. Foreign stacks (RTI) advertise several locators
+   including 0.0.0.0 placeholders; this picks one that can actually be reached.
+
+   NFR-MEM: MEMOIZED on P's user-dest slot. The result is a pure function of P's locator lists, but this
+   sits on the per-sample send path (every ACKNACK/DATA destination resolution), where it was building a
+   dotted-quad STRING (a full FORMAT NIL) and a fresh CONS on EVERY send. The memo cannot go stale: a
+   re-announce parses a FRESH spdp-data carrying a fresh :UNRESOLVED memo (%record-discovered REPLACES the
+   struct in disc-node-discovered), so the cache lifetime is exactly the record's. A benign race between
+   receiver threads recomputes the same value.
+
+   The memoized cons is SHARED, so callers MUST treat it as read-only."
+  (let ((memo (dds.rtps.discovery:spdp-data-user-dest p)))
+    (if (eq memo :unresolved)
+        (setf (dds.rtps.discovery:spdp-data-user-dest p) (%resolve-usable-destination p))
+        memo)))
 
 (defun* %prefix-user-destination (node prefix)
     (function (disc-node (simple-array (unsigned-byte 8) (12))) (or null cons))
