@@ -110,13 +110,7 @@
 
 ;;; ---- clock ----
 
-(defun* monotonic-ns ()
-    (function () integer)
-  "Monotonic time in nanoseconds. M0 uses the portable real-time clock scaled to
-   ns; a CFFI clock_gettime(CLOCK_MONOTONIC) fast path replaces this later."
-  (multiple-value-bind (q) (truncate (* (get-internal-real-time)
-                                        (/ 1000000000 internal-time-units-per-second)))
-    q))
+;; MONOTONIC-NS lives in pal-net.lisp — ONE clock_gettime implementation shared by both impls.
 
 ;;; ---- atomics / threads / gc ----
 ;;; Generic CAS/fetch-add over an ATOMIC-CELL (M0 stub CLOSED, ADR 0041). The SAP-targeted
@@ -214,10 +208,8 @@
   (declare (ignore sap offset delta))
   (error 'pal-unimplemented :op 'atomic-incf-sap-u64))
 
-(defun* spawn (fn &key name)
-    (function (function &key (:name (or null string))) t)
-  "Spawn a thread running FN, named NAME (default \"dds\"). Returns the thread."
-  (bordeaux-threads:make-thread fn :name (or name "dds")))
+;; SPAWN lives in pal-net.lisp — identical bordeaux-threads call on both impls, and it must wrap the thread
+;; body in CALL-WITH-THREAD-CLOCK (defined there) to give the thread its MONOTONIC-NS scratch.
 (defun* join (thread)
     (function (t) t)
   "Block until THREAD finishes; return its result."

@@ -14,6 +14,93 @@
 
 (cffi:defcfun ("clock_gettime" %clock-gettime) :int (clk-id :int) (tp :pointer))
 
+;;; ---- monotonic clock (latency measurement + every RTPS timer deadline) ----
+;; ONE clock, ONE code path, BOTH implementations (owner directive 2026-07-13: Clasp uses the CFFI clock too).
+;; Two Clasp-specific costs had to be root-caused first — see *clock-gettime-fp* and *thread-timespec*.
+
+(defparameter *clock-monotonic-id*
+  (if (member :darwin *features*) 4 1)
+  "clock_gettime(2) clk_id of the finest-grained MONOTONIC clock on this OS, chosen by MEASURED RESOLUTION,
+   not by name — 4 = CLOCK_MONOTONIC_RAW on macOS, 1 = CLOCK_MONOTONIC on Linux (values read from the
+   platform headers, verified against the installed SDK; never from memory).
+
+   Picking by name is silently wrong in BOTH directions. macOS deliberately coarsens CLOCK_MONOTONIC (id 6)
+   to a 1 us tick — useless for profiling a ~22 us path — while its RAW clock ticks at 41 ns. On Linux id 6 is
+   CLOCK_MONOTONIC_COARSE (~ms) and the call SUCCEEDS, so a measurement taken with it is quantised into
+   nonsense while still looking healthy; Linux's CLOCK_MONOTONIC (id 1) is the ns-resolution vDSO fast path.
+   Computed from *FEATURES* rather than a reader conditional so this shared PAL file stays conditional-free.")
+
+(defparameter *clock-gettime-fp*
+  (cffi:foreign-symbol-pointer "clock_gettime")
+  "The RESOLVED clock_gettime function pointer, looked up ONCE at load.
+
+   WP-PERF, and this is a Clasp defect worth naming: calling a foreign function BY NAME on Clasp re-resolves
+   the symbol on EVERY call. Measured on this machine — clock_gettime by name 4230 ns/call, and even a bare
+   getpid() by name 4824 ns/call, versus 379 ns through a pre-resolved pointer. ~3.8 us of every by-name
+   Clasp FFI call is dlsym. SBCL does not have this problem (13 ns either way), so it is invisible unless you
+   measure Clasp. Every hot foreign call in this codebase must go through a cached pointer like this one.")
+
+(defvar *thread-timespec* nil
+  "A per-thread, pre-allocated 16-octet foreign `struct timespec` scratch for MONOTONIC-NS, bound by SPAWN
+   for every PAL-created thread (receiver, sender, flow-control, liveliness, ...); NIL in a thread the PAL
+   did not create, which then falls back to a per-call WITH-FOREIGN-OBJECT.
+
+   WP-PERF, the second Clasp defect: WITH-FOREIGN-OBJECT is a real malloc on Clasp — measured 3790 ns/call
+   for clock read + per-call buffer vs 518 ns with the buffer hoisted, i.e. ~3.3 us of foreign malloc EVERY
+   call. (On SBCL it is stack-allocated and free: 12 ns either way.) The buffer must therefore be reused —
+   but it CANNOT simply be a global, because the receiver thread and the user thread read the clock
+   concurrently and would tear each other's timespec, corrupting a timestamp. Per-thread is the fix that is
+   both fast and race-free.")
+
+(defun* monotonic-ns ()
+    (function () integer)
+  "Monotonic time in NANOSECONDS (clock_gettime, *clock-monotonic-id*) — the timebase for every latency
+   measurement and RTPS timer deadline. Reads the 16-octet struct timespec (tv_sec@0, tv_nsec@8, both 64-bit
+   on the supported targets) into this thread's pre-allocated scratch. Falls back to the scaled
+   internal-real-time clock if the syscall fails, so it never signals.
+
+   Replaces the M0 (get-internal-real-time) implementation on BOTH impls. On SBCL that clock had ONE
+   MICROSECOND of resolution (internal-time-units-per-second = 1e6), so every latency figure this project
+   published was quantised to 1 us per timestamp — which is exactly why they all landed on multiples of 500 ns
+   after RTT/2 — and segment-level profiling of a path whose segments are single microseconds was IMPOSSIBLE,
+   not merely noisy. The PAL's own M1 note promised this fast path and it had never landed.
+
+   Measured cost/resolution: SBCL 12 ns/call, 41 ns tick. Clasp 0.5 us/call, 41 ns tick — SAME clock, same
+   resolution, but Clasp cannot reach SBCL's cost: after removing the per-call dlsym (*clock-gettime-fp*) and
+   the per-call foreign malloc (*thread-timespec*), the ~0.5 us residual is Clasp's libffi dynamic dispatch,
+   for which CFFI provides no direct-call compiler macro on Clasp (verified: COMPILER-MACRO-FUNCTION is NIL
+   for FOREIGN-FUNCALL and FOREIGN-FUNCALL-POINTER there). That residual is upstream and not ours to remove.
+   It is affordable because MONOTONIC-NS is NOT on the per-sample path — it serves blocking-wait deadlines,
+   the flow-controller token bucket (opt-in async writers) and shmem stress loops."
+  (flet ((read-clock (tp)
+           (if (zerop (the (signed-byte 32)
+                           (cffi:foreign-funcall-pointer
+                            *clock-gettime-fp* () :int *clock-monotonic-id* :pointer tp :int)))
+               (+ (* (cffi:mem-ref tp :int64 0) 1000000000) (cffi:mem-ref tp :int64 8))
+               (truncate (* (get-internal-real-time)
+                            (/ 1000000000 internal-time-units-per-second))))))
+    (let ((tp *thread-timespec*))
+      (if tp
+          (read-clock tp)
+          (cffi:with-foreign-object (tp2 :uint8 16) (read-clock tp2))))))
+
+(defun* call-with-thread-clock (fn)
+    (function (function) t)
+  "Run FN with this thread's MONOTONIC-NS scratch timespec allocated and bound, freeing it on exit. SPAWN
+   wraps every PAL thread in this; a non-PAL thread (the user's own) may wrap itself to get the fast clock
+   path — the bench/profiling harness does exactly that."
+  (let ((tp (cffi:foreign-alloc :uint8 :count 16)))
+    (unwind-protect (let ((*thread-timespec* tp)) (funcall fn))
+      (cffi:foreign-free tp))))
+
+(defun* spawn (fn &key name)
+    (function (function &key (:name (or null string))) t)
+  "Spawn a thread running FN, named NAME (default \"dds\"). Returns the thread. Identical on both impls
+   (bordeaux-threads), so it lives here rather than being duplicated per-impl. The body runs inside
+   CALL-WITH-THREAD-CLOCK so every PAL thread gets MONOTONIC-NS's pre-allocated per-thread timespec — without
+   it, a clock read on a Clasp thread pays a ~3.3 us foreign malloc (see *thread-timespec*)."
+  (bordeaux-threads:make-thread (lambda () (call-with-thread-clock fn)) :name (or name "dds")))
+
 (defun* realtime-ns ()
     (function () integer)
   "Wall-clock time in NANOSECONDS since the Unix epoch (clock_gettime CLOCK_REALTIME) — the DDS

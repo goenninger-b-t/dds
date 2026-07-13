@@ -182,7 +182,13 @@ in-segment `PTHREAD_PROCESS_SHARED` mutex/condvar. All thin CFFI wrappers; no ex
 
 | Symbol | Kind | Description |
 |---|---|---|
-| `dds.pal:monotonic-ns` | function | `()` — monotonic time in nanoseconds. |
+| `dds.pal:monotonic-ns` | function | `()` — monotonic time in nanoseconds, via `clock_gettime` (CFFI, one shared implementation on both impls). The timebase for every latency measurement and RTPS timer deadline. **Resolution 41 ns**; cost 16 ns/call on SBCL, 633 ns/call on Clasp (see below). Superseded the M0 `get-internal-real-time` clock, which had **1 µs** resolution on SBCL — every latency figure published before this landed was quantised to 1 µs per timestamp. |
+| `dds.pal:*clock-monotonic-id*` | special | The `clock_gettime` clk_id, chosen by **measured resolution**, not by name: `4` = `CLOCK_MONOTONIC_RAW` on macOS (id `6`, `CLOCK_MONOTONIC`, is deliberately coarsened to a 1 µs tick there), `1` = `CLOCK_MONOTONIC` on Linux (ns, vDSO). Picking by name is silently wrong both ways — id `6` on Linux is `CLOCK_MONOTONIC_COARSE` (~ms) and the call still *succeeds*. |
+| `dds.pal:*clock-gettime-fp*` | special | The `clock_gettime` pointer, resolved **once** at load. Calling a foreign function *by name* on Clasp re-resolves the symbol on **every call** — measured 4230 ns/call (even bare `getpid()` costs 4824 ns) vs 379 ns through a cached pointer. Every hot foreign call must go through a cached pointer. |
+| `dds.pal:*thread-timespec*` | special | Per-thread pre-allocated foreign `struct timespec` for `monotonic-ns`, bound by `spawn`. `with-foreign-object` is a real `malloc` on Clasp (~3.3 µs/call); it must be reused — but per-thread, never global, because the receiver and user threads read the clock concurrently and would tear each other's timestamp. |
+| `dds.pal:call-with-thread-clock` | function | `(fn)` — run FN with this thread's `monotonic-ns` scratch bound. `spawn` wraps every PAL thread in it; a thread the PAL did not create (e.g. a bench harness) may wrap itself to get the fast path instead of the `with-foreign-object` fallback. |
+
+> **Clasp clock cost — a known, root-caused platform limit.** Clasp is **633 ns/call** vs SBCL's **16 ns**, with the *same* clock and the *same* 41 ns resolution. The two avoidable costs are fixed above (per-call `dlsym`, per-call foreign `malloc`); the ~600 ns residual is Clasp's **libffi dynamic dispatch** — CFFI exposes no direct-call compiler macro on Clasp (`compiler-macro-function` is `NIL` for `foreign-funcall` and `foreign-funcall-pointer`), whereas SBCL emits a direct inline call. Closing it requires an upstream CFFI/Clasp contribution, not a change here. It is affordable because `monotonic-ns` is **not on the per-sample path** (it serves blocking-wait deadlines, the flow-controller token bucket on opt-in async writers, and shmem stress loops). **Consequence:** sub-µs *profiling* is done on SBCL; both impls remain fully validated for correctness.
 
 **GC control / measurement**
 
@@ -833,8 +839,8 @@ affect SHMEM on Clasp/Linux.) This mirrors the existing Clasp threading and fore
   `fence` is now a real `:acquire`/`:release`/`:full` barrier, and the SAP-targeted 64-bit atomics + POSIX
   shm/pshared primitives are implemented (SBCL full; Clasp has the SAP-CAS + `shm-create`/macOS gaps noted above).
   The generic `cas`/`atomic-incf` place stubs remain (no callers; the SAP forms supersede them). `gc-suggest` and
-  `with-gc-inhibited` are still no-ops; `monotonic-ns` uses the portable real-time clock scaled to ns (a
-  `clock_gettime(CLOCK_MONOTONIC)` fast path is a later replacement).
+  `with-gc-inhibited` are still no-ops. (`monotonic-ns` NO LONGER uses the portable scaled clock — the
+  promised `clock_gettime` fast path has landed; see the clock entry above.)
 - **UDP is best-effort by design:** the UDPv4 transport's `send` swallows a `sendto` failure to one destination
   (an unreachable/stale/placeholder locator, e.g. a peer advertising `0.0.0.0`) and returns 0 rather than
   signalling — the reliable RTPS layer recovers via HEARTBEAT/ACKNACK. See the [RTPS engine](rtps-engine.md).
