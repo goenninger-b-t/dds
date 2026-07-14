@@ -123,7 +123,7 @@ jobs:
         run: make gate-mem
 
       - name: fuzz (CDR/RTPS parser fuzzers, prod + safety-0)
-        run: make fuzz
+        run: make fuzz LISP=./scripts/with-sbcl.sh
 
       - name: wire (validate emitted RTPS against the tshark RTPS dissector)
         run: make wire
