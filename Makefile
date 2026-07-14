@@ -8,7 +8,7 @@ CLASP := ./scripts/with-clasp.sh
 SBCL  := ./scripts/with-sbcl.sh
 LISP  ?= $(CLASP)
 
-.PHONY: all build test build-clasp build-sbcl test-clasp test-sbcl \
+.PHONY: all build test build-clasp build-sbcl test-clasp test-sbcl gate-build gate-mem \
         build-all test-all gate-hotpath gate-types corpus fuzz wire interop \
         square-pub square-sub square-spy large-pub large-sub gated-sub corpus-capture \
         nokey-pub nokey-sub keyed-flat-pub keyed-flat-sub \
@@ -111,15 +111,21 @@ gate-types: ; ./scripts/gate-types.sh
 # `build` above is the incremental convenience load; THIS is the one that can actually fail.
 gate-build: ; ./scripts/gate-build.sh $(LISP)
 
+# NFR-MEM ALLOCATION RATCHET (ADR 0062). `mem` above measures the CODEC in isolation (~0 B/iter) — a real
+# assertion, but NOT the per-sample budget it is credited with, which is why it stayed green while the live
+# DCPS path allocated ~3.9 KB/sample. gate-mem measures the END-TO-END path and ratchets it DOWN toward 0.
+# Fails on regression AND on an un-lowered ceiling after an improvement. SBCL only (bytes-consed is 0 on Clasp).
+gate-mem: ; ./scripts/gate-mem.sh
+
 # FR-CDR-8: our codec MUST reproduce, byte for byte, the SerializedPayloads RTI Connext puts ON THE WIRE.
 # The vectors in corpus/xcdr2/ are captured from a live Connext writer (scripts/capture-corpus.sh); this
 # target only VERIFIES them, so it needs no Connext install and runs anywhere.
 corpus:
-	$(LISP) --eval '(ql:quickload :dds-bench :silent t)' \
+	$(LISP) --eval '(asdf:load-system :dds-bench)' \
 	        --eval '(uiop:quit (if (zerop (dds.bench:corpus-verify)) 0 1))'
 
 fuzz:
-	$(LISP) --eval '(ql:quickload :dds-tests :silent t)' \
+	$(LISP) --eval '(asdf:load-system :dds-tests)' \
 	        --eval '(handler-case (progn (dds.tests:run-pbt-tests) (uiop:quit 0)) (error (e) (format t "~&~a~%" e) (uiop:quit 1)))'
 
 wire:
@@ -248,17 +254,20 @@ fastdds-keyed-flat-pub:
 fastdds-keyed-flat-sub:
 	./scripts/with-fastdds.sh bash -c 'cd interop/keyed-flatdata/fastdds && ./keyed_flat_sub $(SECONDS)'
 
+# LIVE cross-vendor interop (FR-IO). Was a STUB: it ran `wire` and ECHOED "pending a Connext install"
+# while Connext 7.3.1 was installed and passing — asserting nothing, unable to fail, since M0.
+# A gate that cannot run must not report success: gate-interop.sh FAILS on a missing vendor unless
+# excused via INTEROP_ALLOW_MISSING=connext|fastdds|both.
 interop: wire
-	@echo "interop: 'wire' validates our output vs the tshark RTPS dissector."
-	@echo "interop: bidirectional Connext interop pending a Connext install (M2, FR-IO)."
+	./scripts/gate-interop.sh
 
 bench:
-	$(SBCL) --eval '(ql:quickload :dds-bench :silent t)' \
+	$(SBCL) --eval '(asdf:load-system :dds-bench)' \
 	        --eval '(uiop:symbol-call :dds.bench :run-bench :latency-samples $(LATSAMPLES) :throughput-samples $(THRUSAMPLES))' \
 	        --eval '(uiop:quit 0)'
 
 bench-shmem:
-	$(SBCL) --eval '(ql:quickload :dds-bench :silent t)' \
+	$(SBCL) --eval '(asdf:load-system :dds-bench)' \
 	        --eval '(uiop:symbol-call :dds.bench :run-bench-shmem :latency-samples $(LATSAMPLES) :throughput-samples $(THRUSAMPLES))' \
 	        --eval '(uiop:quit 0)'
 
@@ -266,7 +275,7 @@ bench-shmem:
 # above *zerocopy-min-payload-bytes*). Each ZEROCOPY run asserts disc-node-zc-sends advanced (a
 # 16-byte reference crossed, not the payload). NOT cleared for ship — pending counsel (R6).
 bench-zerocopy:
-	$(SBCL) --eval '(ql:quickload :dds-bench :silent t)' \
+	$(SBCL) --eval '(asdf:load-system :dds-bench)' \
 	        --eval '(uiop:symbol-call :dds.bench :run-bench-zerocopy)' \
 	        --eval '(uiop:quit 0)'
 
@@ -275,7 +284,7 @@ bench-zerocopy:
 # copy out of SHMEM, ~830x less than WP-ZEROCOPY-v1 — NOT literal-0-copy). Lives in dds-tests (needs
 # the dds-gen FlatData type); writes bench/report/2026-06-14-wp-flatdata.md. NOT cleared for ship (R6).
 bench-flatdata:
-	$(SBCL) --eval '(ql:quickload :dds-tests :silent t)' \
+	$(SBCL) --eval '(asdf:load-system :dds-tests)' \
 	        --eval '(handler-case (progn (uiop:symbol-call :dds.tests :run-bench-flatdata :file "bench/report/2026-06-14-wp-flatdata.md") (uiop:quit 0)) (error (e) (format t "~&~a~%" e) (uiop:quit 1)))'
 
 # WP-FLATDATA-ZC-LOAN Phase F2 (FR-PF-3/4, NFR-PERF-7, FR-LANG-7): the literal-0-copy RX headline — the RX GC
@@ -285,7 +294,7 @@ bench-flatdata:
 # dds-gen FlatData type); writes bench/report/2026-06-16-wp-flatdata-zc-loan.md. SBCL only (ZC, ADR 0013).
 # NOT cleared for ship — pending counsel (R6); see ADR 0017.
 bench-flatdata-zc-loan:
-	$(SBCL) --eval '(ql:quickload :dds-tests :silent t)' \
+	$(SBCL) --eval '(asdf:load-system :dds-tests)' \
 	        --eval '(handler-case (progn (uiop:symbol-call :dds.tests :run-bench-flatdata-zc-loan :file "bench/report/2026-06-16-wp-flatdata-zc-loan.md") (uiop:quit 0)) (error (e) (format t "~&~a~%" e) (uiop:quit 1)))'
 
 # WP-FLATDATA-LOAN-WRITE (FR-PF-4, FR-LANG-7): the 0-copy TX headline — the writer writes a FlatData sample
@@ -294,7 +303,7 @@ bench-flatdata-zc-loan:
 # (zero copies), GC bytes/sample + ns/sample. Writes bench/report/2026-07-03-wp-flatdata-loan-write.md. SBCL only
 # (ZC + foreign-SAP writes, ADR 0013). NOT cleared for ship — pending counsel (R6); see ADR 0042.
 bench-flatdata-loan-write:
-	$(SBCL) --eval '(ql:quickload :dds-tests :silent t)' \
+	$(SBCL) --eval '(asdf:load-system :dds-tests)' \
 	        --eval '(handler-case (progn (uiop:symbol-call :dds.tests :run-bench-flatdata-loan-write :file "bench/report/2026-07-03-wp-flatdata-loan-write.md") (uiop:quit 0)) (error (e) (format t "~&~a~%" e) (uiop:quit 1)))'
 
 # WP-ZC-LOAN-LOCKFREE Phase C (FR-PF-3/4, NFR-PERF-7, FR-LANG-7): the lock-free 0-alloc loaned RX headline —
@@ -305,13 +314,13 @@ bench-flatdata-loan-write:
 # bench/report/2026-06-16-wp-zc-loan-lockfree.md. SBCL only (ZC + foreign-SAP atomics, ADR 0013).
 # NOT cleared for ship — pending counsel (R6); see ADR 0018.
 bench-zc-loan-lockfree:
-	$(SBCL) --eval '(ql:quickload :dds-tests :silent t)' \
+	$(SBCL) --eval '(asdf:load-system :dds-tests)' \
 	        --eval '(handler-case (progn (uiop:symbol-call :dds.tests :run-bench-zc-loan-lockfree :file "bench/report/2026-06-16-wp-zc-loan-lockfree.md") (uiop:quit 0)) (error (e) (format t "~&~a~%" e) (uiop:quit 1)))'
 
 # WP-ZC-MULTI-DEST-REFCOUNT (FR-PF-4, FR-LANG-7; R6, ADR 0047): one shared Zero-Copy slot across N co-resident
 # ZC destinations — slots + app->slot copies drop from N to 1 at fan-out. SBCL only (Clasp SHMEM pass-skips).
 bench-multi-dest-zc:
-	$(SBCL) --eval '(ql:quickload :dds-tests :silent t)' \
+	$(SBCL) --eval '(asdf:load-system :dds-tests)' \
 	        --eval '(handler-case (progn (uiop:symbol-call :dds.tests :run-bench-multi-dest-zc :file "bench/report/2026-07-05-wp-zc-multi-dest.md") (uiop:quit 0)) (error (e) (format t "~&~a~%" e) (uiop:quit 1)))'
 
 # WP-ASYNC-FLOW Phase F1 (FR-PF-2, FR-LANG-7): HONEST rate-shaping report — achieved-vs-configured rate,
@@ -320,7 +329,7 @@ bench-multi-dest-zc:
 # FR-PF-2 headline). Standard DDS, NOT R6 (ADR 0016). Writes bench/report/2026-06-15-wp-async-flow.md. SBCL
 # only (real threads + timing; Clasp pass-skips — the flow tests' known Clasp condvar SIGSEGV, NFR-PORT).
 bench-async-flow:
-	$(SBCL) --eval '(ql:quickload :dds-tests :silent t)' \
+	$(SBCL) --eval '(asdf:load-system :dds-tests)' \
 	        --eval '(handler-case (progn (uiop:symbol-call :dds.tests :run-bench-async-flow :file "bench/report/2026-06-15-wp-async-flow.md") (uiop:quit 0)) (error (e) (format t "~&~a~%" e) (uiop:quit 1)))'
 
 # WP-FLOW-EDF-PRIORITY (ADR 0016; FR-QOS-1, FR-LANG-7): deterministic ordering-quality report for the :edf +
@@ -329,7 +338,7 @@ bench-async-flow:
 # sim over the SHIPPED %flow-policy-* selectors (injected clock). Standard DDS, NOT R6 (ADR 0016). Writes
 # bench/report/2026-07-04-wp-flow-edf-priority.md. SBCL (bench convention; the sim is threadless/impl-agnostic).
 bench-flow-edf-priority:
-	$(SBCL) --eval '(ql:quickload :dds-tests :silent t)' \
+	$(SBCL) --eval '(asdf:load-system :dds-tests)' \
 	        --eval '(handler-case (progn (uiop:symbol-call :dds.tests :run-bench-flow-edf-priority :file "bench/report/2026-07-04-wp-flow-edf-priority.md") (uiop:quit 0)) (error (e) (format t "~&~a~%" e) (uiop:quit 1)))'
 
 # WP-KEEPLAST Task E1 (DDS 1.4 §2.2.3.18, FR-LANG-7): HONEST writer-side cost of per-instance
@@ -338,7 +347,7 @@ bench-flow-edf-priority:
 # bytes/sample for KEEP_ALL/KEEP_LAST x keyed/unkeyed + the keyhash-derivation line; SBCL is the
 # record (Clasp bytes-consed=0, NFR-PORT gap). Writes bench/report/2026-06-16-wp-keeplast.md.
 bench-keeplast:
-	$(SBCL) --eval '(ql:quickload :dds-bench :silent t)' \
+	$(SBCL) --eval '(asdf:load-system :dds-bench)' \
 	        --eval '(with-open-file (s "bench/report/2026-06-16-wp-keeplast.md" :direction :output :if-exists :supersede :if-does-not-exist :create) (uiop:symbol-call :dds.bench :run-keeplast-bench :samples $(KLSAMPLES) :instances $(KLINSTANCES) :depth $(KLDEPTH) :stream s))' \
 	        --eval '(uiop:quit 0)'
 
@@ -347,17 +356,17 @@ bench-keeplast:
 # BASELINE (T10 re-measures the integrated path). SBCL is the record (Clasp bytes-consed=0, NFR-PORT).
 # Writes bench/report/2026-06-27-wp-secure-discovery-t4.md.
 bench-rtps-message:
-	$(SBCL) --eval '(ql:quickload :dds-tests :silent t)' \
+	$(SBCL) --eval '(asdf:load-system :dds-tests)' \
 	        --eval '(with-open-file (s "bench/report/2026-06-27-wp-secure-discovery-t4.md" :direction :output :if-exists :supersede :if-does-not-exist :create) (uiop:symbol-call :dds.tests :run-rtps-message-bench :iters $(RTPSITERS) :size $(RTPSSIZE) :stream s))' \
 	        --eval '(uiop:quit 0)'
 
 bench-rtps-message-clasp:
-	$(CLASP) --eval '(ql:quickload :dds-tests :silent t)' \
+	$(CLASP) --eval '(asdf:load-system :dds-tests)' \
 	         --eval '(with-open-file (s "bench/report/2026-06-27-wp-secure-discovery-t4-clasp.md" :direction :output :if-exists :supersede :if-does-not-exist :create) (uiop:symbol-call :dds.tests :run-rtps-message-bench :iters $(RTPSITERS) :size $(RTPSSIZE) :stream s))' \
 	         --eval '(uiop:quit 0)'
 
 bench-rtps-protection:
-	$(SBCL) --eval '(ql:quickload :dds-tests :silent t)' \
+	$(SBCL) --eval '(asdf:load-system :dds-tests)' \
 	        --eval '(with-open-file (s "bench/report/2026-06-28-wp-secure-discovery-t10.md" :direction :output :if-exists :supersede :if-does-not-exist :create) (uiop:symbol-call :dds.tests :run-rtps-protection-bench :iters $(RTPSITERS) :size $(RTPSSIZE) :stream s))' \
 	        --eval '(uiop:quit 0)'
 
@@ -377,7 +386,7 @@ zc-xproc:
 	./scripts/zerocopy-roundtrip.sh
 
 mem:
-	$(SBCL) --eval '(ql:quickload :dds-tests :silent t)' \
+	$(SBCL) --eval '(asdf:load-system :dds-tests)' \
 	        --eval '(handler-case (progn (dds.tests:run-mem-test) (uiop:quit 0)) (error (e) (format t "~&~a~%" e) (uiop:quit 1)))'
 
 clean:

@@ -9,11 +9,26 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 TS=""
-for c in tshark /Applications/Wireshark.app/Contents/MacOS/tshark; do
+# TSHARK_BIN, when set, is the ONLY candidate — it overrides the search rather than being prepended to
+# it. That is what makes this gate falsifiable: point it at a nonexistent path and the gate MUST go red
+# rather than pass vacuously. (Prepending would silently fall through to the real tshark and the
+# falsification would prove nothing — which is exactly the class of mistake this gate exists to catch.)
+CANDIDATES=(tshark /Applications/Wireshark.app/Contents/MacOS/tshark)
+[[ -n "${TSHARK_BIN:-}" ]] && CANDIDATES=("$TSHARK_BIN")
+for c in "${CANDIDATES[@]}"; do
   if command -v "$c" >/dev/null 2>&1; then TS="$c"; break; fi
   [[ -x "$c" ]] && { TS="$c"; break; }
 done
-if [[ -z "$TS" ]]; then echo "wire: SKIP — tshark not found (install Wireshark to validate)"; exit 0; fi
+if [[ -z "$TS" ]]; then
+  # A gate that CANNOT RUN must not report success. This used to `exit 0` on a missing tshark, so on any
+  # machine without Wireshark `make wire` — and `make interop`, which depends on it — passed VACUOUSLY,
+  # validating nothing while printing a green line. That is the same permanently-green failure mode as the
+  # make-corpus stub and the ql:quickload-blinded build gate.
+  echo "wire: FAIL — tshark not found; this gate cannot validate anything without it." >&2
+  echo "      Install Wireshark, or set WIRE_ALLOW_MISSING_TSHARK=1 to DELIBERATELY skip (exits 0)." >&2
+  [[ "${WIRE_ALLOW_MISSING_TSHARK:-}" == "1" ]] && { echo "wire: SKIPPED BY REQUEST (WIRE_ALLOW_MISSING_TSHARK=1) — NOT validated." >&2; exit 0; }
+  exit 1
+fi
 
 # Use a clean Wireshark config dir so the gate is immune to the user's local
 # profile (a stray ~/.config/wireshark/disabled_protos can globally disable
