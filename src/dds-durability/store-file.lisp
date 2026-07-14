@@ -678,7 +678,7 @@
       (dds.pal:fsync-stream stm))
     ;; crash-consistency fault seam (ADR 0029 §10): the <log>.tmp is fully written + fsynced; a crash
     ;; HERE (before the rename) leaves the ORIGINAL log intact (rename is the atomic commit point).
-    (when *durability-debug-file-rewrite-fault*
+    (when *durability-debug-file-rewrite-fault*   ; NOCOND(TEST): inert in production; the UNWIND dies mid-rename — the mechanism under test
       (error "dds.durability: *durability-debug-file-rewrite-fault* — simulated crash after ~a.tmp ~
               fsync, before the atomic rename (crash-before-commit; original log intact)" tid))
     (uiop:rename-file-overwriting-target tmp-path log-path)

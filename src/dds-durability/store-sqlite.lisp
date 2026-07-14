@@ -325,7 +325,7 @@
                                 tn (durable-record-writer-guid r)
                                 (%sn->be8 (durable-record-sn r))))))
                          ;; simulated crash between the DELETE and the re-MAC (test-only; rolls back)
-                         (when *durability-debug-compact-fault*
+                         (when *durability-debug-compact-fault*   ; NOCOND(TEST): inert in production; the UNWIND aborts the live txn — that is the mechanism under test
                            (error "dds.durability: *durability-debug-compact-fault* — simulated crash ~
                                    between the compacting DELETE and the chain re-MAC (topic ~a)" tn))
                          ;; recompute the surviving chain so the next reopen never false-rejects (ADR 0045)
@@ -380,7 +380,7 @@
                     (sqlite:with-transaction (car db-cell)
                       (when (plusp (%sqlite-evict-instance (car db-cell) topic key-hash (car depth-cell)))
                         ;; simulated crash between the DELETE and the re-MAC (test-only; rolls back)
-                        (when *durability-debug-compact-fault*
+                        (when *durability-debug-compact-fault*   ; NOCOND(TEST): inert in production; the UNWIND aborts the live txn
                           (error "dds.durability: *durability-debug-compact-fault* — simulated crash ~
                                   between the online evict DELETE and the chain re-MAC (topic ~a)" topic))
                         ;; re-MAC the survivors so the chain still verifies on the next reopen (ADR 0045;
@@ -533,7 +533,7 @@
                 "DELETE FROM record WHERE topic=? AND writer_guid=? AND sn=?"
                 topic writer-guid (%sn->be8 sn))
                ;; simulated crash between the DELETE and the re-MAC (test-only; rolls back -> leak, no reject)
-               (when *durability-debug-compact-fault*
+               (when *durability-debug-compact-fault*   ; NOCOND(TEST): inert in production; the UNWIND aborts the live txn
                  (error "dds.durability: *durability-debug-compact-fault* — simulated crash between the ~
                          store-delete DELETE and the chain re-MAC (topic ~a)" topic))
                ;; re-MAC the survivors so the chain still verifies on the next reopen (ADR 0045; the same
@@ -559,7 +559,7 @@
              (sqlite:with-transaction (car db-cell)
                (sqlite:execute-non-query (car db-cell) "DELETE FROM record WHERE topic=?" topic)
                ;; simulated crash between the DELETE and the survivor INSERTs (test-only; rolls back)
-               (when *durability-debug-compact-fault*
+               (when *durability-debug-compact-fault*   ; NOCOND(TEST): inert in production; the UNWIND aborts the live txn
                  (error "dds.durability: *durability-debug-compact-fault* — simulated crash mid ~
                          topic-rewrite (topic ~a)" topic))
                (dolist (r records)

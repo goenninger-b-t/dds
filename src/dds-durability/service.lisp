@@ -470,6 +470,7 @@
           (dds.pal:with-lock ((durability-service-lock service))
             (setf (durability-service-running service) nil))
           (ignore-errors (dds.disc:stop-node node))
+          ;; NOCOND(TEST): inert in production; the UNWIND aborts service-start mid-way — the mechanism under test
           (error "dds.durability: *durability-debug-start-fault* is non-NIL — simulated startup failure"))
         (let ((th (dds.pal:spawn
                    (let ((n node) (tn topic-name))

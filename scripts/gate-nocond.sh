@@ -67,6 +67,15 @@ MARKER='HOTPATH-COND'
 # violation, exempt from nothing. So the marker justifies WHERE THE FORM RUNS, not who wrote it: annotate a
 # form your MACRO EVALUATES; never a form your macro OUTPUTS.
 MACRO_MARKER='NOCOND(MACRO)'
+# NOCOND(TEST) — the SECOND (and last) exempt class (owner ruling 2026-07-14). A CRASH SIMULATOR: a
+# signalling form armed ONLY by a debug special that defaults NIL, whose entire purpose is that the UNWIND
+# is the thing being tested — *durability-debug-compact-fault* aborts a live SQLite transaction so the
+# rollback/recovery path runs; *durability-debug-file-rewrite-fault* dies mid-rename; *durability-debug-
+# start-fault* dies mid-service-start. A STATUS VALUE CANNOT SIMULATE A CRASH: the caller would carry on.
+# This is the same TEST justification the hot-path tier already grants (HOTPATH-COND(TEST)), extended to
+# the ratchet tier. The bar is strict and is NOT "it is only used by tests": the form must be INERT IN
+# PRODUCTION (guarded by a debug special defaulting NIL) and the unwind must be the mechanism under test.
+TEST_MARKER='NOCOND(TEST)'
 
 scan() {
   awk -v pat="$SIGNAL_RE" -v marker="$MARKER" '
@@ -138,14 +147,15 @@ count_file() {
   # NOTE: the marker is matched with INDEX (a literal substring), never as a regex — "NOCOND(MACRO)" read
   # as a regex is "NOCOND" followed by the GROUP "MACRO", i.e. it matches NOCONDMACRO and never the real
   # annotation. The self-test below caught exactly that; keep it literal.
-  awk -v pat="$SIGNAL_RE" -v macro="$MACRO_MARKER" '
+  awk -v pat="$SIGNAL_RE" -v macro="$MACRO_MARKER" -v testm="$TEST_MARKER" '
     /^\(defun\*?[ \t]+/ {
       # An in-file TEST function. The %-prefixed form (%run-secure-pm, ...) is the SAME thing as run-*:
       # a test whose ASSERT is its failure mechanism, not production control flow. The original pattern
       # missed it and silently counted 19 test asserts in secure-sedp.lisp as production debt.
       intest = ($2 ~ /-test$/ || $2 ~ /^%?run-/) ? 1 : 0
     }
-    { exempt = index($0, macro) || (NR > 1 && index(last, macro))
+    { exempt = index($0, macro) || (NR > 1 && index(last, macro)) \
+             || index($0, testm) || (NR > 1 && index(last, testm))
       if (!intest && $0 ~ pat && !exempt) n++
       last = $0 }
     END { print n+0 }' "$1"
@@ -167,11 +177,15 @@ cat > "$tmp/count-canary.lisp" <<'EOF'
   (assert (= 1 1)))
 (defun* %run-internal-harness ()
   (assert (= 2 2)))
+(defun* crash-simulator ()
+  (when *debug-fault*   ; NOCOND(TEST): inert in production; the UNWIND is the mechanism under test
+    (error "simulated crash")))
 EOF
 cn="$(count_file "$tmp/count-canary.lisp")"
 if [[ "$cn" -ne 1 ]]; then
   echo "gate-nocond: FAIL — self-test: the ratchet counter must count EXACTLY the 1 unexempt form in the" >&2
-  echo "             canary (2 NOCOND(MACRO) skipped, 2 in-file-test asserts skipped incl. the %run- form). Got ${cn}." >&2
+  echo "             canary (2 NOCOND(MACRO) + 1 NOCOND(TEST) skipped, 2 in-file-test asserts skipped" >&2
+  echo "             incl. the %run- form). Got ${cn}." >&2
   echo "             Either the counter is blind or NOCOND(MACRO) is over-matching — a green ratchet" >&2
   echo "             would prove NOTHING." >&2
   exit 1
