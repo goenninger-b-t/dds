@@ -100,6 +100,20 @@ also stale (its #1 item, `%writer-add-bounded` at "21 %", now measures 1.6 %).
    is only as durable as the reason nothing exercises it.* Declined for ~5 % of a budget whose tail will
    not move either way.
 
+## ⚠️ AND THE PER-SITE INSTRUMENT LIED TOO (correction, 2026-07-14)
+
+The callee-wrapping harness used `(lambda (&rest args) ... (apply orig args))`. **`&rest` conses an argument
+list per call — 32.0 B/call measured, for a 2-arg function; a direct call is 0.0 B.** Every per-site figure
+below therefore includes the wrapper's own allocation.
+
+**The TOTALS are sound** (3648 B/sample was measured unwrapped, and `gate-mem` reproduces it). **The
+per-site numbers are UPPER BOUNDS, not costs.** Memoizing `%reader-routes-for` — whose wrapped cost read
+328 B — moved the ground truth by **88 B**. The rest was the wrapper measuring itself.
+
+**Third instrument to mislead this task** (after `sb-sprof`'s byte attribution, twice). The rule gains a
+corollary: *size every candidate with a `bytes-consed` delta — and verify the delta measures the code, not
+the measurement.* **`gate-mem`'s end-to-end number is the only oracle for a claimed win.**
+
 ## The TX budget, MEASURED (2026-07-14) — the "size it first" step, done
 
 `bench/report/2026-07-14-the-tx-allocation-budget-measured.md`. `bytes-consed` deltas around each callee,

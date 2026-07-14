@@ -205,6 +205,17 @@
   (user-reader-id #x00000107 :type (unsigned-byte 32)) ; this node's user-data reader EntityId
   (user-writer-key-next 1 :type (integer 1)) ; WP-N-ENDPOINT-S1 (ADR 0048): next distinct per-participant USER-writer entity KEY; starts 1 so the first writer keeps EntityId #x0102/#x0103 (byte-identical), each subsequent DataWriter gets a distinct key -> distinct EntityId + SEDP GUID (RTPS 2.5 §9.3.1.2). Builtin/secure keys are untouched.
   (user-reader-key-next 1 :type (integer 1)) ; WP-N-ENDPOINT-S2 (ADR 0048): next distinct per-participant USER-reader entity KEY; starts 1 so the first reader keeps EntityId #x0107/#x0104 (byte-identical), each subsequent DataReader gets a distinct key -> distinct EntityId + SEDP GUID (RTPS 2.5 §9.3.1.2). Writer/reader keys are SEPARATE counters (kind 0x02/0x03 vs 0x07/0x04 disjoints them); builtin/secure keys are untouched.
+  ;; NFR-MEM (ADR 0062): memo of the RESOLVED route — remote-writer GUID -> the (reader-EntityId . engine-reader)
+  ;; list %reader-routes-for hands the receive hooks, or :NONE for "no reader". That resolution was rebuilt from
+  ;; scratch (a copy-list + a fresh cons per route) on EVERY data/heartbeat/gap handler call — 328 B/sample, the
+  ;; single biggest RX allocation — for a value that changes only on match/unmatch. INVALIDATED WHOLESALE
+  ;; (%invalidate-route-cache) by every mutation of READER-ROUTES or USER-READERS: a STALE ROUTE IS SILENT
+  ;; MIS-DELIVERY (a sample lost, or delivered to a dead reader), so the invalidation is coarse ON PURPOSE —
+  ;; discovery events are rare and a clrhash is cheap, while a missed invalidation is a correctness bug.
+  (reader-routes-cache (make-hash-table :test 'equalp) :type hash-table)
+  ;; Bumped by EVERY %invalidate-route-cache. A resolve that races an invalidation must NOT store its now-stale
+  ;; result: %reader-routes-for reads this BEFORE resolving (outside the lock) and stores only if it is unchanged.
+  (reader-routes-generation 0 :type (integer 0))
   (reader-routes (make-hash-table :test 'equalp) :type hash-table) ; WP-N-ENDPOINT-S2 (ADR 0048): the DELIVERY ROUTE — remote-writer 16-octet GUID (equalp) -> list of local user-reader EntityIds matched to it. Populated at %match-remote-endpoint (idempotent), purged on unmatch/lease-expiry (by prefix) + re-added on re-announce. The %drain source-GUID filter (each reader deserializes ONLY its matched writers) and the receive-hook demux (drive/ACKNACK the engine reader matched to the source writer, not unconditionally the primary) read it. Node-lock guarded.
   (reader-join-watermarks (make-hash-table :test 'eql) :type hash-table) ; WP-N-ENDPOINT-2C3 (ADR 0048/0017; MEMORY-SAFETY): the mid-stream ZC-joiner high-water. local user-reader EntityId (eql) -> hash(remote-writer 16-octet GUID equalp -> highest stored SN AT THE MOMENT this reader was route-added to that writer). Set ATOMICALLY with %reader-route-add (same node-lock section) ONLY for a JOINER (the writer's route was already non-empty) on a ZC-loan-capable node. %drain consults max(dr-drained, this) so a joiner NEVER drains a marker delivered before it joined (a marker whose demux %zc-bump did not count it -> would be a cross-reader use-after-free). Empty for the first reader / non-loan nodes (byte-identical). Node-lock guarded.
   ;; FR-XPORT-2 SHMEM intra-host data plane (same-host user DATA only; discovery/HB/ACKNACK stay UDP)
@@ -678,9 +689,11 @@
                   (setf (cdr cell) reader)
                   (when was-primary (setf (disc-node-primary-user-reader node) reader))))
           ((null (disc-node-user-readers node))   ; first reader -> primary (N=1 identity)
+           (%invalidate-route-cache node)
            (push (cons entity-id reader) (disc-node-user-readers node))
            (setf (disc-node-primary-user-reader node) reader))
-          (t (push (cons entity-id reader) (disc-node-user-readers node)))))   ; N-th reader (S4: secured/ZC fence lifted; same-topic fence in add-local-reader is the UAF guard); primary unchanged
+          (t (%invalidate-route-cache node)
+             (push (cons entity-id reader) (disc-node-user-readers node)))))   ; N-th reader (S4: secured/ZC fence lifted; same-topic fence in add-local-reader is the UAF guard); primary unchanged
   reader)
 
 (defun* %reader-route-add (node writer-guid reader-entity-id)
@@ -713,7 +726,8 @@
                              (setf (gethash reader-entity-id (disc-node-reader-join-watermarks node))
                                    (make-hash-table :test 'equalp))))
                 (%node-max-stored-sn node writer-guid)))
-        (setf (gethash key (disc-node-reader-routes node)) (cons reader-entity-id ids)))))
+        (setf (gethash key (disc-node-reader-routes node)) (cons reader-entity-id ids))
+        (%invalidate-route-cache node))))
   t)
 
 (defun* %node-max-stored-sn (node writer-guid)
@@ -876,6 +890,7 @@
   (dds.pal:with-lock ((disc-node-lock node))
     (let ((cell (assoc entity-id (disc-node-user-readers node) :test #'eql)))
       (when cell
+        (%invalidate-route-cache node)
         (setf (disc-node-user-readers node) (remove cell (disc-node-user-readers node)))
         (when (eq (disc-node-primary-user-reader node) (cdr cell))
           (setf (disc-node-primary-user-reader node) (cdr (first (disc-node-user-readers node)))))))
@@ -887,6 +902,7 @@
                      (setf (gethash guid (disc-node-reader-routes node)) pruned)
                      (remhash guid (disc-node-reader-routes node)))))
              (disc-node-reader-routes node))
+    (%invalidate-route-cache node)   ; ADR 0062: once, AFTER the walk — the routes just changed
     (remhash entity-id (disc-node-reader-join-watermarks node)))
   t)
 
@@ -1788,6 +1804,16 @@
             (funcall removed-place (list* direction remote nil))))))
   t)
 
+(defun* %invalidate-route-cache (node)
+    (function (disc-node) t)
+  "Drop the ENTIRE resolved-route memo (ADR 0062). Called by EVERY mutation of READER-ROUTES or
+   USER-READERS. Coarse ON PURPOSE: a stale route is SILENT MIS-DELIVERY — a sample lost, or delivered to a
+   dead reader — whereas a needless clrhash costs nothing (discovery events are rare, the receive path is
+   not). If you add a mutation site, call this from it."
+  (clrhash (disc-node-reader-routes-cache node))
+  (incf (disc-node-reader-routes-generation node))
+  t)
+
 (defun* %lease-sweep (node)
     (function (disc-node) (eql t))
   "Prune every discovered participant whose SPDP last-seen is older than its announced
@@ -1828,6 +1854,7 @@
   (%purge-prefix node prefix #'disc-node-discovered-writers)
   (%purge-prefix node prefix #'disc-node-discovered-readers)
   (%purge-prefix node prefix #'disc-node-reader-routes)   ; WP-N-ENDPOINT-S2 (ADR 0048): drop the lost writer's delivery route (unmatch/lease-expiry) so a reader stops draining a gone writer; a re-announce re-adds it
+  (%invalidate-route-cache node)   ; ADR 0062: the routes just changed — a stale resolved route is SILENT MIS-DELIVERY
   (%purge-reader-join-watermarks node prefix)   ; WP-N-ENDPOINT-2C3 (ADR 0048): drop the lost writer's ZC-joiner high-waters alongside the route (bounds the table; a re-announce re-freezes the watermark via the match-time route-add so a lease-flap never leaves a stale drain-gate = sample-loss)
   (%purge-prefix node prefix #'disc-node-decode-fail-counts)   ; ADR 0031 lim.1: drop the lost writer's decode-failure counters
   (%purge-prefix node prefix #'disc-node-incompat)         ; WP-DDS-INCOMPAT-QOS-PERPAIR (ADR 0048 §16.3): drop the lost peer's INCOMPATIBLE_QOS presence

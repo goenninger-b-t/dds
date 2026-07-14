@@ -2314,14 +2314,39 @@
    byte-identical to S2). An EMPTY route (discovery-less / pre-match / N=1) falls back to the PRIMARY reader under
    disc-node-user-reader-id — byte-identical to the pre-S2 single-reader hooks. A route id with no live engine
    reader is skipped (never a crash)."
-  (let ((ids (dds.pal:with-lock ((disc-node-lock node))
-               (copy-list (gethash writer-guid (disc-node-reader-routes node))))))
-    (if ids
-        (loop for rid in ids
-              for r = (%user-reader-for node rid)
-              when r collect (cons rid r))
-        (let ((r (disc-node-user-reader node)))
-          (and r (list (cons (disc-node-user-reader-id node) r)))))))
+  (let ((memo (dds.pal:with-lock ((disc-node-lock node))
+                (gethash writer-guid (disc-node-reader-routes-cache node)))))
+    (cond
+      ((eq memo :none) nil)                    ; resolved before: this writer reaches no reader
+      (memo memo)                              ; resolved before: the SHARED list (read-only, see below)
+      (t
+       ;; NFR-MEM (ADR 0062): this rebuilt a copy-list + a fresh cons per route on EVERY data/heartbeat/gap
+       ;; handler call — 328 B/sample, the single biggest RX allocation — for a value that changes only on
+       ;; match/unmatch. Resolve once and memoize. The memo is dropped WHOLESALE by %invalidate-route-cache
+       ;; from every mutation of reader-routes / user-readers, because a STALE ROUTE IS SILENT MIS-DELIVERY
+       ;; (a sample lost, or handed to a dead reader) — the invalidation is coarse on purpose.
+       ;; The returned list is SHARED: callers MUST treat it as read-only (they only ever dolist it).
+       ;; %user-reader-for is called OUTSIDE the node lock, exactly as before (it may take the lock itself).
+       (multiple-value-bind (ids gen)
+           (dds.pal:with-lock ((disc-node-lock node))
+             (values (copy-list (gethash writer-guid (disc-node-reader-routes node)))
+                     (disc-node-reader-routes-generation node)))
+         (let ((resolved (if ids
+                             (loop for rid in ids
+                                   for r = (%user-reader-for node rid)
+                                   when r collect (cons rid r))
+                             (let ((r (disc-node-user-reader node)))
+                               (and r (list (cons (disc-node-user-reader-id node) r)))))))
+           (dds.pal:with-lock ((disc-node-lock node))
+             ;; STORE ONLY IF THE ROUTES DID NOT CHANGE UNDER US. %user-reader-for runs outside the lock
+             ;; (it may take it), so an unmatch/prune can land mid-resolve; caching that result would make
+             ;; the memo permanently stale — i.e. silent mis-delivery. On a race we simply return the fresh
+             ;; value and re-resolve next call. Key by a COPY: the caller's GUID buffer must never become a
+             ;; live hash key.
+             (when (= gen (disc-node-reader-routes-generation node))
+               (setf (gethash (copy-seq writer-guid) (disc-node-reader-routes-cache node))
+                     (or resolved :none))))
+           resolved))))))
 
 (defun* %on-user-lifecycle (node writer-id sn kind key-hash status-flags src-prefix)
     (function (disc-node (unsigned-byte 32) integer (member :dispose :unregister) t (unsigned-byte 8)
@@ -4228,7 +4253,8 @@
            (assert (equalp payla (node-sample sub (cons wga 1))) () "writer-A's sample must be stored under writer-A's GUID")
            (assert (equalp paylb (node-sample sub (cons wgb 1))) () "writer-B's sample must be stored under writer-B's GUID")
            ;; route lifecycle: unmatch/lease-expiry drops the route; a re-announce re-adds it (no dropped own-samples)
-           (dds.pal:with-lock ((disc-node-lock sub)) (%purge-prefix sub pa #'disc-node-reader-routes))
+           (dds.pal:with-lock ((disc-node-lock sub)) (%purge-prefix sub pa #'disc-node-reader-routes)
+             (%invalidate-route-cache sub))
            (assert (not (node-reader-matches-writer-p sub ida wga)) () "unmatch/lease-expiry must drop reader-A's route to writer-A")
            (%reader-route-add sub wga ida)
            (assert (node-reader-matches-writer-p sub ida wga) () "a re-announce must re-add reader-A's route (no permanent drop)")
@@ -4682,6 +4708,7 @@
                ;; lease-expiry: purge the route + the watermarks (by prefix) under the node lock (as %lease-sweep does)
                (dds.pal:with-lock ((disc-node-lock zn))
                  (%purge-prefix zn pa #'disc-node-reader-routes)
+                 (%invalidate-route-cache zn)
                  (%purge-reader-join-watermarks zn pa))
                (assert (= 0 (node-reader-join-watermark zn idb gw)) () "2c-3 purge: the watermark must be PURGED on unmatch/lease-expiry (0)")
                (assert (not (node-reader-matches-writer-p zn idb gw)) () "2c-3 purge: the route must be purged too")

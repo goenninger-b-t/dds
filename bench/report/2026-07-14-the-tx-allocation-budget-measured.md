@@ -1,5 +1,24 @@
 # The TX allocation budget, measured — and "zero-alloc TX" is 1136 B/sample of it
 
+> ## ⚠️ CORRECTION (2026-07-14, after the fact) — THE PER-SITE NUMBERS BELOW ARE UPPER BOUNDS
+>
+> The instrumentation wrapper used `(lambda (&rest args) ... (apply orig args))`. **`&rest` conses an
+> argument list on EVERY call: measured at 32.0 B/call for a 2-arg function** (a direct call is 0.0 B).
+> So each per-callee figure below includes the wrapper's own allocation — 32 B × (calls per sample), more
+> for higher arity.
+>
+> **The TOTALS are sound** (3648 B/sample was measured with no wrappers at all, and `gate-mem` reproduces
+> it). **The per-site numbers are NOT costs — they are ceilings.** Ranking by them is still useful; sizing a
+> fix by them is not.
+>
+> Proof: memoizing `%reader-routes-for`, whose wrapped cost read **328 B**, actually moved the ground-truth
+> total by **88 B** (3648 → 3560). The remainder was the wrapper measuring itself.
+>
+> **This is the third instrument to mislead me on this task** — after `sb-sprof`'s byte attribution twice
+> (ADR 0062). The rule stands and now has a corollary: *size every candidate with a `bytes-consed` delta —
+> and verify the delta is measuring the code and not the measurement.* Use `gate-mem`'s end-to-end number as
+> the oracle for any claimed win.
+
 **Date:** 2026-07-14 · **task #29 / ADR 0062 (NFR-MEM)** · SBCL 2.6.5, arm64 Darwin
 Two participants in ONE process, **payload = 0** (the FIXED per-sample overhead, which is what dominates),
 n = 3000, `bytes-consed` deltas around each callee. **Not `sb-sprof`** — ADR 0062 records two occasions where
