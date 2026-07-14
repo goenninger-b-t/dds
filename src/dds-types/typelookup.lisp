@@ -111,22 +111,27 @@
                     (:operation (member :get-types :get-deps))
                     (:type-ids list)
                     (:continuation (or null (simple-array (unsigned-byte 8) (*)))))
-              (simple-array (unsigned-byte 8) (*)))
+              (values (or null (simple-array (unsigned-byte 8) (*))) (or null keyword)))
   "Serialize a TypeLookup_Request (XTypes 1.3 §7.6.3.3.3) as XCDR2-LE octets, including
    the 4-octet CDR2_LE encapsulation header. WRITER-GUID is the 16-octet requester GUID,
    SN the request SequenceNumber, INSTANCE-NAME the bounded<255> service instance name,
    OPERATION :get-types or :get-deps, TYPE-IDS a list of 14-octet EquivalenceHashes
    (serialized as EK_MINIMAL TypeIdentifiers), CONTINUATION an optional continuation_point
-   (<=32 octets, :get-deps only; omitted when NIL or empty). Returns a fresh octet vector."
+   (<=32 octets, :get-deps only; omitted when NIL or empty).
+
+   Returns (values octets NIL) — a fresh octet vector — or (values NIL status) if an argument violates the
+   XTypes bound it is checked against: :BAD-WRITER-GUID / :INSTANCE-NAME-TOO-LONG / :BAD-TYPE-ID /
+   :CONTINUATION-TOO-LONG. These are SPEC BOUNDS on what may go on the wire, so they must be enforced
+   before a single octet is emitted; they are now returned rather than signalled (ADR 0064)."
   (unless (= 16 (length writer-guid))
-    (error "TypeLookup_Request: writer-guid must be 16 octets (GUID_t, XTypes §7.6.3.3.2)"))
+    (bail :bad-writer-guid))            ; GUID_t is 16 octets — XTypes §7.6.3.3.2
   (unless (<= (length instance-name) +tl-max-instance-name+)
-    (error "TypeLookup_Request: instanceName exceeds the string<255> bound (XTypes §7.6.3.3.2)"))
+    (bail :instance-name-too-long))     ; instanceName is string<255> — XTypes §7.6.3.3.2
   (dolist (h type-ids)
     (unless (= 14 (length h))
-      (error "TypeLookup_Request: each type_id must be a 14-octet EquivalenceHash (XTypes §7.3.4.9.1)")))
+      (bail :bad-type-id)))             ; each type_id is a 14-octet EquivalenceHash — XTypes §7.3.4.9.1
   (when (and continuation (> (length continuation) +tl-max-continuation-octets+))
-    (error "TypeLookup_Request: continuation_point exceeds sequence<octet,32> (XTypes §7.6.3.3.3)"))
+    (bail :continuation-too-long))      ; continuation_point is sequence<octet,32> — XTypes §7.6.3.3.3
   ;; 1024 = fixed-part slack: encapsulation+DHEADERs+EMHEADERs+header+continuation+padding
   (let* ((buf (dds.core.buffer:make-octet-buffer
                (+ 1024 (* 16 (length type-ids)) (length instance-name))))
@@ -154,7 +159,7 @@
            (let* ((e (dds.core.buffer:cursor-position c))
                   (out (make-array e :element-type '(unsigned-byte 8))))
              (replace out (dds.core.buffer:octet-buffer-vec buf) :end2 e)
-             out))
+             (values out nil)))
       (dds.pal:free-static (dds.core.buffer:octet-buffer-vec buf)))))
 
 ;;; ---- parse (network-facing: every read bounds-checked, NFR-SEC-POSTURE) ----
@@ -453,7 +458,7 @@
                     (:pairs list)
                     (:dependencies list)
                     (:continuation (or null (simple-array (unsigned-byte 8) (*)))))
-              (simple-array (unsigned-byte 8) (*)))
+              (values (or null (simple-array (unsigned-byte 8) (*))) (or null keyword)))
   "Serialize a TypeLookup_Reply (XTypes 1.3 §7.6.3.3.3) as XCDR2-LE octets, including the
    4-octet CDR2_LE encapsulation header. The header is the §7.6.3.3.2 ReplyHeader —
    relatedRequestId (RELATED-GUID, 16 octets + RELATED-SN, the request's SampleIdentity)
@@ -471,23 +476,27 @@
    REMOTE_EX_OK framing is PEER-CONFIRMED (Fast DDS 3.6.1's client consumed our getTypes
    and getTypeDependencies replies and built the type from them, FR-IO-2 S4 leg
    B-patched); the non-OK Return-arm omission stays CONFIRM-VS-PEER (never provoked live;
-   self-pinned + tshark-validated only). Returns a fresh vector."
+   self-pinned + tshark-validated only).
+
+   Returns (values octets NIL) — a fresh vector — or (values NIL status) if an argument violates an XTypes
+   bound: :BAD-WRITER-GUID / :BAD-RELATED-GUID / :BAD-OPERATION / :BAD-PAIR / :BAD-DEPENDENCY /
+   :CONTINUATION-TOO-LONG. Returned, never signalled (ADR 0064)."
   (when writer-guid
     (unless (= 16 (length writer-guid))
-      (error "TypeLookup_Reply: writer-guid must be 16 octets (GUID_t, XTypes §7.6.3.3.2)")))
+      (bail :bad-writer-guid)))         ; GUID_t is 16 octets — XTypes §7.6.3.3.2
   (unless (= 16 (length related-guid))
-    (error "TypeLookup_Reply: related-guid must be 16 octets (GUID_t, XTypes §7.6.3.3.2)"))
+    (bail :bad-related-guid))           ; GUID_t is 16 octets — XTypes §7.6.3.3.2
   (when (eq remote-ex :ok)
     (unless (member operation '(:get-types :get-deps))
-      (error "TypeLookup_Reply: a REMOTE_EX_OK reply needs :operation :get-types or :get-deps")))
+      (bail :bad-operation)))           ; a REMOTE_EX_OK reply must select a Return arm — §7.6.3.3.3
   (dolist (p pairs)
     (unless (and (= 14 (length (car p))) (plusp (length (cdr p))))
-      (error "TypeLookup_Reply: each pair must be (14-octet hash . TypeObject octets) (XTypes §7.3.4.9.1)")))
+      (bail :bad-pair)))                ; (14-octet hash . TypeObject octets) — XTypes §7.3.4.9.1
   (dolist (d dependencies)
     (unless (and (= 14 (length (car d))) (typep (cdr d) '(unsigned-byte 32)))
-      (error "TypeLookup_Reply: each dependency must be (14-octet hash . UInt32 size) (XTypes §7.6.3.3.3)")))
+      (bail :bad-dependency)))          ; (14-octet hash . UInt32 size) — XTypes §7.6.3.3.3
   (when (and continuation (> (length continuation) +tl-max-continuation-octets+))
-    (error "TypeLookup_Reply: continuation_point exceeds sequence<octet,32> (XTypes §7.6.3.3.3)"))
+    (bail :continuation-too-long))      ; continuation_point is sequence<octet,32> — XTypes §7.6.3.3.3
   ;; 1024 = fixed-part slack; +32/pair and +32/dependency cover framing + padding
   (let* ((buf (dds.core.buffer:make-octet-buffer
                (+ 1024 (* 32 (length dependencies))
@@ -526,7 +535,7 @@
            (let* ((e (dds.core.buffer:cursor-position c))
                   (out (make-array e :element-type '(unsigned-byte 8))))
              (replace out (dds.core.buffer:octet-buffer-vec buf) :end2 e)
-             out))
+             (values out nil)))
       (dds.pal:free-static (dds.core.buffer:octet-buffer-vec buf)))))
 
 ;;; ---- reply parse (network-facing: every read bounds-checked, NFR-SEC-POSTURE) ----
@@ -779,10 +788,15 @@
 
 (defun* type-lookup-respond (request-octets)
     (function ((simple-array (unsigned-byte 8) (*)))
-              (or null (simple-array (unsigned-byte 8) (*))))
+              (values (or null (simple-array (unsigned-byte 8) (*))) (or null keyword)))
   "Answer one inbound TypeLookup request: getTypes/getTypeDependencies over the local
    type registry (XTypes 1.3 §7.6.3.3.4: a participant SHALL answer for any
-   TypeIdentifier it announced). NIL = drop (malformed or guard-rejected). The reply's
+   TypeIdentifier it announced).
+
+   Returns (values reply-octets NIL) to send; (values NIL NIL) = DROP the request (malformed or
+   guard-rejected — the ordinary hostile-input outcome, NOT an error); (values NIL status) if the reply
+   we assembled would itself violate an XTypes bound, which is OUR bug, not the peer's, and is therefore
+   distinguishable from a drop rather than folded into it (ADR 0064). The reply's
    relatedRequestId echoes the request's writer GUID + SN (§7.6.3.3.2); hashes not
    found locally are silently omitted (zero pairs/deps still answers REMOTE_EX_OK);
    an unrecognized TypeLookup_Call discriminator answers REMOTE_EX_UNKNOWN_OPERATION

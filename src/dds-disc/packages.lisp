@@ -86,7 +86,7 @@
            #:node-discovered-participants #:resolved-destination #:node-acks-in
            #:+entityid-tl-req-writer+ #:+entityid-tl-req-reader+
            #:+entityid-tl-reply-writer+ #:+entityid-tl-reply-reader+
-           #:*typelookup-timeout* #:*max-typelookup-pending*
+           #:*typelookup-timeout* #:*max-typelookup-pending* #:*tl-reply-defects*
            #:type-lookup-query #:tl-sweep
            #:assert-participant-liveliness #:disc-node-remote-liveliness-stamp
            #:disc-node-discovered-writers-list #:disc-node-discovered-readers-list

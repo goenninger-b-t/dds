@@ -96,6 +96,26 @@
    deadline path uses), in internal-time-units-per-second ticks."
   (get-internal-real-time))
 
+(defparameter *tl-reply-defects* 0
+  "Count of TypeLookup replies THIS PROCESS failed to serialize because the reply it assembled violated an
+   XTypes bound (a :BAD-PAIR / :BAD-DEPENDENCY / :BAD-RELATED-GUID status from
+   dds.types:serialize-type-lookup-reply). That is OUR defect, never the peer's — a peer can only make us
+   DROP its request, not fail our own encoder. It is counted (and reported once per occurrence on
+   *error-output*) rather than signalled, because it surfaces on the receiver thread where an unwind would
+   kill the thread and stop the node receiving (ADR 0064 rule 1). Non-zero here means a bug in this stack;
+   the tests assert it stays 0.")
+
+(defun* %tl-note-malformed-reply (status)
+    (function (keyword) t)
+  "Record that we could not serialize a TypeLookup reply (STATUS from serialize-type-lookup-reply): bump
+   *tl-reply-defects* and report on *error-output*. The receiver thread has no caller to return a status
+   to, so this is where the value stops — visibly, not silently."
+  (incf *tl-reply-defects*)
+  (format *error-output*
+          "~&dds.disc typelookup: could not serialize a reply (~s) — dropped. This is a defect in this ~
+           stack, not a bad peer request.~%" status)
+  t)
+
 (defun* %send-tl-reply (node prefix octets)
     (function (disc-node (simple-array (unsigned-byte 8) (12)) (simple-array (unsigned-byte 8) (*))) t)
   "Send reply OCTETS to participant PREFIX's metatraffic locator as one RTPS message:
@@ -188,8 +208,14 @@
       (replace octets (dds.core.buffer:octet-buffer-vec buf) :start2 poff :end2 (+ poff plen))
       ;; explicit per-writer dispatch: a future third TL EntityId must not silently route here
       (cond ((= wtr +entityid-tl-req-writer+)
-             (let ((reply (dds.types:type-lookup-respond octets)))
-               (when reply (%send-tl-reply node prefix reply))))
+             ;; TWO different NILs, and they are NOT the same thing: (values NIL NIL) = the peer's request
+             ;; was malformed/guard-rejected -> DROP (the ordinary hostile-input path). (values NIL status)
+             ;; = the reply WE assembled violates an XTypes bound -> OUR defect. This runs on the receiver
+             ;; thread, where there is no caller to return a status to, so both end in a drop — but the
+             ;; second is recorded, not silently folded into the first.
+             (multiple-value-bind (reply status) (dds.types:type-lookup-respond octets)
+               (cond (reply (%send-tl-reply node prefix reply))
+                     (status (%tl-note-malformed-reply status)))))
             ((= wtr +entityid-tl-reply-writer+)
              (%on-tl-reply node prefix octets)))))
   t)
@@ -219,8 +245,31 @@
                            (car hp) (cdr hp)))))
       t)))
 
+(defun* %tl-send-request (node prefix sn req)
+    (function (disc-node (simple-array (unsigned-byte 8) (12)) integer
+               (simple-array (unsigned-byte 8) (*)))
+              (values (eql t) null))
+  "Emit the serialized getTypes TypeLookup_Request REQ (SN) to PREFIX's metatraffic locator. Split out of
+   type-lookup-query so that function's serialize-failure path (unregister the pending entry + fire the
+   continuation) reads as a plain early exit. A peer with no reachable metatraffic locator is a no-op —
+   the pending entry then expires via tl-sweep, which is the pre-existing behaviour."
+  (let ((hp (%remote-metatraffic node prefix)))
+    (when hp
+      ;; per-call buffer: queries fire from ANY thread (the type-gate uses the receiver thread), so the announce thread's tx-msg would race
+      (let ((buf (dds.core.buffer:make-octet-buffer (+ 64 (length req)))))
+        (unwind-protect
+             (%send-msg-buf node buf
+                            (lambda (mc)
+                              (dds.rtps.message:write-data
+                               mc +entityid-tl-req-reader+ +entityid-tl-req-writer+
+                               sn req 0 (length req)))
+                            (car hp) (cdr hp))
+          (dds.pal:free-static (dds.core.buffer:octet-buffer-vec buf))))))
+  (values t nil))
+
 (defun* type-lookup-query (node prefix hashes continuation)
-    (function (disc-node (simple-array (unsigned-byte 8) (12)) list (or null function)) t)
+    (function (disc-node (simple-array (unsigned-byte 8) (12)) list (or null function))
+              (values t (or null keyword)))
   "Ask participant PREFIX's TypeLookup service for the TypeObjects of HASHES (a list
    of 14-octet EquivalenceHashes) via a getTypes TypeLookup_Request (XTypes 1.3
    §7.6.3.3.3) sent to its metatraffic locator. CONTINUATION is called exactly once,
@@ -247,23 +296,21 @@
        (when continuation (funcall continuation nil nil))
        nil)
       (t
-       (let ((req (dds.types:serialize-type-lookup-request
-                   :writer-guid (%tl-writer-guid node) :sn sn
-                   :instance-name (%tl-instance-name prefix)
-                   :operation :get-types :type-ids hashes))
-             (hp (%remote-metatraffic node prefix)))
-         (when hp
-           ;; per-call buffer: queries fire from ANY thread (the type-gate uses the receiver thread), so the announce thread's tx-msg would race
-           (let ((buf (dds.core.buffer:make-octet-buffer (+ 64 (length req)))))
-             (unwind-protect
-                  (%send-msg-buf node buf
-                                 (lambda (mc)
-                                   (dds.rtps.message:write-data
-                                    mc +entityid-tl-req-reader+ +entityid-tl-req-writer+
-                                    sn req 0 (length req)))
-                                 (car hp) (cdr hp))
-               (dds.pal:free-static (dds.core.buffer:octet-buffer-vec buf))))))
-       t))))
+       ;; The pending entry is ALREADY registered above (under the node lock). If the request will not
+       ;; serialize, UNREGISTER it and fire the continuation now — otherwise the caller waits the full
+       ;; *typelookup-timeout* for a request that was never sent, and tl-sweep is left to clean up a
+       ;; failure we already knew about.
+       (multiple-value-bind (req status)
+           (dds.types:serialize-type-lookup-request
+            :writer-guid (%tl-writer-guid node) :sn sn
+            :instance-name (%tl-instance-name prefix)
+            :operation :get-types :type-ids hashes)
+         (when status
+           (dds.pal:with-lock ((disc-node-lock node))
+             (remhash sn (disc-node-tl-pending node)))
+           (when continuation (funcall continuation nil nil))   ; outside-the-lock discipline: lock released above
+           (bail status))
+         (%tl-send-request node prefix sn req))))))
 
 (defun* tl-sweep (node)
     (function (disc-node) (eql t))
