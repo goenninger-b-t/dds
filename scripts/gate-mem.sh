@@ -19,15 +19,23 @@
 # silently stops constraining anything — the same slow death as a gate that cannot fail. The ratchet only
 # moves DOWN, and the ceiling file is the record of how far NFR-MEM has actually got.
 #
-# The ceiling lives in bench/mem-ceiling.txt — one integer, in bytes/sample. It is REVIEWABLE IN A DIFF,
-# on purpose: lowering it is a claim about the system, and it should be seen.
+# The ceilings live in bench/mem-ceiling.txt — one row PER ARCH ("<arch> <bytes>"). REVIEWABLE IN A DIFF,
+# on purpose: lowering one is a claim about the system, and it should be seen.
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
+# PER-ARCHITECTURE ceiling. SBCL's per-sample allocation differs materially by arch (measured: arm64 3560,
+# x86_64 4674 — ~31% more), so a single shared number cannot work: at the x86_64 value the arm64 ratchet
+# would never bite, and at the arm64 value x86_64 is permanently red. Same divergence flipped the FlatData
+# vtable-vs-classic guard.
 CEILING_FILE=bench/mem-ceiling.txt
 [[ -r "$CEILING_FILE" ]] || { echo "gate-mem: FAIL — missing $CEILING_FILE" >&2; exit 1; }
-CEILING="$(tr -d '[:space:]' < "$CEILING_FILE")"
-[[ "$CEILING" =~ ^[0-9]+$ ]] || { echo "gate-mem: FAIL — $CEILING_FILE must be one integer (bytes/sample), got '$CEILING'" >&2; exit 1; }
+ARCH="$(uname -m)"
+CEILING="$(awk -v a="$ARCH" '$1==a {print $2}' "$CEILING_FILE" | head -1)"
+[[ "$CEILING" =~ ^[0-9]+$ ]] || {
+  echo "gate-mem: FAIL — no ceiling for arch '$ARCH' in $CEILING_FILE." >&2
+  echo "          Add a row: '$ARCH <bytes-per-sample>'. Do NOT reuse another arch's number — they differ." >&2
+  exit 1; }
 
 # SBCL only: dds.pal:bytes-consed returns 0 on Clasp, so a Clasp run would measure NOTHING and "pass"
 # vacuously. Refuse rather than pretend (the documented NFR-PORT gap).
@@ -56,17 +64,17 @@ MEASURED="$(grep -o 'MEASURED [0-9.]*' <<<"$out" | awk '{print $2}')"
 
 LOWER_AT="$(awk -v c="$CEILING" 'BEGIN{printf "%.0f", c*0.90}')"
 
-awk -v m="$MEASURED" -v c="$CEILING" -v lo="$LOWER_AT" '
+awk -v m="$MEASURED" -v c="$CEILING" -v lo="$LOWER_AT" -v a="$ARCH" '
 BEGIN {
   printf "gate-mem: end-to-end DCPS allocation = %.1f bytes/sample (ceiling %d, NFR-MEM target 0)\n", m, c;
   if (m > c) {
-    printf "gate-mem: FAIL — ALLOCATION REGRESSED. %.1f > ceiling %d.\n", m, c > "/dev/stderr";
+    printf "gate-mem: FAIL — ALLOCATION REGRESSED on %s. %.1f > ceiling %d.\n", a, m, c > "/dev/stderr";
     print  "          Every byte here feeds the PEER'"'"'s GC, which owns the whole ~10 ms tail (ADR 0062)." > "/dev/stderr";
     exit 1;
   }
   if (m < lo) {
     printf "gate-mem: FAIL — you IMPROVED it (%.1f, well under the %d ceiling). LOWER THE CEILING:\n", m, c > "/dev/stderr";
-    printf "          echo %.0f > bench/mem-ceiling.txt   # and commit it\n", m > "/dev/stderr";
+    printf "          Lower the %s row in bench/mem-ceiling.txt to %.0f and commit it.\n", a, m > "/dev/stderr";
     print  "          A ceiling that is never lowered stops constraining anything. The ratchet only moves DOWN." > "/dev/stderr";
     exit 1;
   }
