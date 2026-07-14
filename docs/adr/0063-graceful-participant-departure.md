@@ -234,6 +234,43 @@ Regression test (write it FIRST, it must go red): N successive participants agai
 RELIABLE + KEEP_ALL responder; assert client #3+ still echo. The existing suite never re-matched a third
 participant against a live writer, which is why this survived 563 green tests.
 
+## ★★ ATTEMPT 2 — THE MATCH-TIME GAP DESIGN IS DEAD. Do not try it again.
+
+Attempt 2 found Defect 2, and it is **fatal to the design**, not a coding slip. Traced on client #1 against
+a **fresh** responder (empty cache, so no GAP should exist at all):
+
+```
+<GAP> gapStart=1 base=2 nb=0 armed=T first-sn=1 -> PREMATCH-BRANCH=T
+PINGER-FAILED: no echo within 5 s
+```
+
+**The GAP declared the reader's OWN first echo irrelevant.** The race:
+
+1. The pinger sees `matched-count = 2` (its OWN endpoints matched) and writes ping 1.
+2. The responder receives it and echoes it — that echo is SN 1 in the writer's cache.
+3. **Only then** does the responder's writer process the SEDP match for the pinger's reader and run
+   `%writer-durability-init`, which now sees a NON-empty history and GAPs `[1,1]`.
+
+Discovery is asymmetric: **the writer can already have produced samples FOR a reader before it has
+processed that reader's match.** Those samples are LIVE, not pre-match, and the writer cannot tell them
+apart from genuinely pre-match ones.
+
+**And the two are the SAME MECHANISM.** `init-reader-proxy-base` sets `unsent-base = lastSN+1`, so the
+writer never PUSHES SN 1 either. The baseline works **only because the reader NACKs for it and the writer
+retransmits**. The "pre-match history" a late-joining reader phantom-NACKs and the "late-matched live
+sample" it legitimately NACKs arrive by the identical path. **You cannot GAP the one without killing the
+other.** Any writer-side irrelevance declaration at match time has this hole.
+
+⇒ **The reader-side gate is NOT the fix, and the implementation order in ATTEMPT 1 was wrong.** Revert to
+this ADR's ORIGINAL order: bound the retained history at the source by removing ghosts promptly (honour +
+send the participant dispose, and give the writer a real unmatch). Then `hc-min-seq` advances, the
+advertised `firstSN` is recent, the new reader's NACK range is small or empty, and the phantom gap cannot
+form. That fix has no race because it never has to distinguish live from pre-match — it simply stops
+retaining what nobody wants.
+
+**KEPT from attempt 2** (landed separately, proven neutral on the repro and green on both impls): the
+`%on-user-gap` **readerId** fix — see below.
+
 ## ATTEMPT 1 — IMPLEMENTED, THEN REVERTED. Read this before attempting it again.
 
 The design above (arm the proxy at match + one contiguous match-time GAP) was implemented and **reverted
