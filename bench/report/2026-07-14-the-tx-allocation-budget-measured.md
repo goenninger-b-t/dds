@@ -64,10 +64,59 @@ around it. That is why "zero-alloc TX" was recorded as done while `write-sample`
    **RETAINED** (on the cache-change for KEEP_LAST eviction, and in the instance record), so pooling it
    touches the **FROZEN type-support contract** — ADR first (ADR 0062 §5).
 
-## The bigger half is still unmeasured
+## The other half, also measured — RX + the drain
 
-TX is ~1300 B. **The receiver threads + engine are ~2350 B — the larger half — and I have not drilled them.**
-Do that next, the same way: `bytes-consed` deltas around callees, never a profiler share.
+Same method. The three top-level buckets account for the whole 3648 B:
+
+| bucket | B/sample | share |
+|---|---|---|
+| **RX `%handle-datagram`** (receiver thread) | **1420** | 39 % |
+| **TX `write-sample`** (user thread) | 1376 | 38 % |
+| **USER `%drain`** (the take path) | 808 | 22 % |
+
+Inside RX:
+
+```
+RX %handle-datagram              1420
+  dispatch-message               1027
+    %on-user-data                 393
+      %deliver-user-sample        349
+    %on-user-heartbeat            393      <- a CONTROL message costs as much as the DATA
+    %on-user-acknack              175
+  %reader-routes-for              328      <- THE SINGLE BIGGEST RX ITEM
+  %source-guid                    131
+  reader-acknack                   22
+  reader-on-data                    0      <- the reliable reader itself is clean
+USER %drain                       808
+  %deserialize-sample             218
+```
+
+**`%on-user-heartbeat` costs as much as `%on-user-data` (393 B each).** The reliable protocol's *control*
+path allocates as much as the data path — that is not where anyone would have looked.
+
+**`%reader-routes-for` — 328 B — is the single biggest RX item, and the cause is one line:**
+
+```lisp
+(let ((ids (with-lock (copy-list (gethash writer-guid (disc-node-reader-routes node))))))
+  (if ids (loop for rid in ids
+                for r = (%user-reader-for node rid)
+                when r collect (cons rid r))   ; fresh list + fresh cons per route, EVERY call
+          ...))
+```
+
+A `copy-list` plus a freshly-consed pair list on **every** data / heartbeat / gap handler call — for a value
+that changes only on match/unmatch.
+
+**It memoizes — but do NOT rush it.** The invalidation points are several (`route-add` disc.lisp:716, the
+route-prune disc.lisp:887, `%purge-prefix` on `disc-node-reader-routes` in two places, and the
+lease/dispose prune), and a **stale route is silent mis-delivery** — data lost, or delivered to a dead
+reader. That is a correctness hazard, not a perf one. Memoize it with the invalidation driven from the
+choke points that already exist (`%fire-unmatch` is now the single unmatch funnel; ADR 0063 §3), and gate it
+on the live re-match repro (`scratchpad/responder.lisp` + `rematch.lisp`), not just the unit suite.
+
+`%source-guid` (131 B) allocates a fresh 16-octet GUID several times per datagram. **CAUTION:** an earlier
+audit established that its result IS retained (it is the key for the reader-proxy, the sample store, and the
+instance tables), so it cannot simply be turned into a shared scratch buffer.
 
 ## Guardrail
 

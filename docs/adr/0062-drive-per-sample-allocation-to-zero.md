@@ -113,8 +113,28 @@ payload = 0, n = 3000. Total round-trip 3648 B/sample.
 | `%write-key-hash` | **175** | the generated keyhash, KEEP_LAST only. RETAINED ⇒ touches the **frozen type-support contract** (§5). |
 | `hc-add-change`, `writer-acquire-payload-buffer` | **0** | **the arena pooling from `c89aae0` genuinely works.** It removed the *payload* allocation and left everything around it — which is exactly why "zero-alloc TX" was recorded as done while `write-sample` still costs 1.3 KB with nothing to serialize. |
 
-**TX ≈ 1300 B. The receiver threads + engine are ≈ 2350 B — the LARGER half, and still undrilled.** Do that
-next, the same way. `make gate-mem` ratchets the total so no step can silently lose its win.
+## The RX budget, MEASURED (2026-07-14) — the whole 3648 B is now accounted for
+
+| bucket | B/sample | share |
+|---|---|---|
+| **RX `%handle-datagram`** (receiver thread) | **1420** | 39 % |
+| **TX `write-sample`** (user thread) | 1376 | 38 % |
+| **USER `%drain`** (the take path) | 808 | 22 % |
+
+| RX site | B/sample | what it is |
+|---|---|---|
+| **`%reader-routes-for`** | **328** | **THE BIGGEST RX ITEM.** A `copy-list` + a freshly-consed `(rid . reader)` list on EVERY data/heartbeat/gap handler call — for a value that changes only on match/unmatch. **It memoizes, but a STALE ROUTE IS SILENT MIS-DELIVERY** (data lost, or delivered to a dead reader). Correctness hazard, not a perf one: drive invalidation from the choke points that already exist (`%fire-unmatch` is now the single unmatch funnel, ADR 0063 §3) and gate it on the LIVE re-match repro, not just the unit suite. |
+| `%on-user-heartbeat` | 393 | **A CONTROL message costs as much as the DATA** (`%on-user-data` is also 393). Nobody would have looked here. |
+| `%deliver-user-sample` | 349 | |
+| `%deserialize-sample` | 218 | the RX products — loan semantics (§4) |
+| `%on-user-acknack` | 175 | |
+| `%source-guid` | 131 | a fresh 16-octet GUID, several times per datagram. **CAUTION: its result IS RETAINED** (the key for the reader-proxy, the sample store, and the instance tables), so it cannot become a shared scratch. |
+| `reader-on-data` | **0** | the reliable reader itself is clean |
+
+**Every one of the top items is now sized and scoped. `make gate-mem` ratchets the total (ceiling 3800,
+measured 3648), so no step can silently lose its win.** Highest value next: `%reader-routes-for` (328 B) and
+the TX send-plan flattening (349 B) — together ~19 % — but BOTH have a correctness invariant to preserve
+(stale-route mis-delivery; byte-identical wire), so neither is a quick edit.
 
 ## Consequences
 
