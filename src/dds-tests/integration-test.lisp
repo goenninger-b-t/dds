@@ -10487,6 +10487,43 @@
 ;;; PUBLICATION_MATCHED current_count DECREASES (current_count_change negative),
 ;;; total_count stays monotonic, and the matched listener fires.
 
+(defun* run-alloc-static-zeroed-test ()
+    (function () t)
+  "NFR-SEC-POSTURE — dds.pal:alloc-static MUST NOT hand back uninitialized memory. These buffers reach the
+   WIRE.
+
+   A FlatData sample IS its SerializedPayload: the constructor writes the encapsulation header and the app
+   writes the fields, but NOTHING writes the inter-field ALIGNMENT PADDING. static-vectors is malloc-backed,
+   so every pad octet used to be leftover heap contents — transmitted to any peer. That is an information
+   disclosure, and it also made the payload non-deterministic: the byte-exactness test passed on macOS/arm64
+   (fresh mmap pages read as zero) and FAILED on Linux/x86-64 (reused heap did not). CI caught it on its
+   second run; a local macOS box CANNOT reproduce it from a fresh allocation.
+
+   ⚠️ THIS TEST CANNOT BE FALSIFIED ON macOS, AND I VERIFIED THAT. It tries to force the allocator to hand
+   back dirty memory (allocate, fill 0xFF, free, re-allocate the same size), but with the zeroing REVERTED
+   it still passes here — macOS does not hand the block back dirty. So on macOS it is a CONTRACT ASSERTION,
+   not a gate: it states what alloc-static must guarantee, and it will catch a regression on LINUX, where
+   the guarantee actually bites.
+
+   THE ORACLE FOR THIS BUG IS CI (Linux/x86-64), not this box. That is not a caveat — it is the finding:
+   the defect existed for the entire life of the project and NO local run could ever have seen it."
+  (let ((n 256))
+    (let ((dirty (dds.pal:alloc-static n)))
+      (fill dirty #xff)
+      (dds.pal:free-static dirty))
+    ;; The allocator will very likely hand the same block back.
+    (let ((fresh (dds.pal:alloc-static n)))
+      (unwind-protect
+           (%check :alloc-static-zeroed
+                   (every #'zerop fresh)
+                   (format nil "alloc-static returned UNINITIALIZED memory (first non-zero at index ~a) — ~
+                                these buffers reach the WIRE: a FlatData sample's alignment padding is never ~
+                                written, so leftover heap contents are transmitted to any peer ~
+                                (NFR-SEC-POSTURE)"
+                           (position-if-not #'zerop fresh)))
+        (dds.pal:free-static fresh))))
+  t)
+
 (defun* run-spdp-dispose-prune-test ()
     (function () t)
   "ADR 0063 — a GRACEFUL participant departure must prune the peer AT ONCE, and a FORGED one must not.

@@ -3740,6 +3740,7 @@
                  ("acked-slot-pin-defer-on-sendref" . run-acked-slot-pin-defer-on-sendref-test)
                  ("reliable-zc-qos"          . run-reliable-zc-qos-test)
                  ("lease-sweep"              . run-lease-sweep-test)
+                 ("alloc-static-zeroed"     . run-alloc-static-zeroed-test)
                  ("spdp-dispose-prune"      . run-spdp-dispose-prune-test)
                  ("writer-unmatch-proxy"    . run-writer-unmatch-proxy-test)
                  ("tce-disallow-default"     . run-tce-disallow-default-test)

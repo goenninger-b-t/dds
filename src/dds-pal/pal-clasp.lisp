@@ -34,9 +34,13 @@
     (function ((integer 0)) (simple-array (unsigned-byte 8) (*)))
   "Allocate N-BYTES of off-heap octet memory the GC neither scans, moves, nor
    reclaims. Returns a foreign-backed (unsigned-byte 8) vector with a stable
-   address; contents unspecified. The single representation stable across all
-   three target GCs. On Clasp, satisfied from *STATIC-POOL* when a free vector
-   of exactly N-BYTES exists (recycled vectors are zero-filled as hygiene)."
+   address. ALWAYS ZERO-FILLED (NFR-SEC-POSTURE) — recycled vectors were already zeroed 'as hygiene', but a
+   FRESH make-static-vector was not, and the contract said 'contents unspecified'. That is UNSAFE HERE:
+   these buffers reach the WIRE. A FlatData sample IS its SerializedPayload, and nothing writes its
+   inter-field ALIGNMENT PADDING, so every pad octet was leftover heap contents transmitted to any peer —
+   an information disclosure, and a non-deterministic payload (it passed on macOS, failed on Linux; see
+   pal-sbcl.lisp). The single representation stable across all three target GCs. Satisfied from
+   *STATIC-POOL* when a free vector of exactly N-BYTES exists."
   (declare (type (integer 0) n-bytes))
   (let ((recycled (bordeaux-threads:with-lock-held (*static-pool-lock*)
                     (let ((free (gethash n-bytes *static-pool*)))
@@ -45,7 +49,8 @@
                         (first free))))))
     (if recycled
         (fill (the (simple-array (unsigned-byte 8) (*)) recycled) 0)
-        (static-vectors:make-static-vector n-bytes :element-type '(unsigned-byte 8)))))
+        (static-vectors:make-static-vector n-bytes :element-type '(unsigned-byte 8)
+                                                   :initial-element 0))))
 
 (defun* free-static (vec)
     (function ((simple-array (unsigned-byte 8) (*))) t)

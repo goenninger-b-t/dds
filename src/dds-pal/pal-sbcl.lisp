@@ -28,9 +28,23 @@
     (function ((integer 0)) (simple-array (unsigned-byte 8) (*)))
   "Allocate N-BYTES of off-heap octet memory the GC neither scans, moves, nor
    reclaims. Returns a foreign-backed (unsigned-byte 8) vector with a stable
-   address (SBCL static-vectors are foreign-allocated, so the SAP is GC-stable)."
+   address (SBCL static-vectors are foreign-allocated, so the SAP is GC-stable).
+
+   ZERO-FILLED (NFR-SEC-POSTURE). static-vectors is malloc-backed, so it used to hand back whatever was in
+   that memory, and the docstring said 'contents unspecified'. That contract is UNSAFE HERE: these buffers
+   reach the WIRE. A FlatData sample IS its SerializedPayload — the constructor writes the encapsulation
+   header and the app writes the fields, but nothing writes the inter-field ALIGNMENT PADDING — so every
+   pad octet was leftover heap contents, transmitted to any peer. That is an information disclosure, and it
+   also made the payload non-deterministic: TXR8FD-XCDR2-IDENTITY-BYTE-EXACT passed on macOS/arm64 (fresh
+   mmap pages read as zero) and FAILED on Linux/x86-64 (reused heap did not). CI caught it on its second
+   run; the local box could not reproduce it.
+
+   The cost is a memset per STATIC allocation — which is not the per-sample path: the arena, the payload
+   pools and the RX buffers are carved at startup, and the hot path draws from them (pool-acquire), never
+   from here."
   (declare (type (integer 0) n-bytes))
-  (static-vectors:make-static-vector n-bytes :element-type '(unsigned-byte 8)))
+  (static-vectors:make-static-vector n-bytes :element-type '(unsigned-byte 8)
+                                             :initial-element 0))
 
 (defun* free-static (vec)
     (function ((simple-array (unsigned-byte 8) (*))) t)
