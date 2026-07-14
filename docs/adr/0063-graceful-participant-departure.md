@@ -152,12 +152,92 @@ one.
   suite never re-matched a third participant against a live writer.
 - Task **#15 ("4 KB large-payload stall") is closed as a misdiagnosis** and superseded by this ADR.
 
-## What is NOT yet proven (do not skip this)
+## ★ THE PROXIMATE MECHANISM — NOW PROVEN (instrumented 2026-07-14). It is a PHANTOM GAP.
 
-The **causal chain is established** — ghost reader ⇒ purge watermark pinned at 1 ⇒ a KEEP_ALL history that
-never purges — and the mitigation confirms it (KEEP_LAST responder: all clients fine). But the **proximate**
-failure mechanism at client #3 is **not** proven: whether the write path stalls on the unbounded history,
-on the push/heartbeat loop against two ghost readers, or on the late-joiner replay to the new reader.
-**Instrument it before fixing it.** This repo has been burned twice this session by a plausible mechanism
-that measurement refuted (`sb-sprof`'s byte attribution; the "4 KB payload" stall itself). Reproduce with
-the harness, confirm the mechanism, *then* write the fix.
+Instrumented the responder (rx / echo-rc / hc-change-count / proxy-count / matched) across the 3-client
+repro. At the moment client #3 joins:
+
+```
+[resp t=20s] rx=1801 echo-ok=1801 echo-FAIL=0 | hc-changes=901 proxies=3 matched=6
+[resp t=22s] rx=1809 echo-ok=1809 echo-FAIL=0 | hc-changes=909 proxies=3 matched=6
+[resp t=24s] rx=1809 echo-ok=1809 echo-FAIL=0 | hc-changes=909 proxies=3 matched=6   <- frozen
+```
+
+Client #3 completes **8 round-trips**, then everything freezes. Decisive facts:
+
+- **`echo-FAIL=0`: `write-sample` NEVER returns `:timeout`.** The writer is NOT blocked and NOT
+  backpressured. Every earlier hypothesis about a wedged/blocking writer is **refuted**.
+- The responder **receives and successfully echoes** #3's first 8 pings. The break is that the echoes
+  stop *reaching* #3 — i.e. it is the **READER** side of client #3 that stalls, right after its first
+  HEARTBEAT.
+
+**The chain.** Ghost readers (#1, #2) are still in the matched set ⇒ `writer-purge-acked` — which purges
+below `min(acked-base)` over **`%matched-reader-keys`** (`dataplane.lisp:3329`), i.e. the DISC match set —
+purges NOTHING ⇒ the KEEP_ALL cache retains 901 changes ⇒ `writer-heartbeat` advertises **`firstSN=1`**
+(`hc-min-seq`, `reliable.lisp:259`) ⇒ client #3's fresh VOLATILE reader believes it is missing SNs 1..901
+and NACKs for history it must never receive. The echo (SN 910) never gets through.
+
+**The false premise, written down in the code.** `%reader-durability-init` (`dataplane.lisp:1943-44`)
+gates the pre-match-history skip on the WRITER'S DURABILITY:
+
+> "…AND, crucially, VOLATILE-reader<->VOLATILE-writer — SKIP-HISTORY is NIL … (**a VOLATILE writer retains
+> no history to wrongly pull**; gating the skip on a RETAINING writer is what keeps reliable drop-recovery
+> intact)."
+
+**A VOLATILE writer with KEEP_ALL retains everything not yet ACKed by every matched reader.** With a ghost
+that never ACKs and is never unmatched, it retains forever. The premise is false, and DDS 1.4 §2.2.3.4 is
+unconditional: a VOLATILE reader receives samples published AFTER it matched — *regardless of the writer's
+DURABILITY*. The skip is gated on the wrong thing.
+
+**⇒ THE WRITER-UNMATCH FIX ALONE DOES NOT FIX THIS.** The purge is gated on the DISC match set, not on the
+writer's proxy table, so dropping the ReaderProxy does not advance the purge (it fixes the unbounded proxy
+leak, which is a real and separate defect). And a CRASHED peer sends no goodbye, so even with §1+§2 the
+ghost — and the phantom gap — persist for the full 100 s lease. The reader-side gate must be fixed.
+
+### The fix, and the trap in it
+
+The writer knows the match-time `lastSN`; the reader does not. So the boundary must be communicated, and
+RTPS has exactly the mechanism: **GAP** — *"Gap: Describes the information that is no longer relevant to
+Readers"* (RTPS 2.5 §8.3.7.4). `%writer-durability-init` (`dataplane.lisp:1918`) already sets the non-TL
+reader's `unsent-base = lastSN+1` — it just never TELLS the reader that `[firstSN, lastSN]` is irrelevant.
+A single GAP with `gapStart=first, gapList.base=last+1, numbits=0` declares an arbitrarily long contiguous
+range irrelevant (`write-gap`, `message.lisp:436`, takes gapStart and base separately; `reader-on-gap`,
+`reliable.lisp:712`, already honours `[gapStart, base-1]`).
+
+**⚠️ THE TRAP — do not just send the GAP.** `reader-on-gap` counts every never-seen → `:gap` transition as
+**SAMPLE_LOST** (DDS 1.4 §2.2.4.1). A match-time GAP over [1..901] would fire **901 bogus SAMPLE_LOST** on
+the new reader — those samples were never *intended* for it, so that is a FALSE status, not a loss. The
+existing discriminator is the lower-clamp to `writer-proxy-first-sn`, whose docstring already says it
+"keeps a durability-skipped pre-match range (which is intentionally not-wanted, not lost) out of the
+tally". So the GAP must be paired with advancing the reader's `first-sn` past the skipped range — i.e.
+reuse the EXISTING skip-history latch (`init-writer-proxy-durability` / `writer-proxy-skip-history`), not
+bypass it.
+
+**Do NOT "fix" this by making a VOLATILE reader blanket-skip to `lastSN+1` on its first HEARTBEAT.** That
+is the tempting one-liner and it REGRESSES reliable drop-recovery: a LIVE sample pushed after match but
+dropped in transit before the first HEARTBEAT would be silently skipped instead of NACKed. That is
+precisely the regression the (otherwise wrong) durability gate was protecting. The boundary must be the
+writer's MATCH-TIME lastSN, which only the writer knows — hence the GAP.
+
+## Implementation order (revised by the instrumented evidence)
+
+1. **The reader-side pre-match-history gate** (`%reader-durability-init` + a match-time GAP from
+   `%writer-durability-init`) — **THE STALL FIX.** Robust even against a CRASHED peer inside the lease
+   window, because it never depends on the ghost being removed. Mind the SAMPLE_LOST trap above.
+2. **Honour an inbound participant dispose** (no new wire surface; our parser already decodes it) — makes
+   ghost removal prompt, lets the KEEP_ALL history purge, bounds memory.
+3. **Send our own goodbye** — new wire surface ⇒ interop vs BOTH vendors.
+4. **Writer unmatch / drop the ReaderProxy** — fixes the unbounded proxy leak across reconnects. Necessary,
+   but on its own it fixes NEITHER the stall NOR the purge (see above).
+
+Regression test (write it FIRST, it must go red): N successive participants against ONE
+RELIABLE + KEEP_ALL responder; assert client #3+ still echo. The existing suite never re-matched a third
+participant against a live writer, which is why this survived 563 green tests.
+
+## Method note
+
+The proximate mechanism above was NOT guessed — it was instrumented, and the instrumentation **refuted**
+the hypothesis this ADR was originally written around (a blocked/backpressured writer: `echo-FAIL=0`,
+`write-sample` never times out). That is the third time this session a plausible mechanism died on contact
+with measurement (`sb-sprof`'s byte attribution; the "4 KB payload stall" that does not exist). **Instrument
+before fixing. Every time.**
