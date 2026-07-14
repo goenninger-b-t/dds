@@ -1,23 +1,26 @@
 # The TX allocation budget, measured — and "zero-alloc TX" is 1136 B/sample of it
 
-> ## ⚠️ CORRECTION (2026-07-14, after the fact) — THE PER-SITE NUMBERS BELOW ARE UPPER BOUNDS
+> ## ⚠️ CORRECTION (2026-07-14) — THE PER-SITE NUMBERS BELOW ARE INFLATED. USE `gate-mem` AS THE ORACLE.
 >
-> The instrumentation wrapper used `(lambda (&rest args) ... (apply orig args))`. **`&rest` conses an
-> argument list on EVERY call: measured at 32.0 B/call for a 2-arg function** (a direct call is 0.0 B).
-> So each per-callee figure below includes the wrapper's own allocation — 32 B × (calls per sample), more
-> for higher arity.
+> **Ground truth:** `%reader-routes-for` measured **328 B/sample** with the harness below. Memoizing it —
+> eliminating essentially all of it (it is called **2.00×/sample** and the memo hits **100 %**; the cache is
+> never invalidated in steady state) — moved the real total by **88 B** (3648 → 3560, per `gate-mem`).
 >
-> **The TOTALS are sound** (3648 B/sample was measured with no wrappers at all, and `gate-mem` reproduces
-> it). **The per-site numbers are NOT costs — they are ceilings.** Ranking by them is still useful; sizing a
-> fix by them is not.
+> The true cost was therefore ~48 B/call: a `copy-list` (16 B) + a pair cons + a list cons. **The harness
+> over-reported it by ~3.5×.**
 >
-> Proof: memoizing `%reader-routes-for`, whose wrapped cost read **328 B**, actually moved the ground-truth
-> total by **88 B** (3648 → 3560). The remainder was the wrapper measuring itself.
+> **I do not know the mechanism, and I am not going to invent one.** My first guess — that the wrapper's
+> `&rest`/`apply` consed an argument list — is **DISPROVEN**: the exact harness shape measures **0.0 B/call**
+> (1-value and 2-value callees alike). I published that guess as a correction before testing the real shape,
+> which is precisely the error this note exists to warn about.
 >
-> **This is the third instrument to mislead me on this task** — after `sb-sprof`'s byte attribution twice
-> (ADR 0062). The rule stands and now has a corollary: *size every candidate with a `bytes-consed` delta —
-> and verify the delta is measuring the code and not the measurement.* Use `gate-mem`'s end-to-end number as
-> the oracle for any claimed win.
+> **What holds:** the **TOTALS** are sound (3648 B/sample measured with no wrappers, reproduced by
+> `gate-mem`). The **per-site numbers rank candidates but do not size them.** Any claimed win must be
+> confirmed end-to-end by `gate-mem` before it is believed.
+>
+> Third instrument to mislead on this task, after `sb-sprof`'s byte attribution (twice, ADR 0062). The rule
+> gains a corollary: *size with a `bytes-consed` delta — then verify the delta against `gate-mem`, because
+> the delta can be wrong too.*
 
 **Date:** 2026-07-14 · **task #29 / ADR 0062 (NFR-MEM)** · SBCL 2.6.5, arm64 Darwin
 Two participants in ONE process, **payload = 0** (the FIXED per-sample overhead, which is what dominates),

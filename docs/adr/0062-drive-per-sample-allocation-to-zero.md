@@ -100,19 +100,24 @@ also stale (its #1 item, `%writer-add-bounded` at "21 %", now measures 1.6 %).
    is only as durable as the reason nothing exercises it.* Declined for ~5 % of a budget whose tail will
    not move either way.
 
-## ⚠️ AND THE PER-SITE INSTRUMENT LIED TOO (correction, 2026-07-14)
+## ⚠️ CORRECTION (2026-07-14) — THE PER-SITE NUMBERS ARE INFLATED; `gate-mem` IS THE ORACLE
 
-The callee-wrapping harness used `(lambda (&rest args) ... (apply orig args))`. **`&rest` conses an argument
-list per call — 32.0 B/call measured, for a 2-arg function; a direct call is 0.0 B.** Every per-site figure
-below therefore includes the wrapper's own allocation.
+**Ground truth:** `%reader-routes-for` measured **328 B/sample** with the callee-wrapping harness. Memoizing
+it — eliminating essentially all of it (called **2.00×/sample**, memo hits **100 %**, never invalidated in
+steady state) — moved the real total by **88 B** (3648 → 3560, `gate-mem`). Its true cost was ~48 B/call
+(a `copy-list` + two conses). **The harness over-reported by ~3.5×.**
 
-**The TOTALS are sound** (3648 B/sample was measured unwrapped, and `gate-mem` reproduces it). **The
-per-site numbers are UPPER BOUNDS, not costs.** Memoizing `%reader-routes-for` — whose wrapped cost read
-328 B — moved the ground truth by **88 B**. The rest was the wrapper measuring itself.
+**I do not know the mechanism and will not invent one.** My first guess — the wrapper's `&rest`/`apply`
+consing an argument list — is **DISPROVEN**: the exact harness shape measures **0.0 B/call**. I published
+that guess as a correction *before testing the real shape*, which is exactly the error this section exists
+to warn about.
 
-**Third instrument to mislead this task** (after `sb-sprof`'s byte attribution, twice). The rule gains a
-corollary: *size every candidate with a `bytes-consed` delta — and verify the delta measures the code, not
-the measurement.* **`gate-mem`'s end-to-end number is the only oracle for a claimed win.**
+**What holds:** the **TOTALS** are sound (measured unwrapped; `gate-mem` reproduces them). The **per-site
+numbers RANK candidates but do not SIZE them.** Every claimed win must be confirmed end-to-end by
+`gate-mem`.
+
+Third instrument to mislead on this task (after `sb-sprof`, twice). Corollary to the rule: *size with a
+`bytes-consed` delta — then verify the delta against `gate-mem`, because the delta can be wrong too.*
 
 ## The TX budget, MEASURED (2026-07-14) — the "size it first" step, done
 
