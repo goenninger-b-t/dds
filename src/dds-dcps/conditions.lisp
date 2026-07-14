@@ -107,7 +107,8 @@
 
 ;; Defined in filter.lisp (loaded after this file); forward-declared so the SQL form
 ;; of create-querycondition can compile a query_expression without a compile warning.
-(declaim (ftype (function (string list function) function) compile-filter))
+;; (values predicate filter-status) since ADR 0064 — it returns its failure, it does not signal.
+(declaim (ftype (function (string list function) (values (or null function) t)) compile-filter))
 
 (defun* create-querycondition (reader &key (states '(:not-read)) (query #'%where-any)
                                           expression (parameters '())
@@ -115,22 +116,29 @@
                                           (instance-states +any-instance-states+))
     (function (data-reader &key (:states list) (:query function) (:expression (or null string))
                     (:parameters list) (:view-states list) (:instance-states list))
-              query-condition)
+              (values (or null query-condition) (or null keyword) t))
   "DataReader::create_querycondition — a ReadCondition that also filters by a query.
    With :EXPRESSION (a DDS Annex B query_expression) + :PARAMETERS (the DDS
    expression_parameters), the query is compiled against the reader's topic type via
    the SQL-subset grammar (FR-DCPS-5); otherwise :QUERY is a Lisp predicate over the
    deserialized sample (%where-any selects all). Triggers / selects only samples matching all THREE
    state masks (STATES / VIEW-STATES / INSTANCE-STATES, the latter two defaulting to ANY_*_STATE) AND
-   satisfying the query."
-  (let* ((qfn (if expression
-                  (compile-filter expression parameters
-                                  (%field-resolver (topic-type-support (dr-topic reader))))
-                  query))
-         (c (make-instance 'query-condition :reader reader :states states :query-fn qfn
-                           :view-states view-states :instance-states instance-states)))
-    (push c (dr-conditions reader))
-    c))
+   satisfying the query.
+
+   A toplevel DDS API boundary for a user-supplied expression (ADR 0064): returns
+   (values condition NIL NIL), or (values NIL :BAD-PARAMETER filter-status) if :EXPRESSION does not
+   compile — never a signalled FILTER-ERROR. The condition is registered on the reader ONLY on success."
+  (let ((qfn query))
+    (when expression
+      (multiple-value-bind (pred status)
+          (compile-filter expression parameters
+                          (%field-resolver (topic-type-support (dr-topic reader))))
+        (when status (return-from create-querycondition (values nil :bad-parameter status)))
+        (setf qfn pred)))
+    (let ((c (make-instance 'query-condition :reader reader :states states :query-fn qfn
+                            :view-states view-states :instance-states instance-states)))
+      (push c (dr-conditions reader))
+      (values c nil nil))))
 
 (defun* make-status-condition (entity &key (mask '(:data-available)))
     (function (entity &key (:mask list)) status-condition)

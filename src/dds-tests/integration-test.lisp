@@ -2985,15 +2985,24 @@
       (let ((p (c "x > shapesize" '() sres)))
         (%check :flt-field-field (%match-p p blue) "x=100 > shapesize=30")
         (%check :flt-field-field-neg (not (%match-p p red)) "x=10 not > shapesize=30"))
-      (%check :flt-err-field
-              (handler-case (progn (c "nope > 1" '() mres) nil) (dds.dcps:filter-error () t))
-              "an unknown field must signal filter-error")
-      (%check :flt-err-syntax
-              (handler-case (progn (c "id >" '() mres) nil) (dds.dcps:filter-error () t))
-              "a truncated expression must signal filter-error")
-      (%check :flt-err-trailing
-              (handler-case (progn (c "id = 1 2" '() mres) nil) (dds.dcps:filter-error () t))
-              "trailing tokens must signal filter-error")))
+      ;; ADR 0064: a bad expression RETURNS a filter-status; it does not signal. Assert the exact CODE and
+      ;; that the primary value is NIL (no half-compiled predicate) — stronger than the old "some
+      ;; filter-error was raised", which any condition of that type would have satisfied.
+      (flet ((bad (expr res)
+               (multiple-value-bind (pred status) (c expr '() res)
+                 (and (null pred) status (dds.dcps:filter-status-code status)))))
+        (%check :flt-err-field (eq :unknown-field (bad "nope > 1" mres))
+                "an unknown field must RETURN status :unknown-field, never signal")
+        (%check :flt-err-syntax (eq :unexpected-end (bad "id >" mres))
+                "a truncated expression must RETURN status :unexpected-end")
+        (%check :flt-err-trailing (eq :trailing-tokens (bad "id = 1 2" mres))
+                "trailing tokens must RETURN status :trailing-tokens")
+        (%check :flt-err-lex (eq :unterminated-string (bad "text = 'oops" mres))
+                "an unterminated string literal must RETURN status :unterminated-string")
+        (%check :flt-err-detail
+                (let ((d (nth-value 1 (c "nope > 1" '() mres))))
+                  (and d (search "nope" (dds.dcps:filter-status-detail d)) t))
+                "the status DETAIL must name the offending field (the expression is user input)"))))
   t)
 
 ;;; ContentFilteredTopic over the wire (M3 #4, FR-DCPS-5): a DataReader on a CFT

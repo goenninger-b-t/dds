@@ -162,7 +162,8 @@
            ;; WP-DCPS-API-COMPLETION S3.T3: on_data_on_readers + get_datareaders/notify_datareaders
            #:get-datareaders #:notify-datareaders
            ;; Content-filter / query SQL-subset grammar (FR-DCPS-5)
-           #:compile-filter #:lex-filter #:filter-error #:filter-error-detail
+           #:compile-filter #:lex-filter
+           #:filter-status #:filter-status-code #:filter-status-detail
            #:content-filtered-topic #:create-contentfilteredtopic
            #:set-cft-expression-parameters
            #:cft-name #:cft-related-topic #:cft-expression #:cft-parameters

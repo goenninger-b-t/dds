@@ -1,7 +1,8 @@
 # ADR 0064 — No Lisp conditions in our code: thread `(values result status)`
 
-- **Status:** **ACCEPTED — IN PROGRESS.** Slice 1 (the PAL network/SHMEM layer + its consumers) is landed.
-  320 production signalling forms remain, ratcheted to zero by `make gate-nocond`.
+- **Status:** **ACCEPTED — IN PROGRESS.** Slice 1 (the PAL network/SHMEM layer + its consumers) and
+  slice 2 (the content-filter / query grammar) are landed. **305** production signalling forms remain,
+  ratcheted to zero by `make gate-nocond`.
 - **Date:** 2026-07-14
 - **Requirements:** FR-LANG-8 (full type contracts), NFR-SEC-POSTURE (a network-facing failure must not
   unwind a receiver thread), the operating contract §4 / §10
@@ -122,10 +123,30 @@ it), in CI:
 3. **The boundary handlers are asserted to exist**, so no refactor can quietly delete the receiver's
    `handler-case` and re-open the one-bad-datagram DoS.
 
+## Slice 2 — the content-filter / query grammar (`src/dds-dcps/filter.lisp`, 15 -> 0)
+
+The user-visible half of the rule. A `filter_expression` is **user input**, and `FILTER-ERROR` unwound
+straight out of `create-contentfilteredtopic` / `create-querycondition` on a typo.
+
+- The `FILTER-ERROR` **condition** becomes a **`FILTER-STATUS` struct** (`code` + `detail`). It is a struct
+  and not a bare keyword *on purpose*: the expression is hand-written, so `:bad-parameter` with no reason
+  is useless to the person who has to fix it. `code` is switchable; `detail` names the offending
+  character / token / field.
+- The recursive-descent helpers are `LABELS` **lexically inside** `compile-filter`, so `BAIL` returns from
+  `compile-filter` itself — a failure ten levels deep in the descent needs no threading and **cannot be
+  dropped by a caller that forgot to check**. The lexer helpers carry an extra result (the next input
+  index), so they return `(values result status next-index)`: status stays in the conventional **second**
+  position and the index rides third.
+- **API boundary:** `create-contentfilteredtopic`, `set-cft-expression-parameters` and
+  `create-querycondition` return `(values object :BAD-PARAMETER filter-status)` — the DDS `ReturnCode_t`
+  *plus* the reason. **Nothing is registered on the participant/reader on failure**, and
+  `set-cft-expression-parameters` now leaves the CFT **untouched** when the new parameters do not compile
+  (the old code assigned the parameters slot *before* compiling, so a throwing compile left the CFT
+  describing parameters it was not actually filtering by — a second latent defect found by the conversion).
+
 ## Order of the remaining work (shallow → deep)
 
-`filter.lisp` (15 — a user-supplied filter expression currently **unwinds out of the DCPS API**, the
-user-visible rule-2 violation) · `typelookup.lisp` (10) · `dsl.lisp` (10) · the durability stores
+`typelookup.lisp` (10) · `dsl.lisp` (10) · the durability stores
 (`store-microservice` 38, `store-encrypted` 14, `store-sqlite` 9) · `secure-sedp.lisp` (19) ·
 `pal-clasp.lisp` (10) · **`dds-dare/primitives.lisp` (96) LAST** — the OpenSSL FFI failure chains are the
 biggest and deepest.

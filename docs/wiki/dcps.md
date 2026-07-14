@@ -251,7 +251,7 @@ A **latent reliability/memory bug** was found + fixed in the course of this work
 | `dds.dcps:make-guard-condition` () | Create a `GuardCondition`. |
 | `dds.dcps:set-trigger-value` (`gc value`) | `GuardCondition::set_trigger_value` — set the trigger and wake any waiting WaitSet. |
 | `dds.dcps:create-readcondition` (`reader &key states view-states instance-states`) | `DataReader::create_readcondition` (DDS 1.4 §2.2.2.5.8) — triggers when the reader holds a sample matching all **three** state masks (`states` default `(:not-read)`; the view/instance masks default to `ANY`). `read_w_condition` / `take_w_condition` select with the same three masks. |
-| `dds.dcps:create-querycondition` (`reader &key states query expression parameters`) | `DataReader::create_querycondition`. With `:expression` (a DDS Annex B query) + `:parameters`, compiles against the topic type; otherwise `:query` is a Lisp predicate over the deserialized sample. |
+| `dds.dcps:create-querycondition` (`reader &key states query expression parameters`) | `DataReader::create_querycondition`. With `:expression` (a DDS Annex B query) + `:parameters`, compiles against the topic type; otherwise `:query` is a Lisp predicate over the deserialized sample. Returns **`(values condition status filter-status)`** (ADR 0064): a query that does not compile yields `(values nil :bad-parameter <filter-status>)` and registers nothing on the reader — it does **not** signal. |
 | `dds.dcps:qc-query-fn` (`qc`) | The compiled query predicate of a `query-condition`. |
 | `dds.dcps:make-status-condition` (`entity &key mask`) | A `StatusCondition` for `entity` enabled for the statuses in `mask` (default `(:data-available)`). |
 | `dds.dcps:get-statuscondition` (`entity`) | `Entity::get_statuscondition` (dds_rtf2_dcps.idl §682) — the entity's own StatusCondition, created lazily with all applicable statuses enabled and bound to its status-changes bitmask; idempotent. |
@@ -367,12 +367,12 @@ the **remote** endpoint is the reader its policy assumes the §7.6.3.4.1 default
 | Symbol | Description |
 |---|---|
 | `dds.dcps:content-filtered-topic` | A `TopicDescription` over a related `Topic` + a compiled filter predicate; v1 filters reader-side. |
-| `dds.dcps:create-contentfilteredtopic` (`participant name related-topic filter-expression &optional parameters`) | `DomainParticipant::create_contentfilteredtopic` — compile a DDS Annex B `filter-expression` + `parameters` against the related topic's type. |
-| `dds.dcps:set-cft-expression-parameters` (`cft parameters`) | `ContentFilteredTopic::set_expression_parameters` — recompile with new parameters; already-created readers pick it up. |
+| `dds.dcps:create-contentfilteredtopic` (`participant name related-topic filter-expression &optional parameters`) | `DomainParticipant::create_contentfilteredtopic` — compile a DDS Annex B `filter-expression` + `parameters` against the related topic's type. Returns **`(values cft status filter-status)`** (ADR 0064): a bad expression yields `(values nil :bad-parameter <filter-status>)` — the DDS `ReturnCode_t` plus a struct whose `detail` says *which* character, token or field is wrong — and the CFT is **not** registered on the participant. A filter expression is user input, so this call used to signal `filter-error` straight out of the DCPS API on a typo; it no longer signals at all. |
+| `dds.dcps:set-cft-expression-parameters` (`cft parameters`) | `ContentFilteredTopic::set_expression_parameters` — recompile with new parameters; already-created readers pick it up. Returns **`(values cft status filter-status)`**. On a rejected parameter set the CFT is **left untouched** (old parameters + old predicate still stand), so live DataReaders can never filter on a half-applied change. |
 | `dds.dcps:cft-name` / `cft-related-topic` / `cft-expression` / `cft-parameters` (`cft`) | Accessors on a `content-filtered-topic`. |
 | `dds.dcps:compile-filter` (`expression parameters resolver`) | Compile a DDS Annex B filter/query expression into a predicate `(lambda (sample) -> boolean)`. `resolver` maps a FIELDNAME to a unary accessor. |
 | `dds.dcps:lex-filter` (`str`) | Tokenize a filter/query expression. |
-| `dds.dcps:filter-error` / `filter-error-detail` | The condition signalled on a lexical/syntactic/field-resolution error, and its detail accessor. |
+| `dds.dcps:filter-status` / `filter-status-code` / `filter-status-detail` | The **status value** returned (never signalled — ADR 0064) on a lexical/syntactic/field-resolution error. `code` is a keyword you can switch on (`:unknown-field`, `:unexpected-end`, `:trailing-tokens`, `:unterminated-string`, `:bad-operator`, `:malformed-number`, `:missing-parameter`, …); `detail` is the human-readable reason, including the offending position or token. |
 
 > The grammar is the DDS 1.4 Annex B subset: comparisons (`= > >= < <= <> !=`), `LIKE`
 > (`%`/`_` wildcards), `BETWEEN … AND …`, `AND`/`OR`/`NOT`, parentheses, `%n` positional
