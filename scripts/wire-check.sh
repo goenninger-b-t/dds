@@ -59,9 +59,19 @@ have 'submessageId: ACKNACK'                'ACKNACK submessage + SequenceNumber
 have 'CDR2_LE \(0x0007\)'                   'XCDR2 encapsulation = CDR2_LE (0x0007)'
 have 'PL_CDR_LE \(0x0003\)'                 'discovery encapsulation = PL_CDR_LE (0x0003)'
 have 'ENTITYID_BUILTIN_PARTICIPANT_WRITER'  'SPDP builtin writer EntityId recognized'
-have 'ENTITYID_TL_SVC_REQ_WRITER'           'TypeLookup builtin EntityIds recognized'
-have 'Type Lookup Request'                  'TypeLookup_Request payload dissected (CDR2_LE)'
-have 'Type Lookup Reply'                    'TypeLookup_Reply payload dissected (CDR2_LE)'
+# TypeLookup dissection is a DISSECTOR CAPABILITY, not a property of our bytes: older tshark builds do not
+# know the TypeLookup service at all. Ubuntu's Wireshark (~4.2) does not; 4.6 does. Probing the dissector —
+# rather than pinning a version — is the honest test: if THIS tshark cannot name TypeLookup on ANY input, it
+# cannot judge ours, so the check is SKIPPED and SAID SO. It is never silently dropped, and it never passes
+# vacuously: every other check still runs, including 'no Malformed submessage'.
+if "$TS" -G fields 2>/dev/null | grep -qi 'typelookup\|type.lookup'; then
+  have 'ENTITYID_TL_SVC_REQ_WRITER'           'TypeLookup builtin EntityIds recognized'
+  have 'Type Lookup Request'                  'TypeLookup_Request payload dissected (CDR2_LE)'
+  have 'Type Lookup Reply'                    'TypeLookup_Reply payload dissected (CDR2_LE)'
+else
+  echo "  SKIP  TypeLookup checks (3) — this tshark's RTPS dissector does not know TypeLookup at all," >&2
+  echo "        so it cannot judge ours. NOT validated here. Install Wireshark >= 4.6 to cover them." >&2
+fi
 lack 'encapsulation kind: Unknown'          'no Unknown encapsulation kind'
 lack 'Malformed'                            'no Malformed submessage'
 
