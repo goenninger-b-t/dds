@@ -80,12 +80,20 @@ jobs:
           ip maddr show || true
           ip route show || true
           echo "=== create + delete ONE participant (30 s hard cap) ==="
-          timeout 30 ./scripts/with-sbcl.sh \
+          timeout 40 ./scripts/with-sbcl.sh \
             --eval '(asdf:load-system :dds)' \
             --eval '(progn
-                      (format t "~&STEP 1: about to create-participant~%") (finish-output)
+                      (dolist (sym (list (quote dds.disc:announce-participant-dispose)
+                                         (quote dds.disc:stop-node)))
+                        (let ((orig (symbol-function sym)) (name sym))
+                          (setf (symbol-function sym)
+                                (lambda (&rest a)
+                                  (format t "~&  -> ENTER ~a~%" name) (finish-output)
+                                  (multiple-value-prog1 (apply orig a)
+                                    (format t "~&  <- LEAVE ~a~%" name) (finish-output))))))
+                      (format t "~&STEP 1: creating~%") (finish-output)
                       (let ((p (dds.dcps:create-participant :domain 0)))
-                        (format t "~&STEP 2: created OK~%") (finish-output)
+                        (format t "~&STEP 2: created OK; now deleting~%") (finish-output)
                         (dds.dcps:delete-participant p)
                         (format t "~&STEP 3: deleted OK~%") (finish-output)))' \
             --eval '(uiop:quit 0)'
