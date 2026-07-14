@@ -1620,6 +1620,17 @@
 ;;; TL late-joiner receives all N byte-exact — DARE is transparent to the relay path.
 ;;; Domain 107 avoids collision with all other harness domains (7,17,27,37,47,57,67,77,87,97).
 
+(defun* %dare-ok-p ()
+    (function () t)
+  "T iff DARE is usable, NIL otherwise — a TRUE predicate.
+
+   dds.dare:dare-available-p is named like a predicate but SIGNALS dare-unavailable (its own docstring says
+   so), so the seven `(unless (dare-available-p) ...skip...)` guards in this file did not skip — they ERRORED.
+   Invisible locally (macOS has OpenSSL 3.5) and fatal in CI (ubuntu-latest ships OpenSSL 3.0). Production
+   callers that want the condition still get it; the tests want a predicate."
+  (handler-case (dds.dare:dare-available-p)
+    (dds.dare:dare-unavailable () nil)))
+
 (defun* run-dare-service-transparency-test ()
     (function () t)
   "DARE-wrapped durability service: publisher writes N TL samples; service seals into encrypted store;
@@ -1802,7 +1813,7 @@
     (function () t)
   "PERSISTENT service tier: write N TL samples; service-stop (store persists); fresh service
    on same dirs simulates restart; TL late-joiner receives all N byte-exact. Domain 117."
-  (unless (dds.dare:dare-available-p)
+  (unless (%dare-ok-p)
     (format t "~&  [persistent-service] SKIP — OpenSSL >= 3.5 not available~%")
     (return-from run-durability-persistent-service-test t))
   (let* ((n 4)
@@ -2130,7 +2141,7 @@
     (function () t)
   "PERSISTENT SQLite service tier: write N TL samples; service-stop (store persists to DB); fresh
    service on same dirs simulates restart (store-open replays); TL late-joiner receives all N byte-exact."
-  (unless (dds.dare:dare-available-p)
+  (unless (%dare-ok-p)
     (format t "~&  [sqlite-service] SKIP — OpenSSL >= 3.5 not available~%")
     (return-from run-durability-sqlite-service-test t))
   (let* ((n 4)
@@ -3661,7 +3672,7 @@
     (function () t)
   "KEEP_LAST cross-restart: write M :data records; reopen with :keep-last D; assert
    exactly D records remain per instance; DARE envelope decrypts (ADR 0029)."
-  (unless (dds.dare:dare-available-p)
+  (unless (%dare-ok-p)
     (format t "~&  [keeplast-cross-restart] SKIP — OpenSSL >= 3.5 not available~%")
     (return-from run-durability-keeplast-cross-restart-test t))
   (let* ((m       6)
@@ -5454,7 +5465,7 @@
    (6) FALLBACK + KEEP_ALL — a KEEP_ALL encrypted store deletes nothing (physical == N); the FILE
        encrypted tier's get-range compacts to newest-D exactly like SQLite (its own physical reclaim lands in
        Sliver 3b — run-durability-file-encrypted-physical-reclaim-test covers the file on-disk bound)."
-  (unless (dds.dare:dare-available-p)
+  (unless (%dare-ok-p)
     (format t "~&  [enc-physical-reclaim] SKIP — OpenSSL >= 3.5 not available~%")
     (return-from run-durability-encrypted-physical-reclaim-test t))
   (let* ((g0  (make-array 16 :element-type '(unsigned-byte 8) :initial-element 7))
@@ -5769,7 +5780,7 @@
    (4) FALLBACK — a KEEP_ALL encrypted file store deletes nothing (on-disk == N).
    (5) MULTI-WRITER + IDEMPOTENT parity — the decorator window is inherited by the file backend: a multi-writer
        instance drops by (guid,sn) not pure SN; an idempotent re-put of a live row loses nothing."
-  (unless (dds.dare:dare-available-p)
+  (unless (%dare-ok-p)
     (format t "~&  [file-enc-physical-reclaim] SKIP — OpenSSL >= 3.5 not available~%")
     (return-from run-durability-file-encrypted-physical-reclaim-test t))
   (let* ((g0  (make-array 16 :element-type '(unsigned-byte 8) :initial-element 7))
@@ -5972,7 +5983,7 @@
        the v3 chain clean (the sweep's store-delete re-MAC is load-bearing, no false-reject).
    (5) IDEMPOTENT — reopening an already-swept store (no new writes) reclaims nothing (physical stays D).
    (6) KEEP_ALL — a KEEP_ALL reopen runs no sweep (retains all, physical == N)."
-  (unless (dds.dare:dare-available-p)
+  (unless (%dare-ok-p)
     (format t "~&  [enc-cross-restart-sweep] SKIP — OpenSSL >= 3.5 not available~%")
     (return-from run-durability-encrypted-cross-restart-sweep-test t))
   (let* ((g0  (make-array 16 :element-type '(unsigned-byte 8) :initial-element 7))
@@ -6150,7 +6161,7 @@
    (3) WINDOW-SEEDED — after reopen+sweep, continued writes (no close) stay D; RED sweep-disabled = leak.
    (4) NO-LOSS + CHAIN — get-range post-sweep = newest D byte-exact; reopen-after-sweep verifies the chain clean.
    (5) KEEP_ALL — a KEEP_ALL reopen runs no sweep (on-disk == N)."
-  (unless (dds.dare:dare-available-p)
+  (unless (%dare-ok-p)
     (format t "~&  [file-enc-cross-restart-sweep] SKIP — OpenSSL >= 3.5 not available~%")
     (return-from run-durability-file-encrypted-cross-restart-sweep-test t))
   (let* ((g0  (make-array 16 :element-type '(unsigned-byte 8) :initial-element 7))
