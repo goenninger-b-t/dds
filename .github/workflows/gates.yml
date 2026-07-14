@@ -68,6 +68,31 @@ jobs:
 
       # ⚠️ THE SUITE HANGS ON THE RUNNER (see the note at the bottom). Bounded so CI gives a FAST RED
       # instead of burning the 60-minute job timeout — a gate that hangs is as useless as one that lies.
+      # DIAGNOSTIC (temporary): the suite hangs on the runner the first time a test calls create-participant.
+      # Isolate it — print the runner's multicast capability, then create + delete ONE participant under a hard
+      # timeout, tracing each step. This tells us WHERE it blocks instead of guessing.
+      - name: Diagnose DDS participant startup on the runner
+        timeout-minutes: 4
+        run: |
+          set -uo pipefail
+          echo "=== interfaces / multicast routes ==="
+          ip -brief addr || true
+          ip maddr show || true
+          ip route show || true
+          echo "=== create + delete ONE participant (30 s hard cap) ==="
+          timeout 30 ./scripts/with-sbcl.sh \
+            --eval '(asdf:load-system :dds)' \
+            --eval '(progn
+                      (format t "~&STEP 1: about to create-participant~%") (finish-output)
+                      (let ((p (dds.dcps:create-participant :domain 0)))
+                        (format t "~&STEP 2: created OK~%") (finish-output)
+                        (dds.dcps:delete-participant p)
+                        (format t "~&STEP 3: deleted OK~%") (finish-output)))' \
+            --eval '(uiop:quit 0)'
+          rc=$?
+          echo "participant probe exit=$rc  (124 = TIMED OUT -> it blocks in create-participant)"
+          exit 0   # diagnostic only: never fail the job on this step
+
       - name: test (SBCL)
         timeout-minutes: 12
         run: make test LISP=./scripts/with-sbcl.sh
