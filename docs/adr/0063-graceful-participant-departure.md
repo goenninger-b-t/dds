@@ -234,6 +234,41 @@ Regression test (write it FIRST, it must go red): N successive participants agai
 RELIABLE + KEEP_ALL responder; assert client #3+ still echo. The existing suite never re-matched a third
 participant against a live writer, which is why this survived 563 green tests.
 
+## ATTEMPT 1 — IMPLEMENTED, THEN REVERTED. Read this before attempting it again.
+
+The design above (arm the proxy at match + one contiguous match-time GAP) was implemented and **reverted
+un-landed**: it did not pass, and it introduced a REGRESSION. The mechanism is right; the implementation
+has at least one more defect. Patch preserved out-of-tree; do not resurrect it without fixing the below.
+
+**What DID work** (traced live): the GAP is emitted, delivered, and consumed —
+`GAP gapStart=41 base=81 numbits=0 pre-armed=T` — and `stale=0` throughout: with the fix, a newly matched
+reader received **no pre-match data at all**. The phantom-NACK is genuinely closed.
+
+**Defect 1 (found and fixed in-attempt, but RECORD IT — it is a trap).** The armed proxy **HIJACKED the
+first REPAIR GAP** it saw. An ACKNACK repair GAP (`%send-user-gap`) carries its SNs in the BITMAP and sets
+`gapStart = base` — an EMPTY contiguous range. The pre-match branch keyed only on `base > first-sn`, so it
+fired on a repair GAP, advanced `first-sn` past legitimately-missing samples and DISCARDED the bitmap —
+silently losing data on a reader with no pre-match history at all. The guard is `gap-start < base` (a real
+contiguous range). **Any future pre-match/irrelevance handling MUST distinguish the two GAP shapes.**
+
+**Defect 2 (NOT found — this is where to start).** Even with that guard, the LIVE cross-process repro
+**broke client #1**, which cannot have a phantom gap (the writer's cache is empty at its match, so no GAP
+is even sent to it — `(>= last first)` is false). Something in the change perturbs a reader that receives
+no match-time GAP at all. Two concrete suspects, neither ruled out:
+  - **The GAP fan-out.** `%writer-durability-init` falls back to `%match-destinations-prefixed` when the new
+    reader's unicast destination does not resolve, which sends the GAP — addressed to the NEW reader's
+    EntityId — to **every matched reader's destination**. If the receive path does not discriminate GAP by
+    readerId, an OLDER reader will consume a GAP meant for someone else and skip its own live samples.
+  - **`numbits = 0`.** `%send-user-gap-range` writes a SequenceNumberSet with an EMPTY bitmap. Confirm
+    against RTPS 2.5 §9.4.2.6 that numBits=0 is legal on the wire and that our own reader/parser round-trips
+    it; a malformed submessage here would corrupt the rest of the datagram's dispatch.
+
+**And the in-process test was NOT a valid oracle.** `dcps-keepall-reconnect` (spin-driven, in-process) loses
+samples for unrelated reasons — **client 0 itself got 28/40**, and runs swung 40/41/28 → 28/40/22. It cannot
+certify this fix. **Use the cross-process live repro** (`scratchpad/responder.lisp` + `rematch.lisp`), which
+isolates the defect deterministically (#1 ok, #2 ok, #3 FAIL, #4 FAIL), or rebuild the in-process test on
+AUTONOMOUS participants + listeners (the `dds.bench:mem-per-sample` pattern), never on `spin`.
+
 ## Method note
 
 The proximate mechanism above was NOT guessed — it was instrumented, and the instrumentation **refuted**
