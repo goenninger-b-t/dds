@@ -406,7 +406,11 @@
       (when (null ti-octets)
         (return-from gate
           (if lb (%gate-legacy-type-object p state remote local lb) :compatible)))
-      (let ((h (handler-case (dds.types:deserialize-type-information-hash ti-octets)
+      ;; TWO ways a hostile/foreign TypeInformation fails, and BOTH mean "no usable hash": a STATUS
+      ;; (:not-minimal-member / :not-ek-minimal — the structure parsed but is not what XTypes says, ADR 0064)
+      ;; and a signalled BUFFER-OVERFLOW from the CDR primitives on a TRUNCATED blob (still a condition —
+      ;; the hand-written CDR layer is a later slice). Fold both to NIL; the gate then fails OPEN, as before.
+      (let ((h (handler-case (values (dds.types:deserialize-type-information-hash ti-octets))
                  (error () nil))))
         (unless h
           (%tg-log remote :compatible "malformed TypeInformation")

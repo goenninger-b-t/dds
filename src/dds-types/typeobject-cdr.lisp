@@ -579,13 +579,21 @@
       out)))
 
 (defun* deserialize-type-information-hash (octets)
-    (function ((simple-array (unsigned-byte 8) (*))) (simple-array (unsigned-byte 8) (*)))
+    (function ((simple-array (unsigned-byte 8) (*)))
+              (values (or null (simple-array (unsigned-byte 8) (*))) (or null keyword)))
   "Parse a serialized TypeInformation and return its minimal EK_MINIMAL TypeIdentifier's
    14-octet EquivalenceHash (the value endpoint matching needs). Lenient: walks the top
    DHEADER, the @id(0x1001) member EMHEADER1 (+NEXTINT), and the two APPENDABLE DHEADERs.
    Accepts both mutable-member framings (XTypes 1.3 §7.4.3.4.2): LC=4 (NEXTINT is the
    member length; the member's own DHEADER follows — our emission) and LC>=5 (NEXTINT is
-   REUSED as the member's leading UInt32, i.e. its DHEADER — Fast DDS 3.6.1 emission)."
+   REUSED as the member's leading UInt32, i.e. its DHEADER — Fast DDS 3.6.1 emission).
+
+   NETWORK-FACING: OCTETS come from a peer's SPDP/SEDP announcement, so a malformed value is an ORDINARY
+   outcome, not an error. Returns (values hash NIL), or (values NIL status) — :NOT-MINIMAL-MEMBER (the
+   @id member is not 0x1001) / :NOT-EK-MINIMAL (the type_id discriminator is not EK_MINIMAL). Returned,
+   never signalled (ADR 0064). A TRUNCATED buffer still surfaces as the CDR layer's BUFFER-OVERFLOW signal
+   (the hand-written CDR primitives are a later slice), so a caller wanting total robustness against a
+   hostile peer must BOTH check the status AND keep a handler for that — which both callers do."
   (let* ((buf (dds.core.buffer:make-octet-buffer (max 16 (length octets))))
          (c (dds.core.buffer:cursor buf :endianness :little)))
     (replace (dds.core.buffer:octet-buffer-vec buf) octets)
@@ -596,7 +604,7 @@
            (multiple-value-bind (mu lc id) (dds.cdr:emheader1-decode (dds.core.buffer:get-u32 c))
              (declare (ignore mu))
              (unless (= id #x1001)
-               (error "TypeInformation parse: expected minimal member 0x1001, got #x~x" id))
+               (bail :not-minimal-member))
              ;; LC>=4: NEXTINT carries the member length (§7.4.3.4.2)
              (when (>= lc 4) (dds.core.buffer:get-u32 c))
              ;; LC=4: a separate member DHEADER follows; LC>=5: NEXTINT was the DHEADER
@@ -604,8 +612,8 @@
              (dds.cdr:cdr-get-dheader c :xcdr2)
              (let ((disc (dds.core.buffer:get-u8 c)))
                (unless (= disc +ek-minimal+)
-                 (error "TypeInformation parse: expected EK_MINIMAL type_id, got #x~x" disc))
+                 (bail :not-ek-minimal))
                (let ((h (make-array 14 :element-type '(unsigned-byte 8))))
                  (dds.core.buffer:get-octets c h 0 14)
-                 h))))
+                 (values h nil)))))
       (dds.pal:free-static (dds.core.buffer:octet-buffer-vec buf)))))

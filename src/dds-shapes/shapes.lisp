@@ -1165,9 +1165,14 @@
                    (sleep 0.05))
                  (let* ((prefix (subseq (dds.rtps.discovery:endpoint-data-guid remote) 0 12))
                         (hash (handler-case
-                                  (dds.types:deserialize-type-information-hash
-                                   (dds.rtps.discovery:endpoint-data-type-information remote))
-                                (error (e)
+                                  (multiple-value-bind (h status)
+                                      (dds.types:deserialize-type-information-hash
+                                       (dds.rtps.discovery:endpoint-data-type-information remote))
+                                    (when status   ; a well-formed blob that is not EK_MINIMAL (ADR 0064)
+                                      (format t "~&[tl-probe] FAIL TypeInformation parse: ~s~%" status)
+                                      (return-from probe nil))
+                                    h)
+                                (error (e)   ; a TRUNCATED blob still signals from the CDR layer
                                   (format t "~&[tl-probe] FAIL TypeInformation parse: ~a~%" e)
                                   (return-from probe nil)))))
                    (format t "~&[tl-probe] peer ~a announces EK_MINIMAL hash ~a; sending getTypes ...~%"
