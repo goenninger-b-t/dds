@@ -17,9 +17,33 @@ make test-all      # test on both
 make gate-build    # THE build gate: clean-cache rebuild + a falsification self-test (see below)
 make gate-types    # every defun has a single-line ftype declaim (FR-LANG-8)
 make gate-hotpath  # no CLOS dispatch (NFR-CLOS) + no UNJUSTIFIED allocation (NFR-MEM) in hot-path files
-make mem           # measured 0 bytes/sample serialize + deserialize (NFR-PERF-8)
+make mem           # CODEC-only: 0 bytes/sample serialize + deserialize (NFR-PERF-8) — see the caveat below
+make gate-mem      # NFR-MEM RATCHET: END-TO-END bytes/sample, must not regress (ADR 0062). SBCL only.
 make wire          # validate emitted RTPS against the tshark RTPS dissector (FR-TOOL-3)
+make interop       # LIVE cross-vendor interop: Connext 7.3.1 + Fast DDS (FR-IO)
 ```
+
+### `make mem` vs `make gate-mem` — read this before trusting either
+
+`make mem` measures the **codec in isolation** (serialize / deserialize / AEAD) and reports ~0 bytes per
+iteration. That is a real assertion and it would fail if the codec regressed — but it measures **no
+workload**, so it is *not* the per-sample budget it is often credited with. It stayed green while the live
+DCPS path allocated ~3.9 KB per sample.
+
+`make gate-mem` measures the **end-to-end DCPS path** — `write-sample` → engine → transport → receiver
+thread → `take-samples` — which is the number NFR-MEM constrains and the one that drives the peer's GC
+pause (the ~10 ms latency tail is a GC *in the peer*, fed by exactly this garbage; ADR 0062).
+
+NFR-MEM's target is **zero**, and we are not there. A gate that failed at "anything above zero" would be
+permanently red and therefore ignored, so `gate-mem` is a **ratchet** against `bench/mem-ceiling.txt`:
+
+- measured **above** the ceiling → **FAIL** (allocation regressed);
+- measured **well below** it → **FAIL**, telling you to *lower the ceiling and commit it*;
+- otherwise → pass, while printing how far above zero we still are.
+
+Failing on an *improvement* is deliberate: a ceiling that is never lowered drifts away from reality and
+quietly stops constraining anything — the same slow death as a gate that cannot fail. The ratchet only
+moves down, and the ceiling file is the record of how far NFR-MEM has actually got.
 
 ### `make gate-build` — and why `make build` alone is not enough
 

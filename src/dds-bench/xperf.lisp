@@ -222,3 +222,58 @@
         collect (run-echo-pinger :domain domain :samples samples :payload-bytes n :warmup warmup
                                  :advertise-address advertise-address :peers peers :label label
                                  :data-representation data-representation)))
+
+(defun* mem-per-sample (&key (domain 7) (samples 3000) (warmup 500) (payload-bytes 0))
+    (function (&key (:domain (integer 0)) (:samples (integer 1)) (:warmup (integer 0))
+                    (:payload-bytes (integer 0)))
+              double-float)
+  "END-TO-END steady-state heap allocation, in BYTES PER SAMPLE, for the DCPS path a real application
+   uses: write-sample -> the engine/transport -> the receiver thread -> take-samples. This is the number
+   NFR-MEM (0 bytes/sample) actually constrains, and the one that drives the peer's GC pause — the ~10 ms
+   latency tail is a GC in the PEER, caused by exactly this garbage (ADR 0062).
+
+   It is deliberately NOT what `run-mem-test` measures. That measures the CODEC in isolation
+   (serialize/deserialize/AEAD) and correctly reports ~0 B/iter — which is why `make mem` was green while
+   the live path allocated thousands of bytes per sample. A gate is only as honest as its workload.
+
+   TWO participants in ONE process: a node IGNORES ITS OWN SPDP announcements, so a writer and reader in
+   the SAME participant would never match. They talk over the loopback transport, so the receiver-thread
+   allocation is included — `bytes-consed` is whole-process, which is the point (the GC does not care
+   which thread made the garbage).
+
+   PAYLOAD-BYTES defaults to 0 to measure the FIXED per-sample overhead, which is what dominates: at zero
+   payload the path still allocates thousands of bytes, so the payload copy is not the problem.
+
+   SBCL only in practice — `dds.pal:bytes-consed` returns 0 on Clasp, so a Clasp run measures nothing.
+   Callers must gate on that (scripts/gate-mem.sh does). Reproducible to about 1 %."
+  (let* ((ts (dds.types:find-type-support "perf-data"))
+         (pw (dds.dcps:create-participant :domain domain :autonomous t :advertise-address "127.0.0.1"))
+         (pr (dds.dcps:create-participant :domain domain :autonomous t :advertise-address "127.0.0.1")))
+    (unwind-protect
+         (let* ((tw (dds.dcps:create-topic pw "PerfPing" "PerfData" ts))
+                (tr (dds.dcps:create-topic pr "PerfPing" "PerfData" ts))
+                (dw (dds.dcps:create-datawriter
+                     (dds.dcps:create-publisher pw) tw
+                     :qos (dds.qos:make-writer-qos :reliability :reliable
+                                                   :history-kind :keep-last :history-depth 1)))
+                (dr (dds.dcps:create-datareader
+                     (dds.dcps:create-subscriber pr) tr
+                     :qos (dds.qos:make-reader-qos :reliability :reliable
+                                                   :history-kind :keep-last :history-depth 1)))
+                (sample (make-perf-data :id 1 :data (%perf-payload payload-bytes))))
+           (loop with deadline = (+ (get-universal-time) 30)
+                 until (and (plusp (dds.dcps:matched-count pw)) (plusp (dds.dcps:matched-count pr)))
+                 do (when (> (get-universal-time) deadline)
+                      (error "mem-per-sample: the two participants never matched — a measurement that ~
+                              never talked to anyone is worse than no measurement"))
+                    (sleep 0.05))
+           (flet ((cycle ()
+                    (dds.dcps:write-sample dw sample)
+                    (loop repeat 200 until (dds.dcps:take-samples dr) do (sleep 0.0002))))
+             (dotimes (i warmup) (cycle))
+             (let ((before (dds.pal:bytes-consed)))
+               (dotimes (i samples) (cycle))
+               (/ (coerce (- (dds.pal:bytes-consed) before) 'double-float)
+                  (coerce samples 'double-float)))))
+      (progn (dds.dcps:delete-participant pw)
+             (dds.dcps:delete-participant pr)))))
