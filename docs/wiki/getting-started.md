@@ -16,6 +16,7 @@ make build-all     # build on both landed impls (Clasp + SBCL)
 make test-all      # test on both
 make gate-build    # THE build gate: clean-cache rebuild + a falsification self-test (see below)
 make gate-types    # every defun has a single-line ftype declaim (FR-LANG-8)
+make gate-pal      # no reader conditionals outside dds-pal/ (contract §10, NFR-PORT)
 make gate-hotpath  # no CLOS dispatch (NFR-CLOS) + no UNJUSTIFIED allocation (NFR-MEM) in hot-path files
 make mem           # CODEC-only: 0 bytes/sample serialize + deserialize (NFR-PERF-8) — see the caveat below
 make gate-mem      # NFR-MEM RATCHET: END-TO-END bytes/sample, must not regress (ADR 0062). SBCL only.
@@ -44,6 +45,34 @@ permanently red and therefore ignored, so `gate-mem` is a **ratchet** against `b
 Failing on an *improvement* is deliberate: a ceiling that is never lowered drifts away from reality and
 quietly stops constraining anything — the same slow death as a gate that cannot fail. The ratchet only
 moves down, and the ceiling file is the record of how far NFR-MEM has actually got.
+
+### CI runs the gates now — and it did not before
+
+Until `.github/workflows/gates.yml`, the **only** workflow in this repo was `publish-wiki.yml`. **No build,
+no tests, no gates ran automatically on any push.** Every check happened only when a human remembered to run
+it locally — which is how `main` went two days without compiling from a clean cache while `make test`
+reported 563/563.
+
+The operating contract asserted CI enforcement that did not exist ("the **CI** hotpath-purity-gate enforces
+this"; "no reader conditionals outside `dds-pal/` — **CI lint** enforces this"). Both claims were false; the
+lint had never been written. `gates.yml` and `make gate-pal` make them true.
+
+**What CI does NOT cover — stated loudly, never silently skipped:**
+
+- **Clasp.** It is a source build, impractical on a hosted runner. The standing rule is that **Clasp AND
+  SBCL must both validate**, so this stays a **human step**:
+  `make test-clasp && make gate-build LISP=./scripts/with-clasp.sh`.
+- **Interop.** Needs licensed RTI Connext + a Fast DDS build. Human step: `make interop`.
+
+### ⚠️ `make bench` is a REPORT, not a gate
+
+It prints latency/throughput and **exits 0 whatever the numbers say** — no pass/fail criterion, so it cannot
+go red, despite §6 listing it among the quality gates. **A green `make bench` is not evidence of anything.**
+
+The gate that actually enforces performance is **`make gate-mem`** — an end-to-end allocation *ratchet*.
+Allocation is what owns the latency tail (the ~10 ms p99.99 is a GC pause in the *peer*; ADR 0062), so that
+is the number under guard. A latency ratchet is not viable on this hardware: the box measures 16–32 µs for
+identical code.
 
 ### `make gate-build` — and why `make build` alone is not enough
 

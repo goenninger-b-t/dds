@@ -1,0 +1,92 @@
+name: Gates
+
+# THERE WAS NO CI. Until this file, the ONLY workflow in the repo was publish-wiki.yml — it runs
+# scripts/publish-wiki.sh and nothing else. No build, no tests, no gates. Every quality gate ran ONLY when a
+# human happened to run it locally.
+#
+# That is not a theoretical hole: `main` did not compile from a clean cache for TWO DAYS while `make test`
+# reported 563/563 (a stale forward declaim; the fasl cache hid it and ql:quickload muffled the warning).
+# Nothing would have caught it, because nothing was running.
+#
+# The operating contract asserted CI enforcement that did not exist — "the CI hotpath-purity-gate enforces
+# this" (§4) and "no reader conditionals outside dds-pal/ (CI lint enforces this)" (§10). Both were false.
+# This workflow makes them true.
+#
+# WHAT THIS RUNS: every gate that needs nothing but SBCL.
+# WHAT IT DOES NOT RUN, AND WHY — stated LOUDLY, never silently skipped (a gate that cannot run must not
+# report success):
+#   * CLASP   — not installable in a hosted runner in reasonable time (it is a source build). The standing
+#               rule is that Clasp AND SBCL must BOTH validate; CI covers SBCL only, so the CLASP LEG
+#               REMAINS A HUMAN STEP: `make test-clasp` + `make gate-build LISP=./scripts/with-clasp.sh`.
+#   * INTEROP — needs licensed RTI Connext + a Fast DDS build. Human step: `make interop`.
+#   * WIRE    — needs tshark; installed below, so it DOES run.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install SBCL, Quicklisp, tshark
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y sbcl tshark
+          curl -sSLo /tmp/ql.lisp https://beta.quicklisp.org/quicklisp.lisp
+          sbcl --non-interactive --load /tmp/ql.lisp \
+               --eval '(quicklisp-quickstart:install)' \
+               --eval '(ql-util:without-prompting (ql:add-to-init-file))'
+          # The repo's launchers expect quicklisp at ~/quicklisp/setup.lisp (they load it explicitly).
+          test -f "$HOME/quicklisp/setup.lisp"
+
+      - name: Preload third-party dependencies
+        # Fetch the deps ONCE with quickload (its warning-muffling is fine for OTHER people's code).
+        # Our OWN systems are then built with asdf:load-system, which is what makes a compile WARNING fail.
+        run: |
+          set -euo pipefail
+          ./scripts/with-sbcl.sh \
+            --eval '(ql:quickload (list :cffi :static-vectors :bordeaux-threads :ironclad :usocket) :silent t)' \
+            --eval '(uiop:quit 0)'
+
+      # THE build gate: clears the fasl cache, rebuilds from scratch, and falsifies itself.
+      # `make build` is incremental and can pass on a tree that does not compile — that is the whole point.
+      - name: gate-build (clean-cache rebuild + self-falsification)
+        run: make gate-build LISP=./scripts/with-sbcl.sh
+
+      - name: test (SBCL)
+        run: make test LISP=./scripts/with-sbcl.sh
+
+      - name: corpus (XCDR byte-exact vs Connext's WIRE bytes)
+        run: make corpus LISP=./scripts/with-sbcl.sh
+
+      - name: gate-hotpath (CLOS purity + allocation purity; prints the NFR-MEM debt)
+        run: make gate-hotpath
+
+      - name: gate-types (every defun ftype-declared)
+        run: make gate-types
+
+      - name: gate-pal (no reader conditionals outside dds-pal/)
+        run: make gate-pal
+
+      - name: gate-mem (NFR-MEM allocation ratchet)
+        run: make gate-mem
+
+      - name: fuzz (CDR/RTPS parser fuzzers, prod + safety-0)
+        run: make fuzz
+
+      - name: wire (validate emitted RTPS against the tshark RTPS dissector)
+        run: make wire
+
+      - name: Declare what CI did NOT cover
+        if: always()
+        run: |
+          echo "::warning::CLASP NOT RUN — CI covers SBCL only. The standing rule is that BOTH must validate."
+          echo "::warning::  Human step: make test-clasp && make gate-build LISP=./scripts/with-clasp.sh"
+          echo "::warning::INTEROP NOT RUN — needs licensed RTI Connext + Fast DDS. Human step: make interop"
