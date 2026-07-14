@@ -22,11 +22,11 @@
    PERIOD, MAX-BURST MUST be >= 1 (signals SIMPLE-ERROR otherwise). Starts full (TOKENS = MAX-BURST) with
    LAST-REFILL = (FUNCALL CLOCK-FN). Flow control is wire-invisible / additive on conforming RTPS (ADR 0016)."
   (unless (and (integerp tokens-per-period) (>= tokens-per-period 1))
-    (error "make-flow-token-bucket: :tokens-per-period must be a positive integer, got ~S." tokens-per-period))
+    (error "make-flow-token-bucket: :tokens-per-period must be a positive integer, got ~S." tokens-per-period))   ; HOTPATH-COND(COLD): constructor argument validation
   (unless (and (integerp period) (>= period 1))
-    (error "make-flow-token-bucket: :period must be a positive integer (ns), got ~S." period))
+    (error "make-flow-token-bucket: :period must be a positive integer (ns), got ~S." period))   ; HOTPATH-COND(COLD): constructor argument validation
   (unless (and (integerp max-burst) (>= max-burst 1))
-    (error "make-flow-token-bucket: :max-burst must be a positive integer (bytes), got ~S." max-burst))
+    (error "make-flow-token-bucket: :max-burst must be a positive integer (bytes), got ~S." max-burst))   ; HOTPATH-COND(COLD): constructor argument validation
   (%make-flow-token-bucket :tokens-per-period tokens-per-period :period period :max-burst max-burst
                            :tokens max-burst :last-refill (funcall clock-fn) :clock-fn clock-fn))
 
@@ -528,7 +528,7 @@
    sender + batch are superseded). Returns the controller."
   (dds.pal:with-lock ((flow-controller-lock controller))
     (when (dds.disc::disc-node-flow-controller node)
-      (error "flow-controller-associate: ~S is already associated with a flow-controller (one per participant)." node))
+      (error "flow-controller-associate: ~S is already associated with a flow-controller (one per participant)." node))   ; HOTPATH-COND(COLD): association-time validation, not per sample
     (setf (dds.disc::disc-node-flow-controller node) controller)
     (dolist (w (dds.disc::%all-user-writers node))
       (%flow-add-writer-locked controller node w)))

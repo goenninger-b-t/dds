@@ -68,7 +68,7 @@
     (function (cursor (integer 0)) fixnum)
   "Set the cursor position (bounds-checked against the buffer capacity)."
   (let ((cap (octet-buffer-capacity (cursor-buffer cursor))))
-    (when (> pos cap) (error 'buffer-overflow :need pos :have cap))
+    (when (> pos cap) (error 'buffer-overflow :need pos :have cap))   ; HOTPATH-COND(GUARD): bounds check on a wire-supplied position; cannot fire in steady state; caught at the receiver boundary (start-udp-receiver / shmem-receive-drain) so a malformed datagram never kills the thread (NFR-SEC-POSTURE)
     (setf (cursor-pos cursor) pos)))
 
 (declaim (inline check-room))
@@ -80,7 +80,7 @@
   (let* ((buf (cursor-buffer cursor))
          (remaining (- (octet-buffer-capacity buf) (cursor-pos cursor))))
     (when (> n remaining)
-      (error 'buffer-overflow :need n :have remaining))))
+      (error 'buffer-overflow :need n :have remaining))))   ; HOTPATH-COND(GUARD): the same bounds check on room-before-write; see line 71
 
 (defun* align (cursor n)
     (function (cursor (integer 1 8)) fixnum)

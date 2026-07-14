@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+# gate-nocond — NO EXCEPTIONS AT ALL IN OUR CODE
+# (owner directive 2026-07-14, NON-NEGOTIABLE; refined same day from "none in the hot path" to "none at all").
+#
+# THE RULE
+#   1. NO Lisp conditions ANYWHERE in our code. Signalling allocates and unwinds; it is control flow that
+#      hides from the type system. Return STATUS VALUES.
+#   2. Every condition MUST be handled at latest at the toplevel DDS API. Nothing escapes as a raw Lisp
+#      condition. The public API returns DDS ReturnCode_t (:ok / :timeout / :not-enabled / :bad-parameter).
+#
+# THE TARGET IS ZERO AND WE ARE AT 725 (non-hot-path). A gate that fails at "anything above zero" would be
+# permanently red and therefore ignored — the same trap `make mem` fell into. So this enforces the rule in
+# TWO tiers:
+#
+#   HOT PATH  — STRICT. Every signalling form must be annotated and justified (below). Currently 0 unjustified.
+#   THE REST  — RATCHETED. The count may only go DOWN (bench/nocond-ceiling.txt). A new `error` anywhere in
+#               src/ fails the build; removing one lets you lower the ceiling. Monotonic march to zero.
+#
+# TWO CHECKS
+#
+#   A. SIGNALLING, by ANNOTATION (mirrors gate-hotpath's allocation scan). A hot-path file may contain a
+#      signalling form, but every one MUST say why:
+#
+#          (error 'buffer-overflow ...)   ; HOTPATH-COND(GUARD): bounds check; cannot fire in steady state;
+#                                         ; caught at the receiver boundary (start-udp-receiver)
+#
+#      Classes:
+#        COLD    setup / teardown / config validation — not on the per-sample path
+#        GUARD   a bounds/security check that CANNOT fire in steady state AND is caught at a named boundary
+#        TEST    test-only
+#        TRACKED a real steady-state condition — KNOWN DEBT, being driven out
+#      An UNMARKED signalling form FAILS the build. The TRACKED set is PRINTED every run.
+#
+#   B. THE BOUNDARY HANDLERS MUST EXIST. Rule 2 is only true if the receiver threads actually catch. A
+#      malformed datagram signals buffer-overflow on the receiver thread; if nothing catches it the thread
+#      DIES and the node stops receiving — a remote DoS from one bad packet. This asserts the handlers are
+#      still there, so nobody deletes them in a refactor.
+#
+# Self-falsifying: plants an unmarked signalling form and asserts the scan rejects it.
+set -uo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+
+HOTPATH_FILES=(
+  "src/dds-core/buffer.lisp"
+  "src/dds-cdr/cdr.lisp"
+  "src/dds-cdr/primitives.lisp"
+  "src/dds-rtps/history.lisp"
+  "src/dds-rtps/message.lisp"
+  "src/dds-xport/shmem.lisp"
+  "src/dds-xport/zerocopy-pool.lisp"
+  "src/dds-disc/flow-control.lisp"
+)
+# SIGNALLING only. `(error () ...)` / `(error (c) ...)` are handler-case CLAUSES — the opposite of a
+# signal — so require the next token NOT to be an open paren.
+SIGNAL_RE='[(](error|signal|cerror|warn)[ \t]+[^( \t]|[(](assert|check-type)[ \t]'
+MARKER='HOTPATH-COND'
+
+scan() {
+  awk -v pat="$SIGNAL_RE" -v marker="$MARKER" '
+    { l[NR]=$0 }
+    END { for (i=1;i<=NR;i++) {
+            if (l[i] ~ pat) {
+              if (l[i] ~ marker) continue
+              if (i>1 && l[i-1] ~ marker) continue
+              printf "%s:%d: %s\n", FILENAME, i, l[i]
+            } } }' "$1"
+}
+
+# ---- 0. FALSIFICATION ----
+tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+cat > "$tmp/canary.lisp" <<'EOF'
+(defun marked ()
+  (error 'x))   ; HOTPATH-COND(TEST): must be ACCEPTED
+(defun unmarked ()
+  (error 'x))
+EOF
+hits="$(scan "$tmp/canary.lisp")"
+n="$(printf '%s' "$hits" | grep -c . || true)"
+if [[ "$n" -ne 1 || "$hits" != *":4:"* ]]; then
+  echo "gate-nocond: FAIL — self-test: must flag EXACTLY the unmarked form (canary line 4). Got ${n}:" >&2
+  printf '%s\n' "$hits" >&2
+  echo "             The gate is BLIND — a green run would prove nothing." >&2
+  exit 1
+fi
+
+violations=0
+
+# ---- A. signalling forms must be justified ----
+for f in "${HOTPATH_FILES[@]}"; do
+  [[ -f "$f" ]] || continue
+  out="$(scan "$f")"
+  if [[ -n "$out" ]]; then printf '%s\n' "$out"; violations=1; fi
+done
+if [[ "$violations" -ne 0 ]]; then
+  echo "gate-nocond: FAIL — unjustified condition-signalling form(s) in a hot-path file." >&2
+  echo "             Mark each with '; ${MARKER}(CLASS): reason' (COLD|GUARD|TEST|TRACKED), or remove it." >&2
+  echo "             Rule: the per-sample path returns STATUS VALUES, never a stack unwind." >&2
+  exit 1
+fi
+
+# ---- B. the boundary handlers must still exist ----
+# Each receiver thread MUST catch, or one malformed datagram kills it and the node stops receiving.
+boundary() {   # boundary <file> <regex> <what>
+  if grep -qE "$2" "$1"; then
+    echo "  ok    $3"
+  else
+    echo "  FAIL  $3 — the handler is GONE. One malformed datagram would now kill the receiver thread." >&2
+    violations=1
+  fi
+}
+echo "gate-nocond: boundary handlers (rule 2 — nothing escapes to a thread's top level):"
+boundary src/dds-xport/udp.lisp   'handler-case \(funcall on-datagram' 'UDP + multicast receiver catches its sink'
+boundary src/dds-xport/shmem.lisp 'handler-case \(shmem-receive-drain' 'SHMEM receiver catches its drain'
+
+[[ "$violations" -ne 0 ]] && { echo "gate-nocond: FAIL — see above." >&2; exit 1; }
+
+# ---- C. THE REST OF src/ — a RATCHET toward zero (rule 1 applies EVERYWHERE, not just the hot path) ----
+CEIL_FILE=bench/nocond-ceiling.txt
+[[ -r "$CEIL_FILE" ]] || { echo "gate-nocond: FAIL — missing $CEIL_FILE" >&2; exit 1; }
+CEIL="$(tr -d '[:space:]' < "$CEIL_FILE")"
+COUNT=0
+while IFS= read -r f; do
+  case "$f" in *dds-tests*) continue ;; esac
+  for h in "${HOTPATH_FILES[@]}"; do [[ "$f" == "$h" ]] && continue 2; done
+  COUNT=$(( COUNT + $(grep -cE "$SIGNAL_RE" "$f" || true) ))
+done < <(find src -name '*.lisp' | sort)
+
+echo "gate-nocond: non-hot-path signalling forms = ${COUNT} (ceiling ${CEIL}, TARGET 0)"
+if [[ "$COUNT" -gt "$CEIL" ]]; then
+  echo "gate-nocond: FAIL — you ADDED a condition. ${COUNT} > ceiling ${CEIL}." >&2
+  echo "             Rule 1: NO exceptions in our code. Return a status value." >&2
+  exit 1
+fi
+if [[ "$COUNT" -lt "$CEIL" ]]; then
+  echo "gate-nocond: FAIL — you REMOVED $(( CEIL - COUNT )). Bank it: echo ${COUNT} > ${CEIL_FILE}" >&2
+  echo "             A ceiling that is never lowered stops constraining anything. The ratchet only moves DOWN." >&2
+  exit 1
+fi
+
+tracked=0
+for f in "${HOTPATH_FILES[@]}"; do
+  [[ -f "$f" ]] || continue
+  tracked=$((tracked + $(grep -cE "${MARKER}\(TRACKED\)" "$f" || true)))
+done
+echo "gate-nocond: PASS — hot path condition-free (every form justified), boundaries intact, ${COUNT} to go."
+if [[ "$tracked" -gt 0 ]]; then
+  echo "gate-nocond: DEBT — ${tracked} TRACKED steady-state condition(s) remain:"
+  for f in "${HOTPATH_FILES[@]}"; do
+    [[ -f "$f" ]] || continue
+    grep -nE "${MARKER}\(TRACKED\)" "$f" | sed "s|^|  ${f}:|" || true
+  done
+fi

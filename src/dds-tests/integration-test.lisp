@@ -10487,6 +10487,33 @@
 ;;; PUBLICATION_MATCHED current_count DECREASES (current_count_change negative),
 ;;; total_count stays monotonic, and the matched listener fires.
 
+(defun* run-no-condition-escapes-api-test ()
+    (function () t)
+  "Owner directive (NON-NEGOTIABLE): NO Lisp condition may escape the toplevel DDS API — the public API
+   returns a DDS ReturnCode_t, never a stack unwind.
+
+   DataWriter::write violated it: the generated codec SIGNALS on an unencodable field (cdr-put-string
+   signals cdr-not-implemented for a non-Latin-1 string — UTF-8 is deferred), and that raw Lisp condition
+   unwound straight out of write-sample into the application. DDS 1.4 §2.2.4.4 says an illegal parameter
+   value is RETCODE_BAD_PARAMETER: a STATUS.
+
+   Asserts: writing a sample with a UTF-8 string returns :bad-parameter and does NOT signal."
+  (let* ((ts (dds.types:find-type-support "shape-type"))
+         (p (dds.dcps:create-participant :domain (test-domain))))
+    (unwind-protect
+         (let* ((tp (dds.dcps:create-topic p "NoCond" "shape-type" ts))
+                (dw (dds.dcps:create-datawriter (dds.dcps:create-publisher p) tp))
+                (utf8 (make-shape-type :color (string (code-char #x263A))   ; ☺ — not Latin-1
+                                       :x 1 :y 2 :shapesize 3))
+                (rc (handler-case (dds.dcps:write-sample dw utf8)
+                      (error (e) (declare (ignore e)) :SIGNALLED))))
+           (%check :nocond-no-unwind (not (eq rc :SIGNALLED))
+                   "write-sample SIGNALLED on an unencodable sample — no Lisp condition may escape the DDS API")
+           (%check :nocond-bad-parameter (eq rc :bad-parameter)
+                   (format nil "write-sample must return RETCODE_BAD_PARAMETER for an unencodable sample, got ~s" rc)))
+      (dds.dcps:delete-participant p)))
+  t)
+
 (defun* run-alloc-static-zeroed-test ()
     (function () t)
   "NFR-SEC-POSTURE — dds.pal:alloc-static MUST NOT hand back uninitialized memory. These buffers reach the

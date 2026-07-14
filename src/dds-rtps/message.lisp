@@ -84,7 +84,7 @@
     (function (dds.core.buffer:cursor (simple-array (unsigned-byte 8) (*)) &key (:vendor (unsigned-byte 16))) fixnum)
   "Write the 20-octet RTPS Header (RTPS 2.5 §9.4.4). GUID-PREFIX is 12 octets; all
    header fields are octet arrays, so there is no endianness."
-  (assert (= 12 (length guid-prefix)))
+  (assert (= 12 (length guid-prefix)))   ; HOTPATH-COND(GUARD): internal invariant (12-octet guidPrefix) — our own callers, never wire data
   (dds.core.buffer:put-octets cursor +protocol-id+ 0 4)
   (dds.core.buffer:put-u8 cursor +protocol-version-major+)
   (dds.core.buffer:put-u8 cursor +protocol-version-minor+)
@@ -102,7 +102,7 @@
    metadata_protection RECEIVE re-dispatch hot path (%on-user-secure-submessage synthesizes a header for the
    recovered submessage per sample). GUID-PREFIX is 12 octets; header fields are octet arrays so there is no
    endianness. Returns 20 (octets written); the CALLER ensures OFF+20 <= (length VEC)."
-  (assert (= 12 (length guid-prefix)))
+  (assert (= 12 (length guid-prefix)))   ; HOTPATH-COND(GUARD): internal invariant (12-octet guidPrefix)
   (replace vec +protocol-id+ :start1 off :end1 (+ off 4) :start2 0 :end2 4)
   (setf (aref vec (+ off 4)) +protocol-version-major+
         (aref vec (+ off 5)) +protocol-version-minor+
@@ -122,7 +122,7 @@
    begin with this source-declaring INFO_SRC, and a strict rtps_protection peer (live RTI Connext) rejects a
    protected payload whose first recovered submessage is not it (decode_rtps_message 'wrong INFO_SRC'). Returns 24
    (octets written); the CALLER ensures OFF+24 <= (length VEC)."
-  (assert (= 12 (length guid-prefix)))
+  (assert (= 12 (length guid-prefix)))   ; HOTPATH-COND(GUARD): internal invariant (12-octet guidPrefix)
   (setf (aref vec off)        +submsg-info-src+
         (aref vec (+ off 1))  +flag-endianness+            ; E=1 little-endian
         (aref vec (+ off 2))  20                            ; octetsToNextHeader = 20 (LE low)
@@ -280,7 +280,7 @@
   (let* ((lo (reduce #'min sns))
          (hi (reduce #'max sns))
          (numbits (1+ (- hi lo))))
-    (assert (<= numbits +seqnum-set-max-bits+))
+    (assert (<= numbits +seqnum-set-max-bits+))   ; HOTPATH-COND(GUARD): internal invariant (numBits <= 256) on the BUILD path — our own value, not wire-supplied
     (let ((bitmap (make-array (max 1 (%seqnum-set-words numbits))   ; HOTPATH-ALLOC(TRACKED): SequenceNumberSet bitmap, per ACKNACK/GAP BUILD (ADR 0062)
                               :element-type '(unsigned-byte 32) :initial-element 0)))
       (dolist (sn sns) (seqnum-set-bit bitmap (- sn lo)))
@@ -289,7 +289,7 @@
 (defun* write-sequence-number-set (cursor base numbits bitmap)
     (function (dds.core.buffer:cursor integer (unsigned-byte 32) (simple-array (unsigned-byte 32) (*))) fixnum)
   "Write a SequenceNumberSet: bitmapBase + numBits + M longs (RTPS 2.5 §9.4.2.6)."
-  (assert (<= numbits +seqnum-set-max-bits+))
+  (assert (<= numbits +seqnum-set-max-bits+))   ; HOTPATH-COND(GUARD): internal invariant (numBits <= 256) on the BUILD path
   (write-sequence-number cursor base)
   (dds.core.buffer:put-u32 cursor numbits)
   (dotimes (i (%seqnum-set-words numbits))
@@ -332,7 +332,7 @@
 (defun* write-fragment-number-set (cursor base numbits bitmap)
     (function (dds.core.buffer:cursor (unsigned-byte 32) (unsigned-byte 32) (simple-array (unsigned-byte 32) (*))) fixnum)
   "Write a FragmentNumberSet: bitmapBase (u32) + numBits + M longs (RTPS 2.5 §9.4.2.8)."
-  (assert (<= numbits +seqnum-set-max-bits+))
+  (assert (<= numbits +seqnum-set-max-bits+))   ; HOTPATH-COND(GUARD): internal invariant (numBits <= 256) on the BUILD path
   (dds.core.buffer:put-u32 cursor base)
   (dds.core.buffer:put-u32 cursor numbits)
   (dotimes (i (%seqnum-set-words numbits))

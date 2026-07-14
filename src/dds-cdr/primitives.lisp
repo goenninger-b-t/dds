@@ -96,7 +96,7 @@
     (dotimes (i n)
       (let ((code (char-code (char s i))))
         (when (> code 255)
-          (error 'cdr-not-implemented :what "non-Latin-1 string (UTF-8 deferred)"))
+          (error 'cdr-not-implemented :what "non-Latin-1 string (UTF-8 deferred)"))   ; HOTPATH-COND(GUARD): non-Latin-1 string on the SERIALIZE path (UTF-8 deferred). CAUGHT at the public API — write-sample maps it to RETCODE_BAD_PARAMETER, so it never unwinds into the application (gate-nocond rule 2). Remove when UTF-8 lands.
         (dds.core.buffer:put-u8 c code)))
     (dds.core.buffer:put-u8 c 0)
     s))

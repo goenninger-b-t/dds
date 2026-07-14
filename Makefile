@@ -8,7 +8,7 @@ CLASP := ./scripts/with-clasp.sh
 SBCL  := ./scripts/with-sbcl.sh
 LISP  ?= $(CLASP)
 
-.PHONY: all build test build-clasp build-sbcl test-clasp test-sbcl gate-build gate-mem gate-pal \
+.PHONY: all build test build-clasp build-sbcl test-clasp test-sbcl gate-build gate-mem gate-pal gate-nocond \
         build-all test-all gate-hotpath gate-types corpus fuzz wire interop \
         square-pub square-sub square-spy large-pub large-sub gated-sub corpus-capture \
         nokey-pub nokey-sub keyed-flat-pub keyed-flat-sub \
@@ -110,6 +110,10 @@ gate-types: ; ./scripts/gate-types.sh
 # No reader conditionals outside dds-pal/ (contract §10, NFR-PORT). The contract claimed "CI lint enforces
 # this" — no such lint existed, and there was no CI to run it in. This is that lint; it falsifies itself.
 gate-pal: ; ./scripts/gate-pal.sh
+
+# Owner directive 2026-07-14 (NON-NEGOTIABLE): no Lisp conditions in the hot path; every condition handled
+# at latest at the toplevel DDS API. Annotation lint + asserts the receiver boundary handlers still exist.
+gate-nocond: ; ./scripts/gate-nocond.sh
 
 # The REAL build gate (operating contract §6): clean-cache rebuild + a falsification self-test.
 # `build` above is the incremental convenience load; THIS is the one that can actually fail.

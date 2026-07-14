@@ -1345,7 +1345,8 @@
     (%instance-handle (topic-type-support (dw-topic dw)) sample)))
 
 (defun* write-sample (dw sample &optional source-timestamp)
-    (function (data-writer t &optional (or null integer)) (member :ok :timeout :not-enabled))
+    (function (data-writer t &optional (or null integer))
+              (member :ok :timeout :not-enabled :bad-parameter))
   "DataWriter::write — serialize SAMPLE via the topic type-support and publish it reliably over the engine
    to all matched/discovered readers. Returns the DDS ReturnCode_t +RETCODE-OK+ (:ok) normally, or
    +RETCODE-TIMEOUT+ (:timeout) if the writer's HistoryCache was full and RELIABILITY.max_blocking_time
@@ -1364,22 +1365,36 @@
    A DISABLED DataWriter refuses the write with +RETCODE-NOT-ENABLED+ (:not-enabled), the write outside
    the NOT_ENABLED-safe set on a disabled entity (DDS 1.4 §2.2.2.1.1.7, S2.T3)."
   (unless (entity-enabled-p dw) (return-from write-sample +retcode-not-enabled+))
+  ;; NO CONDITION MAY ESCAPE THE PUBLIC API (owner directive, NON-NEGOTIABLE; gate-nocond rule 2).
+  ;; The guard must wrap the WHOLE operation, not just the publish: the KEYHASH is computed first, and it
+  ;; serializes the KEY fields — so a keyed type whose key is a string (ShapeType's key IS its colour)
+  ;; signals from %write-key-hash, before the publish is even reached. DDS 1.4 §2.2.4.4: an unencodable
+  ;; sample is RETCODE_BAD_PARAMETER, a STATUS, not a stack unwind. Nothing is published.
+  (handler-case
+      (%write-sample-1 dw sample source-timestamp)
+    (dds.cdr:cdr-not-implemented () +retcode-bad-parameter+)))
+
+(defun* %write-sample-1 (dw sample source-timestamp)
+    (function (data-writer t (or null integer)) (member :ok :timeout :not-enabled :bad-parameter))
+  "The body of WRITE-SAMPLE. Separated so ONE handler-case at the API boundary covers the whole operation —
+   keyhash + serialize + publish (see write-sample)."
   (let ((node (dp-node (pub-participant (dw-publisher dw))))
         (kh (%write-key-hash dw sample)))   ; WP-DCPS-API-COMPLETION S4: reused for both publish + offered-deadline arm (no extra keyhash cons)
     (let* ((ts (topic-type-support (dw-topic dw)))
            (rep (%writer-tx-rep dw))
            (ts-ns (or source-timestamp (dds.pal:realtime-ns)))   ; ADR 0055: a plain write stamps the CURRENT wall-clock (DDS 1.4 §2.2.2.4.2.11 write = write_w_timestamp(now))
-           (rc (if (%flatdata-transcoding-p ts rep)
-                   ;; FlatData under a non-XCDR2 offered rep: the transcoding builder allocates -> allocating path.
-                   (dds.disc:publish-sample node (%serialize-sample ts sample rep) kh nil 0 nil
-                                            (dw-entity-id dw) ts-ns)
-                   ;; WP-PERF: serialize STRAIGHT INTO the writer's arena-pooled buffer — 0 bytes/sample on TX.
-                   ;; Degrades to the allocating path by itself if no pool can be carved / the pool is exhausted.
-                   (dds.disc:publish-sample-into node (%sample-serializer-into ts sample rep) kh
-                                                 (dw-entity-id dw)   ; WP-N-ENDPOINT-S1: THIS writer's own HistoryCache
-                                                 ts-ns))))
+           (rc (progn
+                 (if (%flatdata-transcoding-p ts rep)
+                       ;; FlatData under a non-XCDR2 offered rep: the transcoding builder allocates -> allocating path.
+                       (dds.disc:publish-sample node (%serialize-sample ts sample rep) kh nil 0 nil
+                                                (dw-entity-id dw) ts-ns)
+                       ;; WP-PERF: serialize STRAIGHT INTO the writer's arena-pooled buffer — 0 bytes/sample on TX.
+                       ;; Degrades to the allocating path by itself if no pool can be carved / the pool is exhausted.
+                       (dds.disc:publish-sample-into node (%sample-serializer-into ts sample rep) kh
+                                                     (dw-entity-id dw)   ; WP-N-ENDPOINT-S1: THIS writer's own HistoryCache
+                                                     ts-ns)))))
       (when (eq :timeout rc)
-        (return-from write-sample +retcode-timeout+)))   ; full bounded cache, max_blocking_time elapsed
+        (return-from %write-sample-1 +retcode-timeout+)))   ; full bounded cache, max_blocking_time elapsed
     (assert-liveliness dw)
     (%deadline-touch-writer dw kh sample)   ; WP-DCPS-API-COMPLETION S4: (re)arm this instance's offered DEADLINE (no-op + 0-alloc when DEADLINE is INFINITE; reuses the KEEP_LAST keyhash)
     (let ((h (or kh (%instance-handle (topic-type-support (dw-topic dw)) sample))))   ; S5.T1: write auto-registers the instance (DDS 1.4 §2.2.2.4.2.2)

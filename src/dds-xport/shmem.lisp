@@ -54,7 +54,7 @@
     (function (t (integer 1) (integer 8)) t)
   "Initialise header + the pshared notify block (mutex/cond/stop) + zero every lane cursor/owner.
    CAPACITY must be a multiple of 8. Creator-only."
-  (assert (zerop (mod capacity 8)))
+  (assert (zerop (mod capacity 8)))   ; HOTPATH-COND(COLD): ring geometry check at segment CREATE, not per datagram
   (setf (cffi:mem-ref sap :uint32 +off-magic+) +shm-magic+
         (cffi:mem-ref sap :uint32 +off-version+) +shm-version+
         (cffi:mem-ref sap :uint32 +off-lane-count+) lane-count
@@ -232,7 +232,7 @@
    the busy receiver WILL see this datagram on its next predicate check, never a lost wakeup). The
    lock+signal (a futex syscall) is taken ONLY for a parked receiver, so a tight blast into a draining
    receiver does no per-message futex wake — the WP-SHMEM throughput fix (FR-XPORT-2)."
-  (when *debug-shmem-send-fault* (error 'shmem-send-test-fault))   ; test affordance: inert when NIL (byte-identical production)
+  (when *debug-shmem-send-fault* (error 'shmem-send-test-fault))   ; test affordance: inert when NIL (byte-identical production)   ; HOTPATH-COND(TEST): fault injection, armed only by *debug-shmem-send-fault*
   (let* ((dest (%attach-for st locator)) (sap (dds.pal:shm-sap dest))
          (lane (%claim-lane sap (shmem-transport-token st))))
     (if (and lane (%lane-enqueue sap lane (shmem-locator-capacity locator)
@@ -293,13 +293,13 @@
            (setf c (dds.core.buffer:cursor buf))
            (dds.core.buffer:put-u8 c #xDE) (dds.core.buffer:put-u8 c #xAD)
            (dds.core.buffer:put-u8 c #xBE) (dds.core.buffer:put-u8 c #xEF)
-           (assert (= 4 (dds.xport:send (shmem-transport-transport tx)
+           (assert (= 4 (dds.xport:send (shmem-transport-transport tx)   ; HOTPATH-COND(TEST): in-file self-test
                                         (shmem-transport-locator rx) buf 0 4))
                    () "SHMEM send must enqueue 4 octets and return 4")
            (shmem-receive-drain
             rx (lambda (s size) (setf got (cons size (aref (dds.core.buffer:octet-buffer-vec s) 0)))))
-           (assert got () "SHMEM drain delivered nothing")
-           (assert (equal '(4 . #xDE) got) () "SHMEM round-trip mismatch: ~s (want (4 . 222))" got)
+           (assert got () "SHMEM drain delivered nothing")   ; HOTPATH-COND(TEST): in-file self-test
+           (assert (equal '(4 . #xDE) got) () "SHMEM round-trip mismatch: ~s (want (4 . 222))" got)   ; HOTPATH-COND(TEST): in-file self-test
            t)
       (shmem-transport-close tx)
       (shmem-transport-close rx))))
@@ -465,9 +465,9 @@
              (dds.core.buffer:put-u8 c #x55) (dds.core.buffer:put-u8 c #x66)
              (dds.xport:send (shmem-transport-transport tx) (shmem-transport-locator rx) ob 0 2))
            (loop repeat 100 until received do (sleep 0.02))
-           (assert received () "SHMEM receiver thread did not deliver a datagram")
-           (assert (= 2 (car received)) () "SHMEM wrong datagram size")
-           (assert (= #x55 (cdr received)) () "SHMEM wrong datagram byte")
+           (assert received () "SHMEM receiver thread did not deliver a datagram")   ; HOTPATH-COND(TEST): in-file self-test
+           (assert (= 2 (car received)) () "SHMEM wrong datagram size")   ; HOTPATH-COND(TEST): in-file self-test
+           (assert (= #x55 (cdr received)) () "SHMEM wrong datagram byte")   ; HOTPATH-COND(TEST): in-file self-test
            t)
       (stop-shmem-receiver rx)
       (shmem-transport-close tx)
@@ -522,7 +522,7 @@
                              (> (dds.pal:monotonic-ns) deadline))
                    do (sleep 0.005))
              (let ((got (dds.pal:with-lock (count-lock) delivered)))
-               (assert (= got total) ()
+               (assert (= got total) ()   ; HOTPATH-COND(TEST): in-file self-test
                        "SHMEM stress: delivered ~d of ~d (senders=~d x per-sender=~d) — lost wakeup or hang"
                        got total senders per-sender))
              t))

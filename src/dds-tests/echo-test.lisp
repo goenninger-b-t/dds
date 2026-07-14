@@ -3758,6 +3758,7 @@
                  ("reliable-zc-qos"          . run-reliable-zc-qos-test)
                  ("lease-sweep"              . run-lease-sweep-test)
                  ("alloc-static-zeroed"     . run-alloc-static-zeroed-test)
+                 ("no-condition-escapes-api" . run-no-condition-escapes-api-test)
                  ("spdp-dispose-prune"      . run-spdp-dispose-prune-test)
                  ("writer-unmatch-proxy"    . run-writer-unmatch-proxy-test)
                  ("tce-disallow-default"     . run-tce-disallow-default-test)
