@@ -8,7 +8,8 @@
 #   2. Every condition MUST be handled at latest at the toplevel DDS API. Nothing escapes as a raw Lisp
 #      condition. The public API returns DDS ReturnCode_t (:ok / :timeout / :not-enabled / :bad-parameter).
 #
-# THE TARGET IS ZERO AND WE ARE AT 725 (non-hot-path). A gate that fails at "anything above zero" would be
+# THE TARGET IS ZERO AND WE ARE AT 332 (production, non-hot-path; in-file test functions excluded —
+# an `assert` in a run-*-test IS the test's failure mechanism, not production control flow). A gate that fails at "anything above zero" would be
 # permanently red and therefore ignored — the same trap `make mem` fell into. So this enforces the rule in
 # TWO tiers:
 #
@@ -118,14 +119,25 @@ boundary src/dds-xport/shmem.lisp 'handler-case \(shmem-receive-drain' 'SHMEM re
 CEIL_FILE=bench/nocond-ceiling.txt
 [[ -r "$CEIL_FILE" ]] || { echo "gate-nocond: FAIL — missing $CEIL_FILE" >&2; exit 1; }
 CEIL="$(tr -d '[:space:]' < "$CEIL_FILE")"
+# IN-FILE TEST FUNCTIONS ARE EXCLUDED. Many src/ files carry their own (defun* run-...-test ...) and an
+# `assert` there IS the test's failure mechanism, not production control flow — 393 of the original 725 were
+# these. The rule targets PRODUCTION code: what a user's call can hit. Everything else counts.
+count_file() {
+  awk -v pat="$SIGNAL_RE" '
+    /^\(defun\*?[ \t]+/ {
+      intest = ($2 ~ /-test$/ || $2 ~ /^run-/) ? 1 : 0
+    }
+    { if (!intest && $0 ~ pat) n++ }
+    END { print n+0 }' "$1"
+}
 COUNT=0
 while IFS= read -r f; do
   case "$f" in *dds-tests*) continue ;; esac
   for h in "${HOTPATH_FILES[@]}"; do [[ "$f" == "$h" ]] && continue 2; done
-  COUNT=$(( COUNT + $(grep -cE "$SIGNAL_RE" "$f" || true) ))
+  COUNT=$(( COUNT + $(count_file "$f") ))
 done < <(find src -name '*.lisp' | sort)
 
-echo "gate-nocond: non-hot-path signalling forms = ${COUNT} (ceiling ${CEIL}, TARGET 0)"
+echo "gate-nocond: PRODUCTION signalling forms (non-hot-path, excl. in-file tests) = ${COUNT} (ceiling ${CEIL}, TARGET 0)"
 if [[ "$COUNT" -gt "$CEIL" ]]; then
   echo "gate-nocond: FAIL — you ADDED a condition. ${COUNT} > ceiling ${CEIL}." >&2
   echo "             Rule 1: NO exceptions in our code. Return a status value." >&2
