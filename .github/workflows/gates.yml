@@ -66,7 +66,10 @@ jobs:
       - name: gate-build (clean-cache rebuild + self-falsification)
         run: make gate-build LISP=./scripts/with-sbcl.sh
 
+      # ⚠️ THE SUITE HANGS ON THE RUNNER (see the note at the bottom). Bounded so CI gives a FAST RED
+      # instead of burning the 60-minute job timeout — a gate that hangs is as useless as one that lies.
       - name: test (SBCL)
+        timeout-minutes: 12
         run: make test LISP=./scripts/with-sbcl.sh
 
       - name: corpus (XCDR byte-exact vs Connext's WIRE bytes)
@@ -81,7 +84,9 @@ jobs:
       - name: gate-pal (no reader conditionals outside dds-pal/)
         run: make gate-pal
 
+      # gate-mem creates two DDS participants on loopback — same container-networking exposure as `test`.
       - name: gate-mem (NFR-MEM allocation ratchet)
+        timeout-minutes: 10
         run: make gate-mem
 
       - name: fuzz (CDR/RTPS parser fuzzers, prod + safety-0)
@@ -96,3 +101,19 @@ jobs:
           echo "::warning::CLASP NOT RUN — CI covers SBCL only. The standing rule is that BOTH must validate."
           echo "::warning::  Human step: make test-clasp && make gate-build LISP=./scripts/with-clasp.sh"
           echo "::warning::INTEROP NOT RUN — needs licensed RTI Connext + Fast DDS. Human step: make interop"
+
+# OPEN: THE SUITE HANGS ON THE RUNNER.
+#
+# `make test` completes in ~40 s locally (566/566, macOS AND Linux-targeting code) but HANGS on
+# ubuntu-latest — it ran >16 minutes before being cancelled. It is NOT a compile problem: gate-build (a
+# clean-cache rebuild) passes, and the suite gets PAST the FlatData byte-exactness test that used to fail in
+# one second, which is how we know the alloc-static zero-fill fix landed.
+#
+# Prime suspect: DDS discovery. The suite creates participants that join the SPDP multicast group
+# (239.255.0.1:7400). A hosted runner container may have no multicast route, so discovery blocks forever
+# rather than erroring. Next steps for whoever picks this up:
+#   * find WHICH test hangs (run with a per-test timeout, or bisect the registry in echo-test.lisp);
+#   * check whether the runner has a multicast route at all: `ip maddr show`, `ip route show`;
+#   * if multicast is unavailable, the suite needs a loopback/unicast-peers mode for CI (the runners already
+#     support :peers — see the Fast DDS interop recipe, which is loopback-whitelisted for the same reason).
+# Until then CI is RED on `test` — which is CORRECT and must not be papered over. Do not disable the step.
