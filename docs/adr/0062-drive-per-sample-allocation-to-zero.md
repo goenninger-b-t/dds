@@ -100,6 +100,22 @@ also stale (its #1 item, `%writer-add-bounded` at "21 %", now measures 1.6 %).
    is only as durable as the reason nothing exercises it.* Declined for ~5 % of a budget whose tail will
    not move either way.
 
+## The TX budget, MEASURED (2026-07-14) — the "size it first" step, done
+
+`bench/report/2026-07-14-the-tx-allocation-budget-measured.md`. `bytes-consed` deltas around each callee,
+payload = 0, n = 3000. Total round-trip 3648 B/sample.
+
+| site | B/sample | what it is |
+|---|---|---|
+| `%send-changes-packed` | **349** | a per-sample datagram **PLAN of closures** (`%changes-datagram-plan` returns "a list of (BUILD-THUNK . SHMEM-DEST), each BUILD-THUNK a lambda"). The common case — one small change + optional HEARTBEAT to one destination — can be sent directly with no plan and no closures. **Byte-identical wire is the gate.** |
+| `%capture-push-groups` | **197** | per-send structs/lists for the **Zero-Copy multi-dest refcount** machinery, which is **off by default**. Same class as `312db1b`. (`writer-capture-unsent` is needed regardless — do not skip it.) |
+| `writer-write` | **196** | the `cache-change` struct. Pooling it is a **design change** — a change is retained until ACKed. |
+| `%write-key-hash` | **175** | the generated keyhash, KEEP_LAST only. RETAINED ⇒ touches the **frozen type-support contract** (§5). |
+| `hc-add-change`, `writer-acquire-payload-buffer` | **0** | **the arena pooling from `c89aae0` genuinely works.** It removed the *payload* allocation and left everything around it — which is exactly why "zero-alloc TX" was recorded as done while `write-sample` still costs 1.3 KB with nothing to serialize. |
+
+**TX ≈ 1300 B. The receiver threads + engine are ≈ 2350 B — the LARGER half, and still undrilled.** Do that
+next, the same way. `make gate-mem` ratchets the total so no step can silently lose its win.
+
 ## Consequences
 
 - The remaining path to NFR-MEM is **TX-first**, and it starts by asking why `write-sample` costs 1312 B
