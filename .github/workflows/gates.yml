@@ -38,7 +38,8 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y sbcl tshark
+          # libsqlite3 for the CL `sqlite` binding, libffi for cffi.
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y sbcl tshark libsqlite3-dev libffi-dev
           curl -sSLo /tmp/ql.lisp https://beta.quicklisp.org/quicklisp.lisp
           sbcl --non-interactive --load /tmp/ql.lisp \
                --eval '(quicklisp-quickstart:install)' \
@@ -47,12 +48,17 @@ jobs:
           test -f "$HOME/quicklisp/setup.lisp"
 
       - name: Preload third-party dependencies
-        # Fetch the deps ONCE with quickload (its warning-muffling is fine for OTHER people's code).
-        # Our OWN systems are then built with asdf:load-system, which is what makes a compile WARNING fail.
+        # Fetch the deps ONCE with quickload, which resolves them TRANSITIVELY from the .asd files.
+        # Do NOT hand-list them: my first attempt did, guessed :ironclad/:usocket (not used), MISSED :chipz
+        # and :sqlite, and CI failed on "Component chipz not found". A hand-written list always rots.
+        # quickload's warning-muffling is fine here — it is fetching OTHER people's code. Our OWN systems are
+        # then rebuilt from a CLEARED cache by gate-build via asdf:load-system, which is what makes a compile
+        # WARNING fail the build.
         run: |
           set -euo pipefail
           ./scripts/with-sbcl.sh \
-            --eval '(ql:quickload (list :cffi :static-vectors :bordeaux-threads :ironclad :usocket) :silent t)' \
+            --eval '(ql:quickload :dds-tests :silent t)' \
+            --eval '(ql:quickload :dds-bench :silent t)' \
             --eval '(uiop:quit 0)'
 
       # THE build gate: clears the fasl cache, rebuilds from scratch, and falsifies itself.
