@@ -104,7 +104,7 @@
   (:export #:rtps-writer #:make-rtps-writer #:rtps-writer-hc #:rtps-writer-entityid #:writer-write #:writer-heartbeat
            #:writer-lifecycle-change #:rtps-writer-max-blocking-ns #:%writer-signal-space
            #:writer-data-list #:writer-unsent-list #:writer-on-acknack #:writer-purge-acked #:get-reader-proxy
-           #:init-reader-proxy-base #:writer-finalize-durability #:rtps-writer-finalized
+           #:init-reader-proxy-base #:writer-finalize-durability #:rtps-writer-finalized #:writer-unmatch-reader
            #:reader-proxy #:reader-proxy-acked-base #:reader-proxy-unsent-base
            #:rtps-reader #:make-rtps-reader #:reader-on-data #:reader-on-heartbeat
            #:reader-acknack #:reader-on-gap #:reader-suppress-sn #:reader-complete-p #:init-writer-proxy-durability

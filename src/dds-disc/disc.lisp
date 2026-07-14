@@ -1700,7 +1700,19 @@
    unmatched by participant-lease expiry (DIRECTION :remote-writer / :remote-reader).
    WP-N-ENDPOINT-2C2 (ADR 0048): LOCAL-ENTITY-ID is the matched LOCAL endpoint's EntityId (from the
    per-pair match set), threaded so the status DECREMENT lands on the RIGHT same-topic endpoint; fired
-   once per (local,remote) pair. NIL -> the hook falls back to topic resolution (byte-identical N=1)."
+   once per (local,remote) pair. NIL -> the hook falls back to topic resolution (byte-identical N=1).
+
+   ADR 0063 §3: this is the ONE choke point every departure trigger funnels through — the graceful SPDP
+   dispose, the lease sweep, and an endpoint-level unmatch — so it is also where the ENGINE is told. A
+   remote READER that is gone must lose its ReaderProxy on every local user writer
+   (writer-unmatch-reader): the proxy table had NO removal path at all, so it grew without bound across
+   reconnects and each entry left a frozen acked-base watermark behind. The DCPS hook
+   (%writer-unmatched) only ever decremented the PUBLICATION_MATCHED counters — it never reached the
+   engine."
+  (when (eq direction :remote-reader)
+    (let ((rguid (dds.rtps.discovery:endpoint-data-guid remote)))
+      (dolist (cell (disc-node-user-writers node))   ; iterate the registry alist directly (NFR-MEM); N=1 = one writer
+        (dds.rtps.reliable:writer-unmatch-reader (cdr cell) rguid))))
   (when (disc-node-on-unmatch node)
     (funcall (disc-node-on-unmatch node) direction remote local-entity-id)))
 

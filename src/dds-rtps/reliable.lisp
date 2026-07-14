@@ -151,6 +151,30 @@
   (or (gethash reader-id (rtps-writer-proxies writer))
       (setf (gethash reader-id (rtps-writer-proxies writer)) (make-reader-proxy))))
 
+(defun* writer-unmatch-reader (writer reader-id)
+    (function (rtps-writer t) boolean)
+  "Drop the ReaderProxy for the remote reader named by READER-ID — the writer-side UNMATCH (RTPS 2.5
+   §8.4.7.1: a Writer removes the ReaderProxy of a Reader it is no longer matched with). Returns T iff a
+   proxy was actually removed. Idempotent.
+
+   THERE WAS NO REMOVAL PATH AT ALL (ADR 0063). RTPS-WRITER-PROXIES was create-on-first-use
+   (GET-READER-PROXY) and read — never REMHASHed, on any trigger: not on unmatch, not on lease expiry, not
+   on participant delete. Two consequences:
+
+   1. AN UNBOUNDED LEAK. Every remote reader a writer ever matched stayed in the table forever. A peer that
+      reconnects N times leaves N proxies (a fresh GUID each time), and nothing ever reclaims them.
+
+   2. A STALE WATERMARK. WRITER-PURGE-ACKED purges below min(acked-base) over the readers it is GIVEN. A
+      departed reader's proxy is a watermark frozen at the moment it left, so if it is ever consulted again
+      the KEEP_ALL history cannot purge past it. (The purge is driven from the DISC match set, so the
+      prompt-dispose prune already keeps the departed reader OUT of that set — which is what actually fixed
+      the ADR 0063 stall. This closes the leak the same prune should have closed in the engine.)
+
+   Called from the disc layer's single unmatch choke point (%fire-unmatch), so it runs on EVERY departure
+   trigger — graceful dispose AND lease expiry AND an endpoint-level unmatch — and cannot drift from them."
+  (%with-writer-lock (writer)
+    (remhash reader-id (rtps-writer-proxies writer))))
+
 (defun* writer-write (writer payload &optional (key-hash nil) (inline-qos nil)
                                                (pooled-buffer nil) (pooled-len nil)
                                                (zc-slot nil) (zc-gen 0)

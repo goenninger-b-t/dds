@@ -1,6 +1,6 @@
 # ADR 0063 — Graceful participant departure: announce it, and honour it
 
-- **Status:** Proposed (design + captured wire evidence). Implementation is a follow-on WP.
+- **Status:** **ACCEPTED — IMPLEMENTED AND CLOSED (2026-07-14).** The stall is fixed; all four items landed.
 - **Date:** 2026-07-13
 - **Requirements:** FR-DISC (SPDP), NFR-SEC-POSTURE (resource exhaustion), NFR-INTEROP
 - **Related:** ADR 0062 (allocation), the `%lease-sweep` path, task #15 (**which is a misdiagnosis — see below**)
@@ -233,6 +233,34 @@ writer's MATCH-TIME lastSN, which only the writer knows — hence the GAP.
 Regression test (write it FIRST, it must go red): N successive participants against ONE
 RELIABLE + KEEP_ALL responder; assert client #3+ still echo. The existing suite never re-matched a third
 participant against a live writer, which is why this survived 563 green tests.
+
+## ✅ OUTCOME — CLOSED. What actually landed, and what it cost to get there.
+
+The stall is fixed. **`#1 ok #2 ok #3 FAIL #4 FAIL` → `4/4`**, stable across repeated runs.
+
+| # | item | commit | effect |
+|---|---|---|---|
+| 1 | **Honour an inbound participant dispose** — prune AT ONCE, reusing the lease sweep's own prune (`%prune-participant-locked`) so the two paths cannot drift. Forged-eviction guard: a dispose whose keyhash prefix ≠ the datagram's SOURCE prefix is DROPPED, and we prune by the source prefix, never the wire-named one. | `7c7ea7f` | **THE FIX** |
+| 2 | **Send our own goodbye** in `stop-node`, byte-shape-identical to Connext's captured `delete_participant`. | `7c7ea7f` | **THE FIX** |
+| 3 | **Writer unmatch** — drop the departed reader's ReaderProxy on every local user writer, from the ONE choke point (`%fire-unmatch`) every departure trigger funnels through. | this | closes an **unbounded leak** |
+| 4 | **GAP readerId** — a GAP addressed to reader A was applied to reader B (`(declare (ignore rid))`). | `5a737ee` | independent defect |
+
+**Validated:** live repro 4/4 (3 runs) · **LIVE CONNEXT BOTH WAYS** (outbound: our goodbye matches Connext's
+wire shape; inbound: a real Connext `delete_participant` prunes us at once, peers 1→0, not after 100 s) ·
+interop Connext→us + Fast DDS→us + tshark · 565/565 Clasp AND SBCL · every new test **falsified** (each goes
+red on the defect it guards) · all gates.
+
+### ★ THE LESSON: THIS ADR'S ORIGINAL ORDER WAS RIGHT, AND REORDERING IT COST TWO REVERTED ATTEMPTS.
+
+I moved the reader-side gate to the front because it looked like "the correctness fix". It is not
+implementable: see ATTEMPT 2 below — discovery is asymmetric, so a writer can already have produced samples
+FOR a reader before it has processed that reader's match, and a match-time irrelevance GAP therefore cannot
+distinguish a late-matched LIVE sample from a genuinely pre-match one. **Two attempts, both reverted.**
+
+The fix that worked is the one this ADR specified first, and it is also the *simpler* one: **stop retaining
+what nobody wants.** It has no race precisely because it never has to make that distinction. When a design
+needs to tell two things apart and the information to do so does not exist at that point in the protocol,
+that is not an implementation problem — it is the design telling you it is wrong.
 
 ## ★★ ATTEMPT 2 — THE MATCH-TIME GAP DESIGN IS DEAD. Do not try it again.
 

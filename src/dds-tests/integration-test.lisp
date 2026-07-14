@@ -10546,6 +10546,39 @@
       (dds.disc:stop-node node)))
   t)
 
+(defun* run-writer-unmatch-proxy-test ()
+    (function () t)
+  "ADR 0063 §3 — a departed remote reader must lose its ReaderProxy on every local user writer
+   (RTPS 2.5 §8.4.7.1). It never did: rtps-writer-proxies was create-on-first-use (get-reader-proxy) and
+   read, and NOTHING ever REMHASHed it — not on unmatch, not on lease expiry, not on participant delete.
+   The DCPS hook (%writer-unmatched) only decremented the PUBLICATION_MATCHED counters; it never reached
+   the engine. So every remote reader a writer ever matched stayed in the table FOREVER: an unbounded leak
+   across reconnects, each entry leaving a frozen acked-base watermark behind.
+
+   Asserts: a matched remote reader creates a proxy; firing the unmatch (the ONE choke point both the
+   graceful SPDP dispose and the lease sweep funnel through) REMOVES it."
+  (let ((node (dds.disc:make-disc-node
+               :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element #x54)
+               :host "127.0.0.1" :port 0)))
+    (unwind-protect
+        (let* ((w (dds.rtps.reliable:make-rtps-writer))
+               (rguid (make-array 16 :element-type '(unsigned-byte 8) :initial-element #x77))
+               (rep (dds.rtps.discovery:make-endpoint-data
+                     :guid rguid :topic-name "T" :type-name "X"
+                     :qos (dds.qos:make-qos :reliability :reliable))))
+          (setf (aref rguid 15) #x07)                       ; a reader EntityId kind
+          (dds.disc::%register-user-writer node #x00000102 w)
+          (dds.rtps.reliable:get-reader-proxy w rguid)      ; the writer matched it: proxy created
+          (%check :adr63-proxy-created
+                  (= 1 (hash-table-count (dds.rtps.reliable::rtps-writer-proxies w)))
+                  "a matched remote reader must have a ReaderProxy")
+          (dds.disc::%fire-unmatch node :remote-reader rep nil)
+          (%check :adr63-proxy-removed
+                  (zerop (hash-table-count (dds.rtps.reliable::rtps-writer-proxies w)))
+                  "a departed remote reader must LOSE its ReaderProxy — the table had NO removal path at all, so it grew without bound across reconnects (ADR 0063 §3)"))
+      (dds.disc:stop-node node)))
+  t)
+
 (defun* run-lease-unmatch-test ()
     (function () t)
   "A matched remote endpoint removed by participant-lease expiry decrements the local
