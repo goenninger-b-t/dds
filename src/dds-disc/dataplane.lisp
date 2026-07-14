@@ -3272,16 +3272,26 @@
    EntityId 0x102 across participants keep independent received-SN state (§8.3.5.4). Gated on a matched user
    writer EntityId; mirrors %on-user-heartbeat."
   (multiple-value-bind (rid wid gap-start base numbits bitmap) (dds.rtps.message:parse-gap-body c flags)
-    (declare (ignore rid))
     (when (and base (disc-node-user-reader node) (%user-writer-entityid-p wid))
-      (let ((routes (%reader-routes-for node (%source-guid src-prefix wid))))   ; WP-N-ENDPOINT-S2: the CANONICAL reader matched to this writer
-        (when routes
-          (let ((lost (dds.rtps.reliable:reader-on-gap (cdr (first routes)) (%source-guid src-prefix wid)
+      (let* ((routes (%reader-routes-for node (%source-guid src-prefix wid)))   ; WP-N-ENDPOINT-S2: the readers matched to this writer
+             ;; RTPS 2.5 §8.3.7.4: readerGUID = { Receiver.destGuidPrefix, Gap.readerId }, and "the Gap
+             ;; readerId can be ENTITYID_UNKNOWN, in which case the Gap applies to ALL Readers of that
+             ;; writerGUID within the Participant" — so a NON-unknown readerId addresses exactly ONE reader.
+             ;; We used to (declare (ignore rid)) and apply every GAP to the canonical route, so a GAP
+             ;; addressed to reader A also suppressed SNs on a co-located reader B: B stopped NACKing SNs it
+             ;; had never received and its ack watermark advanced past them — SILENT SAMPLE LOSS on a reader
+             ;; the writer never sent the GAP to. Honour the readerId; a GAP naming a reader we do not host
+             ;; is DROPPED.
+             (targets (if (= rid dds.rtps.message:+entityid-unknown+)
+                          routes
+                          (remove-if-not (lambda (rr) (= (car rr) rid)) routes))))
+        (when targets
+          (let ((lost (dds.rtps.reliable:reader-on-gap (cdr (first targets)) (%source-guid src-prefix wid)
                                                        gap-start base numbits bitmap)))
             ;; WP-DCPS-API-COMPLETION S4: a GAP that declares never-received SNs permanently gone raises
             ;; SAMPLE_LOST on the matched DataReader(s) (DDS 1.4 §2.2.4.1); N=1 -> the canonical route's id.
             (when (and (plusp lost) (disc-node-on-sample-lost node))
-              (dolist (rr routes) (funcall (disc-node-on-sample-lost node) (car rr) lost))))))))
+              (dolist (rr targets) (funcall (disc-node-on-sample-lost node) (car rr) lost))))))))
   t)
 
 (defun* %on-user-acknack (node c flags src-prefix)
