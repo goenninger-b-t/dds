@@ -297,10 +297,18 @@
 
 (defun* shm-attach-by-name-reliable-p ()
     (function () t)
-  "T except on Clasp/macOS-arm64, whose plain cffi:foreign-funcall mispasses shm_open's variadic mode_t so a
-   created object is unre-openable by name (NFR-PORT gap, ADR 0013). The SHMEM transport REQUIRES by-name
-   attach (the sender opens the receiver's named segment), so its loopback tests pass-skip where this is NIL.
-   SBCL is conformant on every platform; Clasp on Linux uses the register varargs ABI and is conformant.
+  "T except on Clasp/macOS-arm64, whose CFFI cannot pass shm_open's variadic mode_t, so a created object is
+   unre-openable by name (NFR-PORT gap, ADR 0013). The SHMEM transport REQUIRES by-name attach (the sender
+   opens the receiver's named segment), so its loopback tests pass-skip where this is NIL. SBCL is
+   conformant on every platform; Clasp on LINUX — the primary platform (§9) — uses the register varargs ABI
+   and is conformant, so Clasp is fully fitted there.
+
+   ⚠️ DO NOT 'FIX' THIS BY SWITCHING THE CALL FORM. It was tried (2026-07-14) and it looked like it worked.
+   Over 30 create+reopen trials on Clasp/macOS-arm64: plain foreign-funcall 10/30, foreign-funcall-varargs
+   0/30, varargs-as-:int 10/30, varargs+fchmod 0/30. The mode lands as GARBAGE and a single trial passes or
+   fails on whether those bits happened to include owner-rw — so a one-shot probe 'proves' whichever answer
+   you want. See dds.pal::%shm-open-create for the full measurement. The remaining fix is upstream in Clasp.
+
    Runtime check (NOT a reader conditional): dds-xport is outside dds-pal."
   (not (and (eq (dds.pal:pal-impl-name) :clasp) (uiop:os-macosx-p))))
 

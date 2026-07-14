@@ -1524,8 +1524,13 @@
          (size (and (dds.types:flatdata-layout-p lay) (dds.types:flatdata-layout-size lay)))
          (ln (or (pop (dw-loan-freelist dw)) (%make-writer-loan))))
     (setf (writer-loan-done ln) nil)
-    (when (and size (eq (dds.pal:pal-impl-name) :sbcl)   ; ZC foreign-SAP writes are SBCL-only (ADR 0013)
-               (dds.disc:node-loan-write-eligible-p node size))
+    ;; Gated on the CAPABILITY, not on the implementation NAME. This used to read
+    ;; (eq (dds.pal:pal-impl-name) :sbcl) because the Clasp PAL stubbed store-sap-u8 out; that stub is gone
+    ;; (it is cffi:mem-ref, exactly as SBCL's sap-ref-8 is), so the foreign-SAP writes work on both impls.
+    ;; What zero-copy still needs is by-name SHMEM attach — and node-loan-write-eligible-p now asks for it,
+    ;; so Clasp/Linux (the primary platform) takes the loan-write path exactly as SBCL does, while
+    ;; Clasp/macOS-arm64 (the residual ADR 0013 defect) degrades gracefully.
+    (when (and size (dds.disc:node-loan-write-eligible-p node size))
       (multiple-value-bind (sap slot base gen) (dds.disc:node-loan-write-acquire node size)
         (when sap                                        ; NIL ⇒ pool saturated ⇒ fall through to the fallback
           (let ((hdr (or (dw-loan-encap dw) (setf (dw-loan-encap dw) (%loan-encap-header ts)))))

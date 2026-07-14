@@ -5,7 +5,11 @@
 
 #-clasp
 (eval-when (:compile-toplevel :load-toplevel :execute)
-  (warn "pal-clasp.lisp loaded on a non-Clasp build; capabilities will stub out."))
+  ;; A diagnostic, not a condition (ADR 0064: nothing in our code signals). WARN would unwind into the
+  ;; loading image's handlers and, under a warnings-as-errors build policy, fail a build that is merely
+  ;; loading the wrong PAL for its implementation.
+  (format *error-output*
+          "~&dds.pal: pal-clasp.lisp loaded on a non-Clasp build — this PAL is not the one for this image.~%"))
 
 
 (defun* pal-impl-name ()
@@ -149,29 +153,28 @@
 
 (defun* load-sap-u8 (sap offset)
     (function (t (integer 0)) (unsigned-byte 8))
-  "8-bit unsigned read of the foreign location at SAP+OFFSET. NFR-PORT gap: backs the
-   FlatData-over-Zero-Copy read-in-place accessors (WP-FLATDATA-ZC-LOAN, R6 — NOT cleared
-   for ship, see ADR 0017), and ZC is SBCL-only (ADR 0013), so the loan path never runs on
-   Clasp; signals PAL-UNIMPLEMENTED rather than offering a half-path (consistent with the
-   cas-sap-u64 stub)."
-  (declare (ignore sap offset))
-  (error 'pal-unimplemented :op 'load-sap-u8))
+  "8-bit unsigned read of the foreign location at SAP+OFFSET (bytes). Backs the FlatData-over-Zero-Copy
+   read-in-place accessors (WP-FLATDATA-ZC-LOAN, ADR 0017): a literal-0-copy field read straight off a SHMEM
+   pool slot SAP, byte-exact to the aref accessor (XCDR2-LE). Same contract as the SBCL PAL's sb-sys:sap-ref-8.
+
+   WAS A PAL-UNIMPLEMENTED STUB, and the stub was never justified: cffi:mem-ref reads a foreign cell on
+   Clasp exactly as it does on SBCL (this file's LOAD-SAP-U64 already did precisely that). The gap was
+   asserted, not measured — owner directive 2026-07-14: Clasp and SBCL MUST be equally fitted."
+  (cffi:mem-ref sap :uint8 offset))
 (defun* load-sap-u16 (sap offset)
     (function (t (integer 0)) (unsigned-byte 16))
-  "16-bit little-endian unsigned read of the foreign location at SAP+OFFSET. Same NFR-PORT
-   gap as LOAD-SAP-U8: ZC is SBCL-only (ADR 0013), so the FlatData-ZC loan path
-   (WP-FLATDATA-ZC-LOAN, R6 — NOT cleared for ship, see ADR 0017) never runs on Clasp;
-   signals PAL-UNIMPLEMENTED."
-  (declare (ignore sap offset))
-  (error 'pal-unimplemented :op 'load-sap-u16))
+  "Aligned 16-bit little-endian unsigned read of the foreign location at SAP+OFFSET (bytes). Backs the
+   FlatData-over-Zero-Copy read-in-place accessors (ADR 0017), byte-exact to the aref accessor. Same
+   contract as the SBCL PAL's sb-sys:sap-ref-16. (Was an unjustified PAL-UNIMPLEMENTED stub — see
+   LOAD-SAP-U8.)"
+  (cffi:mem-ref sap :uint16 offset))
 (defun* load-sap-u32 (sap offset)
     (function (t (integer 0)) (unsigned-byte 32))
-  "32-bit little-endian unsigned read of the foreign location at SAP+OFFSET. Same NFR-PORT
-   gap as LOAD-SAP-U8: ZC is SBCL-only (ADR 0013), so the FlatData-ZC loan path
-   (WP-FLATDATA-ZC-LOAN, R6 — NOT cleared for ship, see ADR 0017) never runs on Clasp;
-   signals PAL-UNIMPLEMENTED."
-  (declare (ignore sap offset))
-  (error 'pal-unimplemented :op 'load-sap-u32))
+  "Aligned 32-bit little-endian unsigned read of the foreign location at SAP+OFFSET (bytes). Backs the
+   FlatData-over-Zero-Copy read-in-place accessors (ADR 0017), byte-exact to the aref accessor. Same
+   contract as the SBCL PAL's sb-sys:sap-ref-32. (Was an unjustified PAL-UNIMPLEMENTED stub — see
+   LOAD-SAP-U8.)"
+  (cffi:mem-ref sap :uint32 offset))
 (defun* load-sap-u64 (sap offset)
     (function (t (integer 0)) (unsigned-byte 64))
   "Aligned 64-bit read of the foreign location at SAP+OFFSET (bytes). Masked to unsigned
@@ -183,35 +186,100 @@
   (setf (cffi:mem-ref sap :uint64 offset) value))
 (defun* store-sap-u8 (sap offset value)
     (function (t (integer 0) (unsigned-byte 8)) (unsigned-byte 8))
-  "8-bit write of VALUE at SAP+OFFSET. Same NFR-PORT gap as LOAD-SAP-U8: ZC is SBCL-only
-   (ADR 0013), so the FlatData loan-write SAP-mode setters (WP-FLATDATA-LOAN-WRITE, R6 — NOT
-   cleared for ship, see ADR 0042) never run on Clasp; signals PAL-UNIMPLEMENTED."
-  (declare (ignore sap offset value))
-  (error 'pal-unimplemented :op 'store-sap-u8))
+  "8-bit write of VALUE at SAP+OFFSET (bytes). Backs the FlatData loan-write SAP-mode Offset setters
+   (WP-FLATDATA-LOAN-WRITE, ADR 0042): a literal-0-copy field write straight into a SHMEM pool slot SAP,
+   byte-exact to the aref setter (XCDR2-LE). Same contract as the SBCL PAL's (setf sb-sys:sap-ref-8).
+   (Was an unjustified PAL-UNIMPLEMENTED stub — see LOAD-SAP-U8.)"
+  (setf (cffi:mem-ref sap :uint8 offset) value))
+;;; ---- atomics over a RAW FOREIGN CELL (the NFR-PORT gap that ADR 0013 declared unclosable) ----
+;;
+;; It was closable. The three primitives below were PAL-UNIMPLEMENTED stubs on the claim that "Clasp has no
+;; hardware atomic over a raw foreign cell" — true of the LISP-side operators that were tried (mp:cas
+;; rejects a cffi:mem-ref place as NOT-ATOMIC; core:acas on a static-vector silently drops a store whose
+;; compare operand exceeds most-positive-fixnum), but the conclusion did not follow. The C ATOMIC RUNTIME is
+;; already linked into the Clasp image and its symbols resolve: __atomic_compare_exchange_8 / _4 and
+;; __atomic_fetch_add_8 are the very functions the compiler emits for C11 _Atomic / GCC __atomic builtins.
+;; They are real hardware atomics (arm64 CASAL / x86 LOCK CMPXCHG), they are valid on MAP_SHARED memory
+;; across PROCESSES, and they take the address as a plain pointer — exactly our SHMEM/ZC use.
+;;
+;; MEASURED, not assumed (scratch harness, this Clasp build): CAS returns the previous value on both the
+;; success and the failure arm, round-trips a FULL-WIDTH 2^64-1 operand (the exact case core:acas dropped),
+;; and 8 threads x 10 000 CAS-increments and fetch-adds each LOSE NOTHING (80 000/80 000).
+;;
+;; Consequence: Clasp is no longer SHMEM-blind or ZC-blind for want of an atomic. Owner directive
+;; 2026-07-14 — Clasp and SBCL MUST be equally fitted.
+;;
+;; __ATOMIC_SEQ_CST = 5 (GCC/LLVM memory-order enum: RELAXED 0, CONSUME 1, ACQUIRE 2, RELEASE 3, ACQ_REL 4,
+;; SEQ_CST 5 — read from the compiler's atomic ABI, not from memory). SEQ_CST is a FULL barrier, matching
+;; SBCL's sb-ext:cas, so both PALs give the ring and the refcount identical ordering.
+(defconstant +atomic-seq-cst+ 5
+  "GCC/LLVM __ATOMIC_SEQ_CST memory order (the atomic ABI's enum value). A FULL barrier — the same ordering
+   sb-ext:cas gives on the SBCL PAL, so the SHMEM ring and the zero-copy refcount behave identically on
+   both implementations.")
+
+(defparameter *cas-u64-fp* (cffi:foreign-symbol-pointer "__atomic_compare_exchange_8")
+  "The RESOLVED __atomic_compare_exchange_8 pointer, looked up ONCE at load. Cached for the same reason as
+   *CLOCK-GETTIME-FP*: a by-NAME foreign call on Clasp re-resolves the symbol on EVERY call (~3.8 us of
+   dlsym), and CAS is on the SHMEM lane-claim / zero-copy refcount hot path.")
+(defparameter *cas-u32-fp* (cffi:foreign-symbol-pointer "__atomic_compare_exchange_4")
+  "The RESOLVED __atomic_compare_exchange_4 pointer, looked up ONCE at load (see *CAS-U64-FP*).")
+(defparameter *fetch-add-u64-fp* (cffi:foreign-symbol-pointer "__atomic_fetch_add_8")
+  "The RESOLVED __atomic_fetch_add_8 pointer, looked up ONCE at load (see *CAS-U64-FP*).")
+
+(defmacro %cas-sap (fp sap offset old new ctype)
+  "Expand to a compare-and-swap of the CTYPE (:uint64 / :uint32) cell at SAP+OFFSET from OLD to NEW via the
+   C atomic-runtime entry FP, yielding the PREVIOUS value (= OLD on success).
+
+   A MACRO, not a function, because cffi:foreign-funcall-pointer is itself a macro: the foreign type must be
+   a LITERAL at the call site, so it cannot be selected at runtime (an (IF ...) there is read as a CFFI type
+   named IF, which is exactly how the first cut failed to compile).
+
+   The C ABI takes EXPECTED **by pointer** and OVERWRITES it with the actual value when the compare fails —
+   which IS the previous value our contract must return, so the failure arm reads it back out of the cell.
+   The read-back is masked because Clasp's CFFI :uint64 mem-ref SIGN-EXTENDS a high-bit-set word (the same
+   defect LOAD-SAP-U64 masks). Uses this thread's pre-allocated scratch (dds.pal:*thread-atomic-cell*) so
+   the CAS retry loop does NO per-call foreign malloc (~3.3 us on Clasp — the *thread-timespec* lesson); a
+   thread the PAL did not create has none and falls back to a per-call WITH-FOREIGN-OBJECT."
+  (let ((cell (gensym "CELL")) (ok (gensym "OK")) (run (gensym "RUN")))
+    `(flet ((,run (,cell)
+              (setf (cffi:mem-ref ,cell ,ctype) ,old)
+              (let ((,ok (cffi:foreign-funcall-pointer
+                          ,fp () :pointer (cffi:inc-pointer ,sap ,offset)
+                          :pointer ,cell ,ctype ,new
+                          :int +atomic-seq-cst+ :int +atomic-seq-cst+ :int)))
+                (if (zerop ,ok)
+                    (logand (cffi:mem-ref ,cell ,ctype) #xFFFFFFFFFFFFFFFF)  ; failed: the ACTUAL previous value
+                    ,old))))                                                 ; succeeded: the previous value WAS old
+       (let ((,cell *thread-atomic-cell*))
+         (if ,cell
+             (,run ,cell)
+             (cffi:with-foreign-object (,cell :uint64) (,run ,cell)))))))
+
 (defun* cas-sap-u64 (sap offset old new)
     (function (t (integer 0) (unsigned-byte 64) (unsigned-byte 64)) (unsigned-byte 64))
-  "Atomic compare-and-swap of the u64 at SAP+OFFSET; returns the PREVIOUS value (= OLD on
-   success). NFR-PORT gap: Clasp has no hardware atomic over a raw foreign cell — mp:cas
-   rejects a cffi:mem-ref place (NOT-ATOMIC), and the only foreign-backed primitive
-   (core:acas on a (unsigned-byte 64) static-vector) silently drops the store when the
-   compare operand exceeds most-positive-fixnum (probed A4); signals PAL-UNIMPLEMENTED so the
-   SHMEM ring stays SBCL-only and Clasp falls back to UDP (ADR 0013, FR-XPORT-2)."
-  (declare (ignore sap offset old new))
-  (error 'pal-unimplemented :op 'cas-sap-u64))
+  "Atomic compare-and-swap of the u64 at SAP+OFFSET; returns the PREVIOUS value (= OLD on success). Backs
+   the SHMEM ring's lane claim and cursor publication (FR-XPORT-2). Full-barrier (SEQ_CST), matching the
+   SBCL PAL's sb-ext:cas. Real hardware CAS via the C atomic runtime — see the block comment above; this was
+   a PAL-UNIMPLEMENTED stub, and the gap it claimed does not exist."
+  (%cas-sap *cas-u64-fp* sap offset old new :uint64))
+
 (defun* cas-sap-u32 (sap offset old new)
     (function (t (integer 0) (unsigned-byte 32) (unsigned-byte 32)) (unsigned-byte 32))
   "Atomic compare-and-swap of the u32 at SAP+OFFSET; returns the PREVIOUS value (= OLD on success). The
-   full-barrier atomic backing the lock-free loan release (WP-ZC-LOAN-LOCKFREE, R6 — NOT cleared for ship,
-   see ADR 0018). Same NFR-PORT gap as CAS-SAP-U64: no Clasp hardware atomic over a raw foreign cell, and ZC
-   is SBCL-only (ADR 0013), so the loan-release path never runs on Clasp; signals PAL-UNIMPLEMENTED."
-  (declare (ignore sap offset old new))
-  (error 'pal-unimplemented :op 'cas-sap-u32))
+   full-barrier atomic backing the lock-free loan release: it CASes ONLY the 4-byte refcount sub-field
+   directly, so the combined (generation<<32)|refcount value never materialises — no bignum boxing at any
+   generation (WP-ZC-LOAN-LOCKFREE, ADR 0018). Same ordering as CAS-SAP-U64."
+  (%cas-sap *cas-u32-fp* sap offset old new :uint32))
+
 (defun* atomic-incf-sap-u64 (sap offset delta)
     (function (t (integer 0) (unsigned-byte 64)) (unsigned-byte 64))
-  "Atomically add DELTA to the u64 at SAP+OFFSET; returns the NEW value. Same NFR-PORT gap as
-   CAS-SAP-U64 (no Clasp foreign atomic); signals PAL-UNIMPLEMENTED (ADR 0013, FR-XPORT-2)."
-  (declare (ignore sap offset delta))
-  (error 'pal-unimplemented :op 'atomic-incf-sap-u64))
+  "Atomically add DELTA to the u64 at SAP+OFFSET; returns the NEW value. __atomic_fetch_add_8 returns the
+   PREVIOUS value, so the new one is prev+DELTA taken mod 2^64 (the counter wraps like the C atomic does,
+   and like the SBCL PAL's). Full-barrier (SEQ_CST)."
+  (logand (+ delta (cffi:foreign-funcall-pointer
+                    *fetch-add-u64-fp* () :pointer (cffi:inc-pointer sap offset)
+                    :uint64 delta :int +atomic-seq-cst+ :uint64))
+          #xFFFFFFFFFFFFFFFF))
 
 ;; SPAWN lives in pal-net.lisp — identical bordeaux-threads call on both impls, and it must wrap the thread
 ;; body in CALL-WITH-THREAD-CLOCK (defined there) to give the thread its MONOTONIC-NS scratch.

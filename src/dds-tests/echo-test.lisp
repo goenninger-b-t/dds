@@ -314,9 +314,21 @@
 
 (defun* run-pal-sap-atomics-test ()
     (function () (eql t))
-  "cas-sap-u64 / atomic-incf-sap-u64 / load/store on a foreign 8-byte region behave atomically (single-thread correctness)."
-  (unless (eq (dds.pal:pal-impl-name) :sbcl) (return-from run-pal-sap-atomics-test t))
-  (let ((m (dds.pal:alloc-static 16)))
+  "cas-sap-u64 / cas-sap-u32 / atomic-incf-sap-u64 over a RAW FOREIGN CELL — the atomics that back the SHMEM
+   ring's lane claim and the zero-copy refcount.
+
+   RUNS ON BOTH IMPLS. It was gated SBCL-only, because the Clasp PAL stubbed these out as an unclosable
+   NFR-PORT gap (ADR 0013: \"Clasp has no hardware atomic over a raw foreign cell\"). That was asserted, not
+   measured — true of the Lisp-side operators tried (mp:cas rejects a cffi:mem-ref place; core:acas drops a
+   store whose compare operand exceeds most-positive-fixnum), but the C atomic runtime is linked into the
+   Clasp image and __atomic_compare_exchange_8/_4 + __atomic_fetch_add_8 are real hardware atomics over a
+   plain pointer. So this asserts PARITY, and it asserts the two things the gap hid:
+
+     (a) a FULL-WIDTH 2^64-1 compare operand round-trips — the exact case core:acas silently dropped, and
+         the one that would have corrupted a ring cursor rather than failing loudly;
+     (b) CONTENTION loses nothing — 8 threads x 2000 CAS-increments and fetch-adds must total exactly
+         16000 each. A CAS that is not really atomic passes every single-threaded check and fails here."
+  (let ((m (dds.pal:alloc-static 64)))
     (unwind-protect
          (let ((sap (dds.pal:static-pointer m)))
            (dds.pal:store-sap-u64 sap 0 0)
@@ -325,6 +337,37 @@
            (%check :cas-fail  (= 42 (dds.pal:cas-sap-u64 sap 0 0 99)) "cas mismatch returns prev")
            (%check :cas-nochg (= 42 (dds.pal:load-sap-u64 sap 0)) "cas mismatch no write")
            (%check :incf      (= 47 (dds.pal:atomic-incf-sap-u64 sap 0 5)) "incf returns new")
+           ;; (a) FULL-WIDTH operand: the case the old Clasp primitive dropped silently
+           (let ((big (1- (expt 2 64))))
+             (dds.pal:store-sap-u64 sap 8 0)
+             (%check :cas-u64-wide-set  (= 0 (dds.pal:cas-sap-u64 sap 8 0 big)) "cas stores a full-width 2^64-1")
+             (%check :cas-u64-wide-read (= big (dds.pal:load-sap-u64 sap 8)) "a full-width u64 reads back unmasked/unsigned")
+             (%check :cas-u64-wide-cmp  (= big (dds.pal:cas-sap-u64 sap 8 big 1))
+                     "cas COMPARES a full-width 2^64-1 operand (never a silently-dropped store)"))
+           ;; u32 CAS (the zero-copy refcount sub-field)
+           (setf (cffi:mem-ref sap :uint32 16) 5)
+           (%check :cas-u32-ok   (= 5 (dds.pal:cas-sap-u32 sap 16 5 6)) "cas-u32 returns prev")
+           (%check :cas-u32-set  (= 6 (dds.pal:load-sap-u32 sap 16)) "cas-u32 stored new")
+           (%check :cas-u32-fail (= 6 (dds.pal:cas-sap-u32 sap 16 99 1)) "cas-u32 mismatch returns prev, no write")
+           ;; (b) CONTENTION: a non-atomic CAS passes everything above and fails HERE
+           (let ((nthreads 8) (iters 2000))
+             (dds.pal:store-sap-u64 sap 24 0)
+             (dds.pal:store-sap-u64 sap 32 0)
+             (let ((ths (loop repeat nthreads
+                              collect (dds.pal:spawn
+                                       (lambda ()
+                                         (dotimes (i iters)
+                                           (loop for old = (dds.pal:load-sap-u64 sap 24)
+                                                 until (= old (dds.pal:cas-sap-u64 sap 24 old (1+ old))))
+                                           (dds.pal:atomic-incf-sap-u64 sap 32 1)))
+                                       :name "pal-cas-contention"))))
+               (mapc #'dds.pal:join ths))
+             (%check :cas-contention
+                     (= (* nthreads iters) (dds.pal:load-sap-u64 sap 24))
+                     "8 threads x 2000 CAS-increments must lose NOTHING (a fake CAS fails only here)")
+             (%check :incf-contention
+                     (= (* nthreads iters) (dds.pal:load-sap-u64 sap 32))
+                     "8 threads x 2000 atomic-incf-sap-u64 must lose NOTHING"))
            t)
       (dds.pal:free-static m))))
 
@@ -334,8 +377,9 @@
    correctness of ATOMIC-INCF (returns the NEW value, signed delta) + CAS (returns the PREVIOUS
    value, succeeds on match / fails on mismatch), then a CONCURRENCY proof that ATOMIC-INCF loses
    no updates — N threads each ATOMIC-INCF a shared cell M times, asserting the final value is
-   exactly N*M. Runs on BOTH impls (unlike the SBCL-only SAP atomics): sb-ext:cas/atomic-incf on
-   SBCL, mp:cas/atomic-incf on Clasp, over the shared (unsigned-byte 64) slot."
+   exactly N*M. Runs on BOTH impls: sb-ext:cas/atomic-incf on SBCL, mp:cas/atomic-incf on Clasp, over the
+   shared (unsigned-byte 64) slot. (The SAP atomics in run-pal-sap-atomics-test are now equally
+   cross-impl — see there; they were the SBCL-only ones until the Clasp gap was closed.)"
   ;; (a) atomic-incf: returns the NEW value; signed delta decrements
   (let ((c (dds.pal:make-atomic-cell)))
     (%check :ainc-5   (= 5 (dds.pal:atomic-incf c 5)) "atomic-incf returns new value (0+5=5)")
@@ -368,8 +412,13 @@
    fixed-width SAP reads that back the FlatData-over-Zero-Copy read-in-place accessors are
    byte-exact little-endian. Write known octets into an octet-buffer, take its buffer-sap, and
    assert load-sap-u8/u16/u32 at offsets 0/2/4 EQUAL the little-endian composition of the same
-   underlying aref bytes (the byte-exact oracle). SBCL only — ZC is SBCL-only (ADR 0013); on
-   Clasp the primitives are a documented NFR-PORT gap, so assert each signals PAL-UNIMPLEMENTED."
+   underlying aref bytes (the byte-exact oracle), plus a store-sap-u8 read-back.
+
+   RUNS IDENTICALLY ON BOTH IMPLS — no branch, no gap. This test used to assert the OPPOSITE on Clasp
+   (\"must signal PAL-UNIMPLEMENTED\"), enshrining a supposed NFR-PORT gap that was asserted rather than
+   measured: cffi:mem-ref reads and writes a foreign cell on Clasp exactly as sb-sys:sap-ref-N does on SBCL.
+   Owner directive 2026-07-14: Clasp and SBCL MUST be equally fitted. A test that asserts a gap is a test
+   that PREVENTS the gap from being closed."
   (let* ((buf (dds.core.buffer:make-octet-buffer 16))
          (vec (dds.core.buffer:octet-buffer-vec buf))
          (bytes (octets #x11 #x22 #xAA #xBB #x01 #x02 #x03 #x04)))
@@ -377,29 +426,22 @@
          (let ((wc (dds.core.buffer:cursor buf :endianness :little))
                (sap (dds.core.buffer:buffer-sap buf)))
            (dds.core.buffer:put-octets wc bytes 0 (length bytes))
-           (if (eq (dds.pal:pal-impl-name) :sbcl)
-               (progn
-                 (%check :sap-u8
-                         (= (dds.pal:load-sap-u8 sap 0) (aref vec 0))
-                         "load-sap-u8 @0 must equal the underlying octet")
-                 (%check :sap-u16
-                         (= (dds.pal:load-sap-u16 sap 2)
-                            (logior (aref vec 2) (ash (aref vec 3) 8)))
-                         "load-sap-u16 @2 must equal the little-endian 2-octet composition")
-                 (%check :sap-u32
-                         (= (dds.pal:load-sap-u32 sap 4)
-                            (logior (aref vec 4) (ash (aref vec 5) 8)
-                                    (ash (aref vec 6) 16) (ash (aref vec 7) 24)))
-                         "load-sap-u32 @4 must equal the little-endian 4-octet composition"))
-               (flet ((unimplemented-p (thunk)
-                        (handler-case (progn (funcall thunk) nil)
-                          (dds.pal:pal-unimplemented () t))))
-                 (%check :sap-u8-gap  (unimplemented-p (lambda () (dds.pal:load-sap-u8 sap 0)))
-                         "load-sap-u8 must signal PAL-UNIMPLEMENTED off SBCL (NFR-PORT)")
-                 (%check :sap-u16-gap (unimplemented-p (lambda () (dds.pal:load-sap-u16 sap 2)))
-                         "load-sap-u16 must signal PAL-UNIMPLEMENTED off SBCL (NFR-PORT)")
-                 (%check :sap-u32-gap (unimplemented-p (lambda () (dds.pal:load-sap-u32 sap 4)))
-                         "load-sap-u32 must signal PAL-UNIMPLEMENTED off SBCL (NFR-PORT)")))
+           (%check :sap-u8
+                   (= (dds.pal:load-sap-u8 sap 0) (aref vec 0))
+                   "load-sap-u8 @0 must equal the underlying octet")
+           (%check :sap-u16
+                   (= (dds.pal:load-sap-u16 sap 2)
+                      (logior (aref vec 2) (ash (aref vec 3) 8)))
+                   "load-sap-u16 @2 must equal the little-endian 2-octet composition")
+           (%check :sap-u32
+                   (= (dds.pal:load-sap-u32 sap 4)
+                      (logior (aref vec 4) (ash (aref vec 5) 8)
+                              (ash (aref vec 6) 16) (ash (aref vec 7) 24)))
+                   "load-sap-u32 @4 must equal the little-endian 4-octet composition")
+           (dds.pal:store-sap-u8 sap 9 #x5A)
+           (%check :sap-u8-store
+                   (and (= #x5A (dds.pal:load-sap-u8 sap 9)) (= #x5A (aref vec 9)))
+                   "store-sap-u8 must be visible through BOTH the SAP read and the underlying aref")
            t)
       (dds.pal:free-static vec))))
 
@@ -2991,13 +3033,20 @@
    (rtps_protection / metadata_protection, the ADR 0036 Carry-10 inheritance) AND data_protection (the
    loan-write-specific gate: the slot would hold pre-transform PLAINTEXT, unlike the classic ZC path where the
    pool receives the already-transformed SecuredPayload) — plus the pool + min-size gates. Deterministic slot
-   reads on a bare disc-node struct; both impls (no SAP, no networking)."
-  (let ((n (dds.disc::%make-disc-node)))
+   reads on a bare disc-node struct; both impls (no SAP, no networking).
+
+   The PLATFORM gate is part of the predicate: a peer must be able to ATTACH the writer pool by name, which
+   Clasp/macOS-arm64 cannot do (ADR 0013 — a Clasp variadic-ABI defect, MEASURED; see
+   dds.pal::%shm-open-create). The positive check below therefore asks for that capability; every
+   fail-closed check must hold on EVERY platform regardless."
+  (let ((n (dds.disc::%make-disc-node))
+        (attachable (dds.xport.shmem:shm-attach-by-name-reliable-p)))
     (%check :lwe-no-pool (not (dds.disc:node-loan-write-eligible-p n 2000))
             "no ZC pool must not be eligible")
     (setf (dds.disc::disc-node-zc-pool n) t)
-    (%check :lwe-eligible (dds.disc:node-loan-write-eligible-p n 2000)
-            "pool + size + all-protections-:none must be eligible")
+    (%check :lwe-eligible (eq (and attachable t)
+                              (and (dds.disc:node-loan-write-eligible-p n 2000) t))
+            "pool + size + all-protections-:none must be eligible exactly where a peer can attach the pool by name")
     (%check :lwe-small (not (dds.disc:node-loan-write-eligible-p n 100))
             "a size at/below *zerocopy-min-payload-bytes* must not be eligible")
     (setf (dds.disc::disc-node-rtps-protection-kind n) :sign)
@@ -3019,12 +3068,12 @@
     (%check :lwe-data-unset-km (not (dds.disc:node-loan-write-eligible-p n 2000))
             ":unset (no governance) WITH a crypto-transform (Slice-1 direct-KM) transforms the payload — fail-closed (ADR 0042 §6)")
     (setf (dds.disc::disc-node-crypto-transform n) nil)
-    (%check :lwe-restored (dds.disc:node-loan-write-eligible-p n 2000)
-            ":unset with NO crypto-transform rides plain — eligibility restored")
+    (%check :lwe-restored (eq (and attachable t) (and (dds.disc:node-loan-write-eligible-p n 2000) t))
+            ":unset with NO crypto-transform rides plain — eligibility restored (where the pool is attachable)")
     (setf (dds.disc::disc-node-user-data-protection-kind n) :none
           (dds.disc::disc-node-crypto-transform n) t)
-    (%check :lwe-data-none-km (dds.disc:node-loan-write-eligible-p n 2000)
-            "governance data=NONE rides plain even with a transform installed — eligible (matches publish-sample)"))
+    (%check :lwe-data-none-km (eq (and attachable t) (and (dds.disc:node-loan-write-eligible-p n 2000) t))
+            "governance data=NONE rides plain even with a transform installed — eligible where attachable (matches publish-sample)"))
   t)
 
 (defun* %lw-armed-change (node payload)

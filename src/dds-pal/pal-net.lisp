@@ -84,13 +84,31 @@
           (read-clock tp)
           (cffi:with-foreign-object (tp2 :uint8 16) (read-clock tp2))))))
 
+(defvar *thread-atomic-cell* nil
+  "A per-thread, pre-allocated 8-octet foreign cell holding the EXPECTED operand of a compare-and-swap,
+   bound by SPAWN for every PAL-created thread; NIL in a thread the PAL did not create, which then falls
+   back to a per-call WITH-FOREIGN-OBJECT.
+
+   Needed only by the Clasp PAL, whose CAS goes through the C atomic runtime (__atomic_compare_exchange_N),
+   and that ABI takes EXPECTED **by pointer** — it writes the actual value back on failure. A per-call
+   foreign cell would therefore put a WITH-FOREIGN-OBJECT on the CAS retry loop, which on Clasp is a real
+   malloc (~3.3 us/call — the same defect that motivated *THREAD-TIMESPEC*), and CAS sits in the SHMEM lane
+   claim and the zero-copy refcount, i.e. the hot path. Per-thread is the fix that is both fast and
+   race-free: two threads CASing concurrently must not share one EXPECTED cell or they tear each other's
+   operand. Carved out of the SAME allocation as *THREAD-TIMESPEC* (one foreign-alloc per thread).")
+
 (defun* call-with-thread-clock (fn)
     (function (function) t)
-  "Run FN with this thread's MONOTONIC-NS scratch timespec allocated and bound, freeing it on exit. SPAWN
-   wraps every PAL thread in this; a non-PAL thread (the user's own) may wrap itself to get the fast clock
-   path — the bench/profiling harness does exactly that."
-  (let ((tp (cffi:foreign-alloc :uint8 :count 16)))
-    (unwind-protect (let ((*thread-timespec* tp)) (funcall fn))
+  "Run FN with this thread's per-thread foreign scratch allocated and bound, freeing it on exit: the
+   MONOTONIC-NS timespec (*THREAD-TIMESPEC*, 16 octets) and the CAS expected-operand cell
+   (*THREAD-ATOMIC-CELL*, 8 octets) are carved from ONE 24-octet allocation. SPAWN wraps every PAL thread in
+   this; a non-PAL thread (the user's own) may wrap itself to get the fast clock + CAS paths — the
+   bench/profiling harness does exactly that. The timespec occupies [0,16) and the CAS cell [16,24), which
+   is 8-aligned because foreign-alloc returns at least 16-byte-aligned memory."
+  (let ((tp (cffi:foreign-alloc :uint8 :count 24)))
+    (unwind-protect (let ((*thread-timespec* tp)
+                          (*thread-atomic-cell* (cffi:inc-pointer tp 16)))
+                      (funcall fn))
       (cffi:foreign-free tp))))
 
 ;;; ---- bulk octet copy to/from a foreign SAP (shared-memory rings, syscall buffers) ----
@@ -503,8 +521,25 @@
     (function (string) fixnum)
   "shm_open O_CREAT|O_EXCL|O_RDWR, mode 0600. The variadic mode's ABI differs per impl on arm64.
    SBCL: foreign-funcall-varargs (stack — verified correct). Clasp: plain foreign-funcall (correct on
-   Linux's register varargs ABI; UNRELIABLE on macOS arm64 — see the NFR-PORT gap, ADR 0013). Reader
-   conditionals are permitted inside dds-pal/."
+   Linux's register varargs ABI; UNRELIABLE on macOS arm64 — the NFR-PORT gap, ADR 0013). Reader
+   conditionals are permitted inside dds-pal/.
+
+   ⚠️ THE macOS-arm64 GAP IS REAL AND IT IS NOT A WRONG CALL FORM — MEASURED, 2026-07-14, because the
+   obvious 'fix' (just use FOREIGN-FUNCALL-VARARGS on Clasp too, as SBCL does) LOOKS like it works. It does
+   not. Over 30 create+reopen trials on Clasp/macOS-arm64, the object was re-openable by name:
+
+       plain foreign-funcall .......... 10/30
+       foreign-funcall-varargs ......... 0/30   <- the 'obvious fix'
+       varargs, mode as :int ........... 10/30
+       varargs + explicit fchmod 0600 ... 0/30
+
+   NONE of them is correct; the mode lands as GARBAGE, and a single trial passes or fails by whether those
+   garbage bits happened to include owner-rw. A one-shot probe therefore 'proves' whichever answer you want
+   — which is exactly how this was nearly declared fixed. The permission bits are fixed at creation on
+   macOS (fchmod afterwards does not repair them), so there is no Lisp-side repair either. This is a Clasp
+   CFFI variadic-ABI defect on Darwin/arm64 and it belongs upstream. Linux (the primary platform, operating
+   contract §9) passes variadic args in registers, so plain foreign-funcall is correct there and Clasp is
+   fully fitted."
   #+sbcl (cffi:foreign-funcall-varargs "shm_open" (:string name :int (logior +o-creat+ +o-excl+ +o-rdwr+)) :unsigned-int #o600 :int)
   #-sbcl (cffi:foreign-funcall "shm_open" :string name :int (logior +o-creat+ +o-excl+ +o-rdwr+) :unsigned-int #o600 :int))
 

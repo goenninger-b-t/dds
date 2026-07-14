@@ -12,7 +12,7 @@
     threads, sockets, monotonic clock, GC control, optimization hints.")
   (:export
    ;; conditions
-   #:pal-error #:pal-unimplemented #:pal-op
+   #:pal-error #:pal-op
    ;; capability introspection
    #:+pal-capabilities+ #:pal-impl-name
    ;; memory (off-heap, non-GC'd, raw-pointer-addressable)
@@ -25,10 +25,11 @@
    #:cas #:atomic-incf #:fence #:atomic-cell #:make-atomic-cell #:atomic-cell-value
    #:cas-sap-u64 #:cas-sap-u32 #:atomic-incf-sap-u64 #:load-sap-u64 #:store-sap-u64
    ;; foreign-SAP fixed-width unsigned reads — back the FlatData-ZC read-in-place
-   ;; accessors (WP-FLATDATA-ZC-LOAN; SBCL-only; R6, NOT cleared for ship — see ADR 0017)
+   ;; accessors (WP-FLATDATA-ZC-LOAN; R6, NOT cleared for ship — see ADR 0017).
+   ;; IMPLEMENTED ON BOTH IMPLS (the Clasp stubs are gone — see the PAL-UNIMPLEMENTED note below).
    #:load-sap-u8 #:load-sap-u16 #:load-sap-u32
    ;; foreign-SAP 8-bit write — backs the FlatData loan-write SAP-mode Offset setters
-   ;; (WP-FLATDATA-LOAN-WRITE; SBCL-only; R6, NOT cleared for ship — see ADR 0042)
+   ;; (WP-FLATDATA-LOAN-WRITE; R6, NOT cleared for ship — see ADR 0042). Both impls.
    #:store-sap-u8
    ;; shared memory segments + in-segment PTHREAD_PROCESS_SHARED mutex/condvar (FR-XPORT-2, ADR 0013)
    #:shm-create #:shm-attach #:shm-detach #:shm-destroy #:shm-sap #:shm-segment-size
@@ -74,14 +75,18 @@
 (in-package #:dds.pal)
 
 (define-condition pal-error (error) ()
-  (:documentation "Base class for all PAL-level failures (control plane only)."))
+  (:documentation "Base class for all PAL-level failures (control plane only). RETAINED ONLY AS A TYPE for
+   any consumer still naming it; NOTHING IN THIS STACK SIGNALS IT (ADR 0064 — no Lisp conditions in our
+   code). It carries no subclasses any more."))
 
-(define-condition pal-unimplemented (pal-error)
-  ((op :initarg :op :reader pal-op :initform nil))
-  (:report (lambda (c s)
-             (format s "PAL capability not implemented on this build: ~s"
-                     (pal-op c))))
-  (:documentation "Signalled by a capability stub not yet provided for this impl."))
+;; PAL-UNIMPLEMENTED is GONE, and not because it was converted to a status — because THE GAP IT NAMED DOES
+;; NOT EXIST. It was signalled by seven Clasp capability stubs (load-sap-u8/u16/u32, store-sap-u8,
+;; cas-sap-u64/u32, atomic-incf-sap-u64) on the claim that Clasp cannot read, write, or atomically
+;; compare-and-swap a raw foreign cell. cffi:mem-ref does the loads/stores on Clasp exactly as
+;; sb-sys:sap-ref-N does on SBCL, and the C atomic runtime linked into the Clasp image
+;; (__atomic_compare_exchange_8/_4, __atomic_fetch_add_8) gives real hardware CAS over a plain pointer —
+;; measured: full-width 2^64-1 operands round-trip and 8-thread contention loses nothing. All seven are
+;; implemented; the Clasp PAL is now capability-equal to the SBCL PAL (owner directive 2026-07-14).
 
 ;; PAL-TIMEOUT is GONE (operating contract: no Lisp conditions in our code). TCP-RECV's read/idle timeout
 ;; was the one PAL condition on a data path; it is now the STATUS VALUE :TIMEOUT, returned as TCP-RECV's

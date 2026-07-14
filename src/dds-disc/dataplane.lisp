@@ -1040,6 +1040,7 @@
    does NOT transfer to loan-write; ADR 0042 §6). NIL ⇒ DCPS loan-sample degrades to a heap/pool-backed FlatData
    sample (graceful, no error)."
   (and (disc-node-zc-pool node)
+       (dds.xport.shmem:shm-attach-by-name-reliable-p)   ; a peer must be able to ATTACH the pool by name (ADR 0013)
        (> size *zerocopy-min-payload-bytes*)
        (not (%zc-payload-wire-protected-p node))
        (not (%loan-write-data-protected-p node))   ; loan-write-specific: the slot would hold pre-transform plaintext (ADR 0042 §6)

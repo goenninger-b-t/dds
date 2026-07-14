@@ -189,12 +189,62 @@ which discarded the **whole datagram** and every sample batched into it. One bad
 sample, and the per-writer watermark still advances (an early return there would have left it unconsumed
 and re-drained forever — caught in review).
 
+## Slice 3c — the Clasp PAL: the gap was not real (`pal-clasp.lisp`, 10 -> 2)
+
+Seven of the ten were `PAL-UNIMPLEMENTED` stubs (`load-sap-u8/u16/u32`, `store-sap-u8`, `cas-sap-u64/u32`,
+`atomic-incf-sap-u64`) — a *capability* claim, not a control-flow one. Owner directive 2026-07-14: **Clasp
+and SBCL MUST be equally fitted.** So they were not converted to statuses; the gap was CLOSED.
+
+- **The loads/stores were never impossible.** `cffi:mem-ref` reads and writes a foreign cell on Clasp
+  exactly as `sb-sys:sap-ref-N` does on SBCL — this very file's `LOAD-SAP-U64` already did precisely that.
+- **Nor were the atomics.** ADR 0013 concluded "Clasp has no hardware atomic over a raw foreign cell". That
+  is true of the *Lisp-side operators tried* (`mp:cas` rejects a `cffi:mem-ref` place as NOT-ATOMIC;
+  `core:acas` silently drops a store whose compare operand exceeds `most-positive-fixnum`) but the
+  conclusion did not follow. The **C atomic runtime is already linked into the Clasp image**:
+  `__atomic_compare_exchange_8` / `_4` and `__atomic_fetch_add_8` resolve, are real hardware atomics
+  (arm64 CASAL / x86 LOCK CMPXCHG), work on MAP_SHARED memory **across processes**, and take a plain
+  pointer. MEASURED: the previous value is returned on both arms, a **full-width 2^64-1** operand
+  round-trips (the exact case `core:acas` dropped), and **8 threads x 10 000 CAS-increments and fetch-adds
+  lose nothing** (80 000/80 000). Cached function pointers (a by-name Clasp FFI call re-dlsyms, ~3.8 us) and
+  a per-thread expected-operand cell (`*THREAD-ATOMIC-CELL*`; `WITH-FOREIGN-OBJECT` is a real ~3.3 us malloc
+  on Clasp) keep it off the hot path's back.
+- `run-pal-sap-atomics-test` was **gated SBCL-only**; it now runs on both impls and additionally asserts the
+  full-width operand and the 8-thread contention (a CAS that is not really atomic passes every
+  single-threaded check and fails only there). `PAL-UNIMPLEMENTED` is deleted. **A test that asserts a gap
+  is a test that prevents the gap from being closed.**
+
+### The part that is NOT closed — and how it nearly shipped as "fixed"
+
+The *other* half of ADR 0013 — `shm_open`'s variadic `mode_t` on Clasp/macOS-arm64 — **is real**, and the
+obvious fix (use `FOREIGN-FUNCALL-VARARGS` on Clasp too, exactly as SBCL does) **looked like it worked**: a
+one-shot probe re-opened the segment by name. It was luck. Over 30 create+reopen trials:
+
+| call form | re-openable by name |
+|---|---|
+| plain `foreign-funcall` (today's code) | **10/30** |
+| `foreign-funcall-varargs` (the "fix") | **0/30** |
+| varargs, mode as `:int` | 10/30 |
+| varargs + explicit `fchmod 0600` | 0/30 |
+
+The mode lands as **garbage**; a trial passes or fails on whether those bits happened to include owner-rw,
+so a single probe "proves" whichever answer you want. macOS fixes the permission bits at creation, so there
+is no Lisp-side repair. This is a Clasp CFFI variadic-ABI defect on Darwin/arm64 and it belongs upstream;
+**Linux — the primary platform (§9) — passes variadic args in registers, so Clasp is fully fitted there.**
+The measurement is recorded at both `dds.pal::%shm-open-create` and
+`dds.xport.shmem:shm-attach-by-name-reliable-p` so nobody re-"fixes" it on a lucky run.
+
+Consequently the zero-copy loan-write gate now asks for the **capability** (`shm-attach-by-name-reliable-p`)
+instead of the **implementation name** (`(eq (pal-impl-name) :sbcl)`), so Clasp/Linux takes the loan-write
+path exactly as SBCL does, and only Clasp/macOS-arm64 degrades.
+
 ## Order of the remaining work (shallow → deep)
 
-the durability stores
-(`store-microservice` 38, `store-encrypted` 14, `store-sqlite` 9) · `secure-sedp.lisp` (19) ·
-`pal-clasp.lisp` (10) · **`dds-dare/primitives.lisp` (96) LAST** — the OpenSSL FFI failure chains are the
-biggest and deepest.
+**the durability store vtable — ONE ATOMIC SLICE, 74 sites across 8 files** (`store-microservice` 38,
+`store-encrypted` 14, `store-sqlite` 9, `store-file` 4, `service` 4, `runner` 3, `spec` 1, `main` 1). The
+backends all implement the SAME `durable-store` vtable, so converting one alone leaves the vtable with two
+contracts and does not build; `dds.pal:fsync-directory` (2 sites x 2 PALs, fail-closed on a failed dirent
+flush) belongs with it, since its 9 callers are these stores. Then `secure-sedp.lisp` (19) ·
+**`dds-dare/primitives.lisp` (96) LAST** — the OpenSSL FFI failure chains are the biggest and deepest.
 
 **Convert ONE FILE at a time; update EVERY caller; re-run the suite after EACH file. Never batch.**
 
