@@ -4,13 +4,12 @@
   "Master off-heap byte budget for all hot-path memory (REQUIREMENTS NFR-MEM).
    Read ONCE at init-arena; rebinding afterwards has no effect until teardown.")
 
-(define-condition arena-exhausted (error)
-  ((requested :initarg :requested :reader arena-exhausted-requested)
-   (remaining :initarg :remaining :reader arena-exhausted-remaining))
-  (:report (lambda (c s)
-             (format s "static arena exhausted: requested ~d, ~d budget remaining"
-                     (arena-exhausted-requested c) (arena-exhausted-remaining c))))
-  (:documentation "Raised at provisioning time when a pool exceeds the budget."))
+;; ARENA-EXHAUSTED (the condition) is GONE. Arena exhaustion is the ORDINARY, EXPECTED outcome NFR-MEM
+;; demands be handled — RESOURCE_LIMITS or a documented allocating fallback, never a silent GC-heap
+;; fill-in — so it is now MAKE-BUFFER-POOL's :ARENA-EXHAUSTED status value, not a stack unwind (ADR 0064).
+;; Every one of its eight call sites already degraded to a NIL pool; each now TESTS the status, and — the
+;; defect that fell out of the conversion — TEARS THE ARENA DOWN, which the catching versions never did:
+;; a failed carve used to leave the just-init'd arena's static allocation orphaned.
 
 (defstruct* (arena (:constructor %make-arena))
   "Static, startup-allocated off-heap memory region with a fixed byte budget;
@@ -58,15 +57,21 @@
   arena)
 
 (defun* make-buffer-pool (arena element-bytes capacity)
-    (function (arena (integer 1) (integer 1)) buffer-pool)
+    (function (arena (integer 1) (integer 1)) (values (or null buffer-pool) (or null keyword)))
   "Carve a fixed-capacity pool of CAPACITY octet-buffers of ELEMENT-BYTES each,
    pre-allocated once from off-heap static memory. Steady-state acquire/release
-   is index manipulation with zero allocation."
+   is index manipulation with zero allocation.
+
+   Returns (values pool NIL), or (values NIL :ARENA-EXHAUSTED) when the carve does not fit the arena's
+   remaining budget. EXHAUSTION IS AN ORDINARY, EXPECTED OUTCOME — NFR-MEM requires it map to
+   RESOURCE_LIMITS or a documented fallback, never a silent GC-heap fill-in — so it is a STATUS VALUE, not
+   the ARENA-EXHAUSTED condition it used to signal (ADR 0064). Every caller already degraded to a NIL pool
+   plus an allocating fallback; they now do it by TESTING the status rather than by catching."
   (declare (type (integer 1) element-bytes capacity))
   (let* ((want (* element-bytes capacity))
          (remaining (- (arena-byte-budget arena) (arena-bytes-used arena))))
     (when (> want remaining)
-      (error 'arena-exhausted :requested want :remaining remaining))
+      (bail :arena-exhausted))
     (let ((slots (make-array capacity)))
       (dotimes (i capacity)
         (setf (svref slots i) (dds.core.buffer:make-octet-buffer element-bytes)))
@@ -76,7 +81,7 @@
                                      :top capacity)))
         (incf (arena-bytes-used arena) want)
         (push pool (arena-pools arena))
-        pool))))
+        (values pool nil)))))
 
 (defun* pool-acquire (pool)
     (function (buffer-pool) t)

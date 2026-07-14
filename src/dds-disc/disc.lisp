@@ -2325,6 +2325,9 @@
                        (cap   *srtps-send-scratch-capacity*)
                        (arena (dds.core.arena:init-arena :bytes (* eb (1+ cap))))   ; +1 slot slack
                        (pool  (dds.core.arena:make-buffer-pool arena eb cap)))
+                  ;; ADR 0064: :arena-exhausted is a STATUS now — an unchecked NIL pool would still
+                  ;; store the ARENA below ('only after the carve succeeds'), orphaning its allocation.
+                  (when (null pool) (dds.core.arena:teardown-arena arena) (return-from %ensure-secure-rx-pool nil))
                   (setf (disc-node-secure-rx-arena node) arena   ; store the arena only after the carve succeeds (teardown reachability)
                         (disc-node-secure-rx-pool node) pool))   ; set the pool LAST — the double-checked-carve flag
               (error () nil))))))   ; arena-exhausted / static-alloc failure -> leave NIL -> allocating fallback
@@ -2366,6 +2369,9 @@
                        (cap   *srtps-send-scratch-capacity*)
                        (arena (dds.core.arena:init-arena :bytes (* eb (1+ cap))))   ; +1 slot slack
                        (pool  (dds.core.arena:make-buffer-pool arena eb cap)))
+                  ;; ADR 0064: :arena-exhausted is a STATUS now — an unchecked NIL pool would still
+                  ;; store the ARENA below ('only after the carve succeeds'), orphaning its allocation.
+                  (when (null pool) (dds.core.arena:teardown-arena arena) (return-from %ensure-bracket-rx-pool nil))
                   (setf (disc-node-bracket-rx-arena node) arena   ; store the arena only after the carve succeeds (teardown reachability)
                         (disc-node-bracket-rx-pool node) pool))   ; set the pool LAST — the double-checked-carve flag
               (error () nil))))))   ; arena-exhausted / static-alloc failure -> leave NIL -> allocating fallback
@@ -2403,6 +2409,9 @@
                        (cap   *srtps-send-scratch-capacity*)
                        (arena (dds.core.arena:init-arena :bytes (* eb (1+ cap))))   ; +1 slot slack
                        (pool  (dds.core.arena:make-buffer-pool arena eb cap)))
+                  ;; ADR 0064: :arena-exhausted is a STATUS now — an unchecked NIL pool would still
+                  ;; store the ARENA below ('only after the carve succeeds'), orphaning its allocation.
+                  (when (null pool) (dds.core.arena:teardown-arena arena) (return-from %ensure-key-id-rx-pool nil))
                   (setf (disc-node-key-id-rx-arena node) arena   ; store the arena only after the carve succeeds (teardown reachability)
                         (disc-node-key-id-rx-pool node) pool))   ; set the pool LAST — the double-checked-carve flag
               (error () nil))))))   ; arena-exhausted / static-alloc failure -> leave NIL -> allocating fallback

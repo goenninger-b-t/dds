@@ -41,4 +41,4 @@
            #:arena-initialized-p #:arena-report
            #:buffer-pool #:make-buffer-pool #:pool-acquire #:pool-release
            #:pool-high-water #:pool-capacity #:pool-in-use
-           #:arena-exhausted))
+           ))

@@ -107,6 +107,11 @@
                        (cap   *srtps-send-scratch-capacity*)
                        (arena (dds.core.arena:init-arena :bytes (* eb (1+ cap))))   ; +1 slot slack
                        (pool  (dds.core.arena:make-buffer-pool arena eb cap)))
+                  ;; ADR 0064: an exhausted arena is a STATUS now, not a condition — so it MUST be TESTED.
+                  ;; An unchecked NIL pool would still run the SETF below, storing the ARENA whose own
+                  ;; comment says 'only after the carve succeeds' — orphaning its static allocation on
+                  ;; every failed carve.
+                  (when (null pool) (dds.core.arena:teardown-arena arena) (return-from %ensure-send-scratch-pool nil))
                   (setf (disc-node-send-scratch-arena node) arena   ; store the arena only after the carve succeeds (teardown reachability)
                         (disc-node-send-scratch-pool node) pool))   ; set the pool LAST — the double-checked-carve flag
               (error () nil))))))   ; arena-exhausted / static-alloc failure -> leave NIL -> allocating fallback
@@ -147,6 +152,11 @@
                        (cap   *srtps-send-scratch-capacity*)
                        (arena (dds.core.arena:init-arena :bytes (* eb (1+ cap))))   ; +1 slot slack
                        (pool  (dds.core.arena:make-buffer-pool arena eb cap)))
+                  ;; ADR 0064: an exhausted arena is a STATUS now, not a condition — so it MUST be TESTED.
+                  ;; An unchecked NIL pool would still run the SETF below, storing the ARENA whose own
+                  ;; comment says 'only after the carve succeeds' — orphaning its static allocation on
+                  ;; every failed carve.
+                  (when (null pool) (dds.core.arena:teardown-arena arena) (return-from %ensure-submsg-scratch-pool nil))
                   (setf (disc-node-submsg-scratch-arena node) arena   ; store the arena only after the carve succeeds (teardown reachability)
                         (disc-node-submsg-scratch-pool node) pool))   ; set the pool LAST — the double-checked-carve flag
               (error () nil))))))   ; arena-exhausted / static-alloc failure -> leave NIL -> allocating fallback
@@ -989,6 +999,11 @@
                        (cap   4)
                        (arena (dds.core.arena:init-arena :bytes (* eb (1+ cap))))   ; +1 slot slack
                        (pool  (dds.core.arena:make-buffer-pool arena eb cap)))
+                  ;; ADR 0064: an exhausted arena is a STATUS now, not a condition — so it MUST be TESTED.
+                  ;; An unchecked NIL pool would still run the SETF below, storing the ARENA whose own
+                  ;; comment says 'only after the carve succeeds' — orphaning its static allocation on
+                  ;; every failed carve.
+                  (when (null pool) (dds.core.arena:teardown-arena arena) (return-from %ensure-zc-overlay-scratch nil))
                   (setf (disc-node-zc-overlay-scratch-arena node) arena   ; store the arena only after the carve succeeds (teardown reachability)
                         (disc-node-zc-overlay-scratch-pool node) pool))   ; set the pool LAST — the double-checked-carve flag
               (error () nil))))))   ; arena-exhausted / static-alloc failure -> leave NIL -> fail-closed skip
@@ -3576,6 +3591,9 @@
        (handler-case
            (let* ((arena (dds.core.arena:init-arena :bytes (* element-bytes (1+ capacity))))   ; +1 slot slack
                   (pool (dds.core.arena:make-buffer-pool arena element-bytes capacity)))
+             ;; ADR 0064: :arena-exhausted is a STATUS now. Test it — an unchecked NIL pool would still PUSH
+             ;; the arena onto the per-writer list ("only after the carve succeeds"), leaking it.
+             (when (null pool) (dds.core.arena:teardown-arena arena) (return-from %ensure-secured-payload-pool nil))
              (dds.pal:with-lock ((disc-node-payload-arena-lock node))   ; WP-N-ENDPOINT-S3: serialize the shared-list push (the carve runs under the per-WRITER lock; a dedicated leaf lock stops two writers' first-publishes lost-updating the list)
                (push arena (disc-node-payload-arena node)))   ; add to the per-writer arena LIST (never overwrite a prior writer's), only after the carve succeeds (teardown reachability)
              pool)
@@ -3608,6 +3626,8 @@
                   (let* ((arena (dds.core.arena:init-arena :bytes (* element-bytes (1+ capacity))))   ; +1 slot slack
                          (pool (dds.core.arena:make-buffer-pool arena element-bytes capacity))
                          (handles (make-array capacity)))
+                    ;; ADR 0064: :arena-exhausted is a STATUS now — test it before installing anything.
+                    (when (null pool) (dds.core.arena:teardown-arena arena) (return-from %ensure-secured-decode-pool nil))
                     (dotimes (i capacity) (setf (svref handles i) (%make-secured-loan-handle)))   ; preallocate the handle freelist (recycled, zero per-sample cons)
                     (setf (disc-node-decode-handle-vec node) handles
                           (disc-node-decode-handle-top node) capacity
