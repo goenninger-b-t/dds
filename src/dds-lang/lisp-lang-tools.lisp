@@ -12,7 +12,7 @@
    "Language tools (L-1): DEFUN* / DEFSTRUCT* — definition forms that make the full type
     contract (FR-LANG-8) and the mandatory docstring (§5.1) structural rather than a
     convention checked after the fact. Used to define every function and struct in the stack.")
-  (:export #:defun* #:defstruct* #:plusp-length))
+  (:export #:defun* #:defstruct* #:plusp-length #:try #:bail))
 
 (in-package #:net.goenninger.dds.lang)
 
@@ -34,7 +34,22 @@ Signals a compile-time error if DOCSTRING is not a non-empty string, SIGNATURE i
 (FUNCTION (arg-types...) result) form, or SIGNATURE's required arg-type count does not match
 LAMBDA-LIST's required parameter count (a mismatch silently mis-types parameters).  Also emits a
 (DECLARE (TYPE ...)) for each required parameter from SIGNATURE so every argument is typed inside the
-body, not only at the call boundary (M3/M4).  Consing: none at runtime (pure macro)."
+body, not only at the call boundary (M3/M4).  Consing: none at runtime (pure macro).
+
+BODY is wrapped in a MACROLET binding the two STATUS-THREADING operators that implement the
+no-conditions rule (operating contract: no Lisp condition is signalled anywhere in our code; a failure
+is a value threaded to the caller, and the toplevel DDS API turns it into a ReturnCode_t):
+
+  (TRY form)     evaluate FORM, which returns (VALUES result status).  If STATUS is non-NIL the
+                 enclosing function IMMEDIATELY returns (VALUES NIL status) — the failure propagates
+                 to ITS caller unchanged.  Otherwise TRY yields FORM's primary value.
+  (BAIL status)  return (VALUES NIL STATUS) from the enclosing function.
+
+A function that can fail therefore declares its result as (VALUES (OR NULL x) (OR NULL KEYWORD)) and
+its callers wrap every call in TRY.  This exists because the failure mode of hand-written propagation
+is SILENT: one unchecked call swallows the status and hands a NIL onward where a value was expected.
+TRY makes the check the DEFAULT and the omission the visible thing.  Leading DECLARE forms in BODY are
+hoisted OUT of the MACROLET so (DECLARE (IGNORE ...)) still refers to the lambda-list variables."
   (check-type docstring (and string (satisfies plusp-length)))
   (assert (and (consp signature) (eq (car signature) 'function) (listp (second signature))) ()
           "DEFUN* ~S: SIGNATURE must be a (FUNCTION (arg-types...) result) form, got ~S."
@@ -48,13 +63,25 @@ required parameter(s) — they must match (a mismatch silently mis-types paramet
                 name sig-req ll-req)))
     (let ((decls (loop for p in lambda-list for ty in arg-types
                        until (member p lambda-list-keywords)
-                       collect `(type ,ty ,p))))
+                       collect `(type ,ty ,p)))
+          (body-decls (loop for f in body while (and (consp f) (eq (car f) 'declare)) collect f))
+          (forms (loop for f on body
+                       unless (and (consp (car f)) (eq (caar f) 'declare)) return f)))
       `(progn
          (declaim (ftype ,signature ,name))
          (defun ,name ,lambda-list
            ,docstring
            ,@(when decls (list (cons 'declare decls)))
-           ,@body)))))
+           ,@body-decls
+           (macrolet
+               ((try (form)
+                  (let ((v (gensym "VALUE")) (s (gensym "STATUS")))
+                    (list 'multiple-value-bind (list v s) form
+                          (list 'when s (list 'return-from ',name (list 'values nil s)))
+                          v)))
+                (bail (status)
+                  (list 'return-from ',name (list 'values nil status))))
+             ,@forms))))))
 
 (defmacro defstruct* (name-and-options docstring &body slots)
   "Define a struct with NAME-AND-OPTIONS (as for DEFSTRUCT), a mandatory non-empty

@@ -12,11 +12,15 @@
   (port 0 :type (unsigned-byte 16)))
 
 (defun* make-udp-transport (&key (host "0.0.0.0") (port 0))
-    (function (&key (:host string) (:port (unsigned-byte 16))) (values dds.xport:transport t))
+    (function (&key (:host string) (:port (unsigned-byte 16)))
+              (values (or null dds.xport:transport) t (or null keyword)))
   "Open a UDPv4 socket bound to HOST:PORT and wrap it in a transport record.
    SEND assumes OFF is 0 for v1 (whole-buffer datagram from index 0). Returns
-   (values transport socket); the socket has no slot in the frozen record."
-  (let ((socket (dds.pal:udp-open :host host :port port)))
+   (values transport socket NIL); the socket has no slot in the frozen record.
+   On a PAL open failure returns (values NIL NIL status) — the caller must not proceed with a NIL
+   transport (operating contract: failures are threaded, never signalled)."
+  (multiple-value-bind (socket status) (dds.pal:udp-open :host host :port port)
+    (when status (return-from make-udp-transport (values nil nil status)))
     (values
      (dds.xport:make-transport
       :kind :udpv4
@@ -40,7 +44,8 @@
       :receive-loop (lambda () (values))
       :open-receive-resource (lambda (&rest args) (declare (ignore args)) (values))
       :close (lambda () (dds.pal:udp-close socket)))
-     socket)))
+     socket
+     nil)))
 
 (defun* udp-transport-local-port (socket)
     (function (t) (integer 0 65535))

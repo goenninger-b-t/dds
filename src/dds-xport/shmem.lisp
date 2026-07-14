@@ -51,24 +51,28 @@
   (cffi:mem-ref sap :uint32 +off-max-record+))
 
 (defun* %ring-init (sap lane-count capacity)
-    (function (t (integer 1) (integer 8)) t)
+    (function (t (integer 1) (integer 8)) (values t (or null keyword)))
   "Initialise header + the pshared notify block (mutex/cond/stop) + zero every lane cursor/owner.
-   CAPACITY must be a multiple of 8. Creator-only."
-  (assert (zerop (mod capacity 8)))   ; HOTPATH-COND(COLD): ring geometry check at segment CREATE, not per datagram
+   CAPACITY must be a multiple of 8 (:BAD-RING-GEOMETRY otherwise). Creator-only. Returns (values T NIL),
+   or (values NIL status) — :BAD-RING-GEOMETRY / :MUTEX-INIT-FAILED / :COND-INIT-FAILED. Never signals:
+   the geometry check was an ASSERT, which unwound the caller's stack; it is now a status value like every
+   other failure in this stack."
+  (unless (zerop (mod capacity 8)) (bail :bad-ring-geometry))
   (setf (cffi:mem-ref sap :uint32 +off-magic+) +shm-magic+
         (cffi:mem-ref sap :uint32 +off-version+) +shm-version+
         (cffi:mem-ref sap :uint32 +off-lane-count+) lane-count
         (cffi:mem-ref sap :uint32 +off-capacity+) capacity
         (cffi:mem-ref sap :uint32 +off-max-record+) (- capacity 8))
-  (dds.pal:pshared-mutex-init sap +mutex-off+)
-  (dds.pal:pshared-cond-init sap +cond-off+)
+  (try (dds.pal:pshared-mutex-init sap +mutex-off+))
+  (try (dds.pal:pshared-cond-init sap +cond-off+))
   (dds.pal:store-sap-u64 sap +stop-off+ 0)
   (dds.pal:store-sap-u64 sap +parked-off+ 0)
-  (dotimes (i lane-count t)
+  (dotimes (i lane-count)
     (let ((b (%lane-desc-off i)))
       (dds.pal:store-sap-u64 sap (+ b +lane-off-owner+) 0)
       (dds.pal:store-sap-u64 sap (+ b +lane-off-write+) 0)
-      (dds.pal:store-sap-u64 sap (+ b +lane-off-read+) 0))))
+      (dds.pal:store-sap-u64 sap (+ b +lane-off-read+) 0)))
+  (values t nil))
 
 (defun* %ring-validate (sap)
     (function (t) t)
@@ -186,18 +190,16 @@
    make-shmem-locator :name (seg-name-for-guid remote-prefix) without reaching the %-internal."
   (%seg-name guid))
 
-(defun* make-shmem-transport (&key participant-guid (host-uuid 0) (lane-count 8) (capacity 65536))
-    (function (&key (:participant-guid (simple-array (unsigned-byte 8) (12))) (:host-uuid (unsigned-byte 64))
-               (:lane-count (integer 1)) (:capacity (integer 8))) shmem-transport)
-  "Create this participant's SHMEM receive segment (+ ring + pshared notify block) and a transport record
-   whose SEND attaches to the destination segment and enqueues. CAPACITY is per-lane ring bytes (mult of 8)."
-  (let* ((name (%seg-name participant-guid)) (token (%guid-token participant-guid))
-         (seg (progn (ignore-errors (dds.pal:shm-destroy name))
-                     (dds.pal:shm-create name (%segment-bytes lane-count capacity))))
-         (st (%make-shmem-transport :segment seg :name name :host-uuid host-uuid :lane-count lane-count
-                                    :capacity capacity :token token
-                                    :sink (dds.core.buffer:make-octet-buffer capacity))))
-    (%ring-init (dds.pal:shm-sap seg) lane-count capacity)
+(defun* %make-shmem-transport-record (seg name host-uuid lane-count capacity token)
+    (function (t string (unsigned-byte 64) (integer 1) (integer 8) (unsigned-byte 64))
+              (values shmem-transport null))
+  "Wrap the CREATED + INITIALISED segment SEG in the shmem-transport + the frozen dds.xport transport
+   record. Split out of make-shmem-transport so that function's failure paths (which must detach SEG) stay
+   readable; it is never called with a half-initialised segment. Always succeeds — returns (values st NIL)
+   so it composes with the status-threading convention."
+  (let ((st (%make-shmem-transport :segment seg :name name :host-uuid host-uuid :lane-count lane-count
+                                   :capacity capacity :token token
+                                   :sink (dds.core.buffer:make-octet-buffer capacity))))
     (setf (shmem-transport-transport st)
           (dds.xport:make-transport
            :kind :shmem :locator-kind :shmem :max-message-size (- capacity 8)
@@ -205,7 +207,25 @@
            :receive-loop (lambda () (values))
            :open-receive-resource (lambda (&rest a) (declare (ignore a)) (shmem-transport-locator st))
            :close (lambda () (shmem-transport-close st))))
-    st))
+    (values st nil)))
+
+(defun* make-shmem-transport (&key participant-guid (host-uuid 0) (lane-count 8) (capacity 65536))
+    (function (&key (:participant-guid (simple-array (unsigned-byte 8) (12))) (:host-uuid (unsigned-byte 64))
+               (:lane-count (integer 1)) (:capacity (integer 8)))
+              (values (or null shmem-transport) (or null keyword)))
+  "Create this participant's SHMEM receive segment (+ ring + pshared notify block) and a transport record
+   whose SEND attaches to the destination segment and enqueues. CAPACITY is per-lane ring bytes (mult of 8).
+   Returns (values transport NIL), or (values NIL status) if the segment cannot be created/mapped or the
+   ring cannot be initialised (the segment is detached AND unlinked again on that path — a failed transport
+   leaves no mapped, half-initialised shm object behind for a peer to attach to)."
+  (let* ((name (%seg-name participant-guid)) (token (%guid-token participant-guid)))
+    (dds.pal:shm-destroy name)                       ; drop a stale leftover of the same name (no-op if absent)
+    (multiple-value-bind (seg status) (dds.pal:shm-create name (%segment-bytes lane-count capacity))
+      (when status (bail status))
+      (multiple-value-bind (ok init-status) (%ring-init (dds.pal:shm-sap seg) lane-count capacity)
+        (declare (ignore ok))
+        (when init-status (dds.pal:shm-detach seg) (dds.pal:shm-destroy name) (bail init-status)))
+      (%make-shmem-transport-record seg name host-uuid lane-count capacity token))))
 
 (defun* shmem-transport-locator (st)
     (function (shmem-transport) shmem-locator)
@@ -214,18 +234,26 @@
                       :lane-count (shmem-transport-lane-count st) :capacity (shmem-transport-capacity st)))
 
 (defun* %attach-for (st locator)
-    (function (shmem-transport shmem-locator) t)
-  "Cached shm-segment for LOCATOR's destination (attach once per name; off the hot path)."
-  (or (gethash (shmem-locator-name locator) (shmem-transport-attach-cache st))
-      (setf (gethash (shmem-locator-name locator) (shmem-transport-attach-cache st))
-            (dds.pal:shm-attach (shmem-locator-name locator)
-                                (%segment-bytes (shmem-locator-lane-count locator) (shmem-locator-capacity locator))))))
+    (function (shmem-transport shmem-locator) (values t (or null keyword)))
+  "Cached shm-segment for LOCATOR's destination (attach once per name; off the hot path). Returns
+   (values segment NIL), or (values NIL status) if the destination segment cannot be attached — a peer
+   that died between advertising its locator and this send. That used to be an shm-attach CONDITION
+   unwinding OUT OF A SEND; it is now a status, and %shmem-send turns it into the ordinary 0-octets-sent
+   result (the caller falls back to UDP), which is what the send path already meant to do.
+   A failed attach is NOT cached: the peer may come back."
+  (let ((cached (gethash (shmem-locator-name locator) (shmem-transport-attach-cache st))))
+    (when cached (return-from %attach-for (values cached nil))))
+  (let ((seg (try (dds.pal:shm-attach
+                   (shmem-locator-name locator)
+                   (%segment-bytes (shmem-locator-lane-count locator) (shmem-locator-capacity locator))))))
+    (values (setf (gethash (shmem-locator-name locator) (shmem-transport-attach-cache st)) seg) nil)))
 
 (defun* %shmem-send (st locator buffer len)
     (function (shmem-transport shmem-locator dds.core.buffer:octet-buffer (integer 0)) (integer 0))
   "Attach to LOCATOR's segment, claim/lookup our lane, enqueue LEN octets, then CONDITIONALLY wake the
    receiver: signal the dest cond ONLY if the receiver is parked. Returns LEN on success, 0 on
-   lane-full/claim-fail (caller falls back to UDP / RESOURCE_LIMITS). The enqueue published the
+   attach-fail (the peer's segment is gone) / lane-full / claim-fail — in every one of those the caller
+   falls back to UDP / RESOURCE_LIMITS. The enqueue published the
    write-cursor with a RELEASE fence; a FULL fence here orders that store before the parked load (the
    StoreLoad half of the Dekker handshake with the receiver — the receiver publishes parked=1 then
    full-fences then re-checks the data, so at least one side observes the other: a skipped signal means
@@ -233,18 +261,20 @@
    lock+signal (a futex syscall) is taken ONLY for a parked receiver, so a tight blast into a draining
    receiver does no per-message futex wake — the WP-SHMEM throughput fix (FR-XPORT-2)."
   (when *debug-shmem-send-fault* (error 'shmem-send-test-fault))   ; test affordance: inert when NIL (byte-identical production)   ; HOTPATH-COND(TEST): fault injection, armed only by *debug-shmem-send-fault*
-  (let* ((dest (%attach-for st locator)) (sap (dds.pal:shm-sap dest))
-         (lane (%claim-lane sap (shmem-transport-token st))))
-    (if (and lane (%lane-enqueue sap lane (shmem-locator-capacity locator)
-                                 (dds.core.buffer:octet-buffer-vec buffer) 0 len))
-        (progn
-          (dds.pal:fence :full)                          ; order the enqueue's cursor store before the parked load (StoreLoad)
-          (when (= 1 (dds.pal:load-sap-u64 sap +parked-off+))   ; wake ONLY a parked receiver; skip the futex for a busy one
-            (dds.pal:pshared-lock sap +mutex-off+)
-            (dds.pal:pshared-cond-signal sap +cond-off+)
-            (dds.pal:pshared-unlock sap +mutex-off+))
-          len)
-        0)))
+  (multiple-value-bind (dest attach-status) (%attach-for st locator)
+    (when attach-status (return-from %shmem-send 0))   ; peer segment gone: 0 sent = the caller falls back to UDP
+    (let* ((sap (dds.pal:shm-sap dest))
+           (lane (%claim-lane sap (shmem-transport-token st))))
+      (if (and lane (%lane-enqueue sap lane (shmem-locator-capacity locator)
+                                   (dds.core.buffer:octet-buffer-vec buffer) 0 len))
+          (progn
+            (dds.pal:fence :full)                          ; order the enqueue's cursor store before the parked load (StoreLoad)
+            (when (= 1 (dds.pal:load-sap-u64 sap +parked-off+))   ; wake ONLY a parked receiver; skip the futex for a busy one
+              (dds.pal:pshared-lock sap +mutex-off+)
+              (dds.pal:pshared-cond-signal sap +cond-off+)
+              (dds.pal:pshared-unlock sap +mutex-off+))
+            len)
+          0))))
 
 (defun* shmem-receive-drain (st on-datagram)
     (function (shmem-transport function) t)

@@ -30,6 +30,12 @@ DDS is a peer-to-peer, brokerless pub/sub standard: applications declare **Topic
   startup from an off-heap arena sized by `*static-arena-bytes*`; steady state allocates
   **zero** bytes per sample, and arena exhaustion maps to DDS `RESOURCE_LIMITS`, never a
   silent GC-heap fallback.
+- **Failures are returned, not signalled.** No Lisp condition is raised anywhere in the stack
+  (ADR 0064): a fallible function returns `(values result status)`, callers propagate the
+  status, and the public DDS API turns it into a `ReturnCode_t`. A malformed datagram can
+  therefore never unwind a receiver thread — the one-bad-packet DoS is structurally excluded
+  rather than caught. A condition raised by a *dependency* is contained at the call that makes
+  it. The `gate-nocond` CI gate ratchets the remaining sites to zero.
 - **The wire is the oracle.** Correctness is established by **XCDR byte-exactness** against
   reference vectors and by **interop validated with the Wireshark/tshark RTPS dissector** —
   not by "it looks right." Wire constants are pinned from the in-repo OMG specs and verified,
@@ -166,6 +172,7 @@ make build-all     # build on both landed impls (Clasp + SBCL)
 make test-all      # test on both
 make gate-types    # every defun has a single-line ftype declaim (FR-LANG-8)
 make gate-hotpath  # no CLOS dispatch / per-sample alloc in hot-path files (NFR-CLOS)
+make gate-nocond   # NO Lisp conditions in our code — failures are returned, never signalled (ADR 0064)
 make mem           # measured 0 bytes/sample serialize/deserialize (NFR-PERF-8)
 make wire          # validate emitted RTPS against the tshark RTPS dissector (FR-TOOL-3)
 make all           # build-all + test-all + gates + mem

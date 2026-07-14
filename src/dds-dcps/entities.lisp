@@ -688,10 +688,16 @@
                     (:permissions-ca (or (simple-array (unsigned-byte 8) (*)) null))
                     (:governance (or (simple-array (unsigned-byte 8) (*)) null))
                     (:permissions (or (simple-array (unsigned-byte 8) (*)) null)))
-              domain-participant)
+              (values (or null domain-participant) (or null keyword)))
   "DomainParticipantFactory::create_participant — open the RTPS engine (a multicast
    disc-node) for DOMAIN, install the match/incompatible-QoS hooks that surface DDS
    statuses to the application, start the receiver, and return an enabled participant.
+
+   Returns (values participant NIL). If the ENGINE cannot be opened — the OS refuses a socket option, the
+   SPDP multicast join, or the SHMEM segment — it returns (values NIL status) rather than signalling: this
+   is the TOPLEVEL DDS API boundary, where the operating contract requires a failure to surface as a
+   returned value (DDS 1.4 create_participant likewise returns a NULL handle on failure, so the NIL primary
+   value is the conformant shape). Callers MUST check it; a NIL participant is not usable.
    AUTONOMOUS (WP-DCPS-API-COMPLETION S7): T spawns a background announcer thread that drives the SPDP/SEDP
    announce + the lease/liveliness/autopurge sweeps on the DISCOVERY_CONFIG announce-period cadence, so the
    application never calls spin (spin becomes a no-op). NIL (default) = the deterministic app-driven spin.
@@ -727,17 +733,18 @@
   (let ((access-handle (%validate-access-config identity permissions-ca governance permissions))
         (installed nil))   ; T once the participant is fully constructed and will be returned
     (unwind-protect
-        (let* ((node (dds.disc:make-disc-node :domain domain :multicast t
-                                              :advertise-address advertise-address
-                                              :peers peers :port port
-                                              ;; §9.3.2.1: a security-enabled participant announces the
-                                              ;; authenticated GUID derived from its identity cert (so a
-                                              ;; conformant peer accepts our handshake); plain = demo prefix.
-                                              :guid-prefix (if identity
-                                                               (%participant-guid-prefix identity)
-                                                               (%make-guid-prefix))
-                                              :identity-token-octets
-                                              (when identity (dds.security:identity-token identity))))
+        (let* ((node (try (dds.disc:make-disc-node
+                           :domain domain :multicast t
+                           :advertise-address advertise-address
+                           :peers peers :port port
+                           ;; §9.3.2.1: a security-enabled participant announces the
+                           ;; authenticated GUID derived from its identity cert (so a
+                           ;; conformant peer accepts our handshake); plain = demo prefix.
+                           :guid-prefix (if identity
+                                            (%participant-guid-prefix identity)
+                                            (%make-guid-prefix))
+                           :identity-token-octets
+                           (when identity (dds.security:identity-token identity)))))
                (p (make-instance 'domain-participant :domain domain :node node
                                  :enabled (%child-created-enabled-p (get-participant-factory))   ; S2.T3: factory ENTITY_FACTORY autoenable
                                  :qos (or qos (when (typep *default-participant-qos* 'dds.qos:qos)

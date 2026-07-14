@@ -1954,11 +1954,13 @@ holes are closed — **no wire-protocol change, no new crypto, no new dependency
   **`dds.pal:tcp-set-recv-timeout (sock seconds)`** (`setsockopt(SO_RCVTIMEO)`, a 16-byte `struct timeval`,
   portable across SBCL + Clasp — the `SO_RCVTIMEO` optname is OS-specific, an `#+darwin`/`#-darwin` constant
   inside `dds-pal` like the existing socket-option constants, never an impl conditional) arms an idle
-  deadline; `tcp-recv` now signals a distinct **`pal-timeout`** when the deadline fires (`socket-receive`
-  returns `n=NIL` on a timeout vs `n=0` on a clean close — identical on both impls — so a timeout is never
-  confused with EOF or data). The **server** arms it on each accepted socket (`make-microservice-server
-  :recv-timeout`, default 30 s), so a stalled recv trips `pal-timeout`, the per-connection backstop **drops**
-  that connection, and the accept loop **survives to serve the next client**. The **client** arms it on its
+  deadline; `tcp-recv` returns a distinct **status `:timeout`** as its second value when the deadline fires
+  (`socket-receive` returns `n=NIL` on a timeout vs `n=0` on a clean close — identical on both impls — so a
+  timeout is never confused with `:eof` or data). *(This was a signalled `pal-timeout` condition until
+  ADR 0064 — no Lisp conditions in our code — which replaced it with the status value; the three outcomes
+  stay exactly as distinguishable, with no stack unwind.)* The **server** arms it on each accepted socket
+  (`make-microservice-server :recv-timeout`, default 30 s), so a stalled recv returns `:timeout`, the serve
+  loop **drops** that connection, and the accept loop **survives to serve the next client**. The **client** arms it on its
   connection (`make-microservice-store :recv-timeout`), so a stalled/half-open server surfaces as a clean
   `microservice-conn-lost` → the §8.10.4 reconnect path, never an infinite hang.
 - **Incremental body allocation (amplification guard).** `%ms-recv-message` used to allocate the **declared**

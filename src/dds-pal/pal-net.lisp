@@ -198,33 +198,42 @@
   (defconstant +ip-multicast-loop+ 34))
 
 (defun* %setsockopt (socket level opt bytes)
-    (function (t fixnum fixnum list) t)
-  "Raw setsockopt(fd, LEVEL, OPT, BYTES) via CFFI for options sb-bsd-sockets does
-   not expose. BYTES is the option value as a list of octets. Signals on failure."
+    (function (t fixnum fixnum list) (values (or null fixnum) (or null keyword)))
+  "Raw setsockopt(fd, LEVEL, OPT, BYTES) via CFFI for options sb-bsd-sockets does not expose. BYTES is
+   the option value as a list of octets. Returns (values rc NIL) on success, (values NIL :SETSOCKOPT-FAILED)
+   on a non-zero return — it NEVER signals (operating contract: no Lisp conditions in our code; a failure
+   is a status value threaded to the caller, never a stack unwind)."
   (let ((fd (sb-bsd-sockets:socket-file-descriptor socket))
         (n (length bytes)))
     (cffi:with-foreign-object (p :uint8 n)
       (loop for i from 0 for b in bytes do (setf (cffi:mem-aref p :uint8 i) b))
       (let ((rc (cffi:foreign-funcall "setsockopt" :int fd :int level :int opt
                                       :pointer p :uint n :int)))
-        (unless (zerop rc) (error "setsockopt(level=~a opt=~a) failed rc=~a" level opt rc))
-        rc))))
+        (if (zerop rc) (values rc nil) (bail :setsockopt-failed))))))
 
 (defun* udp-set-reuse-port (socket)
-    (function (t) t)
-  "Enable SO_REUSEPORT so multiple participants on one host can share the SPDP
-   multicast port. Must be called before bind."
-  (%setsockopt socket +sol-socket+ +so-reuseport+ '(1 0 0 0)))
+    (function (t) (values t (or null keyword)))
+  "Enable SO_REUSEPORT so multiple participants on one host can share the SPDP multicast port. Must be
+   called before bind. Returns (values T NIL), or (values NIL :SETSOCKOPT-FAILED) if the option is refused."
+  (try (%setsockopt socket +sol-socket+ +so-reuseport+ '(1 0 0 0)))
+  (values t nil))
 
 (defun* udp-open (&key (host "0.0.0.0") (port 0) reuse-port)
-    (function (&key (:host string) (:port (integer 0 65535)) (:reuse-port t)) t)
-  "Open a UDPv4 socket bound to HOST:PORT (port 0 = ephemeral). REUSE-PORT enables
-   SO_REUSEPORT before bind (shared multicast port). Returns the socket."
+    (function (&key (:host string) (:port (integer 0 65535)) (:reuse-port t)) (values t (or null keyword)))
+  "Open a UDPv4 socket bound to HOST:PORT (port 0 = ephemeral). REUSE-PORT enables SO_REUSEPORT before
+   bind (shared multicast port). Returns (values socket NIL), or (values NIL :SETSOCKOPT-FAILED) if
+   SO_REUSEPORT is refused — in which case the half-open socket is CLOSED before returning, so a failed
+   open leaks no file descriptor."
   (let ((s (make-instance 'sb-bsd-sockets:inet-socket :type :datagram :protocol :udp)))
     (setf (sb-bsd-sockets:sockopt-reuse-address s) t)
-    (when reuse-port (udp-set-reuse-port s))
+    (when reuse-port
+      (multiple-value-bind (ok status) (udp-set-reuse-port s)
+        (declare (ignore ok))
+        (when status
+          (sb-bsd-sockets:socket-close s)
+          (bail status))))
     (sb-bsd-sockets:socket-bind s (%parse-ipv4 host) port)
-    s))
+    (values s nil)))
 
 (defun* udp-local-port (socket)
     (function (t) (integer 0 65535))
@@ -245,14 +254,17 @@
     (values size addr port)))
 
 (defun* udp-join-multicast (socket group)
-    (function (t string) t)
-  "Join the IPv4 multicast GROUP (dotted-quad) on the default interface and enable
-   loopback (RTPS 2.5 §9.6.1.1). ip_mreq = imr_multiaddr(group) + imr_interface
-   (INADDR_ANY). The socket must already be bound to the multicast port."
+    (function (t string) (values t (or null keyword)))
+  "Join the IPv4 multicast GROUP (dotted-quad) on the default interface and enable loopback
+   (RTPS 2.5 §9.6.1.1). ip_mreq = imr_multiaddr(group) + imr_interface (INADDR_ANY). The socket must
+   already be bound to the multicast port. Returns (values T NIL), or (values NIL :SETSOCKOPT-FAILED) if
+   either the membership or the loopback option is refused (a node that cannot join the SPDP group cannot
+   discover anyone — the caller must surface it, not proceed deaf)."
   (let ((g (%parse-ipv4 group)))
-    (%setsockopt socket +ipproto-ip+ +ip-add-membership+
-                 (list (aref g 0) (aref g 1) (aref g 2) (aref g 3) 0 0 0 0))
-    (%setsockopt socket +ipproto-ip+ +ip-multicast-loop+ '(1))))
+    (try (%setsockopt socket +ipproto-ip+ +ip-add-membership+
+                      (list (aref g 0) (aref g 1) (aref g 2) (aref g 3) 0 0 0 0)))
+    (try (%setsockopt socket +ipproto-ip+ +ip-multicast-loop+ '(1)))
+    (values t nil)))
 
 ;; tcp-shutdown is defined below (same sb-bsd-sockets substrate); forward-declared so udp-close can use it.
 (declaim (ftype (function (t &optional fixnum) t) tcp-shutdown))
@@ -292,20 +304,25 @@
 #+darwin (defconstant +so-nosigpipe+ #x1022 "Darwin SO_NOSIGPIPE optname (suppress SIGPIPE on a dead peer).")
 
 (defun* %tcp-suppress-sigpipe (socket)
-    (function (t) t)
+    (function (t) (values t (or null keyword)))
   "Route a write-to-closed-peer to EPIPE (SOCKET-ERROR) rather than SIGPIPE. Darwin: SO_NOSIGPIPE;
-   elsewhere a no-op (the runtime ignores SIGPIPE process-wide)."
+   elsewhere a no-op (the runtime ignores SIGPIPE process-wide). Returns (values T NIL) or
+   (values NIL :SETSOCKOPT-FAILED)."
   (declare (ignorable socket))
-  #+darwin (%setsockopt socket +sol-socket+ +so-nosigpipe+ '(1 0 0 0))
-  t)
+  #+darwin (try (%setsockopt socket +sol-socket+ +so-nosigpipe+ '(1 0 0 0)))
+  (values t nil))
 
 (defun* tcp-connect (host port)
-    (function (string (integer 0 65535)) t)
-  "Open a TCPv4 stream socket connected to HOST:PORT. Returns the connected socket."
+    (function (string (integer 0 65535)) (values t (or null keyword)))
+  "Open a TCPv4 stream socket connected to HOST:PORT. Returns (values socket NIL), or
+   (values NIL :SETSOCKOPT-FAILED) if SIGPIPE suppression is refused (the socket is closed first, so a
+   failed connect leaks no fd)."
   (let ((s (make-instance 'sb-bsd-sockets:inet-socket :type :stream :protocol :tcp)))
-    (%tcp-suppress-sigpipe s)
+    (multiple-value-bind (ok status) (%tcp-suppress-sigpipe s)
+      (declare (ignore ok))
+      (when status (sb-bsd-sockets:socket-close s) (bail status)))
     (sb-bsd-sockets:socket-connect s (%parse-ipv4 host) port)
-    s))
+    (values s nil)))
 
 (defun* tcp-listen (host port &key (backlog 8))
     (function (string (integer 0 65535) &key (:backlog (integer 1))) t)
@@ -319,11 +336,15 @@
     s))
 
 (defun* tcp-accept (listener)
-    (function (t) t)
-  "Block until a client connects to LISTENER; return the connected stream socket (SIGPIPE suppressed)."
+    (function (t) (values t (or null keyword)))
+  "Block until a client connects to LISTENER; return (values connected-socket NIL) with SIGPIPE
+   suppressed, or (values NIL :SETSOCKOPT-FAILED) if the suppression is refused (the accepted socket is
+   closed first, so a failed accept leaks no fd)."
   (let ((s (sb-bsd-sockets:socket-accept listener)))
-    (%tcp-suppress-sigpipe s)
-    s))
+    (multiple-value-bind (ok status) (%tcp-suppress-sigpipe s)
+      (declare (ignore ok))
+      (when status (sb-bsd-sockets:socket-close s) (bail status)))
+    (values s nil)))
 
 (defun* tcp-local-port (listener)
     (function (t) (integer 0 65535))
@@ -331,11 +352,12 @@
   (nth-value 1 (sb-bsd-sockets:socket-name listener)))
 
 (defun* tcp-set-recv-timeout (socket seconds)
-    (function (t (real 0)) t)
-  "Arm SO_RCVTIMEO on stream SOCKET so a blocking tcp-recv that makes no progress for SECONDS raises a
-   PAL-TIMEOUT (a DISTINCT catchable outcome, not a clean-EOF NIL and not data) instead of blocking
-   forever — the read/idle DoS guard for the durability microservice (ADR 0050 §4.6, operating contract
-   §4). SECONDS 0 clears the timeout (block indefinitely, the default). The option value is a 16-byte
+    (function (t (real 0)) (values t (or null keyword)))
+  "Arm SO_RCVTIMEO on stream SOCKET so a blocking tcp-recv that makes no progress for SECONDS returns the
+   status :TIMEOUT (a DISTINCT outcome, not a clean-EOF :EOF and not data) instead of blocking forever —
+   the read/idle DoS guard for the durability microservice (ADR 0050 §4.6, operating contract
+   §4). SECONDS 0 clears the timeout (block indefinitely, the default). Returns (values T NIL) or
+   (values NIL :SETSOCKOPT-FAILED). The option value is a 16-byte
    struct timeval: tv_sec as 8 little-endian octets, then tv_usec (< 10^6, so < 2^32) as 4 little-endian
    octets + 4 zero octets — a layout valid for BOTH the Darwin int32 tv_usec (offset 8, 4 tail-pad bytes)
    AND the Linux long tv_usec (offset 8, 8 bytes), so ONE encoding is portable across OSes. SO_RCVTIMEO
@@ -343,19 +365,25 @@
    — never impl-specific, so this carries no #+sbcl/#+clasp conditional. Reuses %setsockopt (DRY)."
   (let* ((sec (floor seconds))
          (usec (floor (* (- seconds sec) 1000000))))
-    (%setsockopt socket +sol-socket+ +so-rcvtimeo+
-                 (list (ldb (byte 8 0) sec)  (ldb (byte 8 8) sec)  (ldb (byte 8 16) sec) (ldb (byte 8 24) sec)
-                       (ldb (byte 8 32) sec) (ldb (byte 8 40) sec) (ldb (byte 8 48) sec) (ldb (byte 8 56) sec)
-                       (ldb (byte 8 0) usec) (ldb (byte 8 8) usec) (ldb (byte 8 16) usec) (ldb (byte 8 24) usec)
-                       0 0 0 0))
-    t))
+    (try (%setsockopt socket +sol-socket+ +so-rcvtimeo+
+                      (list (ldb (byte 8 0) sec)  (ldb (byte 8 8) sec)  (ldb (byte 8 16) sec) (ldb (byte 8 24) sec)
+                            (ldb (byte 8 32) sec) (ldb (byte 8 40) sec) (ldb (byte 8 48) sec) (ldb (byte 8 56) sec)
+                            (ldb (byte 8 0) usec) (ldb (byte 8 8) usec) (ldb (byte 8 16) usec) (ldb (byte 8 24) usec)
+                            0 0 0 0)))
+    (values t nil)))
 
 (defun* tcp-send (socket buffer len)
-    (function (t (simple-array (unsigned-byte 8) (*)) (integer 0)) (integer 0))
+    (function (t (simple-array (unsigned-byte 8) (*)) (integer 0))
+              (values (or null (integer 0)) (or null keyword)))
   "Send exactly LEN octets of BUFFER[0..LEN) over stream SOCKET, looping over short writes (a stream
-   socket may accept fewer than requested). Returns LEN. Signals on a failed / zero-progress write
-   (peer reset) — the socket-level error is contained here, never leaked to callers as a raw
-   sb-bsd-sockets condition."
+   socket may accept fewer than requested). Returns (values LEN NIL) on success, or
+   (values NIL :SEND-FAILED) on a torn socket — a peer reset, or a write that makes ZERO progress.
+
+   NEVER signals. The sb-bsd-sockets SOCKET-ERROR is a LIBRARY condition raised beneath us; it is caught
+   HERE, at the lowest boundary that can see it, and turned into a status value — which is rule 2 of the
+   no-conditions contract (a condition from a dependency is contained at the call, never re-signalled and
+   never allowed to unwind a caller's stack). Callers distinguish a torn connection from a short send by
+   the status, not by a handler."
   (let ((sent 0))
     (declare (type (integer 0) sent))
     (handler-case
@@ -364,31 +392,40 @@
                               (sb-bsd-sockets:socket-send socket buffer len)
                               (sb-bsd-sockets:socket-send socket (subseq buffer sent len) (- len sent)))))
                    (when (or (null n) (zerop n))
-                     (error "dds.pal: tcp-send made no progress (sent ~d of ~d)" sent len))
+                     (bail :send-failed))                       ; no progress: the peer is gone
                    (incf sent n)))
-      (sb-bsd-sockets:socket-error (e)
-        (error "dds.pal: tcp-send failed on stream socket: ~a" e)))
-    len))
+      (sb-bsd-sockets:socket-error () (bail :send-failed)))
+    (values len nil)))
 
 (defun* tcp-recv (socket buffer len)
-    (function (t (simple-array (unsigned-byte 8) (*)) (integer 0)) (or null (integer 0)))
+    (function (t (simple-array (unsigned-byte 8) (*)) (integer 0))
+              (values (or null (integer 0)) (or null keyword)))
   "Receive exactly LEN octets into BUFFER[0..LEN) from stream SOCKET, looping over partial reads until
    the full frame is assembled (TCP is a byte stream — one frame may split across segments; a partial
-   read is normal, NOT end-of-stream). Returns LEN, or NIL on EOF / peer-close / connection-reset
-   before LEN bytes arrive (a torn or short read = the connection dropped). If SOCKET has a recv timeout
-   armed (tcp-set-recv-timeout) and no data arrives within the deadline, SIGNALS PAL-TIMEOUT — a DISTINCT
-   catchable outcome, NOT confused with a clean EOF (NIL): sb-bsd-sockets:socket-receive returns n=0 on a
-   clean peer-close but n=NIL on an SO_RCVTIMEO timeout OR an EINTR-interrupted receive (verified identical
-   on SBCL + Clasp), so this splits them. EINTR is thus CONSERVATIVELY classified as a timeout (n=NIL ⟸
-   timeout OR EINTR) — the disposition is identical either way (drop / reconnect), so folding the rare
-   interrupted-syscall case into PAL-TIMEOUT is safe and keeps the branch minimal. BUFFER must hold >= LEN
-   octets. The first read lands straight in BUFFER; only a genuine split allocates one scratch buffer."
-  (when (zerop len) (return-from tcp-recv 0))
+   read is normal, NOT end-of-stream).
+
+   THREE OUTCOMES, and they are DISTINCT — the caller MUST NOT confuse them:
+     (values LEN NIL)      the full frame arrived.
+     (values NIL :EOF)     EOF / peer-close / connection-reset before LEN bytes (the connection dropped).
+     (values NIL :TIMEOUT) SOCKET has a recv timeout armed (tcp-set-recv-timeout) and no data arrived
+                           within the deadline — a STALLED peer, not a closed one.
+
+   sb-bsd-sockets:socket-receive returns n=0 on a clean peer-close but n=NIL on an SO_RCVTIMEO timeout OR
+   an EINTR-interrupted receive (verified identical on SBCL + Clasp), which is what lets this split :EOF
+   from :TIMEOUT. EINTR is CONSERVATIVELY classified as :TIMEOUT (n=NIL ⟸ timeout OR EINTR) — the
+   disposition is identical either way (drop / reconnect), so folding the rare interrupted-syscall case in
+   is safe and keeps the branch minimal. This was a PAL-TIMEOUT condition until the no-conditions rule;
+   the status value carries exactly the same information with no stack unwind (the sb-bsd-sockets
+   SOCKET-ERROR is a library condition, contained here and mapped to :EOF — rule 2).
+
+   BUFFER must hold >= LEN octets. The first read lands straight in BUFFER; only a genuine split allocates
+   one scratch buffer."
+  (when (zerop len) (return-from tcp-recv (values 0 nil)))
   (let ((got 0) (scratch nil))
     (declare (type (integer 0) got))
-    (flet ((step-outcome (n)          ; n>0 = data; n=0 = clean EOF -> NIL; n=NIL = SO_RCVTIMEO -> PAL-TIMEOUT
-             (cond ((null n) (error 'pal-timeout :op 'tcp-recv))
-                   ((zerop n) (return-from tcp-recv nil)))))
+    (flet ((step-outcome (n)          ; n>0 = data; n=0 = clean EOF; n=NIL = SO_RCVTIMEO/EINTR
+             (cond ((null n) (bail :timeout))
+                   ((zerop n) (bail :eof)))))
       (handler-case
           (loop while (< got len)
                 do (if (zerop got)
@@ -404,8 +441,8 @@
                            (step-outcome n)
                            (replace buffer scratch :start1 got :end1 (+ got n) :end2 n)
                            (incf got n)))))
-        (sb-bsd-sockets:socket-error () (return-from tcp-recv nil))))
-    len))
+        (sb-bsd-sockets:socket-error () (bail :eof))))
+    (values len nil)))
 
 ;; shutdown(2) SHUT_RDWR (disable BOTH directions of a connected stream socket). The value 2 is IDENTICAL
 ;; on Darwin (sys/socket.h) and Linux (bits/socket.h) — a POSIX/OS ABI constant, NOT impl-specific — so it
@@ -454,12 +491,13 @@
   (name "" :type string) (fd -1 :type fixnum) (sap nil :type t) (size 0 :type (integer 0)))
 
 (defun* %mmap-shared (fd size)
-    (function (fixnum (integer 1)) t)
-  "mmap SIZE bytes of FD shared R/W; signal on MAP_FAILED. Returns the foreign SAP."
+    (function (fixnum (integer 1)) (values t (or null keyword)))
+  "mmap SIZE bytes of FD shared R/W. Returns (values sap NIL), or (values NIL :MMAP-FAILED) on
+   MAP_FAILED — never signals."
   (let ((p (cffi:foreign-funcall "mmap" :pointer (cffi:null-pointer) :unsigned-long size
                                  :int +prot-rw+ :int +map-shared+ :int fd :long 0 :pointer)))
-    (when (= (cffi:pointer-address p) +map-failed-addr+) (error "mmap failed (size=~a)" size))
-    p))
+    (when (= (cffi:pointer-address p) +map-failed-addr+) (bail :mmap-failed))
+    (values p nil)))
 
 (defun* %shm-open-create (name)
     (function (string) fixnum)
@@ -471,27 +509,35 @@
   #-sbcl (cffi:foreign-funcall "shm_open" :string name :int (logior +o-creat+ +o-excl+ +o-rdwr+) :unsigned-int #o600 :int))
 
 (defun* shm-create (name size)
-    (function (string (integer 1)) shm-segment)
-  "Create+map an exclusive POSIX shm object NAME of SIZE bytes (shm_open O_CREAT|O_EXCL,
-   ftruncate, mmap MAP_SHARED). A stale leftover (EEXIST) is unlinked and recreated."
+    (function (string (integer 1)) (values (or null shm-segment) (or null keyword)))
+  "Create+map an exclusive POSIX shm object NAME of SIZE bytes (shm_open O_CREAT|O_EXCL, ftruncate,
+   mmap MAP_SHARED). A stale leftover (EEXIST) is unlinked and recreated. Returns (values segment NIL),
+   or (values NIL status) with status :SHM-OPEN-FAILED / :FTRUNCATE-FAILED / :MMAP-FAILED. Never signals.
+   EVERY failure path CLOSES the fd it opened before returning — a failed create leaks no descriptor."
   (let ((fd (%shm-open-create name)))
     (when (minusp fd)
       (cffi:foreign-funcall "shm_unlink" :string name :int)
       (setf fd (%shm-open-create name)))
-    (when (minusp fd) (error "shm_open(create ~a) failed" name))
+    (when (minusp fd) (bail :shm-open-failed))
     (when (minusp (cffi:foreign-funcall "ftruncate" :int fd :long size :int))
-      (cffi:foreign-funcall "close" :int fd :int) (error "ftruncate(~a) failed" name))
-    (handler-case (make-shm-segment :name name :fd fd :sap (%mmap-shared fd size) :size size)
-      (error (e) (cffi:foreign-funcall "close" :int fd :int) (error e)))))
+      (cffi:foreign-funcall "close" :int fd :int)
+      (bail :ftruncate-failed))
+    (multiple-value-bind (sap status) (%mmap-shared fd size)
+      (when status (cffi:foreign-funcall "close" :int fd :int) (bail status))
+      (values (make-shm-segment :name name :fd fd :sap sap :size size) nil))))
 
 (defun* shm-attach (name size)
-    (function (string (integer 1)) shm-segment)
-  "Open+map an EXISTING shm object NAME of SIZE bytes (shm_open O_RDWR, mmap).
-   No mode arg: the 2-arg open is non-variadic -> plain cffi:foreign-funcall."
+    (function (string (integer 1)) (values (or null shm-segment) (or null keyword)))
+  "Open+map an EXISTING shm object NAME of SIZE bytes (shm_open O_RDWR, mmap). No mode arg: the 2-arg
+   open is non-variadic -> plain cffi:foreign-funcall. Returns (values segment NIL), or (values NIL status)
+   with status :SHM-OPEN-FAILED (no such segment — the ordinary case for a stale/forged peer name, which
+   the zero-copy reader treats as 'no pool', never a crash) or :MMAP-FAILED. Never signals; the fd is
+   closed on the mmap failure path."
   (let ((fd (cffi:foreign-funcall "shm_open" :string name :int +o-rdwr+ :int)))
-    (when (minusp fd) (error "shm_open(attach ~a) failed" name))
-    (handler-case (make-shm-segment :name name :fd fd :sap (%mmap-shared fd size) :size size)
-      (error (e) (cffi:foreign-funcall "close" :int fd :int) (error e)))))
+    (when (minusp fd) (bail :shm-open-failed))
+    (multiple-value-bind (sap status) (%mmap-shared fd size)
+      (when status (cffi:foreign-funcall "close" :int fd :int) (bail status))
+      (values (make-shm-segment :name name :fd fd :sap sap :size size) nil))))
 
 (defun* shm-sap (segment) (function (shm-segment) t) "Foreign SAP base of SEGMENT." (shm-segment-sap segment))
 
@@ -516,26 +562,29 @@
   (cffi:inc-pointer sap offset))
 
 (defun* pshared-mutex-init (sap offset)
-    (function (t (integer 0)) t)
-  "Initialise a PTHREAD_PROCESS_SHARED mutex at SAP+OFFSET (creator only)."
+    (function (t (integer 0)) (values t (or null keyword)))
+  "Initialise a PTHREAD_PROCESS_SHARED mutex at SAP+OFFSET (creator only). Returns (values T NIL), or
+   (values NIL :MUTEX-INIT-FAILED) on a non-zero pthread_mutex_init return. The attr is destroyed on BOTH
+   paths (no leak on failure)."
   (cffi:with-foreign-object (ma :char 16)
     (cffi:foreign-funcall "pthread_mutexattr_init" :pointer ma :int)
     (cffi:foreign-funcall "pthread_mutexattr_setpshared" :pointer ma :int +pthread-process-shared+ :int)
     (let ((rc (cffi:foreign-funcall "pthread_mutex_init" :pointer (%ptr+ sap offset) :pointer ma :int)))
       (cffi:foreign-funcall "pthread_mutexattr_destroy" :pointer ma :int)
-      (unless (zerop rc) (error "pthread_mutex_init failed rc=~a" rc))
-      t)))
+      (unless (zerop rc) (bail :mutex-init-failed))
+      (values t nil))))
 
 (defun* pshared-cond-init (sap offset)
-    (function (t (integer 0)) t)
-  "Initialise a PTHREAD_PROCESS_SHARED condition variable at SAP+OFFSET (creator only)."
+    (function (t (integer 0)) (values t (or null keyword)))
+  "Initialise a PTHREAD_PROCESS_SHARED condition variable at SAP+OFFSET (creator only). Returns
+   (values T NIL), or (values NIL :COND-INIT-FAILED). The attr is destroyed on BOTH paths."
   (cffi:with-foreign-object (ca :char 16)
     (cffi:foreign-funcall "pthread_condattr_init" :pointer ca :int)
     (cffi:foreign-funcall "pthread_condattr_setpshared" :pointer ca :int +pthread-process-shared+ :int)
     (let ((rc (cffi:foreign-funcall "pthread_cond_init" :pointer (%ptr+ sap offset) :pointer ca :int)))
       (cffi:foreign-funcall "pthread_condattr_destroy" :pointer ca :int)
-      (unless (zerop rc) (error "pthread_cond_init failed rc=~a" rc))
-      t)))
+      (unless (zerop rc) (bail :cond-init-failed))
+      (values t nil))))
 
 (defun* pshared-lock (sap offset)
     (function (t (integer 0)) t)

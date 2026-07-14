@@ -430,15 +430,21 @@
                  (cffi:foreign-funcall "munmap" :pointer sap2 :unsigned-long size :int)))
              ;; by-name attach: cross-process path. Deterministic with the SBCL varargs create
              ;; (verified macOS arm64); Clasp/macOS-arm64 mispasses the variadic mode -> tolerated.
-             (handler-case
-                 (let ((seg2 (dds.pal:shm-attach name size)))
-                   (unwind-protect
-                        (%check :shm-attach-by-name
-                                (= #xCAFEF00D (cffi:mem-ref (dds.pal:shm-sap seg2) :uint32 0))
-                                "named attach sees the first's write")
-                     (dds.pal:shm-detach seg2)))
-               (error (e)
-                 (when (%shm-attach-by-name-reliable-p) (error e))))
+             ;; shm-attach RETURNS a status now (it does not signal), so the NFR-PORT gap is an explicit
+             ;; branch: where the attach MUST work, a failed attach FAILS the test; where the ABI gap is
+             ;; tolerated, it is skipped. (Previously a handler-case swallowed it — which would also have
+             ;; swallowed a genuine attach bug on the platforms where attach must work.)
+             (multiple-value-bind (seg2 status) (dds.pal:shm-attach name size)
+               (cond
+                 ((null status)
+                  (unwind-protect
+                       (%check :shm-attach-by-name
+                               (= #xCAFEF00D (cffi:mem-ref (dds.pal:shm-sap seg2) :uint32 0))
+                               "named attach sees the first's write")
+                    (dds.pal:shm-detach seg2)))
+                 ((%shm-attach-by-name-reliable-p)
+                  (%check :shm-attach-by-name nil
+                          (format nil "named attach MUST work on this platform, got ~s" status)))))
              t)
         (dds.pal:shm-detach seg)
         (dds.pal:shm-destroy name)))))

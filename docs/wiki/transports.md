@@ -93,6 +93,16 @@ The transport selection is a discovery-layer policy, controlled by one special v
 The single frozen L0 surface (IMPLEMENTATION-PLAN §7.6). Everything above L0 depends only on these symbols;
 per-impl bodies live in `pal-<impl>.lisp`.
 
+**Failures are returned, never signalled (ADR 0064).** Every fallible PAL call returns
+**`(values result status)`**: `status` is `nil` on success, otherwise a keyword naming the failure
+(`:setsockopt-failed`, `:eof`, `:timeout`, `:shm-open-failed`, `:ftruncate-failed`, `:mmap-failed`,
+`:mutex-init-failed`, `:cond-init-failed`, `:send-failed`). Nothing in this layer signals a Lisp condition
+— a failure is a value the caller tests and propagates, and the toplevel DDS API turns it into a
+`ReturnCode_t`. Inside a `defun*` body, propagate with **`(try form)`** (return `(values nil status)` from
+the enclosing function if `form` failed, else yield its primary value) and fail with **`(bail :status)`**.
+Conditions raised by *dependencies* (e.g. `sb-bsd-sockets:socket-error`) are caught at the PAL call that
+makes them and converted to a status there.
+
 **Conditions & introspection**
 
 | Symbol | Kind | Description |
@@ -142,13 +152,13 @@ in-segment `PTHREAD_PROCESS_SHARED` mutex/condvar. All thin CFFI wrappers; no ex
 
 | Symbol | Kind | Description |
 |---|---|---|
-| `dds.pal:shm-create` | function | `(name size)` — `shm_open(O_CREAT\|O_EXCL\|O_RDWR,0600)` + `ftruncate` + `mmap(MAP_SHARED)`; returns a segment handle. The creator. A stale segment from a crashed peer is reclaimed (`O_EXCL` fails -> `shm_unlink` + recreate). |
-| `dds.pal:shm-attach` | function | `(name size)` — `shm_open(O_RDWR)` + `mmap`; a sender attaches to a receiver's existing segment by name. |
+| `dds.pal:shm-create` | function | `(name size)` — `shm_open(O_CREAT\|O_EXCL\|O_RDWR,0600)` + `ftruncate` + `mmap(MAP_SHARED)`. The creator. Returns `(values segment nil)`, or `(values nil status)` — `:shm-open-failed` / `:ftruncate-failed` / `:mmap-failed`, each closing the fd it opened. A stale segment from a crashed peer is reclaimed (`O_EXCL` fails -> `shm_unlink` + recreate). |
+| `dds.pal:shm-attach` | function | `(name size)` — `shm_open(O_RDWR)` + `mmap`; a sender attaches to a receiver's existing segment by name. Returns `(values segment nil)`, or `(values nil :shm-open-failed)` when no such segment exists — the **ordinary** outcome for a stale/forged peer name, which the zero-copy reader caches as "no pool". |
 | `dds.pal:shm-detach` | function | `(handle)` — `munmap` + `close`. |
 | `dds.pal:shm-destroy` | function | `(name)` — `shm_unlink`. |
 | `dds.pal:shm-sap` | function | `(handle)` — the `mmap` base SAP, for the typed `sap-ref-*`/`cffi:mem-ref` reads/writes the ring uses. |
 | `dds.pal:shm-segment-size` | function | `(handle)` — the segment's byte length. |
-| `dds.pal:pshared-mutex-init` / `pshared-cond-init` | functions | `(sap offset)` — creator-only init of a `PTHREAD_PROCESS_SHARED` mutex / condvar living **in** the segment. |
+| `dds.pal:pshared-mutex-init` / `pshared-cond-init` | functions | `(sap offset)` — creator-only init of a `PTHREAD_PROCESS_SHARED` mutex / condvar living **in** the segment. Return `(values t nil)` or `(values nil :mutex-init-failed / :cond-init-failed)`. |
 | `dds.pal:pshared-lock` / `pshared-unlock` | functions | `(sap offset)` — lock / unlock the in-segment mutex. |
 | `dds.pal:pshared-cond-wait` | function | `(sap cond-offset mutex-offset)` — wait on the in-segment cond, releasing the mutex. |
 | `dds.pal:pshared-cond-signal` / `pshared-cond-broadcast` | functions | `(sap offset)` — wake one / all waiters on the in-segment cond. |
@@ -170,13 +180,13 @@ in-segment `PTHREAD_PROCESS_SHARED` mutex/condvar. All thin CFFI wrappers; no ex
 
 | Symbol | Kind | Description |
 |---|---|---|
-| `dds.pal:udp-open` | function | `(&key host port reuse-port)` — open a UDPv4 socket bound to `host:port` (port 0 = ephemeral); `reuse-port` enables `SO_REUSEPORT` before bind. Returns the socket. |
+| `dds.pal:udp-open` | function | `(&key host port reuse-port)` — open a UDPv4 socket bound to `host:port` (port 0 = ephemeral); `reuse-port` enables `SO_REUSEPORT` before bind. Returns `(values socket nil)`, or `(values nil :setsockopt-failed)` — the half-open socket is closed first, so a failed open leaks no fd. |
 | `dds.pal:udp-local-port` | function | `(socket)` — the bound local port of `socket`. |
 | `dds.pal:udp-send-to` | function | `(socket buffer length host port)` — send `length` octets of `buffer` from `socket` to `host:port`. |
 | `dds.pal:udp-recv` | function | `(socket buffer length)` — block until a datagram arrives; return `(values size sender-address sender-port)`. Used from a dedicated receiver thread. |
 | `dds.pal:udp-close` | function | `(socket)` — close `socket`. |
-| `dds.pal:udp-set-reuse-port` | function | `(socket)` — enable `SO_REUSEPORT` so multiple participants on one host can share the SPDP multicast port. Must be called before bind. |
-| `dds.pal:udp-join-multicast` | function | `(socket group)` — join the IPv4 multicast `group` (dotted-quad) on the default interface and enable loopback (RTPS 2.5 §9.6.1.1). The socket must already be bound to the multicast port. |
+| `dds.pal:udp-set-reuse-port` | function | `(socket)` — enable `SO_REUSEPORT` so multiple participants on one host can share the SPDP multicast port. Must be called before bind. Returns `(values t nil)` or `(values nil :setsockopt-failed)`. |
+| `dds.pal:udp-join-multicast` | function | `(socket group)` — join the IPv4 multicast `group` (dotted-quad) on the default interface and enable loopback (RTPS 2.5 §9.6.1.1). The socket must already be bound to the multicast port. Returns `(values t nil)` or `(values nil :setsockopt-failed)` — a node that cannot join the SPDP group discovers nobody, so the caller must surface it rather than proceed deaf. |
 
 **Clock**
 

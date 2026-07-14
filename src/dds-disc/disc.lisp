@@ -919,17 +919,24 @@
   (concatenate 'string (dds.xport.shmem:seg-name-for-guid guid) "z"))
 
 (defun* %zc-make-pool (node)
-    (function (disc-node) t)
+    (function (disc-node) (values t (or null keyword)))
   "Create + init this node's WP-ZEROCOPY writer pool (FR-PF-3, ADR 0014): an shm segment of
    +zerocopy-pool-slots+ x +zerocopy-pool-slot-bytes+ named %zc-pool-name. A stale leftover is unlinked +
-   recreated by shm-create. Caller has gated on *zerocopy-enabled* AND the node having SHMEM. NOT cleared
-   for ship — pending counsel (R6)."
-  (let ((seg (dds.pal:shm-create (%zc-pool-name (disc-node-guid-prefix node))
-                                 (dds.xport.zerocopy::%zc-bytes +zerocopy-pool-slots+ +zerocopy-pool-slot-bytes+))))
-    (dds.xport.zerocopy::%zc-init (dds.pal:shm-sap seg) +zerocopy-pool-slots+ +zerocopy-pool-slot-bytes+)
+   recreated by shm-create. Caller has gated on *zerocopy-enabled* AND the node having SHMEM. Returns
+   (values T NIL), or (values NIL status) if the segment cannot be created or its pshared mutex cannot be
+   initialised — the pool is NOT half-installed on the node (the slots are set only after a clean init),
+   and the segment is detached before returning. NOT cleared for ship — pending counsel (R6)."
+  (multiple-value-bind (seg status)
+      (dds.pal:shm-create (%zc-pool-name (disc-node-guid-prefix node))
+                          (dds.xport.zerocopy::%zc-bytes +zerocopy-pool-slots+ +zerocopy-pool-slot-bytes+))
+    (when status (bail status))
+    (multiple-value-bind (ok init-status)
+        (dds.xport.zerocopy::%zc-init (dds.pal:shm-sap seg) +zerocopy-pool-slots+ +zerocopy-pool-slot-bytes+)
+      (declare (ignore ok))
+      (when init-status (dds.pal:shm-detach seg) (bail init-status)))
     (setf (disc-node-zc-pool node) seg
-          (disc-node-zc-pool-sap node) (dds.pal:shm-sap seg)))
-  t)
+          (disc-node-zc-pool-sap node) (dds.pal:shm-sap seg))
+    (values t nil)))
 
 (defun* %zc-node-capable-p (node)
     (function (disc-node) t)
@@ -966,8 +973,15 @@
                             (capture-data-key-hash nil) (crypto-transform nil)
                             (identity-token-octets nil) (on-stateless-message nil)
                             (lease-duration-seconds 100) (lease-duration-nanosec 0))
-    (function (&key (:guid-prefix (simple-array (unsigned-byte 8) (12))) (:domain (integer 0)) (:host string) (:port (unsigned-byte 16)) (:peers list) (:multicast t) (:advertise-address string) (:batch-max-samples (integer 1)) (:capture-data-key-hash t) (:crypto-transform t) (:identity-token-octets t) (:on-stateless-message t) (:lease-duration-seconds (signed-byte 32)) (:lease-duration-nanosec (integer 0))) disc-node)
+    (function (&key (:guid-prefix (simple-array (unsigned-byte 8) (12))) (:domain (integer 0)) (:host string) (:port (unsigned-byte 16)) (:peers list) (:multicast t) (:advertise-address string) (:batch-max-samples (integer 1)) (:capture-data-key-hash t) (:crypto-transform t) (:identity-token-octets t) (:on-stateless-message t) (:lease-duration-seconds (signed-byte 32)) (:lease-duration-nanosec (integer 0))) (values (or null disc-node) (or null keyword)))
   "Open a metatraffic UDPv4 socket bound to HOST:PORT and build a discovery node.
+
+   Returns (values node NIL), or (values NIL status) if the node cannot be built — the OS refused a
+   socket option / the SPDP multicast join / the SHMEM segment, or CRYPTO-TRANSFORM was combined with
+   zero-copy (:CRYPTO-AND-ZEROCOPY-EXCLUSIVE; ADR 0031 known-limitation 4). It NEVER signals (operating
+   contract: no Lisp conditions in our code). EVERY failure path releases the sockets/segments this call
+   had already opened, so a refused participant leaks no file descriptor and no shm object. The DCPS
+   toplevel (create-participant) maps the status to a DDS ReturnCode_t.
    PEERS is a list of (host-string . port) the node announces SPDP to (FR-DISC-4).
    MULTICAST opens a second socket bound to the SPDP multicast port and joins the
    well-known group, so the node also discovers peers via multicast (FR-DISC-3).
@@ -997,39 +1011,59 @@
   ;; In multicast mode bind the unicast socket to 0.0.0.0: a loopback-bound socket
   ;; cannot egress to a multicast group (EADDRNOTAVAIL), and 0.0.0.0 still receives
   ;; unicast SEDP addressed to 127.0.0.1:port.
-  (multiple-value-bind (tr sock)
+  (multiple-value-bind (tr sock open-status)
       (dds.xport.udp:make-udp-transport :host (if multicast "0.0.0.0" host) :port port)
-    (let* ((host-uuid (%host-uuid))
-           (node (%make-disc-node :guid-prefix guid-prefix :domain domain
-                                  :advertise-address advertise-address
-                                  :socket sock :transport tr :peers peers
-                                  :lease-duration-seconds lease-duration-seconds
-                                  :lease-duration-nanosec lease-duration-nanosec
-                                  :batch-max-samples batch-max-samples
-                                  :capture-data-key-hash (and capture-data-key-hash t)
-                                  :crypto-transform crypto-transform
-                                  :identity-token-octets identity-token-octets
-                                  :on-stateless-message on-stateless-message
-                                  :host-uuid host-uuid
-                                  :shmem (when *shmem-enabled*   ; SHMEM receive segment for same-host user DATA (FR-XPORT-2)
-                                           (dds.xport.shmem:make-shmem-transport
-                                            :participant-guid guid-prefix :host-uuid host-uuid
-                                            :lane-count +shmem-default-lane-count+ :capacity +shmem-default-capacity+))
-                                  :tx-payload (dds.core.buffer:make-octet-buffer *metatraffic-payload-bytes*)
-                                  :tx-msg (dds.core.buffer:make-octet-buffer *max-datagram-bytes*)
-                                  :rx-tx-msg (dds.core.buffer:make-octet-buffer *max-datagram-bytes*))))
-      (when multicast
-        (let ((ms (dds.pal:udp-open :host "0.0.0.0"
-                                    :port (dds.rtps.message:spdp-multicast-port domain)
-                                    :reuse-port t)))
-          (dds.pal:udp-join-multicast ms +spdp-multicast-group+)
-          (setf (disc-node-mcast-socket node) ms)))
-      (when (and *zerocopy-enabled* (disc-node-shmem node))   ; WP-ZEROCOPY writer pool (FR-PF-3, ADR 0014)
-        (%zc-make-pool node))
-      ;; DDS-Security §9.5.3.3 Slice-1 (ADR 0031): crypto + ZC unsupported — SecuredPayload cannot be applied in-place to a ZC loan.
-      (when (and crypto-transform (disc-node-zc-pool node))
-        (error "crypto-transform and zero-copy are mutually exclusive in Slice 1 (ADR 0031 known-limitation 4): use one or the other"))
-      node)))
+    (when open-status (bail open-status))
+    (let ((host-uuid (%host-uuid)) (shmem nil) (mcast nil) (node nil))
+      ;; every failure below UNWINDS NOTHING (no conditions) — so each one must hand back the OS
+      ;; resources this call already took, or a refused participant leaks an fd + an shm segment.
+      (flet ((release (status)
+               (when (and node (disc-node-zc-pool node)) (dds.pal:shm-detach (disc-node-zc-pool node)))
+               (when mcast (dds.pal:udp-close mcast))
+               (when shmem (dds.xport.shmem:shmem-transport-close shmem))
+               (dds.pal:udp-close sock)
+               status))
+        (when *shmem-enabled*   ; SHMEM receive segment for same-host user DATA (FR-XPORT-2)
+          (multiple-value-bind (st status)
+              (dds.xport.shmem:make-shmem-transport
+               :participant-guid guid-prefix :host-uuid host-uuid
+               :lane-count +shmem-default-lane-count+ :capacity +shmem-default-capacity+)
+            (when status (bail (release status)))
+            (setf shmem st)))
+        (setf node (%make-disc-node :guid-prefix guid-prefix :domain domain
+                                    :advertise-address advertise-address
+                                    :socket sock :transport tr :peers peers
+                                    :lease-duration-seconds lease-duration-seconds
+                                    :lease-duration-nanosec lease-duration-nanosec
+                                    :batch-max-samples batch-max-samples
+                                    :capture-data-key-hash (and capture-data-key-hash t)
+                                    :crypto-transform crypto-transform
+                                    :identity-token-octets identity-token-octets
+                                    :on-stateless-message on-stateless-message
+                                    :host-uuid host-uuid
+                                    :shmem shmem
+                                    :tx-payload (dds.core.buffer:make-octet-buffer *metatraffic-payload-bytes*)
+                                    :tx-msg (dds.core.buffer:make-octet-buffer *max-datagram-bytes*)
+                                    :rx-tx-msg (dds.core.buffer:make-octet-buffer *max-datagram-bytes*)))
+        (when multicast
+          (multiple-value-bind (ms status)
+              (dds.pal:udp-open :host "0.0.0.0"
+                                :port (dds.rtps.message:spdp-multicast-port domain)
+                                :reuse-port t)
+            (when status (bail (release status)))
+            (setf mcast ms))
+          (multiple-value-bind (ok status) (dds.pal:udp-join-multicast mcast +spdp-multicast-group+)
+            (declare (ignore ok))
+            (when status (bail (release status))))   ; cannot join SPDP = discovers nobody: FAIL, never proceed deaf
+          (setf (disc-node-mcast-socket node) mcast))
+        (when (and *zerocopy-enabled* (disc-node-shmem node))   ; WP-ZEROCOPY writer pool (FR-PF-3, ADR 0014)
+          (multiple-value-bind (ok status) (%zc-make-pool node)
+            (declare (ignore ok))
+            (when status (bail (release status)))))
+        ;; DDS-Security §9.5.3.3 Slice-1 (ADR 0031): crypto + ZC unsupported — SecuredPayload cannot be applied in-place to a ZC loan.
+        (when (and crypto-transform (disc-node-zc-pool node))
+          (bail (release :crypto-and-zerocopy-exclusive)))
+        (values node nil)))))
 
 (defun* disc-node-port (node)
     (function (disc-node) (integer 0 65535))

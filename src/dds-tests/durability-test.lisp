@@ -9194,8 +9194,8 @@
   "WP-DURABILITY-MS-DOS amplification gate (ADR 0050 §4.6): a huge DECLARED body length must NOT force a
    huge up-front allocation. (i) An OVER-CAP declared length (> +ms-max-message+) is rejected as a protocol
    error BEFORE any body buffer is allocated. (ii) A huge AT-CAP declared length with NO body TIMES OUT via
-   the incremental reader (a bounded chunk, not the full 256 MiB) — proven BEHAVIORALLY (it returns via
-   PAL-TIMEOUT, no infinite block / OOM) on both impls, and NUMERICALLY (allocated << the declared length)
+   the incremental reader (a bounded chunk, not the full 256 MiB) — proven BEHAVIORALLY (it RETURNS, with
+   status :TIMEOUT — no infinite block / OOM) on both impls, and NUMERICALLY (allocated << the declared length)
    where the impl exposes a consing counter (SBCL; Clasp reports 0, a documented NFR-PORT gap). Read INLINE
    on a raw socketpair (the test thread) so the allocation is measurable. Bounded (1 s reader timeout)."
   ;; (i) OVER-CAP declared length -> protocol error, no allocation
@@ -9220,8 +9220,7 @@
           (dds.pal:tcp-send cli (octets 0 0 0 16) 4)             ; body-len = #x10000000 = +ms-max-message+ (256 MiB), send NO body
           (let ((consed0 (dds.pal:bytes-consed)))
             (%check :ms-huge-times-out
-                    (eq :timeout (handler-case (progn (dds.durability::%ms-recv-message srv) :no-timeout)
-                                   (dds.pal:pal-timeout () :timeout)))
+                    (eq :timeout (nth-value 1 (dds.durability::%ms-recv-message srv)))
                     "a huge (at-cap) declared body with NO data TIMES OUT via the incremental reader (no infinite block, no OOM)")
             (let ((delta (- (dds.pal:bytes-consed) consed0)))
               (%check :ms-huge-bounded-alloc

@@ -2506,20 +2506,24 @@
     (function (disc-node (simple-array (unsigned-byte 8) (12))) t)
   "WP-ZEROCOPY reader side (FR-PF-3, ADR 0014): the mapped base SAP of the writer pool published by the
    participant at SRC-PREFIX, or NIL if the pool cannot be opened (a forged/stale source prefix derives a
-   deterministic %zc-pool-name that simply does not exist -> shm-attach errors -> cached as :none, dropped
-   — never a crash). MEMOIZED per source prefix under zc-attach-lock (attach once per remote writer; two
-   receiver threads racing the first attach for one writer are serialized). The attach SIZE uses the
-   SHARED geometry constants (+zerocopy-pool-slots+ / +zerocopy-pool-slot-bytes+), NOT a wire-supplied
-   value, so an untrusted ref can never size the mapping (NFR-SEC-POSTURE)."
+   deterministic %zc-pool-name that simply does not exist -> shm-attach returns :SHM-OPEN-FAILED -> cached
+   as :none, dropped — never a crash). A MISSING PEER POOL IS AN ORDINARY OUTCOME HERE, NOT AN ERROR: it
+   used to be an shm-attach CONDITION swallowed by IGNORE-ERRORS, which also swallowed every other fault;
+   it is now the explicit status value the PAL returns. MEMOIZED per source prefix under zc-attach-lock
+   (attach once per remote writer; two receiver threads racing the first attach for one writer are
+   serialized). The attach SIZE uses the SHARED geometry constants (+zerocopy-pool-slots+ /
+   +zerocopy-pool-slot-bytes+), NOT a wire-supplied value, so an untrusted ref can never size the mapping
+   (NFR-SEC-POSTURE)."
   (dds.pal:with-lock ((disc-node-zc-attach-lock node))
     (let ((cached (gethash src-prefix (disc-node-zc-attach-cache node))))
       (cond
         ((eq cached :none) nil)
         (cached (dds.pal:shm-sap cached))
-        (t (let ((seg (ignore-errors
-                       (dds.pal:shm-attach (%zc-pool-name src-prefix)
-                                           (dds.xport.zerocopy::%zc-bytes
-                                            +zerocopy-pool-slots+ +zerocopy-pool-slot-bytes+)))))
+        (t (multiple-value-bind (seg status)
+               (dds.pal:shm-attach (%zc-pool-name src-prefix)
+                                   (dds.xport.zerocopy::%zc-bytes
+                                    +zerocopy-pool-slots+ +zerocopy-pool-slot-bytes+))
+             (when status (setf seg nil))          ; no such pool (or it will not map): remember "none"
              (setf (gethash (copy-seq src-prefix) (disc-node-zc-attach-cache node)) (or seg :none))
              (and seg
                   (dds.xport.zerocopy::%zc-validate (dds.pal:shm-sap seg))   ; ABI magic/version guard

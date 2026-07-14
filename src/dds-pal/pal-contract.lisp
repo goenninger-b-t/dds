@@ -12,7 +12,7 @@
     threads, sockets, monotonic clock, GC control, optimization hints.")
   (:export
    ;; conditions
-   #:pal-error #:pal-unimplemented #:pal-op #:pal-timeout
+   #:pal-error #:pal-unimplemented #:pal-op
    ;; capability introspection
    #:+pal-capabilities+ #:pal-impl-name
    ;; memory (off-heap, non-GC'd, raw-pointer-addressable)
@@ -53,8 +53,8 @@
    #:udp-set-reuse-port #:udp-join-multicast
    ;; TCPv4 stream sockets (native, FR-XPORT-1). Byte-stream full-send / full-frame recv loops
    ;; (a stream is not message-framed): tcp-send loops over short writes, tcp-recv loops until LEN
-   ;; bytes or peer-close (NIL). tcp-set-recv-timeout arms SO_RCVTIMEO so a stalled tcp-recv raises
-   ;; PAL-TIMEOUT (a DoS/idle guard) instead of blocking forever. tcp-shutdown (shutdown(2) SHUT_RDWR)
+   ;; bytes or peer-close (status :EOF). tcp-set-recv-timeout arms SO_RCVTIMEO so a stalled tcp-recv
+   ;; returns status :TIMEOUT (a DoS/idle guard) instead of blocking forever. tcp-shutdown (shutdown(2) SHUT_RDWR)
    ;; portably WAKES a thread blocked in tcp-recv (Linux + Darwin) WITHOUT freeing the fd — the clean
    ;; cross-thread server-stop wake, no double-close (ADR 0050 §4.8). Backs the durability MICROSERVICE
    ;; persistence backend (ADR 0050).
@@ -83,15 +83,10 @@
                      (pal-op c))))
   (:documentation "Signalled by a capability stub not yet provided for this impl."))
 
-(define-condition pal-timeout (pal-error)
-  ((op :initarg :op :reader pal-op :initform nil))
-  (:report (lambda (c s) (format s "PAL socket operation timed out: ~s" (pal-op c))))
-  (:documentation "A blocking PAL socket receive (TCP-RECV) reached its SO_RCVTIMEO deadline before any
-    data arrived — the read/idle timeout fired (armed by TCP-SET-RECV-TIMEOUT). A DISTINCT catchable
-    outcome, NOT a clean EOF (TCP-RECV's NIL return) and NOT data: a stalled/slow-loris peer surfaces here
-    so a caller DROPS the connection (server) or treats it as a lost connection (client) rather than
-    blocking forever. Only sockets with a timeout armed can raise it; a socket without SO_RCVTIMEO set
-    still blocks and returns NIL on a genuine peer-close, exactly as before."))
+;; PAL-TIMEOUT is GONE (operating contract: no Lisp conditions in our code). TCP-RECV's read/idle timeout
+;; was the one PAL condition on a data path; it is now the STATUS VALUE :TIMEOUT, returned as TCP-RECV's
+;; second value and distinguished from :EOF and from data exactly as the condition was. Nothing signals,
+;; so nothing has to catch: a stalled/slow-loris peer is a status the caller tests, not a stack unwind.
 
 (defparameter +pal-capabilities+
   '(:memory :atomics :threads :sockets :clock :gc-control :opt-hints)

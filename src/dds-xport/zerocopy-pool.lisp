@@ -43,8 +43,10 @@
   (+ +zc-slots-off+ (* i (%zc-slot-stride (%zc-slot-bytes sap)))))
 
 (defun* %zc-init (sap slot-count slot-bytes)
-    (function (t (integer 1) (integer 1)) t)
+    (function (t (integer 1) (integer 1)) (values t (or null keyword)))
   "Initialise header + pshared mutex; zero every slot's refcount/generation/len/pubseq. Creator-only.
+   Returns (values T NIL), or (values NIL :MUTEX-INIT-FAILED) if the PROCESS_SHARED mutex cannot be
+   initialised — the caller must NOT install a pool whose lock does not exist.
    WP-ZC-LOAN-LOCKFREE (R6, ADR 0018; NOT cleared for ship — pending counsel): the freelist is DROPPED — a
    slot is reclaimable iff its refcount==0, so init builds no freelist head and the LEN field no longer
    overlays a freelist 'next' (it is just the payload length, initialised 0)."
@@ -52,13 +54,14 @@
         (cffi:mem-ref sap :uint32 +zc-off-version+) +zc-version+
         (cffi:mem-ref sap :uint32 +zc-off-slot-count+) slot-count
         (cffi:mem-ref sap :uint32 +zc-off-slot-bytes+) slot-bytes)
-  (dds.pal:pshared-mutex-init sap +zc-mutex-off+)
-  (dotimes (i slot-count t)
+  (try (dds.pal:pshared-mutex-init sap +zc-mutex-off+))
+  (dotimes (i slot-count)
     (let ((b (%zc-slot-off sap i)))
       (setf (cffi:mem-ref sap :uint32 (+ b +zc-slot-off-refcount+)) 0
             (cffi:mem-ref sap :uint32 (+ b +zc-slot-off-generation+)) 0
             (cffi:mem-ref sap :uint32 (+ b +zc-slot-off-len+)) 0)
-      (dds.pal:store-sap-u64 sap (+ b +zc-slot-off-pubseq+) 0))))
+      (dds.pal:store-sap-u64 sap (+ b +zc-slot-off-pubseq+) 0)))
+  (values t nil))
 
 (defun* %zc-validate (sap)
     (function (t) t)
