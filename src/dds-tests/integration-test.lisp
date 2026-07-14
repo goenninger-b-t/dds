@@ -10487,6 +10487,65 @@
 ;;; PUBLICATION_MATCHED current_count DECREASES (current_count_change negative),
 ;;; total_count stays monotonic, and the matched listener fires.
 
+(defun* run-spdp-dispose-prune-test ()
+    (function () t)
+  "ADR 0063 — a GRACEFUL participant departure must prune the peer AT ONCE, and a FORGED one must not.
+
+   A peer that deletes its participant announces it: a dispose/unregister on the SPDPbuiltinParticipantWriter
+   naming its own GUID in PID_KEY_HASH (captured from a live RTI Connext 7.3.1 delete_participant). We
+   decoded that datagram and threw it away, so the ONLY removal path was the 100 s lease sweep. Until then
+   the departed peer stayed MATCHED, and writer-purge-acked — which purges below min(acked-base) over the
+   matched readers — was pinned by a ghost that would never ACK again, so a RELIABLE + KEEP_ALL HistoryCache
+   purged NOTHING and advertised that stale history to every new reader (the phantom gap: the 3rd successive
+   client got no data, permanently).
+
+   SECURITY (NFR-SEC-POSTURE): the disposed instance is named by the wire's own PID_KEY_HASH, so a peer
+   could otherwise evict ANY OTHER participant by naming its GUID — an unauthenticated, trivially forgeable
+   DoS against a third party. A dispose whose keyhash prefix is not the datagram's SOURCE prefix is DROPPED.
+
+   Asserts: (1) a self-naming dispose prunes the peer + fires on-unmatch; (2) a dispose naming a DIFFERENT
+   participant leaves that participant untouched."
+  (let ((node (dds.disc:make-disc-node
+               :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element #x53)
+               :host "127.0.0.1" :port 0))
+        (unmatched '()))
+    (unwind-protect
+        (let* ((victim (make-array 12 :element-type '(unsigned-byte 8) :initial-element #x71))
+               (attacker (make-array 12 :element-type '(unsigned-byte 8) :initial-element #x42))
+               (rw (%remote-writer-ep #x02)))
+          (setf (dds.disc:disc-node-on-unmatch node)
+                (lambda (direction remote &optional local-eid) (declare (ignore local-eid))
+                  (push (cons direction remote) unmatched)))
+          (replace (dds.rtps.discovery:endpoint-data-guid rw) victim :end1 12)
+          (dds.disc::%record-match node rw)
+          (setf (gethash (copy-seq (dds.rtps.discovery:endpoint-data-guid rw))
+                         (dds.disc::disc-node-discovered-writers node)) rw)
+          (dds.disc::%seed-discovered-stale node victim 100 0)   ; discovered, lease 100 s, NOT stale
+          ;; (2) FORGED: the ATTACKER sends a dispose naming the VICTIM. Must be DROPPED.
+          (let ((kh (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)))
+            (replace kh victim :end2 12)
+            (setf (aref kh 14) #x01 (aref kh 15) #xc1)          ; ENTITYID_PARTICIPANT
+            (dds.disc::%on-spdp-dispose node attacker kh))      ; src=attacker, keyhash names victim
+          (%check :adr63-forged-dispose-dropped
+                  (and (gethash victim (dds.disc::disc-node-discovered node))
+                       (plusp (hash-table-count (dds.disc::disc-node-matches node))))
+                  "a dispose naming ANOTHER participant must be DROPPED — else any peer can evict any other")
+          ;; (1) GENUINE: the VICTIM disposes ITSELF. Must prune immediately.
+          (let ((kh (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)))
+            (replace kh victim :end2 12)
+            (setf (aref kh 14) #x01 (aref kh 15) #xc1)
+            (dds.disc::%on-spdp-dispose node victim kh))        ; src == the disposed GUID
+          (%check :adr63-dispose-pruned
+                  (zerop (hash-table-count (dds.disc::disc-node-discovered node)))
+                  "a self-naming SPDP dispose must prune the departed participant AT ONCE (not after the lease)")
+          (%check :adr63-dispose-unmatched
+                  (zerop (hash-table-count (dds.disc::disc-node-matches node)))
+                  "the departed participant's matched endpoints must be dropped — a ghost reader that never ACKs pins writer-purge-acked")
+          (%check :adr63-dispose-fired-unmatch (= 1 (length unmatched))
+                  "on-unmatch must fire once for the departed peer"))
+      (dds.disc:stop-node node)))
+  t)
+
 (defun* run-lease-unmatch-test ()
     (function () t)
   "A matched remote endpoint removed by participant-lease expiry decrements the local

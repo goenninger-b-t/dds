@@ -31,7 +31,7 @@
            #:%all-user-writer-ids #:%all-user-reader-ids #:%user-endpoint-kinds #:%local-user-writer-id-for-topic
            #:parse-peers
            #:start-node #:stop-node
-           #:announce-participant #:announce-endpoints
+           #:announce-participant #:announce-participant-dispose #:announce-endpoints
            #:enable-publisher #:enable-subscriber
            #:%writer-durability-init #:%reader-durability-init #:finalize-writer-durability
            #:publish-sample #:publish-sample-into #:*plain-payload-max-bytes*

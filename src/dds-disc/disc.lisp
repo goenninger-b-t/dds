@@ -1164,6 +1164,47 @@
   (%announce-secure-spdp node)   ; T11: protected re-announce over secure SPDP (off plain; no-op when security OFF)
   t)
 
+(defun* announce-participant-dispose (node)
+    (function (disc-node) t)
+  "Announce that THIS participant is going away: one DISPOSE+UNREGISTER DATA on the
+   SPDPbuiltinParticipantWriter (ADR 0063), to the same destinations as the periodic announce. Called from
+   STOP-NODE before the sockets come down, so a peer prunes us AT ONCE instead of waiting out our
+   leaseDuration (100 s by default) — during which, to a peer with a RELIABLE + KEEP_ALL writer, we are a
+   ghost reader that never ACKs and therefore pins its purge watermark and wedges its HistoryCache.
+
+   THE WIRE FORM IS THE ORACLE, captured from a live RTI Connext 7.3.1 delete_participant (see ADR 0063):
+     SN = the SPDP writer's next sequence number (the announce and the goodbye share one SN stream)
+     NO serializedPayload — DataFlag 0, KeyFlag 0; the instance is named ONLY by inline QoS
+     PID_STATUS_INFO = 0x03 = DisposedFlag | UnregisteredFlag (RTPS 2.5 §9.6.4.9; the spec requires both:
+       'Data Messages that unregister an instance must also dispose it')
+     PID_KEY_HASH   = our participant GUID = 12-octet guidPrefix + ENTITYID_PARTICIPANT (0x000001c1)
+
+   BEST-EFFORT, sent ONCE (as Connext does): the SPDPbuiltinParticipantWriter is a Best-Effort
+   StatelessWriter (§8.5.3), so this CAN be lost — and a CRASHED participant never sends it at all. It is a
+   prompt-cleanup optimization, NEVER a guarantee; the peer's lease sweep stays the backstop."
+  (incf (disc-node-spdp-sn node))
+  (let ((sn (disc-node-spdp-sn node))
+        (key-hash (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)))
+    (replace key-hash (disc-node-guid-prefix node) :end2 12)          ; GUID = prefix + ENTITYID_PARTICIPANT
+    (setf (aref key-hash 12) #x00 (aref key-hash 13) #x00
+          (aref key-hash 14) #x01 (aref key-hash 15) #xc1)            ; 0x000001c1, MSB-first (§9.3.1.2)
+    (flet ((send-bye (host port)
+             (%send-msg-buf node (disc-node-tx-msg node)
+                            (lambda (mc)
+                              (dds.rtps.message:write-data-dispose
+                               mc dds.rtps.discovery:+entityid-spdp-reader+
+                               dds.rtps.discovery:+entityid-spdp-writer+
+                               sn key-hash
+                               (logior dds.rtps.message:+statusinfo-disposed+
+                                       dds.rtps.message:+statusinfo-unregistered+)))
+                            host port)))
+      (dolist (peer (disc-node-peers node))
+        (send-bye (car peer) (cdr peer)))
+      (when (disc-node-mcast-socket node)
+        (send-bye +spdp-multicast-group+
+                  (dds.rtps.message:spdp-multicast-port (disc-node-domain node))))))
+  t)
+
 (defun* %qos-from-reliability (reliability)
     (function (integer) dds.qos:qos)
   "Build a QoS from a legacy wire reliability constant (back-compat for callers that
@@ -1752,29 +1793,83 @@
                        (push prefix dead))))
                  (disc-node-discovered node))
         (dolist (prefix dead)
-          (remhash prefix (disc-node-discovered node))
-          (remhash prefix (disc-node-participant-last-seen node))
-          (remhash prefix (disc-node-builtin-readers node))
-          (remhash prefix (disc-node-auth-state node))
-          (%invalidate-shmem-dest node prefix)   ; a leased-out peer's cached SHMEM dest must not be reused
-          (%purge-prefix node prefix #'disc-node-discovered-writers)
-          (%purge-prefix node prefix #'disc-node-discovered-readers)
-          (%purge-prefix node prefix #'disc-node-reader-routes)   ; WP-N-ENDPOINT-S2 (ADR 0048): drop the lost writer's delivery route (unmatch/lease-expiry) so a reader stops draining a gone writer; a re-announce re-adds it
-          (%purge-reader-join-watermarks node prefix)   ; WP-N-ENDPOINT-2C3 (ADR 0048): drop the lost writer's ZC-joiner high-waters alongside the route (bounds the table; a re-announce re-freezes the watermark via the match-time route-add so a lease-flap never leaves a stale drain-gate = sample-loss)
-
-          (%purge-prefix node prefix #'disc-node-decode-fail-counts)   ; ADR 0031 lim.1: drop the lost writer's decode-failure counters
-          (%purge-prefix node prefix #'disc-node-incompat)         ; WP-DDS-INCOMPAT-QOS-PERPAIR (ADR 0048 §16.3): drop the lost peer's INCOMPATIBLE_QOS presence
-          (%purge-prefix node prefix #'disc-node-incompat-pairs)   ; ...and its per-pair fire set (an incompatible remote is NOT in disc-node-matches, so it needs its OWN prefix-purge — %collect-and-remove-matches only covers matched remotes); a re-discovery re-fires + the tables stay bounded
-          (%purge-prefix node prefix #'disc-node-inconsistent)     ; WP-DDS-INCOMPAT-QOS-PERPAIR F1b: drop the lost peer's INCONSISTENT_TOPIC gate too (pre-existing stuck-gate, now symmetric with incompat) so a re-discovered inconsistent remote re-fires
-          (%collect-and-remove-matches node prefix
-                                       (lambda (dm) (push dm removed)))
+          (%prune-participant-locked node prefix (lambda (dm) (push dm removed)))
           (push prefix lost))))   ; ADR-0034 MINOR-4: fire on-participant-lost per dead peer OUTSIDE the lock
-    (dolist (dm removed) (%fire-unmatch node (car dm) (cadr dm) (cddr dm)))
-    (dolist (prefix lost)
-      (%prune-pvms-bootstrap-km node prefix)   ; ADR-0036/0040: prune the lost peer's PVMS bootstrap KM (disc-internal)
-      (when (disc-node-on-participant-lost node)
-        (funcall (disc-node-on-participant-lost node) prefix)))   ; ADR-0034: drop the lost peer's crypto-manager KMs
+    (%fire-participant-gone node removed lost)
     t))
+
+(defun* %prune-participant-locked (node prefix collect-match)
+    (function (disc-node (simple-array (unsigned-byte 8) (12)) function) t)
+  "Drop EVERY trace of the departed participant PREFIX. CALLER MUST HOLD the node lock; the removed
+   MATCHED endpoints are handed to COLLECT-MATCH so on-unmatch can fire OUTSIDE the lock
+   (%fire-participant-gone). Idempotent — a re-announced participant simply re-adds.
+
+   Shared by BOTH departure paths so they cannot drift (ADR 0063): the LEASE sweep (%lease-sweep, RTPS 2.5
+   §8.5.3.3.2 — the only removal trigger the spec names) and the GRACEFUL DISPOSE (%on-spdp-dispose — the
+   prompt path a peer gives us when it deletes its participant cleanly). A crashed peer sends no dispose,
+   so the lease sweep remains the backstop; the dispose merely makes the common case immediate."
+  (remhash prefix (disc-node-discovered node))
+  (remhash prefix (disc-node-participant-last-seen node))
+  (remhash prefix (disc-node-builtin-readers node))
+  (remhash prefix (disc-node-auth-state node))
+  (%invalidate-shmem-dest node prefix)   ; a departed peer's cached SHMEM dest must not be reused
+  (%purge-prefix node prefix #'disc-node-discovered-writers)
+  (%purge-prefix node prefix #'disc-node-discovered-readers)
+  (%purge-prefix node prefix #'disc-node-reader-routes)   ; WP-N-ENDPOINT-S2 (ADR 0048): drop the lost writer's delivery route (unmatch/lease-expiry) so a reader stops draining a gone writer; a re-announce re-adds it
+  (%purge-reader-join-watermarks node prefix)   ; WP-N-ENDPOINT-2C3 (ADR 0048): drop the lost writer's ZC-joiner high-waters alongside the route (bounds the table; a re-announce re-freezes the watermark via the match-time route-add so a lease-flap never leaves a stale drain-gate = sample-loss)
+  (%purge-prefix node prefix #'disc-node-decode-fail-counts)   ; ADR 0031 lim.1: drop the lost writer's decode-failure counters
+  (%purge-prefix node prefix #'disc-node-incompat)         ; WP-DDS-INCOMPAT-QOS-PERPAIR (ADR 0048 §16.3): drop the lost peer's INCOMPATIBLE_QOS presence
+  (%purge-prefix node prefix #'disc-node-incompat-pairs)   ; ...and its per-pair fire set (an incompatible remote is NOT in disc-node-matches, so it needs its OWN prefix-purge — %collect-and-remove-matches only covers matched remotes); a re-discovery re-fires + the tables stay bounded
+  (%purge-prefix node prefix #'disc-node-inconsistent)     ; WP-DDS-INCOMPAT-QOS-PERPAIR F1b: drop the lost peer's INCONSISTENT_TOPIC gate too (pre-existing stuck-gate, now symmetric with incompat) so a re-discovered inconsistent remote re-fires
+  (%collect-and-remove-matches node prefix collect-match)
+  t)
+
+(defun* %fire-participant-gone (node removed lost)
+    (function (disc-node list list) t)
+  "Fire the departure hooks for the participants %PRUNE-PARTICIPANT-LOCKED removed — OUTSIDE the node lock
+   (ADR-0034 MINOR-4). REMOVED is the collected matched-endpoint list, LOST the departed prefixes."
+  (dolist (dm removed) (%fire-unmatch node (car dm) (cadr dm) (cddr dm)))
+  (dolist (prefix lost)
+    (%prune-pvms-bootstrap-km node prefix)   ; ADR-0036/0040: prune the lost peer's PVMS bootstrap KM (disc-internal)
+    (when (disc-node-on-participant-lost node)
+      (funcall (disc-node-on-participant-lost node) prefix)))   ; ADR-0034: drop the lost peer's crypto-manager KMs
+  t)
+
+(defun* %on-spdp-dispose (node src-prefix key-hash)
+    (function (disc-node (simple-array (unsigned-byte 8) (12))
+               (or null (simple-array (unsigned-byte 8) (*)))) t)
+  "A peer announced that it DELETED its participant: a DISPOSE/UNREGISTER on the
+   SPDPbuiltinParticipantWriter (ADR 0063). Prune it IMMEDIATELY instead of waiting out its leaseDuration
+   (100 s by default), reusing the lease sweep's own prune (%prune-participant-locked) so the two paths
+   cannot drift.
+
+   WHY IT MATTERS. Until the peer is pruned it stays in the MATCHED set, and writer-purge-acked purges
+   below min(acked-base) over %matched-reader-keys — so a ghost reader that will never ACK again pins the
+   watermark and a RELIABLE + KEEP_ALL HistoryCache purges NOTHING. It then advertises that stale history
+   in every HEARTBEAT and a freshly-matched reader NACKs for samples it must never receive. Pruning on the
+   goodbye keeps the retained history bounded, which is what makes the phantom gap unreachable.
+
+   SECURITY — NEVER TRUST THE WIRE (NFR-SEC-POSTURE). The disposed instance is named by the inline
+   PID_KEY_HASH (the participant GUID: 12-octet prefix + ENTITYID_PARTICIPANT). Its prefix MUST equal the
+   datagram's SOURCE prefix. Without that check any peer could evict ANY OTHER participant from our
+   discovery by simply naming its GUID — an unauthenticated, trivially forgeable denial of service against
+   a third party. A dispose that names anyone but the sender is DROPPED. (SPDP is best-effort and
+   unauthenticated; a keyed/secured deployment additionally gates this datagram at the SRTPS layer.)
+
+   A dispose can be LOST — SPDP rides a Best-Effort StatelessWriter (RTPS 2.5 §8.5.3) — and a CRASHED peer
+   sends none at all, so this is a PROMPT-CLEANUP OPTIMIZATION, never a guarantee. The lease sweep remains
+   the backstop (§8.5.3.3.2 names lease expiry as the only removal trigger the spec requires)."
+  (when (and key-hash (>= (length key-hash) 12))
+    (let ((named (make-array 12 :element-type '(unsigned-byte 8))))
+      (replace named key-hash :end2 12)
+      (when (equalp named src-prefix)                 ; forged-eviction guard: it may only dispose ITSELF
+        (let ((removed '()) (lost '()))
+          (dds.pal:with-lock ((disc-node-lock node))
+            (when (gethash src-prefix (disc-node-discovered node))   ; idempotent: ignore an unknown/duplicate goodbye
+              (%prune-participant-locked node src-prefix (lambda (dm) (push dm removed)))
+              (push src-prefix lost)))
+          (%fire-participant-gone node removed lost)))))
+  t)
 
 (defun* %record-match (node remote)
     (function (disc-node dds.rtps.discovery:endpoint-data) boolean)
@@ -2351,11 +2446,23 @@
             ;; security is OFF / the source is not :keyed -> byte-identical plain delivery (and on the post-SRTPS
             ;; re-dispatch, so the just-decoded authentic user DATA is delivered).
             (unless (and enforce-rtps (%user-writer-entityid-p wtr))
-              (when (and (not has-payload) (not (eq kind :data)) (disc-node-on-lifecycle node))
-                ;; A no-payload dispose/unregister DATA (RTPS 2.5 §9.6.4.9): route the named instance +
-                ;; StatusInfo + datagram SRC-PREFIX (§9.4.4) to the lifecycle hook (S2 owner-clear needs
-                ;; the FULL source GUID, DDS 1.4 §2.2.3.9.2 — mirrors the on-data hook below).
-                (funcall (disc-node-on-lifecycle node) wtr sn kind key-hash status-flags src-prefix))
+              (when (and (not has-payload) (not (eq kind :data)))
+                (cond
+                  ;; ADR 0063 — the peer DELETED its participant. A dispose/unregister on the
+                  ;; SPDPbuiltinParticipantWriter carries NO serializedPayload: the instance is named ONLY
+                  ;; by the inline PID_KEY_HASH (the participant GUID = 12-octet prefix +
+                  ;; ENTITYID_PARTICIPANT), exactly as a live RTI Connext 7.3.1 delete_participant emits it
+                  ;; (SN+1, DataFlag=0, plen=0, PID_STATUS_INFO=0x03 = D|U). We already DECODE all of this —
+                  ;; parse-data-body hands back KIND and KEY-HASH — and used to throw it away, so a cleanly
+                  ;; departed peer lingered as a ghost for its full 100 s lease. It MUST be handled HERE, on
+                  ;; the no-payload path: the writerId cond below is gated on HAS-PAYLOAD and can never see it.
+                  ((= wtr dds.rtps.discovery:+entityid-spdp-writer+)
+                   (%on-spdp-dispose node src-prefix key-hash))
+                  ;; A no-payload dispose/unregister DATA (RTPS 2.5 §9.6.4.9): route the named instance +
+                  ;; StatusInfo + datagram SRC-PREFIX (§9.4.4) to the lifecycle hook (S2 owner-clear needs
+                  ;; the FULL source GUID, DDS 1.4 §2.2.3.9.2 — mirrors the on-data hook below).
+                  ((disc-node-on-lifecycle node)
+                   (funcall (disc-node-on-lifecycle node) wtr sn kind key-hash status-flags src-prefix))))
               (when has-payload
                 (cond
                   ((= wtr dds.rtps.discovery:+entityid-spdp-writer+)
@@ -2576,7 +2683,12 @@
    (FR-XPORT-2) — then free the reusable announce scratch buffers. The joins MUST precede the frees: an
    in-flight %HANDLE-DATAGRAM on ANY receiver thread (a SHMEM record feeds the same entry point) writes
    into RX-TX-MSG/TX-MSG, so freeing first is a use-after-free (observed via canary instrumentation). The
-   WP-ASYNC sender (which may itself SHMEM-send) is stopped+joined first. Idempotent."
+   WP-ASYNC sender (which may itself SHMEM-send) is stopped+joined first. Idempotent.
+
+   ADR 0063: FIRST, while the sockets and the tx-msg buffer are still alive, announce our DEPARTURE
+   (announce-participant-dispose) so peers prune us AT ONCE instead of holding us as a ghost for our full
+   leaseDuration. Best-effort and non-fatal: a failure here must never block teardown."
+  (ignore-errors (announce-participant-dispose node))   ; say goodbye while the sockets are still up
   (when (disc-node-flow-controller node)   ; WP-ASYNC-FLOW: unregister from any flow-controller BEFORE the frees below — unregister is a PER-NODE EMIT BARRIER (it removes NODE from the writers list, then BLOCKS until the SHARED scheduler is not mid-emit on NODE), so the subsequent udp-close/shmem-close/free-static never race a live scheduler send on NODE (no use-after-free). A bare unregister-without-join would NOT be safe; the barrier is what makes it safe (ADR 0016 §Teardown)
     (flow-controller-unregister (disc-node-flow-controller node) node))
   (cond
