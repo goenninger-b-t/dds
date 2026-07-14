@@ -235,18 +235,28 @@
    with-hot-optimizations, so this wrapper's (safety 0) does NOT recompile them — it confirms the WRAPPER code
    (the encap parse + the accessor reads here) is safety-independent, NOT that it forces the kernel to run
    safety-0. The kernel's guard is safety-independent for a stronger reason: it is an EXPLICIT manual
-   (when (< avail +size+) (error ...)) (dsl.lisp), not a compiler bound, so it holds under any policy. Returns
-   T on a clean read, NIL on a cleanly-signalled reject; an OOB would corrupt/crash rather than signal."
+   (when (< avail +size+) (return-from ... (values nil :short-payload))) (dsl.lisp), not a compiler bound, so it
+   holds under any policy. Returns T on a clean read, NIL on a clean reject.
+
+   THE REJECT IS A STATUS NOW (ADR 0064), AND THIS ARM IS WHY IT MUST BE CHECKED: at (safety 0) the Offset
+   getters do NOT signal on a NIL sample — they read memory off NIL and hand back a garbage integer. So a
+   caller that ignores the status and reads the sample anyway turns a REJECTED payload into an ACCEPTED one
+   with an out-of-bounds read. That is the whole silent-swallow hazard, made concrete. The fuzz caught
+   exactly this when the status was first introduced."
   (declare (optimize (speed 3) (safety 0) (debug 0)))
   (handler-case
       (let* ((ob (dds.core.buffer:octet-buffer-over vec))
              (rc (dds.core.buffer:cursor ob :endianness :little))
              (target (make-fd-abc-flatdata)))
         (dds.cdr:parse-encapsulation-header rc)
-        (deserialize-into-fd-abc-fd target rc :xcdr2)
-        (let ((sum (+ (fd-abc-a-fd target) (fd-abc-b-fd target) (fd-abc-c-fd target))))
-          (dds.pal:free-static (dds.core.buffer:octet-buffer-vec target))
-          (and (integerp sum) t)))
+        (multiple-value-bind (out status) (deserialize-into-fd-abc-fd target rc :xcdr2)
+          (declare (ignore out))
+          (when status                                  ; rejected: NEVER read the sample
+            (dds.pal:free-static (dds.core.buffer:octet-buffer-vec target))
+            (return-from %fd-wrap-read-safety0 nil))
+          (let ((sum (+ (fd-abc-a-fd target) (fd-abc-b-fd target) (fd-abc-c-fd target))))
+            (dds.pal:free-static (dds.core.buffer:octet-buffer-vec target))
+            (and (integerp sum) t))))
     (error () nil)))
 
 (defun* %gen-fd-wrap-payload (prng)
@@ -279,17 +289,21 @@
     (function ((simple-array (unsigned-byte 8) (*))) t)
   "Run the FlatData wrap over VEC the way the engine does (parse encap header, then the vtable
    deserialize-<name>-fd, then read every field via the Offset getters) under the PRODUCTION optimization
-   policy. Returns T on a clean accept+in-bounds read, NIL on a cleanly-signalled reject. Any escaping non-error
-   or OOB is a fuzz failure (caught by the caller). DRY: deserialize-fd-abc-fd itself delegates the validate +
-   clamp to deserialize-into-fd-abc-fd, so this exercises BOTH the full vtable and the inner copy."
+   policy. Returns T on a clean accept+in-bounds read, NIL on a clean reject — which is a STATUS now, not a
+   signalled condition (ADR 0064), and MUST be checked before the sample is read: the reject returns a NIL
+   sample, and the Offset getters happily read off NIL rather than signalling. Any escaping error or OOB is a
+   fuzz failure (caught by the caller). deserialize-fd-abc-fd frees its own buffer on the reject path, so
+   there is nothing to free here when it rejects. DRY: deserialize-fd-abc-fd delegates the validate + clamp to
+   deserialize-into-fd-abc-fd, so this exercises BOTH the full vtable and the inner copy."
   (handler-case
       (let* ((ob (dds.core.buffer:octet-buffer-over vec))
              (rc (dds.core.buffer:cursor ob :endianness :little)))
         (dds.cdr:parse-encapsulation-header rc)
-        (let* ((s (deserialize-fd-abc-fd rc :xcdr2))
-               (ok (and (integerp (fd-abc-a-fd s)) (integerp (fd-abc-b-fd s)) (integerp (fd-abc-c-fd s)))))
-          (dds.pal:free-static (dds.core.buffer:octet-buffer-vec s))
-          ok))
+        (multiple-value-bind (s status) (deserialize-fd-abc-fd rc :xcdr2)
+          (when status (return-from %fd-wrap-read-checked nil))   ; rejected: NEVER read the sample
+          (let ((ok (and (integerp (fd-abc-a-fd s)) (integerp (fd-abc-b-fd s)) (integerp (fd-abc-c-fd s)))))
+            (dds.pal:free-static (dds.core.buffer:octet-buffer-vec s))
+            ok)))
     (error () nil)))
 
 (defun* fuzz-flatdata-wrap ()
@@ -509,12 +523,16 @@
   "Drive the PRODUCTION engine RX (dds.dcps::%deserialize-sample = parse encap header, then the FlatData
    :deserialize = deserialize-xcv-fd -> deserialize-into-xcv-fd, where A1's foreign-rep transcode lives) over the
    untrusted payload VEC, then read every -fd accessor on a returned sample and free its buffer. Returns T on a
-   clean accept+in-bounds read, NIL on a CLEANLY-signalled reject (buffer-overflow from the length guard / the
-   struct codec check-room, or cdr-not-implemented from a non-transcodable rep). Any OTHER signalled condition is
-   an uncontrolled low-level error (re-signalled by the caller's handler as a fuzz failure); an OOB would corrupt
-   or crash rather than signal."
+   clean accept+in-bounds read, NIL on a CLEAN REJECT.
+
+   A reject now arrives TWO ways and BOTH are clean (ADR 0064): the FlatData guards the DSL used to EMIT as
+   conditions (short body, non-transcodable rep) are now a STATUS — %deserialize-sample returns (values NIL
+   status) — while the struct codec's own check-room inside the transcode arm still SIGNALS buffer-overflow
+   (it lives in the hand-written CDR primitives, not in generated code, and is a later slice). Anything else
+   signalled is an uncontrolled low-level error (re-signalled by the caller's handler as a fuzz failure); an
+   OOB would corrupt or crash rather than signal or return."
   (let* ((ts (dds.types:find-type-support "xcv"))
-         (sample (handler-case (dds.dcps::%deserialize-sample ts vec)
+         (sample (handler-case (values (dds.dcps::%deserialize-sample ts vec))
                    ((or dds.core.buffer:buffer-overflow dds.cdr:cdr-not-implemented) () nil))))
     (when sample
       (unwind-protect
@@ -530,12 +548,14 @@
    with-hot-optimizations, so this wrapper's (safety 0) does NOT recompile them — it confirms the WRAPPER code
    (the encap parse + the accessor reads here) is safety-independent. The kernel's foreign-body decode is
    safety-independent for a stronger reason: every cdr-get-* bounds-checks via an EXPLICIT check-room
-   (when (< room need) (error 'buffer-overflow ...)) and the length guard is an EXPLICIT manual
-   (when (< avail ...) (error ...)) (dsl.lisp), NOT compiler-inserted array bounds, so they hold under any policy.
-   Returns T on a clean read, NIL on a cleanly-signalled reject; an OOB would corrupt/crash rather than signal."
+   (when (< room need) (error 'buffer-overflow ...)) and the FlatData length guard is an EXPLICIT manual
+   (when (< avail ...) (return-from ... (values nil :short-payload))) (dsl.lisp), NOT compiler-inserted array
+   bounds, so they hold under any policy. Returns T on a clean read, NIL on a clean reject (a STATUS from the
+   FlatData guards, or a signalled buffer-overflow from the struct codec's check-room); an OOB would
+   corrupt/crash rather than signal or return."
   (declare (optimize (speed 3) (safety 0) (debug 0)))
   (let* ((ts (dds.types:find-type-support "xcv"))
-         (sample (handler-case (dds.dcps::%deserialize-sample ts vec)
+         (sample (handler-case (values (dds.dcps::%deserialize-sample ts vec))
                    ((or dds.core.buffer:buffer-overflow dds.cdr:cdr-not-implemented) () nil))))
     (when sample
       (unwind-protect

@@ -40,11 +40,11 @@
       ((and (consp dds-type) (eq (car dds-type) :sequence))
        (let* ((elt (second dds-type))
               (row (cdr (assoc elt *dds-type-map*))))
-         (unless row
+         (unless row   ; NOCOND(MACRO): macroexpansion-time — rejects a malformed type spec at COMPILE time
            (error "define-dds-type: unsupported sequence element ~s in ~s" elt spec))
          (destructuring-bind (eltype default eput eget ealign esize) row
            (declare (ignore default))
-           (when (eq esize :var)
+           (when (eq esize :var)   ; NOCOND(MACRO): macroexpansion-time — compile-time rejection
              (error "define-dds-type: sequence of variable-size element ~s not supported in v1"
                     elt))
            ;; WP-PERF: :elt-ltype is the element's LISP type — it makes the decoded sequence a
@@ -54,7 +54,7 @@
                  :elt-type elt :elt-ltype eltype :key (getf opts :key)))))
       ((keywordp dds-type)
        (let ((row (cdr (assoc dds-type *dds-type-map*))))
-         (unless row
+         (unless row   ; NOCOND(MACRO): macroexpansion-time — compile-time rejection
            (error "define-dds-type: unsupported member type ~s in ~s" dds-type spec))
          (destructuring-bind (ltype default put get align size) row
            (list :slot slot :kind :scalar :ltype ltype :default default :put put :get get
@@ -70,6 +70,7 @@
                :des-into (%sym tpkg "DESERIALIZE-INTO-" (string dds-type))
                :ssize (%sym tpkg "%SSIZE-" (string dds-type))
                :key (getf opts :key))))
+      ;; NOCOND(MACRO): macroexpansion-time — compile-time rejection
       (t (error "define-dds-type: unsupported member type ~s in ~s" dds-type spec)))))
 
 (defun* %octet-sequence-p (m)
@@ -225,16 +226,17 @@
          (fd-ssz (%sym pkg "SERIALIZED-SIZE-" (string name) "-FD"))
          (fd-tx (%sym pkg "TX-TRANSCODE-" (string name) "-FD"))
          (tname (string-downcase (string name))))
-    (unless (eq ext :final)
+    (unless (eq ext :final)   ; NOCOND(MACRO): macroexpansion-time — compile-time rejection
       (error "define-dds-type: only :final extensibility is supported in v1 (got ~s)" ext))
     ;; FlatData v1 gate: :flatdata t requires every member to be a fixed-size scalar (FR-PF-4, ADR 0015).
     ;; This already constrains @key members to fixed-size scalars (WP-KEYED-FLATDATA): a string/sequence/
     ;; variable-size @key still errors here; the keyhash is read from the buffer via key-hash-<name>-fd below.
     (when (getf options :flatdata)
       (when (some (lambda (m) (or (getf m :var) (not (eq (getf m :kind) :scalar)))) parsed)
+        ;; NOCOND(MACRO): macroexpansion-time — compile-time rejection
         (error "define-dds-type: :flatdata v1 requires FINAL + fixed-size scalar members (no string/sequence/nested/variable); got ~s"
                (find-if (lambda (m) (or (getf m :var) (not (eq (getf m :kind) :scalar)))) parsed))))
-    (when (some (lambda (m) (not (eq (getf m :kind) :scalar))) keys)
+    (when (some (lambda (m) (not (eq (getf m :kind) :scalar))) keys)   ; NOCOND(MACRO): macroexpansion-time
       (error "define-dds-type: only scalar/string @key members are supported in v1"))
     (multiple-value-bind (fd-offs fd-body) (when flatp (%flatdata-offsets parsed))
       (declare (ignorable fd-offs fd-body))
@@ -456,7 +458,7 @@
                    (declare (ignore sample mode))
                    ,fd-body)
                  (declaim (ftype (function (dds.core.buffer:octet-buffer dds.core.buffer:cursor &optional symbol)
-                                           dds.core.buffer:octet-buffer)
+                                           (values (or null dds.core.buffer:octet-buffer) (or null keyword)))
                                  ,fd-dnto))
                  (defun ,fd-dnto (target cursor &optional (mode :xcdr2))
                    ,(format nil "WP-FLATDATA deserialize into a PRE-LOANED FlatData buffer TARGET, branching on the ~
@@ -486,7 +488,7 @@
                        (declare (type (simple-array (unsigned-byte 8) (*)) src dst))
                        ;; false-REJECT-safe: need >= 4 octets even to read the representation id (never OOB).
                        (when (< avail 4)
-                         (error 'dds.core.buffer:buffer-overflow :need 4 :have avail))
+                         (return-from ,fd-dnto (values nil :short-payload)))
                        ;; rep-id NBO at vec[0..1]; classify against +representation-ids+ (§7.6.3.1.2; not from memory).
                        (let ((id (logior (ash (aref src 0) 8) (aref src 1))))
                          (multiple-value-bind (kind tmode tendian) (dds.cdr:flatdata-rx-rep-plan id)
@@ -494,7 +496,7 @@
                              (:native
                               ;; PLAIN_CDR2_LE (0x0007): read-in-place (0-copy, UNCHANGED) — header+OPTIONS already in TARGET.
                               (when (< avail ,fd-size-sym)
-                                (error 'dds.core.buffer:buffer-overflow :need ,fd-size-sym :have avail))
+                                (return-from ,fd-dnto (values nil :short-payload)))
                               (replace dst src :start1 4 :end1 ,fd-size-sym :start2 4 :end2 ,fd-size-sym))
                              (:transcode
                               ;; foreign rep: decode the body (struct codec, foreign mode+endianness) then write canonical.
@@ -505,11 +507,11 @@
                                   ,@(loop for m in parsed
                                           collect `(setf (,(fd-acc m) target) (,(acc m) %st))))))
                              (:reject
-                              (error 'dds.cdr:cdr-not-implemented
-                                     :what (format nil "FlatData ~a: non-transcodable representation id #x~2,'0x~2,'0x (a FINAL fixed-size FlatData type is PLAIN-encapsulated; expected PLAIN_CDR(2)_BE/LE)"
-                                                   ,tname (aref src 0) (aref src 1)))))))
-                       target)))
-                 (declaim (ftype (function (dds.core.buffer:cursor &optional symbol) dds.core.buffer:octet-buffer)
+                              (return-from ,fd-dnto
+                                (values nil :representation-not-supported))))))
+                       (values target nil))))
+                 (declaim (ftype (function (dds.core.buffer:cursor &optional symbol)
+                                           (values (or null dds.core.buffer:octet-buffer) (or null keyword)))
                                  ,fd-des))
                  (defun ,fd-des (cursor &optional (mode :xcdr2))
                    ,(format nil "WP-FLATDATA deserialize=READ-IN-PLACE (RX, type-support :deserialize, same ~
@@ -526,7 +528,15 @@
                      outcome). The 0-ALLOC steady-state RX path is deserialize-into-~a-fd (copy into a loaned buffer). MODE ignored. ~
                      NOT cleared for ship — pending counsel (R6); see ADR 0015." tname (symbol-name fd-size-sym)
                             tname tname tname)
-                   (,fd-dnto (,fd-ctor) cursor mode))
+                   ;; The FlatData buffer is allocated BEFORE the payload is validated, so a rejected payload
+                   ;; must FREE it here: the reject used to unwind out as a condition and LEAK this buffer on
+                   ;; every malformed/forged datagram (a remote memory-exhaustion vector). ADR 0064.
+                   (let ((buf (,fd-ctor)))
+                     (multiple-value-bind (out status) (,fd-dnto buf cursor mode)
+                       (when status
+                         (dds.pal:free-static (dds.core.buffer:octet-buffer-vec buf))
+                         (return-from ,fd-des (values nil status)))
+                       (values out nil))))
                  ;;;; NOT cleared for ship — pending counsel (R6); see ADR 0015.
                  (declaim (ftype (function (t dds.core.buffer:octet-buffer dds.cdr:cdr-mode symbol)
                                            (simple-array (unsigned-byte 8) (*)))

@@ -50,13 +50,19 @@ its callers wrap every call in TRY.  This exists because the failure mode of han
 is SILENT: one unchecked call swallows the status and hands a NIL onward where a value was expected.
 TRY makes the check the DEFAULT and the omission the visible thing.  Leading DECLARE forms in BODY are
 hoisted OUT of the MACROLET so (DECLARE (IGNORE ...)) still refers to the lambda-list variables."
-  (check-type docstring (and string (satisfies plusp-length)))
+  ;; Every check in this macro BODY runs at MACROEXPANSION time — it rejects a malformed DEFUN* form at
+  ;; COMPILE time, i.e. it fails the build. It is not runtime control flow and there is no caller to return
+  ;; a status to. (Owner ruling 2026-07-14; the converse is absolute — a macro may never EMIT a signalling
+  ;; form into the code it generates.)
+  (check-type docstring (and string (satisfies plusp-length)))   ; NOCOND(MACRO): macroexpansion-time
+  ;; NOCOND(MACRO): macroexpansion-time
   (assert (and (consp signature) (eq (car signature) 'function) (listp (second signature))) ()
           "DEFUN* ~S: SIGNATURE must be a (FUNCTION (arg-types...) result) form, got ~S."
           name signature)
   (let ((arg-types (second signature)))
     (flet ((required (lst) (loop for x in lst until (member x lambda-list-keywords) count t)))
       (let ((ll-req (required lambda-list)) (sig-req (required arg-types)))
+        ;; NOCOND(MACRO): macroexpansion-time
         (assert (= ll-req sig-req) ()
                 "DEFUN* ~S: SIGNATURE declares ~D required arg type(s) but the lambda list has ~D ~
 required parameter(s) — they must match (a mismatch silently mis-types parameters)."
@@ -90,11 +96,13 @@ DOCSTRING (M5), and SLOTS each of which MUST be a list slot-specifier carrying a
 string; each SLOT a DEFSTRUCT slot specifier list containing :TYPE.  Expands to a
 DEFSTRUCT.  Signals a compile-time error if DOCSTRING is not a non-empty string or any
 slot lacks a :TYPE.  Consing: none at runtime (pure macro)."
+  ;; NOCOND(MACRO): macroexpansion-time — rejects a malformed DEFSTRUCT* form at COMPILE time
   (check-type docstring (and string (satisfies plusp-length)))
   (let ((struct-name (if (consp name-and-options)
                          (car name-and-options)
                          name-and-options)))
     (dolist (slot slots)
+      ;; NOCOND(MACRO): macroexpansion-time
       (assert (and (consp slot) (member :type slot)) ()
               "DEFSTRUCT* ~S: slot ~S must be a list specifier carrying a :TYPE (M3)."
               struct-name slot)))

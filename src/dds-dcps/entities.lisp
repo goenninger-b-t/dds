@@ -504,7 +504,7 @@
     (:plain-cdr2-be  (values :xcdr2 :big))))
 
 (defun* %deserialize-payload (ts ob)
-    (function (t dds.core.buffer:octet-buffer) t)
+    (function (t dds.core.buffer:octet-buffer) (values t (or null keyword)))
   "Deserialize a SerializedPayload (encap header + body) already RESIDENT in octet-buffer OB into a sample via TS,
    WITHOUT allocating or freeing OB — the buffer is caller-owned (a scratch buffer for %deserialize-sample, or the
    pooled secured-decode buffer read IN PLACE for the WP-DCPS-SECURED-TAKE-LOAN loan). The parsed encapsulation
@@ -517,17 +517,23 @@
     (let ((encap (dds.cdr:parse-encapsulation-header rc)))
       (multiple-value-bind (mode endian) (%encap->codec encap)
         (dds.core.buffer:cursor-set-endianness rc endian)
+        ;; A FlatData :deserialize returns (values sample status) — a forged/short payload or a
+        ;; non-transcodable representation id is now a STATUS, not a signalled reject (ADR 0064: a macro may
+        ;; never emit a condition into generated code). A classic struct :deserialize returns one value, so
+        ;; its status reads as NIL. Both shapes pass straight through.
         (funcall (dds.types:type-support-deserialize ts) rc mode)))))
 
 (defun* %deserialize-sample (ts bytes)
-    (function (t (simple-array (unsigned-byte 8) (*))) t)
+    (function (t (simple-array (unsigned-byte 8) (*))) (values t (or null keyword)))
   "Deserialize a SerializedPayload (encap header + body) into a sample via TS. Copies BYTES into a fresh scratch
    octet-buffer (sized exactly), decodes it in place via %deserialize-payload, then frees the scratch — the
    allocating deserialize path (the copy-backed and non-secured samples). See %deserialize-payload for the
    representation-selection contract."
   (let ((ob (dds.core.buffer:make-octet-buffer (length bytes))))
     (replace (dds.core.buffer:octet-buffer-vec ob) bytes)
-    (prog1 (%deserialize-payload ts ob)
+    ;; MULTIPLE-value-prog1: PROG1 would drop the status and hand the caller a bare NIL sample with no
+    ;; indication the payload was rejected — precisely the silent-swallow this whole rework exists to stop.
+    (multiple-value-prog1 (%deserialize-payload ts ob)
       (dds.pal:free-static (dds.core.buffer:octet-buffer-vec ob)))))
 
 ;;; ---- DomainParticipantFactory + participant lifecycle ----
@@ -2367,29 +2373,14 @@
       (%reader-advance-drained dr sguid sn)))
   t)
 
-(defun* %drain-one-secured (dr node ts key loan sn sguid)
-    (function (data-reader t t cons dds.disc:secured-loan-handle integer t) t)
-  "WP-DCPS-SECURED-TAKE-LOAN (ADR 0038 residual (i)): drain ONE secured sample whose disc-node store slot is a
-   dds.disc:secured-loan-handle (the decode-pool loan the receiver thread built via decode-serialized-payload-into
-   — zero per-sample decrypt-output alloc). The DCPS-level win is the DECODE BUFFER: the plaintext is read IN PLACE
-   from the pooled buffer (secured-loan-bytes + secured-loan-handle-len) over [0, LEN) — no allocating decrypt
-   vector. The typed deserialize copy PERSISTS (Copy #2): a plain XCDR2 secured payload must still be deserialized
-   into an application struct, so DATA is an INDEPENDENT struct and the honest scope is 'zero-decode-buffer-alloc
-   secured read via the loan API', NOT a literal zero-copy read. Mirrors %drain-one-loan: revive the instance,
-   KEEP_LAST-drop, register the LOAN handle in the SEPARATE dr-secured-loans registry BEFORE delivery (so a
-   drained-but-never-taken loan is still swept at reader-close), and append a cached-sample carrying the struct as
-   DATA and the handle as LOAN (for the type-dispatched return). Like %drain-one-loan the loan path does not apply
-   the content-filter / RESOURCE_LIMITS / EXCLUSIVE-ownership arbitration (the disc-node decode pool is the hard
-   resource bound); the per-writer watermark advances for every outcome (the reliable engine already ACKed)."
-  (let* ((len (dds.disc:secured-loan-handle-len loan))
-         (ob (or (dr-secured-scratch dr)
-                 (setf (dr-secured-scratch dr)
-                       (dds.core.buffer:octet-buffer-over (dds.disc:secured-loan-bytes loan)))))
-         (data (progn                                              ; repoint the reusable wrapper at THIS pooled buffer, bound to [0,len) (zero per-sample cons; NFR-SEC-POSTURE bounds)
-                 (setf (dds.core.buffer:octet-buffer-vec ob) (dds.disc:secured-loan-bytes loan)
-                       (dds.core.buffer:octet-buffer-capacity ob) len)
-                 (%deserialize-payload ts ob)))
-         (handle (%instance-handle ts data))
+(defun* %drain-one-secured-deliver (dr node ts key loan sn sguid data)
+    (function (data-reader t t t t integer t t) t)
+  "Deliver an already-decoded secured sample DATA (the in-place decode of LOAN's pooled buffer): register
+   the loan handle, revive the instance, apply the KEEP_LAST per-instance drop, append the cached sample,
+   and advance the per-writer watermark. Split out of %drain-one-secured so that function's decode-reject
+   path (return the loan, advance, drop) reads as a plain early exit rather than nesting the whole
+   delivery inside a multiple-value-bind."
+  (let* ((handle (%instance-handle ts data))
          (rec (%reader-revive-instance dr handle (dds.disc:node-sample-writer node key))))
     (push loan (dr-secured-loans dr))                             ; register the LOAN handle BEFORE delivery (reader-close safety)
     (let ((depth (%reader-keeplast-depth dr)))
@@ -2409,6 +2400,39 @@
   (when sguid
     (%reader-advance-drained dr sguid sn))
   t)
+
+(defun* %drain-one-secured (dr node ts key loan sn sguid)
+    (function (data-reader t t cons dds.disc:secured-loan-handle integer t) t)
+  "WP-DCPS-SECURED-TAKE-LOAN (ADR 0038 residual (i)): drain ONE secured sample whose disc-node store slot is a
+   dds.disc:secured-loan-handle (the decode-pool loan the receiver thread built via decode-serialized-payload-into
+   — zero per-sample decrypt-output alloc). The DCPS-level win is the DECODE BUFFER: the plaintext is read IN PLACE
+   from the pooled buffer (secured-loan-bytes + secured-loan-handle-len) over [0, LEN) — no allocating decrypt
+   vector. The typed deserialize copy PERSISTS (Copy #2): a plain XCDR2 secured payload must still be deserialized
+   into an application struct, so DATA is an INDEPENDENT struct and the honest scope is 'zero-decode-buffer-alloc
+   secured read via the loan API', NOT a literal zero-copy read. Mirrors %drain-one-loan: revive the instance,
+   KEEP_LAST-drop, register the LOAN handle in the SEPARATE dr-secured-loans registry BEFORE delivery (so a
+   drained-but-never-taken loan is still swept at reader-close), and append a cached-sample carrying the struct as
+   DATA and the handle as LOAN (for the type-dispatched return). Like %drain-one-loan the loan path does not apply
+   the content-filter / RESOURCE_LIMITS / EXCLUSIVE-ownership arbitration (the disc-node decode pool is the hard
+   resource bound); the per-writer watermark advances for every outcome (the reliable engine already ACKed)."
+  (let* ((len (dds.disc:secured-loan-handle-len loan))
+         (ob (or (dr-secured-scratch dr)
+                 (setf (dr-secured-scratch dr)
+                       (dds.core.buffer:octet-buffer-over (dds.disc:secured-loan-bytes loan))))))
+    ;; repoint the reusable wrapper at THIS pooled buffer, bound to [0,len) (zero per-sample cons; NFR-SEC-POSTURE bounds)
+    (setf (dds.core.buffer:octet-buffer-vec ob) (dds.disc:secured-loan-bytes loan)
+          (dds.core.buffer:octet-buffer-capacity ob) len)
+    (multiple-value-bind (data decode-status) (%deserialize-payload ts ob)
+      ;; A rejected payload is a STATUS now (ADR 0064), so DATA is NIL — never pass that to %instance-handle.
+      ;; RETURN THE LOAN: this handle pins a slot in the disc-node decode pool, and it has NOT yet been
+      ;; pushed onto dr-secured-loans (that happens below, on the delivery path), so nothing else would ever
+      ;; free it — a forged payload would leak a pool slot per datagram until the pool starved. Advance the
+      ;; watermark anyway: the reliable engine has already ACKed this SN and will not resend it.
+      (when decode-status
+        (dds.disc:node-return-loan node loan)
+        (when sguid (%reader-advance-drained dr sguid sn))
+        (return-from %drain-one-secured t))
+      (%drain-one-secured-deliver dr node ts key loan sn sguid data))))
 
 (defun* take-loaned (dr)
     (function (data-reader) (values list list))
@@ -2546,9 +2570,17 @@
       (%drain-one-secured dr node ts key bytes sn sguid)
       (return-from %drain-one-sample t))
     (when bytes
-      (let ((data (%deserialize-sample ts bytes)))
-        ;; ContentFilteredTopic: drop reader-side a sample failing the filter.
-        (when (or (null (dr-filter dr)) (funcall (dr-filter dr) data))
+      (multiple-value-bind (data decode-status) (%deserialize-sample ts bytes)
+        ;; A REJECTED payload (FlatData: short body / non-transcodable representation id) is a STATUS now,
+        ;; not a signalled condition (ADR 0064). Drop the sample: never hand a NIL DATA to the filter or to
+        ;; %instance-handle. It must still fall through to the watermark advance at the tail — an early
+        ;; return here would leave the sample unconsumed in the node store and re-drained on every pass,
+        ;; forever. Strictly better than the old behaviour: the reject used to unwind to the receiver-thread
+        ;; boundary handler, which discarded the WHOLE DATAGRAM (and every other sample batched into it);
+        ;; one bad sample now costs exactly one sample.
+        (when (and (null decode-status)
+                   ;; ContentFilteredTopic: drop reader-side a sample failing the filter.
+                   (or (null (dr-filter dr)) (funcall (dr-filter dr) data)))
           (let* ((handle (%instance-handle ts data))
                  (reason (%resource-reject-reason dr handle))
                  (verdict (if (and (null reason) (%reader-exclusive-p dr))

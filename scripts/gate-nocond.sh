@@ -55,6 +55,18 @@ HOTPATH_FILES=(
 # signal — so require the next token NOT to be an open paren.
 SIGNAL_RE='[(](error|signal|cerror|warn)[ \t]+[^( \t]|[(](assert|check-type)[ \t]'
 MARKER='HOTPATH-COND'
+# NOCOND(MACRO) — the ONE exempt class (owner ruling 2026-07-14). A signalling form reached ONLY at
+# MACROEXPANSION time (define-dds-type rejecting a malformed type spec; defun*/defstruct* rejecting a bad
+# signature or a missing docstring) is a COMPILE-TIME rejection: it fails the BUILD. None of the three
+# reasons for the no-conditions rule can apply to it — there is no running program, so it cannot unwind a
+# thread, cannot allocate on a hot path, and cannot hide in a predicate. CL offers no other way to reject a
+# malformed macro form, and forcing it to a status would only move the failure from build time to run time.
+#
+# The owner's OTHER ruling bounds this precisely: a macro may NEVER *EMIT* a signalling form into the code
+# it generates. A condition that a macro plants in a generated codec runs at EXECUTION time and is a plain
+# violation, exempt from nothing. So the marker justifies WHERE THE FORM RUNS, not who wrote it: annotate a
+# form your MACRO EVALUATES; never a form your macro OUTPUTS.
+MACRO_MARKER='NOCOND(MACRO)'
 
 scan() {
   awk -v pat="$SIGNAL_RE" -v marker="$MARKER" '
@@ -123,13 +135,43 @@ CEIL="$(tr -d '[:space:]' < "$CEIL_FILE")"
 # `assert` there IS the test's failure mechanism, not production control flow — 393 of the original 725 were
 # these. The rule targets PRODUCTION code: what a user's call can hit. Everything else counts.
 count_file() {
-  awk -v pat="$SIGNAL_RE" '
+  # NOTE: the marker is matched with INDEX (a literal substring), never as a regex — "NOCOND(MACRO)" read
+  # as a regex is "NOCOND" followed by the GROUP "MACRO", i.e. it matches NOCONDMACRO and never the real
+  # annotation. The self-test below caught exactly that; keep it literal.
+  awk -v pat="$SIGNAL_RE" -v macro="$MACRO_MARKER" '
     /^\(defun\*?[ \t]+/ {
       intest = ($2 ~ /-test$/ || $2 ~ /^run-/) ? 1 : 0
     }
-    { if (!intest && $0 ~ pat) n++ }
+    { exempt = index($0, macro) || (NR > 1 && index(last, macro))
+      if (!intest && $0 ~ pat && !exempt) n++
+      last = $0 }
     END { print n+0 }' "$1"
 }
+
+# FALSIFY THE RATCHET COUNTER *AND* THE NOCOND(MACRO) EXEMPTION. An exemption nobody has watched fail is a
+# hole: if the marker silently matched everything, the count would collapse to 0 and this gate would wave
+# the whole campaign through while reporting PASS. So prove BOTH directions on a canary — the annotated
+# forms are skipped, the bare one is still counted, and an in-file test's assert stays excluded.
+cat > "$tmp/count-canary.lisp" <<'EOF'
+(defun* macro-marked ()
+  (unless row   ; NOCOND(MACRO): compile-time — must NOT be counted
+    (error "bad type spec"))
+  ;; NOCOND(MACRO): on the PRECEDING line — must NOT be counted
+  (error "also compile-time"))
+(defun* counted ()
+  (error "this one is production control flow — MUST be counted"))
+(defun* run-something-test ()
+  (assert (= 1 1)))
+EOF
+cn="$(count_file "$tmp/count-canary.lisp")"
+if [[ "$cn" -ne 1 ]]; then
+  echo "gate-nocond: FAIL — self-test: the ratchet counter must count EXACTLY the 1 unexempt form in the" >&2
+  echo "             canary (2 NOCOND(MACRO) skipped, 1 in-file-test assert skipped). Got ${cn}." >&2
+  echo "             Either the counter is blind or NOCOND(MACRO) is over-matching — a green ratchet" >&2
+  echo "             would prove NOTHING." >&2
+  exit 1
+fi
+
 COUNT=0
 while IFS= read -r f; do
   case "$f" in *dds-tests*) continue ;; esac

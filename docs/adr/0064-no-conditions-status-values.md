@@ -1,8 +1,8 @@
 # ADR 0064 — No Lisp conditions in our code: thread `(values result status)`
 
-- **Status:** **ACCEPTED — IN PROGRESS.** Slice 1 (the PAL network/SHMEM layer + its consumers) and
-  slice 2 (the content-filter / query grammar) are landed. **305** production signalling forms remain,
-  ratcheted to zero by `make gate-nocond`.
+- **Status:** **ACCEPTED — IN PROGRESS.** Slices 1 (PAL network/SHMEM + consumers), 2 (content-filter /
+  query grammar), 3a (TypeLookup serializers) and 3b (the type-compiler DSL) are landed. **280** production
+  signalling forms remain, ratcheted to zero by `make gate-nocond`.
 - **Date:** 2026-07-14
 - **Requirements:** FR-LANG-8 (full type contracts), NFR-SEC-POSTURE (a network-facing failure must not
   unwind a receiver thread), the operating contract §4 / §10
@@ -144,9 +144,54 @@ straight out of `create-contentfilteredtopic` / `create-querycondition` on a typ
   (the old code assigned the parameters slot *before* compiling, so a throwing compile left the CFT
   describing parameters it was not actually filtering by — a second latent defect found by the conversion).
 
+## Slice 3b — the type compiler (`src/dds-gen/dsl.lisp`), and the ONE exempt class
+
+`define-dds-type`'s ten sites are **two different things**, and the owner ruled on each (2026-07-14):
+
+**(i) MACROEXPANSION-TIME — explicitly OK, and now an annotated exempt class `NOCOND(MACRO)`.**
+Seven sites (`unsupported member type`, `:flatdata v1 requires fixed-size scalar members`, `only :final
+extensibility`) fire while the macro EXPANDS: they reject a malformed type spec at **compile** time, i.e.
+they fail the build. None of the three reasons for the rule can apply — there is no running program, so
+such a form cannot unwind a thread, cannot allocate on a hot path, and cannot hide in a predicate. CL
+offers no other way to reject a malformed macro form, and forcing it to a status would only move the
+failure from build time to run time. `DEFUN*`/`DEFSTRUCT*`'s own `check-type`/`assert` are the same class.
+`gate-nocond` now skips a signalling form carrying `; NOCOND(MACRO)` — and **falsifies that exemption**: a
+canary proves the annotated forms are skipped, the bare one is still counted, and an in-file test's
+`assert` stays excluded. (The first cut of that check went **red immediately**: the marker was used as an
+awk *regex*, where `NOCOND(MACRO)` means "NOCOND" followed by the *group* `MACRO` — so it matched
+`NOCONDMACRO` and never the real annotation. It is matched with `index()` as a literal now.)
+
+**(ii) EMITTED INTO GENERATED CODE — a plain violation, exempt from nothing.** Owner: *"There MUST NEVER be
+a condition emitted from a macro into code that runs at execution time."* Three sites sat inside the
+backquote and were planted into every generated FlatData codec: the short-payload guards and the
+non-transcodable-representation reject. They are gone. `deserialize-<name>-fd` /
+`deserialize-into-<name>-fd` now return `(values sample status)` — `:SHORT-PAYLOAD` /
+`:REPRESENTATION-NOT-SUPPORTED` — threaded through `%deserialize-payload` → `%deserialize-sample` →
+`%drain-one-sample` / `%drain-one-secured`. The marker justifies **where the form runs, not who wrote it**:
+annotate a form your macro *evaluates*; never one your macro *outputs*.
+
+Three defects fell out of it:
+
+- **A rejected payload LEAKED its FlatData buffer.** `deserialize-<name>-fd` allocates the sample buffer
+  *before* validating the payload; the reject then unwound straight past the free. Every malformed or
+  forged datagram leaked one buffer — a remote memory-exhaustion vector. The reject path frees it now.
+- **A rejected SECURED payload leaked a decode-pool slot.** In `%drain-one-secured` the loan handle is
+  pushed onto `dr-secured-loans` only on the delivery path, so a decode reject left the pinned pool slot
+  with no owner to free it — a forged payload would starve the pool. It is returned now.
+- **`(safety 0)` makes an unchecked status an OUT-OF-BOUNDS READ.** The FlatData Offset getters do not
+  signal on a `NIL` sample — they read memory off `NIL` and hand back a garbage integer. The wrap fuzz
+  caught this the moment the status was introduced: a caller that ignored the status and read the sample
+  anyway turned a **rejected** short payload into an **accepted** one. This is the silent-swallow hazard
+  made concrete, and it is why `TRY` exists.
+
+Net RX behaviour is strictly better: a bad sample used to unwind to the receiver-thread boundary handler,
+which discarded the **whole datagram** and every sample batched into it. One bad sample now costs one
+sample, and the per-writer watermark still advances (an early return there would have left it unconsumed
+and re-drained forever — caught in review).
+
 ## Order of the remaining work (shallow → deep)
 
-`typelookup.lisp` (10) · `dsl.lisp` (10) · the durability stores
+the durability stores
 (`store-microservice` 38, `store-encrypted` 14, `store-sqlite` 9) · `secure-sedp.lisp` (19) ·
 `pal-clasp.lisp` (10) · **`dds-dare/primitives.lisp` (96) LAST** — the OpenSSL FFI failure chains are the
 biggest and deepest.
