@@ -140,7 +140,10 @@ count_file() {
   # annotation. The self-test below caught exactly that; keep it literal.
   awk -v pat="$SIGNAL_RE" -v macro="$MACRO_MARKER" '
     /^\(defun\*?[ \t]+/ {
-      intest = ($2 ~ /-test$/ || $2 ~ /^run-/) ? 1 : 0
+      # An in-file TEST function. The %-prefixed form (%run-secure-pm, ...) is the SAME thing as run-*:
+      # a test whose ASSERT is its failure mechanism, not production control flow. The original pattern
+      # missed it and silently counted 19 test asserts in secure-sedp.lisp as production debt.
+      intest = ($2 ~ /-test$/ || $2 ~ /^%?run-/) ? 1 : 0
     }
     { exempt = index($0, macro) || (NR > 1 && index(last, macro))
       if (!intest && $0 ~ pat && !exempt) n++
@@ -162,11 +165,13 @@ cat > "$tmp/count-canary.lisp" <<'EOF'
   (error "this one is production control flow — MUST be counted"))
 (defun* run-something-test ()
   (assert (= 1 1)))
+(defun* %run-internal-harness ()
+  (assert (= 2 2)))
 EOF
 cn="$(count_file "$tmp/count-canary.lisp")"
 if [[ "$cn" -ne 1 ]]; then
   echo "gate-nocond: FAIL — self-test: the ratchet counter must count EXACTLY the 1 unexempt form in the" >&2
-  echo "             canary (2 NOCOND(MACRO) skipped, 1 in-file-test assert skipped). Got ${cn}." >&2
+  echo "             canary (2 NOCOND(MACRO) skipped, 2 in-file-test asserts skipped incl. the %run- form). Got ${cn}." >&2
   echo "             Either the counter is blind or NOCOND(MACRO) is over-matching — a green ratchet" >&2
   echo "             would prove NOTHING." >&2
   exit 1
