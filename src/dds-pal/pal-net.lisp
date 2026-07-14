@@ -254,9 +254,27 @@
                  (list (aref g 0) (aref g 1) (aref g 2) (aref g 3) 0 0 0 0))
     (%setsockopt socket +ipproto-ip+ +ip-multicast-loop+ '(1))))
 
+;; tcp-shutdown is defined below (same sb-bsd-sockets substrate); forward-declared so udp-close can use it.
+(declaim (ftype (function (t &optional fixnum) t) tcp-shutdown))
+
 (defun* udp-close (socket)
     (function (t) t)
-  "Close SOCKET."
+  "Close SOCKET — SHUTTING IT DOWN FIRST (NFR-PORT).
+
+   On LINUX, close(2) does NOT reliably unblock a thread parked in recvfrom(2) on this socket. Our UDP /
+   multicast / SHMEM receiver threads park exactly there, and start-udp-receiver's contract was 'the thread
+   exits when the socket is closed (udp-recv then signals)' — which is TRUE ON DARWIN AND FALSE ON LINUX.
+   So stop-node closed the sockets and then JOINED the receiver threads, which were still blocked in
+   recvfrom, and the join NEVER RETURNED: delete-participant hung, and THE STACK COULD NOT SHUT DOWN ON
+   LINUX AT ALL — the platform the operating contract calls primary (§9).
+
+   shutdown(2) DOES wake a blocked recv, portably, on both Darwin and Linux. THIS REPO ALREADY KNEW THAT and
+   says so in tcp-shutdown's own docstring, added for the durability microservice server — the UDP path
+   simply never got the same treatment.
+
+   Found by CI on Linux (traced: ENTER stop-node -> the goodbye completes -> no LEAVE). NO LOCAL macOS RUN
+   COULD EVER HAVE SEEN IT, and there was no CI until this week."
+  (ignore-errors (tcp-shutdown socket))      ; wake any thread parked in udp-recv, THEN release the fd
   (sb-bsd-sockets:socket-close socket))
 
 ;; TCPv4 stream sockets (FR-XPORT-1). Same sb-bsd-sockets substrate as UDP above (native on SBCL

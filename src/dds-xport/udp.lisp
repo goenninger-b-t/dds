@@ -91,8 +91,11 @@
 (defun* start-udp-receiver (socket on-datagram)
     (function (t function) t)
   "Spawn a thread that blocks on SOCKET, receiving each datagram into a 64 KiB
-   octet-buffer and calling (ON-DATAGRAM buffer size). The thread exits when the
-   socket is closed (udp-recv then signals). Returns the thread (FR-XPORT-5)."
+   octet-buffer and calling (ON-DATAGRAM buffer size). The thread exits when the socket is closed —
+   dds.pal:udp-close SHUTS THE SOCKET DOWN before closing it, which is what actually wakes this thread:
+   on Linux close(2) alone does NOT unblock a parked recvfrom, so without the shutdown this thread stays
+   blocked forever and stop-node's join never returns (NFR-PORT; see udp-close). Returns the thread
+   (FR-XPORT-5)."
   (dds.pal:spawn
    (lambda ()
      (let ((buf (dds.core.buffer:make-octet-buffer 65507)))
