@@ -655,22 +655,23 @@
 (defun* %parse-config-safety0 (argv env)
     (function (list list) t)
   "Call parse-durability-config under (safety 0). The manual explicit guards in the parser are
-   safety-level-independent — they must signal DURABILITY-CONFIG-ERROR or return valid values
-   regardless of the optimization policy. Returns T on a clean signal or a valid result."
+   safety-level-independent — they must RETURN a durability-config-status or a valid triple (ADR 0064: a
+   malformed config is a returned value, NEVER a signal) regardless of the optimization policy. Returns T on
+   a clean return, NIL if an UNCONTROLLED error leaked (which would now be a real bug — a bad config no
+   longer signals)."
   (declare (optimize (speed 3) (safety 0) (debug 0)))
   (handler-case
       (progn
         (dds.durability:parse-durability-config :argv argv :env env)
         t)
-    (dds.durability:durability-config-error () t)
     (error () nil)))
 
 (defun* fuzz-durability-config ()
     (function () t)
   "Property-based fuzz of PARSE-DURABILITY-CONFIG (WP-DURABILITY-SERVICE-TRANSIENT, NFR-SEC-POSTURE).
-   For each random (argv, env) pair: the parser MUST either signal DURABILITY-CONFIG-ERROR (a clean,
-   controlled condition) or return a valid (specs max-restarts window-seconds) triple — NEVER an
-   uncontrolled low-level error, OOB, or crash.  A (safety 0) wrapper additionally confirms the
+   For each random (argv, env) pair: the parser MUST RETURN — a durability-config-status (a clean,
+   controlled value) as the 4th value on malformed input, or a valid (specs max-restarts window-seconds)
+   triple — NEVER SIGNAL (ADR 0064), and never an uncontrolled low-level error, OOB, or crash.  A (safety 0) wrapper additionally confirms the
    explicit-manual-check argument: all parse guards are non-safety-dependent, so the (safety 0)
    wrapper must reach the same verdict (error vs. success) as the production-policy arm.
    Deterministic + seeded (reproducible on SBCL + Clasp); 2000 iterations."
@@ -679,15 +680,14 @@
     (dotimes (i iters t)
       (let* ((argv (%gen-durability-config-argv prng))
              (env  (%gen-durability-config-env  prng))
-             ;; production-policy arm: must signal durability-config-error OR return valid triple
+             ;; production-policy arm: must RETURN (status or valid triple), NEVER signal (ADR 0064)
              (prod-ok (handler-case
                           (progn
                             (dds.durability:parse-durability-config :argv argv :env env)
                             t)
-                        (dds.durability:durability-config-error () t)
                         (error (e)
                           (error 'test-failure :name "durability-config-fuzz"
-                                 :detail (format nil "iter ~d argv=~s env=~s: production parse leaked uncontrolled error: ~a"
+                                 :detail (format nil "iter ~d argv=~s env=~s: production parse SIGNALLED (config errors are STATUSES now, ADR 0064): ~a"
                                                  i argv env e)))))
              ;; (safety 0) wrapper: must agree (signal iff production signalled)
              (s0-ok (%parse-config-safety0 argv env)))

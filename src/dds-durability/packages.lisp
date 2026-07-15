@@ -26,7 +26,7 @@
            #:parse-durability-config
            #:parse-durability-server-config
            #:durability-usage
-           #:durability-config-error
+           #:durability-config-status #:durability-config-status-message
            #:%spec->argv
            #:make-encrypted-store #:*dare-error-hook*
            #:make-file-store #:file-store-sync

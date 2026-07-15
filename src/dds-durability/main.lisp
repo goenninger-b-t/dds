@@ -6,21 +6,42 @@
 ;;; Bounds-check: all network-facing / wire-derived parse paths are explicit manual checks
 ;;; independent of CL safety level (NFR-SEC-POSTURE).
 
-;;; --- condition ---
+;;; --- status value (ADR 0064: no conditions — a malformed config is a RETURNED value, not a signal) ---
 
-(define-condition durability-config-error (error)
-  ((message :initarg :message :reader durability-config-error-message))
-  (:report (lambda (c s)
-             (format s "dds.durability config error: ~a"
-                     (durability-config-error-message c))))
-  (:documentation "Signalled by PARSE-DURABILITY-CONFIG on any malformed or unknown argument.
-                   Always an explicit manual check; never a safety-0-dependent type dispatch."))
+(defstruct* (durability-config-status (:constructor %make-config-status (message)))
+  "A malformed / unknown / missing config argument — the STATUS VALUE threaded out of the config parsers
+   (ADR 0064: no Lisp conditions in our code). Was a DURABILITY-CONFIG-ERROR condition that UNWOUND out of
+   DURABILITY-SERVICE-MAIN — a toplevel entry point — on a bad CLI arg. MESSAGE is the human-readable
+   diagnostic (the config is operator input, so it must name the offending flag/value); the toplevel prints
+   it and exits non-zero. Always an explicit manual check, safety-level-independent (NFR-SEC-POSTURE)."
+  (message "" :type string))
 
-(defun* %config-error (fmt &rest args)
-    (function (string &rest t) nil)
-  "Signal DURABILITY-CONFIG-ERROR with a formatted message. Explicit, safety-level-independent."
-  (error 'durability-config-error
-         :message (apply #'format nil fmt args)))
+;; %CONFIG-ERROR is a MACRO, not a function: it expands to (BAIL <status>), a LOCAL non-local return from
+;; the enclosing DEFUN* (BAIL is bound by DEFUN* in every body) — NOT a condition, no unwind past the
+;; function. Every parse fn is a DEFUN* returning (VALUES result status), so a (%CONFIG-ERROR ...) inside a
+;; cond/when/handler-case clause returns (VALUES NIL <status>) from that parse fn, and the caller threads it.
+;; A macro emitting BAIL (a return) is fine — the forbidden pattern is a macro emitting a CONDITION.
+(defmacro %config-error (fmt &rest args)
+  "Return (VALUES NIL <durability-config-status>) from the enclosing DEFUN* with a formatted MESSAGE.
+   Explicit, safety-level-independent. Expands to (BAIL (%make-config-status (format nil FMT ARGS...)))."
+  `(bail (%make-config-status (format nil ,fmt ,@args))))
+
+(defstruct* (cli-config (:constructor %make-cli-config))
+  "The parsed durability-SERVICE CLI/env config bundle %PARSE-ARGV returns as ONE value (so the parser fits
+   the (VALUES result status) convention — status threading needs a single result value, and %parse-argv
+   otherwise returns eleven). Read by PARSE-DURABILITY-CONFIG. Every field mirrors a %parse-argv return
+   (domain/topics/mode/max-restarts/window-seconds/name + the persistence-backend coordinates)."
+  (domain 0 :type (integer 0))
+  (topics '() :type list)
+  (mode :thread :type (member :thread :process))
+  (max-restarts 3 :type (integer 0))
+  (window-seconds 5 :type (integer 1))
+  (name "" :type string)
+  (backend nil :type (or null string))
+  (ms-host nil :type (or null string))
+  (ms-port nil :type (or null (integer 0 65535)))
+  (dir nil :type (or null string))
+  (key-dir nil :type (or null string)))
 
 ;;; --- env lookup ---
 
@@ -35,8 +56,9 @@
 ;;; --- topic pair parsing ---
 
 (defun* %parse-topic-pair (token)
-    (function (string) (cons string string))
-  "Parse \"NAME:TYPE\" into (NAME . TYPE). Explicit bounds check: no colon -> DURABILITY-CONFIG-ERROR."
+    (function (string) (values (or null (cons string string)) (or null durability-config-status)))
+  "Parse \"NAME:TYPE\" into (values (NAME . TYPE) NIL), or (values NIL status) on a malformed token
+   (no colon / empty name / empty type). Explicit bounds check; returned, never signalled (ADR 0064)."
   (let ((colon (position #\: token)))
     (unless colon
       (%config-error "malformed --topic argument ~s: expected NAME:TYPE (colon separator missing)" token))
@@ -44,17 +66,19 @@
       (%config-error "malformed --topic argument ~s: topic name must not be empty" token))
     (when (= colon (1- (length token)))
       (%config-error "malformed --topic argument ~s: type name must not be empty" token))
-    (cons (subseq token 0 colon) (subseq token (1+ colon)))))
+    (values (cons (subseq token 0 colon) (subseq token (1+ colon))) nil)))
 
 (defun* %parse-topics-env (raw)
-    (function (string) list)
-  "Parse a comma-separated \"NAME:TYPE,...\" env value into a list of (NAME . TYPE) conses."
+    (function (string) (values (or null list) (or null durability-config-status)))
+  "Parse a comma-separated \"NAME:TYPE,...\" env value into (values ((NAME . TYPE) ...) NIL), or
+   (values NIL status) if any token is malformed. A try-loop (not mapcar) so a bad token's status
+   propagates instead of being dropped by mapcar's single-value take."
   (let ((parts (loop for start = 0 then (1+ end)
                      for end = (position #\, raw :start start)
                      for tok = (string-trim '(#\Space #\Tab) (subseq raw start (or end (length raw))))
                      unless (zerop (length tok)) collect tok
                      while end)))
-    (mapcar #'%parse-topic-pair parts)))
+    (values (loop for tok in parts collect (try (%parse-topic-pair tok))) nil)))
 
 ;;; --- service persistence backend selection (semantics A; ADR 0050 §4.9) ---
 ;;; --backend {file|sqlite|microservice} selects the durability SERVICE's OWN client-side persistence
@@ -72,17 +96,16 @@
   (namestring (merge-pathnames "dds-durability/" (uiop:temporary-directory))))
 
 (defun* %parse-service-backend (source val)
-    (function (string (or null string)) string)
-  "Parse VAL into a durability-SERVICE persistence backend: the canonical lowercase \"file\" / \"sqlite\"
-   / \"microservice\" string consumed by MAKE-DURABILITY-STORE-FACTORY, else DURABILITY-CONFIG-ERROR naming
-   the valid set (an explicit, safety-level-independent check). SOURCE names the origin (a flag or env var)
-   for the message. The reserved value \"server\" is REJECTED here with a steering message: it selects the
-   microservice-SERVER MODE (semantics B, ADR 0050 §4.9), which %DURABILITY-SERVER-MODE-P intercepts BEFORE
-   this service parser ever runs, so it is not a service persistence backend."
+    (function (string (or null string)) (values (or null string) (or null durability-config-status)))
+  "Parse VAL into a durability-SERVICE persistence backend: (values \"file\"/\"sqlite\"/\"microservice\" NIL)
+   consumed by MAKE-DURABILITY-STORE-FACTORY, or (values NIL status) naming the valid set. SOURCE names the
+   origin (a flag or env var) for the message. The reserved value \"server\" is REJECTED here with a steering
+   message: it selects the microservice-SERVER MODE (semantics B, ADR 0050 §4.9), which %DURABILITY-SERVER-
+   MODE-P intercepts BEFORE this service parser ever runs, so it is not a service persistence backend."
   (cond ((null val) (%config-error "~a requires an argument (one of: file, sqlite, microservice)" source))
-        ((string-equal val "file") "file")
-        ((string-equal val "sqlite") "sqlite")
-        ((string-equal val "microservice") "microservice")
+        ((string-equal val "file") (values "file" nil))
+        ((string-equal val "sqlite") (values "sqlite" nil))
+        ((string-equal val "microservice") (values "microservice" nil))
         ((string-equal val "server")
          (%config-error "~a server selects the microservice SERVER mode, not a durability-service persistence backend; run the SERVER with --backend server, or pick a service backend (one of: file, sqlite, microservice)" source))
         (t (%config-error "~a ~s is not a durability-service persistence backend (expected one of: file, sqlite, microservice; 'server' selects the microservice SERVER mode)" source val))))
@@ -91,15 +114,13 @@
 
 (defun* %parse-argv (argv env)
     (function (list (or list function))
-              (values (integer 0) list (member :thread :process) (integer 0) (integer 1) string
-                      (or null string) (or null string) (or null (integer 0 65535))
-                      (or null string) (or null string)))
+              (values (or null cli-config) (or null durability-config-status)))
   "Walk ARGV collecting --domain, --topic, --mode, --max-restarts, --window-seconds, --name and the
    persistence-backend flags --backend, --ms-host, --ms-port, --dir, --key-dir (ADR 0050 §4.9, semantics A).
-   Unknown flags → DURABILITY-CONFIG-ERROR. Returns 11 values:
-   (domain topics mode max-restarts window-seconds name backend ms-host ms-port dir key-dir).
-   BACKEND is NIL when neither --backend nor env DDS_DURABILITY_BACKEND is given (the caller then keeps the
-   in-memory default — the DEFAULT-UNCHANGED path); otherwise a canonical \"file\"/\"sqlite\"/\"microservice\"."
+   Returns (values cli-config NIL), or (values NIL status) on an unknown flag / malformed value / missing
+   argument — returned, never signalled (ADR 0064). The eleven fields ride in the CLI-CONFIG bundle so this
+   fits the (values result status) convention (BACKEND is NIL when neither --backend nor env
+   DDS_DURABILITY_BACKEND is given — the DEFAULT-UNCHANGED in-memory path)."
   (let ((domain nil)
         (topics '())
         (mode   nil)
@@ -126,7 +147,7 @@
           ((string= flag "--topic")
            (let ((val (pop rest)))
              (unless val (%config-error "--topic requires an argument"))
-             (push (%parse-topic-pair val) topics)))
+             (push (try (%parse-topic-pair val)) topics)))
           ((string= flag "--mode")
            (let ((val (pop rest)))
              (unless val (%config-error "--mode requires an argument"))
@@ -152,7 +173,7 @@
              (unless val (%config-error "--name requires an argument"))
              (setf name val)))
           ((string= flag "--backend")
-           (setf backend (%parse-service-backend "--backend" (pop rest))))
+           (setf backend (try (%parse-service-backend "--backend" (pop rest)))))
           ((string= flag "--ms-host")
            (let ((val (pop rest)))
              (unless val (%config-error "--ms-host requires an argument"))
@@ -186,7 +207,7 @@
     (when (null topics)
       (let ((v (%env-get env "DDS_DURABILITY_TOPICS")))
         (when (and v (not (zerop (length v))))
-          (setf topics (%parse-topics-env v)))))
+          (setf topics (try (%parse-topics-env v))))))
     (unless mode
       (let ((v (%env-get env "DDS_DURABILITY_MODE")))
         (when v
@@ -200,7 +221,7 @@
     (unless backend
       (let ((v (%env-get env "DDS_DURABILITY_BACKEND")))
         (when (and v (plusp (length v)))
-          (setf backend (%parse-service-backend "env DDS_DURABILITY_BACKEND" v)))))
+          (setf backend (try (%parse-service-backend "env DDS_DURABILITY_BACKEND" v))))))
     (unless ms-host
       (let ((v (%env-get env "DDS_DURABILITY_MS_HOST")))
         (when (and v (plusp (length v))) (setf ms-host v))))
@@ -218,21 +239,24 @@
     (unless key-dir
       (let ((v (%env-get env "DDS_DURABILITY_KEY_DIR")))
         (when (and v (plusp (length v))) (setf key-dir v))))
-    (values (or domain 0)
-            (nreverse topics)
-            (or mode :thread)
-            (or max-restarts 3)
-            (or window-seconds 5)
-            (or name "")
-            backend ms-host ms-port dir key-dir)))
+    (values (%make-cli-config :domain (or domain 0)
+                              :topics (nreverse topics)
+                              :mode (or mode :thread)
+                              :max-restarts (or max-restarts 3)
+                              :window-seconds (or window-seconds 5)
+                              :name (or name "")
+                              :backend backend :ms-host ms-host :ms-port ms-port
+                              :dir dir :key-dir key-dir)
+            nil)))
 
 ;;; --- service persistence store-factory (semantics A; ADR 0050 §4.9) ---
 
 (defun* %service-store-factory (backend dir key-dir ms-host ms-port)
     (function ((or null string) (or null string) (or null string)
                (or null string) (or null (integer 0 65535)))
-              (or null function))
-  "Return the 0-arg persistence store-factory the durability SERVICE should use for BACKEND, or NIL when
+              (values (or null function) (or null durability-config-status)))
+  "Return (values factory NIL) — the 0-arg persistence store-factory the durability SERVICE should use for
+   BACKEND — or (values NIL status) on a missing REQUIRED coordinate. (values NIL NIL) when
    BACKEND is NIL (the caller then keeps MAKE-SERVICE-SPEC's in-memory default — the DEFAULT-UNCHANGED path,
    no behavior change when --backend is omitted). Reuses the shared MAKE-DURABILITY-STORE-FACTORY dispatch
    (spec.lisp) — it does NOT reimplement backend selection; it only wires the CLI-parsed values into it.
@@ -245,43 +269,53 @@
                       records live on the REMOTE server, so DIR here is only the CLIENT-LOCAL DARE epoch-dir
                       and defaults to %DEFAULT-PERSISTENCE-DIR when omitted.
    KEY-DIR (the ML-KEM-1024 key dir) defaults to DIR/keys/. All checks are explicit + safety-level-independent."
-  (when backend
-    (let ((ms (string-equal backend "microservice")))
-      (when (and ms (null ms-port))
-        (%config-error "--backend microservice requires --ms-port (or env DDS_DURABILITY_MS_PORT): the remote microservice server to connect to"))
-      (when (and (not ms) (null dir))
-        (%config-error "--backend ~a requires --dir (or env DDS_DURABILITY_DIR): a PERSISTENT backend must name its durable store directory (there is no temp-dir fallback)" backend))
-      (let* ((d (or dir (%default-persistence-dir)))    ; only microservice reaches the default (client-local DARE epoch-dir)
-             (k (or key-dir (namestring (merge-pathnames "keys/" (uiop:ensure-directory-pathname d))))))
-        (make-durability-store-factory backend :dir d :key-dir k :ms-host ms-host :ms-port ms-port)))))
+  (if (null backend)
+      (values nil nil)
+      (let ((ms (string-equal backend "microservice")))
+        (when (and ms (null ms-port))
+          (%config-error "--backend microservice requires --ms-port (or env DDS_DURABILITY_MS_PORT): the remote microservice server to connect to"))
+        (when (and (not ms) (null dir))
+          (%config-error "--backend ~a requires --dir (or env DDS_DURABILITY_DIR): a PERSISTENT backend must name its durable store directory (there is no temp-dir fallback)" backend))
+        (let* ((d (or dir (%default-persistence-dir)))    ; only microservice reaches the default (client-local DARE epoch-dir)
+               (k (or key-dir (namestring (merge-pathnames "keys/" (uiop:ensure-directory-pathname d))))))
+          ;; make-durability-store-factory (spec.lisp) still SIGNALS on a missing ms-port — UNREACHABLE from
+          ;; here (we validated ms-port above); it is converted with the store-factory slice, not this one.
+          (values (make-durability-store-factory backend :dir d :key-dir k :ms-host ms-host :ms-port ms-port)
+                  nil)))))
 
 ;;; --- public parse entry point (PURE — no I/O) ---
 
 (defun* parse-durability-config (&key (argv '()) (env '()))
     (function (&key (:argv list) (:env (or list function)))
-              (values list (integer 0) (integer 1)))
-  "Parse CLI ARGV + ENV into (values specs max-restarts window-seconds).
+              (values (or null list) (integer 0) (integer 1) (or null durability-config-status)))
+  "Parse CLI ARGV + ENV into (values specs max-restarts window-seconds NIL), or (values NIL 0 1 status) on
+   malformed / unknown / missing input — RETURNED, never signalled (ADR 0064; DURABILITY-SERVICE-MAIN prints
+   the status message and exits non-zero rather than unwinding).
    SPECS is a list of one SERVICE-SPEC (MVP single-service).
    MAX-RESTARTS and WINDOW-SECONDS are the parsed supervisor opts (defaults 3 / 5).
    ARGV is a list of CLI token strings. ENV is an alist of (NAME . VALUE) or a 1-arg fn.
-   Precedence: CLI > env > defaults. Signals DURABILITY-CONFIG-ERROR on malformed input.
+   Precedence: CLI > env > defaults.
    PERSISTENCE BACKEND (semantics A, ADR 0050 §4.9): --backend {file|sqlite|microservice} (env
    DDS_DURABILITY_BACKEND) selects the service's own store via %SERVICE-STORE-FACTORY → the shared
    MAKE-DURABILITY-STORE-FACTORY; --dir/--key-dir/--ms-host/--ms-port supply its coordinates. When --backend
    is omitted the spec keeps MAKE-SERVICE-SPEC's in-memory default (no behavior change). The reserved
    --backend server MODE value (semantics B) is intercepted upstream by %DURABILITY-SERVER-MODE-P and never
    reaches this parser."
-  (multiple-value-bind (domain topics mode max-restarts window-seconds name backend ms-host ms-port dir key-dir)
-      (%parse-argv argv env)
-    (let ((store (%service-store-factory backend dir key-dir ms-host ms-port)))
+  (multiple-value-bind (cfg status) (%parse-argv argv env)
+    (when status (return-from parse-durability-config (values nil 0 1 status)))
+    (multiple-value-bind (store store-status)
+        (%service-store-factory (cli-config-backend cfg) (cli-config-dir cfg) (cli-config-key-dir cfg)
+                                (cli-config-ms-host cfg) (cli-config-ms-port cfg))
+      (when store-status (return-from parse-durability-config (values nil 0 1 store-status)))
       (values (list (apply #'make-service-spec
-                           :domain domain
-                           :topics topics
-                           :mode   mode
-                           :name   name
+                           :domain (cli-config-domain cfg)
+                           :topics (cli-config-topics cfg)
+                           :mode   (cli-config-mode cfg)
+                           :name   (cli-config-name cfg)
                            (when store (list :store store))))
-              max-restarts
-              window-seconds))))
+              (cli-config-max-restarts cfg)
+              (cli-config-window-seconds cfg)
+              nil))))
 
 ;;; --- spec -> argv serializer (used by runner for subprocess launch) ---
 
@@ -335,32 +369,33 @@
   (recv-timeout +ms-default-recv-timeout+ :type (integer 1)))
 
 (defun* %config-parse-int (flag val min)
-    (function (string (or null string) integer) integer)
-  "Parse VAL (the argument to FLAG) as an integer >= MIN, else DURABILITY-CONFIG-ERROR. An explicit,
-   safety-level-independent manual check (NFR-SEC-POSTURE) — the server-parser sibling of %parse-argv's
-   inline integer guards, factored so the repeated parse+range check is written once (DRY)."
+    (function (string (or null string) integer)
+              (values (or null integer) (or null durability-config-status)))
+  "Parse VAL (the argument to FLAG) as an integer >= MIN: (values int NIL), or (values NIL status). An
+   explicit, safety-level-independent manual check (NFR-SEC-POSTURE) — returned, never signalled (ADR 0064).
+   parse-integer's own condition on a non-integer is CONTAINED here (handler-case) and mapped to a status."
   (unless val (%config-error "~a requires an argument" flag))
   (let ((n (handler-case (parse-integer val)
              (error () (%config-error "~a argument ~s is not an integer" flag val)))))
     (when (< n min) (%config-error "~a ~d must be >= ~d" flag n min))
-    n))
+    (values n nil)))
 
 (defun* %parse-inner-backend (source val)
-    (function (string (or null string)) (member :file :sqlite))
-  "Parse VAL into an inner-store backend keyword (:file / :sqlite), else DURABILITY-CONFIG-ERROR.
-   SOURCE names the origin (a flag or env var) for the message."
+    (function (string (or null string))
+              (values (or null (member :file :sqlite)) (or null durability-config-status)))
+  "Parse VAL into an inner-store backend keyword: (values (:file|:sqlite) NIL), or (values NIL status).
+   SOURCE names the origin (a flag or env var) for the message. Returned, never signalled (ADR 0064)."
   (cond ((null val) (%config-error "~a requires an argument" source))
-        ((string-equal val "file") :file)
-        ((string-equal val "sqlite") :sqlite)
+        ((string-equal val "file") (values :file nil))
+        ((string-equal val "sqlite") (values :sqlite nil))
         (t (%config-error "~a ~s is not 'file' or 'sqlite'" source val))))
 
 (defun* %parse-server-argv (argv env)
-    (function (list (or list function)) server-config)
-  "Walk server-mode ARGV (+ DDS_DURABILITY_* env fallbacks) into a SERVER-CONFIG. Mirrors %parse-argv's
-   flag-loop + env-fallback + %config-error idiom (no divergent CLI framework). The --backend server
-   discriminator token is consumed here (it selected this mode). Unknown flags, malformed values, and a
-   missing --port / --inner-dir all signal DURABILITY-CONFIG-ERROR (explicit checks, safety-independent).
-   Precedence: CLI > env > defaults."
+    (function (list (or list function)) (values (or null server-config) (or null durability-config-status)))
+  "Walk server-mode ARGV (+ DDS_DURABILITY_* env fallbacks) into (values SERVER-CONFIG NIL), or
+   (values NIL status) on an unknown flag / malformed value / missing --port|--inner-dir. Mirrors
+   %parse-argv's flag-loop + env-fallback idiom; returned, never signalled (ADR 0064). Precedence: CLI > env
+   > defaults. The --backend server discriminator token is consumed here (it selected this mode)."
   (let ((host nil) (port nil) (inner-backend nil) (inner-dir nil)
         (max-conn nil) (recv-to nil) (rest argv))
     (loop while rest do
@@ -375,55 +410,57 @@
              (unless val (%config-error "--host requires an argument"))
              (setf host val)))
           ((string= flag "--port")
-           (let ((n (%config-parse-int "--port" (pop rest) 0)))
+           (let ((n (try (%config-parse-int "--port" (pop rest) 0))))
              (when (> n 65535) (%config-error "--port ~d must be <= 65535" n))
              (setf port n)))
           ((string= flag "--inner-backend")
-           (setf inner-backend (%parse-inner-backend "--inner-backend" (pop rest))))
+           (setf inner-backend (try (%parse-inner-backend "--inner-backend" (pop rest)))))
           ((string= flag "--inner-dir")
            (let ((val (pop rest)))
              (unless val (%config-error "--inner-dir requires an argument"))
              (setf inner-dir val)))
           ((string= flag "--max-connections")
-           (setf max-conn (%config-parse-int "--max-connections" (pop rest) 1)))
+           (setf max-conn (try (%config-parse-int "--max-connections" (pop rest) 1))))
           ((string= flag "--recv-timeout")
-           (setf recv-to (%config-parse-int "--recv-timeout" (pop rest) 1)))
+           (setf recv-to (try (%config-parse-int "--recv-timeout" (pop rest) 1))))
           (t (%config-error "unknown server-mode flag ~s" flag)))))
     (unless host
       (let ((v (%env-get env "DDS_DURABILITY_HOST"))) (when (and v (plusp (length v))) (setf host v))))
     (unless port
       (let ((v (%env-get env "DDS_DURABILITY_PORT")))
         (when v
-          (let ((n (%config-parse-int "env DDS_DURABILITY_PORT" v 0)))
+          (let ((n (try (%config-parse-int "env DDS_DURABILITY_PORT" v 0))))
             (when (> n 65535) (%config-error "env DDS_DURABILITY_PORT ~d must be <= 65535" n))
             (setf port n)))))
     (unless inner-backend
       (let ((v (%env-get env "DDS_DURABILITY_INNER_BACKEND")))
-        (when v (setf inner-backend (%parse-inner-backend "env DDS_DURABILITY_INNER_BACKEND" v)))))
+        (when v (setf inner-backend (try (%parse-inner-backend "env DDS_DURABILITY_INNER_BACKEND" v))))))
     (unless inner-dir
       (let ((v (%env-get env "DDS_DURABILITY_INNER_DIR"))) (when (and v (plusp (length v))) (setf inner-dir v))))
     (unless max-conn
       (let ((v (%env-get env "DDS_DURABILITY_MAX_CONNECTIONS")))
-        (when v (setf max-conn (%config-parse-int "env DDS_DURABILITY_MAX_CONNECTIONS" v 1)))))
+        (when v (setf max-conn (try (%config-parse-int "env DDS_DURABILITY_MAX_CONNECTIONS" v 1))))))
     (unless recv-to
       (let ((v (%env-get env "DDS_DURABILITY_RECV_TIMEOUT")))
-        (when v (setf recv-to (%config-parse-int "env DDS_DURABILITY_RECV_TIMEOUT" v 1)))))
+        (when v (setf recv-to (try (%config-parse-int "env DDS_DURABILITY_RECV_TIMEOUT" v 1))))))
     (unless port
       (%config-error "microservice server mode requires --port (or env DDS_DURABILITY_PORT)"))
     (unless (and inner-dir (plusp (length inner-dir)))
       (%config-error "microservice server mode requires --inner-dir (or env DDS_DURABILITY_INNER_DIR)"))
-    (%make-server-config :host (or host "127.0.0.1") :port port
-                         :inner-backend (or inner-backend :file) :inner-dir inner-dir
-                         :max-connections (or max-conn +ms-default-max-connections+)
-                         :recv-timeout (or recv-to +ms-default-recv-timeout+))))
+    (values (%make-server-config :host (or host "127.0.0.1") :port port
+                                 :inner-backend (or inner-backend :file) :inner-dir inner-dir
+                                 :max-connections (or max-conn +ms-default-max-connections+)
+                                 :recv-timeout (or recv-to +ms-default-recv-timeout+))
+            nil)))
 
 (defun* parse-durability-server-config (&key (argv '()) (env '()))
-    (function (&key (:argv list) (:env (or list function))) server-config)
-  "Parse microservice-SERVER-mode CLI ARGV + ENV into a SERVER-CONFIG (ADR 0050 §4.8). PURE (no I/O),
-   unit-testable. Selected when --backend server (or env DDS_DURABILITY_BACKEND=server) is present — see
-   %DURABILITY-SERVER-MODE-P / DURABILITY-SERVICE-MAIN. Precedence CLI > env > defaults; --port and
-   --inner-dir are REQUIRED (host/inner-backend/max-connections/recv-timeout default). Signals
-   DURABILITY-CONFIG-ERROR on any malformed or missing argument (the sibling of PARSE-DURABILITY-CONFIG)."
+    (function (&key (:argv list) (:env (or list function)))
+              (values (or null server-config) (or null durability-config-status)))
+  "Parse microservice-SERVER-mode CLI ARGV + ENV into (values SERVER-CONFIG NIL), or (values NIL status) on
+   any malformed / missing argument — RETURNED, never signalled (ADR 0064; the sibling of
+   PARSE-DURABILITY-CONFIG). PURE (no I/O), unit-testable. Selected when --backend server (or env
+   DDS_DURABILITY_BACKEND=server) is present. Precedence CLI > env > defaults; --port and --inner-dir are
+   REQUIRED (host/inner-backend/max-connections/recv-timeout default)."
   (%parse-server-argv argv env))
 
 (defun* %durability-server-mode-p (argv env)
@@ -530,6 +567,16 @@
 
 ;;; --- main entrypoint ---
 
+(defun* %durability-config-fail (status block)
+    (function (durability-config-status t) t)
+  "Report a config STATUS at the toplevel (ADR 0064: this is where a malformed CLI/env surfaces as an exit
+   code, never an unwind): print its MESSAGE + the usage to *error-output*, then UIOP:QUIT 1 when BLOCK (an
+   operator run) or RETURN the STATUS when NIL (an in-process caller / test inspects it)."
+  (format *error-output* "~&dds.durability: ~a~%~%~a"
+          (durability-config-status-message status) (durability-usage))
+  (finish-output *error-output*)
+  (if block (uiop:quit 1) status))
+
 (defun* durability-service-main (&key (argv nil) (env '()) (block t))
     (function (&key (:argv (or null list)) (:env (or list function)) (:block t)) t)
   "CLI/env entrypoint for the durability service.
@@ -561,29 +608,34 @@
        (finish-output *standard-output*)
        (if block (uiop:quit 0) :help))
       ((%durability-server-mode-p effective-argv env)
-       (let ((cfg (parse-durability-server-config :argv (or effective-argv '()) :env env)))
-         (%run-microservice-server :host (server-config-host cfg) :port (server-config-port cfg)
-                                   :inner-backend (server-config-inner-backend cfg)
-                                   :inner-dir (server-config-inner-dir cfg)
-                                   :max-connections (server-config-max-connections cfg)
-                                   :recv-timeout (server-config-recv-timeout cfg)
-                                   :block block)))
+       (multiple-value-bind (cfg status)
+           (parse-durability-server-config :argv (or effective-argv '()) :env env)
+         (if status
+             (%durability-config-fail status block)   ; ADR 0064: a bad CLI/env is a RETURNED status here, not an unwind
+             (%run-microservice-server :host (server-config-host cfg) :port (server-config-port cfg)
+                                       :inner-backend (server-config-inner-backend cfg)
+                                       :inner-dir (server-config-inner-dir cfg)
+                                       :max-connections (server-config-max-connections cfg)
+                                       :recv-timeout (server-config-recv-timeout cfg)
+                                       :block block))))
       (t
-       (multiple-value-bind (specs max-restarts window-seconds)
+       (multiple-value-bind (specs max-restarts window-seconds status)
            (parse-durability-config :argv (or effective-argv '()) :env env)
-         (let* ((runner (make-service-runner specs))
-                (sup    (make-supervisor runner
-                                        :max-restarts max-restarts
-                                        :window-seconds window-seconds)))
-           (runner-start runner)
-           (supervisor-start sup)
-           (if block
-               (progn
-                 (setf *durability-shutdown-requested* nil)
-                 (dds.pal:install-signal-handler
-                  '(:term :int)
-                  (lambda () (setf *durability-shutdown-requested* t)))
-                 (loop until *durability-shutdown-requested* do (sleep 0.2))
-                 (%graceful-shutdown runner sup)
-                 (uiop:quit 0))
-               (cons runner sup))))))))
+         (if status
+             (%durability-config-fail status block)   ; ADR 0064: print the message + usage, exit non-zero — never unwind
+             (let* ((runner (make-service-runner specs))
+                    (sup    (make-supervisor runner
+                                            :max-restarts max-restarts
+                                            :window-seconds window-seconds)))
+               (runner-start runner)
+               (supervisor-start sup)
+               (if block
+                   (progn
+                     (setf *durability-shutdown-requested* nil)
+                     (dds.pal:install-signal-handler
+                      '(:term :int)
+                      (lambda () (setf *durability-shutdown-requested* t)))
+                     (loop until *durability-shutdown-requested* do (sleep 0.2))
+                     (%graceful-shutdown runner sup)
+                     (uiop:quit 0))
+                   (cons runner sup)))))))))

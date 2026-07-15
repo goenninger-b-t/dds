@@ -850,23 +850,19 @@
     (declare (ignore specs-d))
     (%check :cfg-mr-default (= 3 mr-d) "default max-restarts must be 3")
     (%check :cfg-ws-default (= 5 ws-d) "default window-seconds must be 5"))
-  ;; --- malformed --topic (no colon) must signal a clean condition, never crash ---
-  (let ((errored nil))
-    (handler-case
-        (dds.durability:parse-durability-config
-         :argv '("--topic" "NoColonHere") :env '())
-      (error () (setf errored t)))
-    (%check :cfg-malformed-topic errored
-            "malformed --topic (no colon) must signal a condition"))
+  ;; --- malformed --topic (no colon) must RETURN a clean status (ADR 0064), never crash / signal ---
+  (%check :cfg-malformed-topic
+          (typep (nth-value 3 (dds.durability:parse-durability-config
+                               :argv '("--topic" "NoColonHere") :env '()))
+                 'dds.durability:durability-config-status)
+          "malformed --topic (no colon) must RETURN a durability-config-status (4th value)")
   ;; --- (safety 0) variant: the guard must be an explicit check, not a runtime type error ---
-  (let ((errored nil))
-    (handler-case
-        (locally (declare (optimize (safety 0)))
-          (dds.durability:parse-durability-config
-           :argv '("--topic" "StillBad") :env '()))
-      (error () (setf errored t)))
-    (%check :cfg-malformed-safety0 errored
-            "malformed --topic must signal even at (safety 0) — explicit manual check"))
+  (%check :cfg-malformed-safety0
+          (locally (declare (optimize (safety 0)))
+            (typep (nth-value 3 (dds.durability:parse-durability-config
+                                 :argv '("--topic" "StillBad") :env '()))
+                   'dds.durability:durability-config-status))
+          "malformed --topic must RETURN a status even at (safety 0) — explicit manual check")
   t)
 
 (defun* run-durability-process-smoke-test ()
@@ -8525,7 +8521,7 @@
    the default. parse-durability-server-config: full flags -> the SERVER-CONFIG slots; defaults
    (host/inner-backend/max-connections/recv-timeout) when omitted; env fallback + CLI>env precedence; a
    battery of BAD args (missing --port / missing --inner-dir / bad --inner-backend / non-integer --port /
-   --max-connections 0 / unknown flag) each signal a CLEAN durability-config-error (never a crash), incl. at
+   --max-connections 0 / unknown flag) each RETURN a CLEAN durability-config-status (never a crash / signal, ADR 0064), incl. at
    (safety 0). %durability-server-mode-p selects server mode ONLY for --backend server (a plain service argv
    stays the default durability-service mode — no regression). durability-usage shows the server mode. PURE,
    both impls."
@@ -8558,10 +8554,9 @@
               :env '(("DDS_DURABILITY_PORT" . "9999") ("DDS_DURABILITY_INNER_DIR" . "/tmp/env")))))
     (%check :srvcfg-cli-wins-port (= 8080 (dds.durability::server-config-port cfg)) "CLI --port overrides env")
     (%check :srvcfg-cli-wins-dir (string= "/tmp/cli" (dds.durability::server-config-inner-dir cfg)) "CLI --inner-dir overrides env"))
-  (flet ((bad (argv)
-           (eq :err (handler-case
-                        (progn (dds.durability:parse-durability-server-config :argv argv :env '()) :ok)
-                      (dds.durability:durability-config-error () :err)))))
+  (flet ((bad (argv)   ; ADR 0064: a malformed server config RETURNS a durability-config-status (2nd value)
+           (typep (nth-value 1 (dds.durability:parse-durability-server-config :argv argv :env '()))
+                  'dds.durability:durability-config-status)))
     (%check :srvcfg-bad-noport (bad (list "--backend" "server" "--inner-dir" "/tmp/x")) "missing --port -> config-error")
     (%check :srvcfg-bad-nodir (bad (list "--backend" "server" "--port" "5000")) "missing --inner-dir -> config-error")
     (%check :srvcfg-bad-backend (bad (list "--backend" "server" "--port" "5000" "--inner-dir" "/x" "--inner-backend" "mongo"))
@@ -8572,12 +8567,11 @@
     (%check :srvcfg-bad-unknown (bad (list "--backend" "server" "--port" "5000" "--inner-dir" "/x" "--frobnicate"))
             "unknown server-mode flag -> config-error"))
   (%check :srvcfg-bad-safety0
-          (eq :err (handler-case
-                       (locally (declare (optimize (safety 0)))
-                         (dds.durability:parse-durability-server-config
-                          :argv (list "--backend" "server" "--inner-dir" "/x") :env '()))
-                     (dds.durability:durability-config-error () :err)))
-          "missing --port signals even at (safety 0) — explicit manual check")
+          (locally (declare (optimize (safety 0)))
+            (typep (nth-value 1 (dds.durability:parse-durability-server-config
+                                 :argv (list "--backend" "server" "--inner-dir" "/x") :env '()))
+                   'dds.durability:durability-config-status))
+          "missing --port RETURNS a status even at (safety 0) — explicit manual check")
   (%check :srvcfg-detect-cli (dds.durability::%durability-server-mode-p (list "--backend" "server" "--port" "1") '())
           "%durability-server-mode-p T for --backend server")
   (%check :srvcfg-detect-env (dds.durability::%durability-server-mode-p '() '(("DDS_DURABILITY_BACKEND" . "server")))
@@ -8617,7 +8611,7 @@
    (4) RECONCILIATION: %durability-server-mode-p partitions the reserved 'server' MODE value (B) from the
        file/sqlite/microservice backend values (A) — server -> server mode, the three backends -> the service
        parser (semantics A), so the two roles never silently collide.
-   (5) BAD VALUE -> a clean durability-config-error naming the valid set (incl. the reserved 'server' steer +
+   (5) BAD VALUE -> a clean durability-config-status naming the valid set (incl. the reserved 'server' steer +
        a missing --ms-port for microservice + (safety 0)).
    (6) USAGE documents BOTH roles.
    (7) DARE-gated round-trip (skips if OpenSSL<3.5): the file backend persists to the file-store on-disk
@@ -8628,10 +8622,9 @@
              (dds.durability::durable-store-name
               (funcall (dds.durability::service-spec-store
                         (first (dds.durability:parse-durability-config :argv argv :env (or env '())))))))
-           (cfg-err (argv &optional env)
-             (eq :err (handler-case
-                          (progn (dds.durability:parse-durability-config :argv argv :env (or env '())) :ok)
-                        (dds.durability:durability-config-error () :err)))))
+           (cfg-err (argv &optional env)   ; ADR 0064: parse-durability-config RETURNS the status as its 4th value
+             (typep (nth-value 3 (dds.durability:parse-durability-config :argv argv :env (or env '())))
+                    'dds.durability:durability-config-status)))
     ;; (1) SERVICE-ON-BACKEND — the selected backend is the encrypted-persistent tier (DARE-free construction)
     (%check :bsel-file-selected
             (eq :encrypted-persistent (sstore-name (list "--backend" "file" "--dir" "/tmp/bsel-sel")))
@@ -8651,23 +8644,19 @@
       (%check :bsel-default-contract (and (= 1 (length specs)) (= 3 mr) (= 5 ws))
               "default parse: 1 spec + default supervisor opts (3/5) unchanged"))
     ;; (3) PURE parse observability + canonicalization
-    (multiple-value-bind (d tp m mr ws n be mh mp dir kd)
-        (dds.durability::%parse-argv (list "--backend" "MicroService" "--ms-host" "H"
-                                           "--ms-port" "7" "--dir" "/d" "--key-dir" "/k") '())
-      (declare (ignore d tp m mr ws n))
-      (%check :bsel-parse-be (string= "microservice" be) "--backend canonicalized to lowercase")
-      (%check :bsel-parse-mh (string= "H" mh) "--ms-host parsed")
-      (%check :bsel-parse-mp (eql 7 mp) "--ms-port parsed")
-      (%check :bsel-parse-dir (string= "/d" dir) "--dir parsed")
-      (%check :bsel-parse-kd (string= "/k" kd) "--key-dir parsed"))
+    (let ((cfg (dds.durability::%parse-argv (list "--backend" "MicroService" "--ms-host" "H"
+                                                "--ms-port" "7" "--dir" "/d" "--key-dir" "/k") '())))
+      (%check :bsel-parse-be (string= "microservice" (dds.durability::cli-config-backend cfg)) "--backend canonicalized to lowercase")
+      (%check :bsel-parse-mh (string= "H" (dds.durability::cli-config-ms-host cfg)) "--ms-host parsed")
+      (%check :bsel-parse-mp (eql 7 (dds.durability::cli-config-ms-port cfg)) "--ms-port parsed")
+      (%check :bsel-parse-dir (string= "/d" (dds.durability::cli-config-dir cfg)) "--dir parsed")
+      (%check :bsel-parse-kd (string= "/k" (dds.durability::cli-config-key-dir cfg)) "--key-dir parsed"))
     (%check :bsel-env-backend
             (eq :encrypted-persistent
                 (sstore-name '() '(("DDS_DURABILITY_BACKEND" . "sqlite") ("DDS_DURABILITY_DIR" . "/tmp/bsel-env"))))
             "env DDS_DURABILITY_BACKEND selects the backend")
-    (multiple-value-bind (d tp m mr ws n be)
-        (dds.durability::%parse-argv (list "--backend" "file") '(("DDS_DURABILITY_BACKEND" . "sqlite")))
-      (declare (ignore d tp m mr ws n))
-      (%check :bsel-cli-over-env (string= "file" be) "CLI --backend overrides env DDS_DURABILITY_BACKEND"))
+    (let ((cfg (dds.durability::%parse-argv (list "--backend" "file") '(("DDS_DURABILITY_BACKEND" . "sqlite")))))
+      (%check :bsel-cli-over-env (string= "file" (dds.durability::cli-config-backend cfg)) "CLI --backend overrides env DDS_DURABILITY_BACKEND"))
     ;; (4) RECONCILIATION — server-mode-p partitions the 'server' MODE value from the backend values
     (%check :bsel-recon-server (dds.durability::%durability-server-mode-p (list "--backend" "server") '())
             "--backend server -> server MODE (semantics B, unchanged)")
@@ -8689,23 +8678,20 @@
     (%check :bsel-bad-sqlite-nodir (cfg-err (list "--backend" "sqlite"))
             "--backend sqlite WITHOUT --dir -> config-error")
     (%check :bsel-bad-file-nodir-names-dir
-            (let ((msg (handler-case
-                           (progn (dds.durability:parse-durability-config :argv (list "--backend" "file")) "")
-                         (dds.durability:durability-config-error (c)
-                           (dds.durability::durability-config-error-message c)))))
+            (let* ((status (nth-value 3 (dds.durability:parse-durability-config :argv (list "--backend" "file"))))
+                   (msg (if status (dds.durability:durability-config-status-message status) "")))
               (and (search "--dir" msg) (search "file" msg)))
-            "the missing-dir error names --dir (and the backend)")
+            "the missing-dir status names --dir (and the backend)")
     ;; microservice does NOT require --dir — its durable records are REMOTE; the local dir is only the
     ;; client-side DARE epoch-dir (tmp-default). The asymmetry is intentional.
     (%check :bsel-ms-nodir-ok
             (not (cfg-err (list "--backend" "microservice" "--ms-port" "5555")))
             "--backend microservice WITHOUT --dir does NOT error (client-local DARE dir defaults; durable data is remote)")
     (%check :bsel-bad-safety0
-            (eq :err (handler-case
-                         (locally (declare (optimize (safety 0)))
-                           (dds.durability:parse-durability-config :argv (list "--backend" "bogus") :env '()))
-                       (dds.durability:durability-config-error () :err)))
-            "bad --backend signals even at (safety 0) — explicit manual check")
+            (locally (declare (optimize (safety 0)))
+              (typep (nth-value 3 (dds.durability:parse-durability-config :argv (list "--backend" "bogus") :env '()))
+                     'dds.durability:durability-config-status))
+            "bad --backend RETURNS a status even at (safety 0) — explicit manual check")
     ;; (6) USAGE documents BOTH roles
     (let ((u (dds.durability:durability-usage)))
       (%check :bsel-usage-values (search "file | sqlite | microservice" u) "usage documents the service backend values")
