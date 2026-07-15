@@ -85,7 +85,8 @@
 ;;; --- installer (mirror %INSTALL-AUTH-MANAGER) ---
 
 (defun* %install-access-control (p access-handle)
-    (function (domain-participant dds.security:access-handle) domain-participant)
+    (function (domain-participant dds.security:access-handle)
+              (values (or null domain-participant) (or null keyword)))
   "Store ACCESS-HANDLE (the participant's validated §8.4 Governance + shared Permissions, owning the
    Permissions-CA X509_STORE*) in P's DP-ACCESS-STATE and install %PARTICIPANT-PERMISSIONS-GATE on P's
    disc-node PERMISSIONS-GATE hook (composed after the Slice-2 auth-gate). Installed ONLY for an
@@ -94,17 +95,19 @@
    path). When governance protects discovery, also install the secure-SEDP routing predicate + the
    EFFECTIVE base protection kind (SECURE-SEDP-PROTECTION-KIND) so the announce HONORS the
    discovery_protection_kind directive (SIGN vs ENCRYPT). DELETE-PARTICIPANT frees the held access-handle.
-   FAIL-CLOSED REJECTS (a clear error, BEFORE any state is installed) a governance whose topic_rule sets
-   data_protection AND metadata_protection to DIFFERENT non-NONE kinds on the same user endpoint — the single-km
-   downgrade combo (§9.5.2, ADR-0040); same-kind and any-NONE combos are accepted unchanged. Returns P."
+   FAIL-CLOSED REJECTS (BEFORE any state is installed) a governance whose topic_rule sets data_protection
+   AND metadata_protection to DIFFERENT non-NONE kinds on the same user endpoint — the single-km downgrade
+   combo (§9.5.2, ADR-0040); same-kind and any-NONE combos are accepted unchanged.
+
+   Returns (values P NIL) on success, or (values NIL :MIXED-KIND-GOVERNANCE) on the fail-closed reject —
+   RETURNED, never signalled (ADR 0064). No state is installed before the check, so a rejected governance
+   leaves P untouched; create-participant maps the status to a ReturnCode and (via its unwind-protect) frees
+   the access-handle, exactly as it did when this signalled."
   ;; §9.5.2 single-km fail-closed (ADR-0040): a topic_rule with data AND metadata protection at DIFFERENT non-NONE kinds is unrepresentable by one EntityCrypto key (the payload kind wins -> the metadata tier is DOWNGRADED); reject at install, never silently collapse to one km
   (let* ((gov (dds.security:access-handle-governance access-handle))
          (bad (and gov (dds.security:governance-mixed-nonnone-kind-conflict gov))))
     (when bad
-      (error "%install-access-control: topic_rule ~s sets data_protection=~a and metadata_protection=~a — different non-NONE kinds are unrepresentable by one user-endpoint EntityCrypto key (§9.5.2); the payload kind would win and DOWNGRADE the metadata/submessage tier. Use the same kind for both tiers, or NONE for one (ADR-0040)."
-             (dds.security:topic-rule-topic-expr bad)
-             (dds.security:topic-rule-data-protection-kind bad)
-             (dds.security:topic-rule-metadata-protection-kind bad))))
+      (bail :mixed-kind-governance)))
   (setf (dp-access-state p) access-handle)
   (setf (dds.disc:disc-node-permissions-gate (dp-node p))
         (lambda (node remote local) (%participant-permissions-gate p node remote local)))
@@ -192,4 +195,4 @@
     (when gov
       (setf (dds.disc:disc-node-crypto-keying-required-p (dp-node p))
             (dds.security:governance-any-protection-p gov))))
-  p)
+  (values p nil))

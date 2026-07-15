@@ -779,7 +779,9 @@
             ;; pass the configured signed Permissions octets so the handshake emits c.perm (§9.3.2.1, T6)
             (%install-auth-manager p identity permissions))
           (when access-handle      ; DDS-Security §8.4 AccessControl manager — validated above, install the gate
-            (%install-access-control p access-handle))
+            ;; A mixed-kind governance is a FAIL-CLOSED reject: create-participant returns (values NIL status)
+            ;; and the unwind-protect below frees the access-handle (installed is still NIL). ADR 0064.
+            (try (%install-access-control p access-handle)))
           (dds.disc:start-node node)
           (setf (dp-autonomous-p p) autonomous)   ; WP-DCPS-API-COMPLETION S7: autonomous discovery mode
           (%apply-discovery-cadence p)   ; S7: push the DISCOVERY_CONFIG announced leaseDuration onto the node BEFORE the first announce

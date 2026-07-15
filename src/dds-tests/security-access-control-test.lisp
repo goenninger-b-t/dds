@@ -1261,25 +1261,24 @@
             "data=NONE + metadata=ENCRYPT (a NONE tier) must NOT be flagged")
     (%check :mk-none-none-ok       (null (dds.security:governance-mixed-nonnone-kind-conflict (mk :none :none)))
             "data=NONE + metadata=NONE must NOT be flagged")
-    ;; (b) %install-access-control: FAIL-CLOSED REJECT (signal) on a mixed-kind governance; ACCEPT a same-kind one
+    ;; (b) %install-access-control: FAIL-CLOSED REJECT on a mixed-kind governance; ACCEPT a same-kind one.
+    ;; ADR 0064: the reject is now a RETURNED STATUS (:mixed-kind-governance), not a signal — assert the
+    ;; exact status keyword, which is strictly stronger than the old "some error was signalled".
     (let ((p (dds.dcps:create-participant :domain (test-domain +td-collect+))))
       (unwind-protect
            (progn
              (setf (dds.dcps::dp-auth-state p)
                    (dds.dcps::%make-auth-manager-state :identity (dds.security::%make-identity-handle)))
              (%check :mk-install-rejects-mixed
-                     (handler-case
-                         (progn (dds.dcps::%install-access-control
-                                 p (dds.security:make-access-handle :governance (mk :sign :encrypt)))
-                                nil)
-                       (error () t))
-                     "%install-access-control must SIGNAL on data=SIGN + metadata=ENCRYPT (fail-closed, no silent single-km collapse)")
+                     (eq :mixed-kind-governance
+                         (nth-value 1 (dds.dcps::%install-access-control
+                                       p (dds.security:make-access-handle :governance (mk :sign :encrypt)))))
+                     "%install-access-control must RETURN :mixed-kind-governance on data=SIGN + metadata=ENCRYPT (fail-closed, no silent single-km collapse)")
              (%check :mk-install-accepts-samekind
-                     (handler-case
-                         (progn (dds.dcps::%install-access-control
-                                 p (dds.security:make-access-handle :governance (mk :encrypt :encrypt)))
-                                t)
-                       (error () nil))
+                     (multiple-value-bind (ip status)
+                         (dds.dcps::%install-access-control
+                          p (dds.security:make-access-handle :governance (mk :encrypt :encrypt)))
+                       (and ip (null status)))
                      "%install-access-control must ACCEPT a same-kind (data=ENCRYPT + metadata=ENCRYPT) governance (no false-REJECT)"))
         (dds.dcps:delete-participant p))))
   t)
