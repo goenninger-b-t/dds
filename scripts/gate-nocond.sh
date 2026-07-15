@@ -81,6 +81,7 @@ scan() {
   awk -v pat="$SIGNAL_RE" -v marker="$MARKER" '
     { l[NR]=$0 }
     END { for (i=1;i<=NR;i++) {
+            if (l[i] ~ /^[ \t]*;/) continue
             if (l[i] ~ pat) {
               if (l[i] ~ marker) continue
               if (i>1 && l[i-1] ~ marker) continue
@@ -156,7 +157,11 @@ count_file() {
     }
     { exempt = index($0, macro) || (NR > 1 && index(last, macro)) \
              || index($0, testm) || (NR > 1 && index(last, testm))
-      if (!intest && $0 ~ pat && !exempt) n++
+      # a FULL-COMMENT line (first non-blank char is ;) is not code — a (error ...) MENTIONED in prose is
+      # not a signalling form. Only whole-comment lines are skipped; a trailing ; after real code is not,
+      # because a signalling token at start-of-form there would be real debt.
+      iscomment = ($0 ~ /^[ \t]*;/)
+      if (!intest && !iscomment && $0 ~ pat && !exempt) n++
       last = $0 }
     END { print n+0 }' "$1"
 }
@@ -180,6 +185,7 @@ cat > "$tmp/count-canary.lisp" <<'EOF'
 (defun* crash-simulator ()
   (when *debug-fault*   ; NOCOND(TEST): inert in production; the UNWIND is the mechanism under test
     (error "simulated crash")))
+;;; A prose mention of (error ...) on a full-comment line must NOT be counted.
 EOF
 cn="$(count_file "$tmp/count-canary.lisp")"
 if [[ "$cn" -ne 1 ]]; then
