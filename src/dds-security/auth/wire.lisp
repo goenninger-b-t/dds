@@ -57,96 +57,115 @@
                    binary-props))))
 
 ;;; --- CDR-LE parse primitives for the DataHolder / envelope parse path ---
-;;; All return (values result new-pos) or signal a simple-error on any malformed input.
-;;; The public API catches (error ...) via handler-bind so all failures are fail-closed.
-
-(defmacro %dh-fail ()
-  "Signal a simple-error (fail-closed parse abort); caught by handler-bind in public API."
-  `(error "dataholder-parse-error"))
+;;; Each returns (values result new-pos status): STATUS is NIL on success, or :DH-PARSE-ERROR on any
+;;; malformed / truncated / over-declared input. It is a STATUS VALUE, not a signalled condition (ADR 0064).
+;;; This used to be a %DH-FAIL macro that expanded (error "dataholder-parse-error") into every reader — the
+;;; exact "a macro must NEVER emit a condition into code that runs at execution time" pattern the owner
+;;; forbade — caught by handler-bind in the two public entrypoints. Now the readers RETURN the status, every
+;;; caller threads it, and the entrypoints turn it into their fail-closed tuple: nothing signals, nothing is
+;;; caught. Every length is bounds-checked BEFORE any aref (NFR-SEC-POSTURE), so no low-level condition
+;;; escapes either.
 
 (defun* %dh-read-u32-le (octets pos n)
     (function ((simple-array (unsigned-byte 8) (*)) fixnum fixnum)
-              (values (unsigned-byte 32) fixnum))
-  "Read u32-LE at POS in OCTETS (length N); advance POS by 4. Signals dataholder-parse-error on truncation."
-  (when (> (+ pos 4) n) (%dh-fail))
+              (values (or null (unsigned-byte 32)) fixnum (or null keyword)))
+  "Read u32-LE at POS in OCTETS (length N); advance POS by 4. (values u32 new-pos NIL), or
+   (values NIL pos :DH-PARSE-ERROR) on truncation."
+  (when (> (+ pos 4) n) (return-from %dh-read-u32-le (values nil pos :dh-parse-error)))
   (values (logior (aref octets pos)
                   (ash (aref octets (+ pos 1))  8)
                   (ash (aref octets (+ pos 2)) 16)
                   (ash (aref octets (+ pos 3)) 24))
-          (+ pos 4)))
+          (+ pos 4)
+          nil))
 
 (defun* %dh-read-string-le (octets pos n)
     (function ((simple-array (unsigned-byte 8) (*)) fixnum fixnum)
-              (values string fixnum))
-  "Read a CDR-LE string at POS (u32-LE(len+1) | ascii | NUL | pad4). Returns (values string new-pos).
-   Signals dataholder-parse-error on truncation or if len > 65536."
-  (multiple-value-bind (len p2) (%dh-read-u32-le octets pos n)
-    (when (> len 65536) (%dh-fail))
+              (values (or null string) fixnum (or null keyword)))
+  "Read a CDR-LE string at POS (u32-LE(len+1) | ascii | NUL | pad4). (values string new-pos NIL), or
+   (values NIL pos :DH-PARSE-ERROR) on truncation or if len > 65536."
+  (multiple-value-bind (len p2 status) (%dh-read-u32-le octets pos n)
+    (when status (return-from %dh-read-string-le (values nil p2 status)))
+    (when (> len 65536) (return-from %dh-read-string-le (values nil pos :dh-parse-error)))
     (let* ((pad   (mod (- 4 (mod len 4)) 4))
            (total (+ len pad)))
-      (when (> (+ p2 total) n) (%dh-fail))
+      (when (> (+ p2 total) n) (return-from %dh-read-string-le (values nil pos :dh-parse-error)))
       (let* ((str-len (max 0 (1- len)))
              (s       (make-string str-len)))
         (dotimes (i str-len)
           (setf (char s i) (code-char (aref octets (+ p2 i)))))
-        (values s (+ p2 total))))))
+        (values s (+ p2 total) nil)))))
 
 (defun* %dh-read-octet-seq-le (octets pos n)
     (function ((simple-array (unsigned-byte 8) (*)) fixnum fixnum)
-              (values (simple-array (unsigned-byte 8) (*)) fixnum))
-  "Read a CDR-LE §9.3.4 BinaryProperty octet sequence (u32-LE(len) | bytes | pad-to-4). Returns
-   (values bytes new-pos) with new-pos advanced PAST the 4-byte alignment padding (Fast DDS
-   readOctetVector aligns pos to (pos+3)&~3). Clamped to N so a missing trailing pad on the final
-   property never reads past the buffer. Signals dataholder-parse-error on truncation or len > 0x1000000."
-  (multiple-value-bind (len p2) (%dh-read-u32-le octets pos n)
-    (when (> len #x1000000) (%dh-fail))
-    (when (> (+ p2 len) n) (%dh-fail))
+              (values (or null (simple-array (unsigned-byte 8) (*))) fixnum (or null keyword)))
+  "Read a CDR-LE §9.3.4 BinaryProperty octet sequence (u32-LE(len) | bytes | pad-to-4). (values bytes
+   new-pos NIL) with new-pos advanced PAST the 4-byte alignment padding (Fast DDS readOctetVector aligns
+   pos to (pos+3)&~3; clamped to N so a missing trailing pad on the final property never reads past the
+   buffer), or (values NIL pos :DH-PARSE-ERROR) on truncation or len > 0x1000000."
+  (multiple-value-bind (len p2 status) (%dh-read-u32-le octets pos n)
+    (when status (return-from %dh-read-octet-seq-le (values nil p2 status)))
+    (when (> len #x1000000) (return-from %dh-read-octet-seq-le (values nil pos :dh-parse-error)))
+    (when (> (+ p2 len) n) (return-from %dh-read-octet-seq-le (values nil pos :dh-parse-error)))
     (let ((v   (make-array len :element-type '(unsigned-byte 8)))
           (end (logand (+ p2 len 3) (lognot 3))))
       (dotimes (i len) (setf (aref v i) (aref octets (+ p2 i))))
-      (values v (min end n)))))
+      (values v (min end n) nil))))
 
 (defun* %dh-skip-string-le (octets pos n)
     (function ((simple-array (unsigned-byte 8) (*)) fixnum fixnum)
-              fixnum)
-  "Advance POS past a CDR-LE string. Signals dataholder-parse-error on truncation."
-  (multiple-value-bind (_ p2) (%dh-read-string-le octets pos n)
-    (declare (ignore _))
-    p2))
+              (values fixnum (or null keyword)))
+  "Advance POS past a CDR-LE string. (values new-pos NIL), or (values pos :DH-PARSE-ERROR) on truncation."
+  (multiple-value-bind (s p2 status) (%dh-read-string-le octets pos n)
+    (declare (ignore s))
+    (values p2 status)))
 
 (defun* %dh-skip-octet-seq-le (octets pos n)
     (function ((simple-array (unsigned-byte 8) (*)) fixnum fixnum)
-              fixnum)
-  "Advance POS past a CDR-LE octet sequence. Signals dataholder-parse-error on truncation."
-  (multiple-value-bind (_ p2) (%dh-read-octet-seq-le octets pos n)
-    (declare (ignore _))
-    p2))
+              (values fixnum (or null keyword)))
+  "Advance POS past a CDR-LE octet sequence. (values new-pos NIL), or (values pos :DH-PARSE-ERROR)."
+  (multiple-value-bind (v p2 status) (%dh-read-octet-seq-le octets pos n)
+    (declare (ignore v))
+    (values p2 status)))
 
 ;;; --- DataHolder extent scanner: determines the byte-length of one DataHolder without fully
 ;;;     deserialising it. Used by parse-generic-message to slice DataHolder blobs from the envelope. ---
 
 (defun* %dh-scan-extent (octets pos n)
     (function ((simple-array (unsigned-byte 8) (*)) fixnum fixnum)
-              fixnum)
-  "Return the new POS after consuming one complete CDR-LE DataHolder starting at POS.
-   Signals dataholder-parse-error on any malformed/truncated structure."
+              (values fixnum (or null keyword)))
+  "Return (values new-pos NIL) after consuming one complete CDR-LE DataHolder starting at POS, or
+   (values pos :DH-PARSE-ERROR) on any malformed/truncated structure. The dotimes walks CHECK the skip
+   status each iteration and return early — a plain dotimes cannot, so this is where the thread is visible."
   ;; class_id string
-  (setf pos (%dh-skip-string-le octets pos n))
+  (multiple-value-bind (p0 s0) (%dh-skip-string-le octets pos n)
+    (when s0 (return-from %dh-scan-extent (values pos s0)))
+    (setf pos p0))
   ;; PropertySeq: u32-LE count + count*(name-str + value-str)  -- name+value ONLY, no propagate (T1)
-  (multiple-value-bind (pc p2) (%dh-read-u32-le octets pos n)
-    (when (> pc 65536) (%dh-fail))
+  (multiple-value-bind (pc p2 status) (%dh-read-u32-le octets pos n)
+    (when status (return-from %dh-scan-extent (values pos status)))
+    (when (> pc 65536) (return-from %dh-scan-extent (values pos :dh-parse-error)))
     (setf pos p2)
     (dotimes (_ pc)
-      (setf pos (%dh-skip-string-le octets pos n))    ; name
-      (setf pos (%dh-skip-string-le octets pos n)))   ; value
+      (multiple-value-bind (pn sn) (%dh-skip-string-le octets pos n)    ; name
+        (when sn (return-from %dh-scan-extent (values pos sn)))
+        (setf pos pn))
+      (multiple-value-bind (pv sv) (%dh-skip-string-le octets pos n)    ; value
+        (when sv (return-from %dh-scan-extent (values pos sv)))
+        (setf pos pv)))
     ;; BinaryPropertySeq: u32-LE count + count*(name-str + octet-seq)  -- name+value ONLY, no propagate (T1)
-    (multiple-value-bind (bc p3) (%dh-read-u32-le octets pos n)
-      (when (> bc 65536) (%dh-fail))
+    (multiple-value-bind (bc p3 status2) (%dh-read-u32-le octets pos n)
+      (when status2 (return-from %dh-scan-extent (values pos status2)))
+      (when (> bc 65536) (return-from %dh-scan-extent (values pos :dh-parse-error)))
       (setf pos p3)
       (dotimes (_ bc)
-        (setf pos (%dh-skip-string-le  octets pos n))    ; name
-        (setf pos (%dh-skip-octet-seq-le octets pos n)))  ; value
-      pos)))
+        (multiple-value-bind (pn sn) (%dh-skip-string-le  octets pos n)    ; name
+          (when sn (return-from %dh-scan-extent (values pos sn)))
+          (setf pos pn))
+        (multiple-value-bind (pv sv) (%dh-skip-octet-seq-le octets pos n)  ; value
+          (when sv (return-from %dh-scan-extent (values pos sv)))
+          (setf pos pv)))
+      (values pos nil))))
 
 ;;; --- Public DataHolder codec ---
 
@@ -163,33 +182,39 @@
   "Parse CDR-LE DataHolder octets (§9.3.4) back to a handshake-token (§9.3.2). Fail-closed.
    Bounds-checks every length. Returns NIL on any malformed/truncated/over-declared input.
    Caps: seq count <= 65536; string len <= 65536; value len <= 0x1000000."
+  ;; ADR 0064: the readers RETURN :dh-parse-error; check it after each and return NIL (fail-closed) — no
+  ;; handler-bind, no signal. `bad` names the single fail-closed exit, so the thread reads as one word.
   (block %dh-parse-token
-    (handler-bind
-        ((error (lambda (c) (declare (ignore c)) (return-from %dh-parse-token nil))))
+    (macrolet ((bad () '(return-from %dh-parse-token nil)))
       (let ((n   (length octets))
             (pos 0))
         ;; class_id — all §9.3.2 HandshakeMessageToken class_ids are non-empty
-        (multiple-value-bind (class-id p2) (%dh-read-string-le octets pos n)
-          (when (zerop (length class-id)) (%dh-fail))
+        (multiple-value-bind (class-id p2 status) (%dh-read-string-le octets pos n)
+          (when status (bad))
+          (when (zerop (length class-id)) (bad))
           (setf pos p2)
           ;; PropertySeq (skip entries — HST has count=0 but we tolerate non-zero for parsing)
-          (multiple-value-bind (pc p3) (%dh-read-u32-le octets pos n)
-            (when (> pc 65536) (%dh-fail))
+          (multiple-value-bind (pc p3 status2) (%dh-read-u32-le octets pos n)
+            (when status2 (bad))
+            (when (> pc 65536) (bad))
             (setf pos p3)
             (dotimes (_ pc)
-              (setf pos (%dh-skip-string-le octets pos n))    ; name
-              (setf pos (%dh-skip-string-le octets pos n)))   ; value (no propagate on the wire, T1)
+              (multiple-value-bind (pn sn) (%dh-skip-string-le octets pos n) (when sn (bad)) (setf pos pn))  ; name
+              (multiple-value-bind (pv sv) (%dh-skip-string-le octets pos n) (when sv (bad)) (setf pos pv))) ; value (no propagate on the wire, T1)
             ;; BinaryPropertySeq
-            (multiple-value-bind (bc p4) (%dh-read-u32-le octets pos n)
-              (when (> bc 65536) (%dh-fail))
+            (multiple-value-bind (bc p4 status3) (%dh-read-u32-le octets pos n)
+              (when status3 (bad))
+              (when (> bc 65536) (bad))
               (setf pos p4)
               (let ((props nil))
                 (dotimes (_ bc)
                   ;; name
-                  (multiple-value-bind (name p5) (%dh-read-string-le octets pos n)
+                  (multiple-value-bind (name p5 sn) (%dh-read-string-le octets pos n)
+                    (when sn (bad))
                     (setf pos p5)
                     ;; value (octet sequence); §9.3.4 BinaryProperty = name+value ONLY, no propagate (T1)
-                    (multiple-value-bind (val p6) (%dh-read-octet-seq-le octets pos n)
+                    (multiple-value-bind (val p6 sv) (%dh-read-octet-seq-le octets pos n)
+                      (when sv (bad))
                       (setf pos p6)
                       (push (cons name val) props))))
                 (%make-handshake-token :class-id class-id
@@ -283,20 +308,20 @@
                    source-endpoint-guid message-class-id dataholder-octets-list) on success.
    Returns (values NIL 0 NIL 0 NIL NIL NIL NIL NIL) on any malformed/truncated/over-declared input.
    Caps: DataHolderSeq count <= 65536. Each DataHolder blob is sliced as raw CDR-LE octets."
+  ;; ADR 0064: no handler-bind. The fixed-size GUID/SN reads bounds-check locally (`bad` = the fail-closed
+  ;; tuple); the DataHolder reads/scan RETURN :dh-parse-error and are checked after each call.
   (block %pgm-parse
-    (handler-bind
-        ((error (lambda (c) (declare (ignore c))
-                  (return-from %pgm-parse (values nil 0 nil 0 nil nil nil nil nil)))))
+    (macrolet ((bad () '(return-from %pgm-parse (values nil 0 nil 0 nil nil nil nil nil))))
       (let ((n   (length octets))
             (pos 0))
         (flet ((read-guid ()
-                 (when (> (+ pos 16) n) (%dh-fail))
+                 (when (> (+ pos 16) n) (bad))
                  (let ((g (make-array 16 :element-type '(unsigned-byte 8))))
                    (dotimes (i 16) (setf (aref g i) (aref octets (+ pos i))))
                    (setf pos (+ pos 16))
                    g))
                (read-sn64 ()
-                 (when (> (+ pos 8) n) (%dh-fail))
+                 (when (> (+ pos 8) n) (bad))
                  (let ((v 0))
                    (dotimes (i 8)
                      (setf v (logior v (ash (aref octets (+ pos i)) (* 8 i)))))
@@ -310,16 +335,20 @@
                  (dest-ep   (read-guid))
                  (src-ep    (read-guid)))
             ;; message_class_id (CDR-LE string)
-            (multiple-value-bind (class-id p2) (%dh-read-string-le octets pos n)
+            (multiple-value-bind (class-id p2 status) (%dh-read-string-le octets pos n)
+              (when status (bad))
               (setf pos p2)
               ;; message_data DataHolderSeq
-              (multiple-value-bind (dh-count p3) (%dh-read-u32-le octets pos n)
-                (when (> dh-count 65536) (%dh-fail))
+              (multiple-value-bind (dh-count p3 status2) (%dh-read-u32-le octets pos n)
+                (when status2 (bad))
+                (when (> dh-count 65536) (bad))
                 (setf pos p3)
                 (let ((dh-list nil))
                   (dotimes (_ dh-count)
                     (let ((start pos))
-                      (setf pos (%dh-scan-extent octets pos n))
+                      (multiple-value-bind (pe se) (%dh-scan-extent octets pos n)
+                        (when se (bad))
+                        (setf pos pe))
                       (let* ((dh-len  (- pos start))
                              (dh-blob (make-array dh-len :element-type '(unsigned-byte 8))))
                         (replace dh-blob octets :start2 start :end2 pos)
