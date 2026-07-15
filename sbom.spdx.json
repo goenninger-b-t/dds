@@ -3,7 +3,7 @@
   "@graph": [
     {
       "@id": "_:creationinfo",
-      "created": "2026-07-14T18:41:56Z",
+      "created": "2026-07-15T07:29:58Z",
       "createdBy": [
         "https://github.com/goenninger-b-t/dds/sbom#agent/goenninger-b-t"
       ],
@@ -102,8 +102,8 @@
       "software_declaredLicense": "https://github.com/goenninger-b-t/dds/sbom#license/CC-BY-ND-4.0",
       "software_downloadLocation": "https://github.com/goenninger-b-t/dds",
       "software_homePage": "https://github.com/goenninger-b-t/dds",
-      "software_packageUrl": "pkg:github/goenninger-b-t/dds@5a9164b",
-      "software_packageVersion": "0.0.0-dev+git.5a9164b",
+      "software_packageUrl": "pkg:github/goenninger-b-t/dds@2f7ec82",
+      "software_packageVersion": "0.0.0-dev+git.2f7ec82",
       "software_primaryPurpose": "library",
       "spdxId": "https://github.com/goenninger-b-t/dds/sbom#package/common-lisp-dds",
       "suppliedBy": "https://github.com/goenninger-b-t/dds/sbom#agent/goenninger-b-t",

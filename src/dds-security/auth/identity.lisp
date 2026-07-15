@@ -273,12 +273,17 @@
    IdentityToken — as advertised by live RTI Connext 7.3.1: class_id only, zero properties — returns
    all-NIL values with WELL-FORMED-P T). On malformed/truncated input returns all-NIL + WELL-FORMED-P NIL.
    Bounds-checks every length before trusting wire data (NFR-SEC-POSTURE; fail-closed)."
-  (handler-case
+  ;; NO handler-case (ADR 0064): the four length checks below were `error`s CAUGHT BY THIS FUNCTION'S OWN
+  ;; handler and turned into all-NIL + well-formed-p NIL. That is a local early-exit, so it is now a
+  ;; RETURN-FROM to the function's block — same result (a malformed/truncated token yields WELL-FORMED-P
+  ;; NIL, fail-closed), no signal raised, no catch. The bounds are checked BEFORE every aref (NFR-SEC-
+  ;; POSTURE), so no low-level condition can escape either.
+  (macrolet ((bad () '(return-from %parse-remote-token-strings (values nil nil nil nil nil))))
       (let ((n (length token-octets))
             (pos 0))
         ;; labels (not flet) so read-cdr-string can call read-u32
         (labels ((read-u32 ()
-                   (when (> (+ pos 4) n) (error "truncated"))
+                   (when (> (+ pos 4) n) (bad))
                    (let ((v (logior (aref token-octets pos)
                                     (ash (aref token-octets (+ pos 1))  8)
                                     (ash (aref token-octets (+ pos 2)) 16)
@@ -289,8 +294,8 @@
                    ;; uint32-LE(len) || bytes(len including NUL) || pad-to-4
                    (let* ((len (read-u32))
                           (pad (mod (- 4 (mod len 4)) 4)))
-                     (when (> len 65536) (error "string too long"))
-                     (when (> (+ pos len pad) n) (error "truncated string"))
+                     (when (> len 65536) (bad))
+                     (when (> (+ pos len pad) n) (bad))
                      (let* ((str-len (max 0 (1- len)))
                             (s (make-string str-len)))
                        (dotimes (i str-len)
@@ -306,7 +311,7 @@
           (read-cdr-string)
           ;; read property count
           (let ((count (read-u32)))
-            (when (> count 256) (error "too many properties"))
+            (when (> count 256) (bad))
             ;; read up to 4 properties; extract by name
             (let ((cert-sn nil) (cert-algo nil) (ca-sn nil) (ca-algo nil))
               (dotimes (i count)
@@ -316,8 +321,7 @@
                         ((string= name +id-token-prop-ca-sn+)     (setf ca-sn     value))
                         ((string= name +id-token-prop-ca-algo+)   (setf ca-algo   value)))))
               ;; parsed cleanly -> well-formed T (values may be NIL for a §9.3.2.1 empty token)
-              (values cert-sn cert-algo ca-sn ca-algo t)))))
-    (error () (values nil nil nil nil nil))))
+              (values cert-sn cert-algo ca-sn ca-algo t)))))))
 
 (defun* validate-remote-identity (local remote-identity-token)
     (function (identity-handle (simple-array (unsigned-byte 8) (*)))
