@@ -263,7 +263,8 @@
                (rsm-off (+ tag-off +common-mac-len+))                     ; rsm_count @ 36+align4(N)
                (total   (+ rsm-off +receiver-specific-macs-count-len+)))  ; 40+align4(N), a multiple of 4
           ;; §9.5.3.3.4.3 GMAC/!encrypt: SecuredPayload = header(20)‖plaintext(N)‖4-align pad‖common_mac(16)‖rsm_count(4); the pad rides INSIDE the GMAC'd body (Fast DDS/Connext-compatible) so the SecuredPayload is 4-aligned — a non-4-aligned inner DATA submessage makes a conformant peer's secure-RTPS submessage walk fail to find SRTPS_POSTFIX (observed live, WP-SECURITY-DATA-SIGN-LIVE-CONNEXT); the trailing pad is authenticated + ignored by the receiver's CDR deserializer
-          (unless (<= total (length vec))
+          ;; O(1) output-extent check; caller sizes OUT-BUF via serialized-secured-payload-length (>= total).
+          (unless (<= total (length vec))   ; NOCOND(GUARD): cannot fire on valid input — defense-in-depth vs an internal sizing bug, contained at the encode caller (NFR-SEC-POSTURE)
             (error 'dds.core.buffer:buffer-overflow :need total :have (length vec)))
           (%put-crypto-header-into km vec)
           ;; visible plaintext VERBATIM as the CryptoContent, then the 4-align pad zeroed (Fast DDS serialize_SecureDataBody !do_encryption)
@@ -282,8 +283,8 @@
                (pad     (mod (- n) 4))                                             ; §9.5.3.3.3 SecureDataTag 4-align pad
                (rsm-off (+ tag-off +common-mac-len+ pad))                          ; rsm_count @ 40+N+pad
                (total   (+ rsm-off +receiver-specific-macs-count-len+)))           ; 44+N+pad
-          ;; O(1) output-extent bound BEFORE any write (safety-0-safe; replaces the cursor check-room) — NFR-SEC-POSTURE
-          (unless (<= total (length vec))
+          ;; O(1) output-extent bound BEFORE any write (safety-0-safe); caller sizes OUT-BUF via serialized-secured-payload-length (>= total).
+          (unless (<= total (length vec))   ; NOCOND(GUARD): cannot fire on valid input — defense-in-depth, contained at the encode caller (NFR-SEC-POSTURE)
             (error 'dds.core.buffer:buffer-overflow :need total :have (length vec)))
           (%put-crypto-header-into km vec)
           ;; crypto_content length (uint32 BE, §9.5.3.3.4.4) — byte-identical to serialize-crypto-content's %put-u32-be

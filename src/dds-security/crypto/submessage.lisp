@@ -473,7 +473,8 @@
          (macs-bytes  (* count (+ +transformation-key-id-len+ +common-mac-len+)))
          (postfix-len (+ +common-mac-len+ +receiver-specific-macs-count-len+ macs-bytes))
          (total       (+ entries-loc macs-bytes)))
-    (unless (<= (+ out-off total) (length vec))
+    ;; O(1) output-extent check BEFORE any write (safety-0-safe); caller sizes OUT-BUF (the per-node submessage-scratch pool) to hold OUT-OFF + the bracket length.
+    (unless (<= (+ out-off total) (length vec))   ; NOCOND(GUARD): cannot fire on valid input; %maybe-wrap-user-submessages fail-closes / drops on overflow — defense-in-depth (NFR-SEC-POSTURE)
       (error 'dds.core.buffer:buffer-overflow :need (+ out-off total) :have (length vec)))
     ;; PREFIX submessage header ‖ CryptoHeader (kind ‖ key_id ‖ session_id ‖ iv_suffix), by raw offset
     (%put-sec-header-at vec out-off prefix-kind +secure-data-header-len+)

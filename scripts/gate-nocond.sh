@@ -76,6 +76,15 @@ MACRO_MARKER='NOCOND(MACRO)'
 # the ratchet tier. The bar is strict and is NOT "it is only used by tests": the form must be INERT IN
 # PRODUCTION (guarded by a debug special defaulting NIL) and the unwind must be the mechanism under test.
 TEST_MARKER='NOCOND(TEST)'
+# NOCOND(GUARD) — the THIRD exempt class (owner ruling 2026-07-15). Extends the hot-path tier's existing
+# GUARD justification (HOTPATH-COND(GUARD)) to the ratchet tier, with the SAME strict bar: a bounds /
+# security check that CANNOT fire on valid input AND is contained at a named boundary — defense-in-depth
+# for NFR-SEC-POSTURE. The canonical case: an O(1) output-extent check before a crypto/CDR write whose
+# caller has already sized the buffer exactly (the check can only fire on an internal sizing bug, and
+# then it fails closed at the encode caller / receiver boundary). The bar is NOT "it rarely fires": the
+# form must be UNREACHABLE on valid input. Each site is annotated + justified per-site, like GUARD on the
+# hot path.
+GUARD_MARKER='NOCOND(GUARD)'
 
 scan() {
   awk -v pat="$SIGNAL_RE" -v marker="$MARKER" '
@@ -148,7 +157,7 @@ count_file() {
   # NOTE: the marker is matched with INDEX (a literal substring), never as a regex — "NOCOND(MACRO)" read
   # as a regex is "NOCOND" followed by the GROUP "MACRO", i.e. it matches NOCONDMACRO and never the real
   # annotation. The self-test below caught exactly that; keep it literal.
-  awk -v pat="$SIGNAL_RE" -v macro="$MACRO_MARKER" -v testm="$TEST_MARKER" '
+  awk -v pat="$SIGNAL_RE" -v macro="$MACRO_MARKER" -v testm="$TEST_MARKER" -v guardm="$GUARD_MARKER" '
     /^\(defun\*?[ \t]+/ {
       # An in-file TEST function. The %-prefixed form (%run-secure-pm, ...) is the SAME thing as run-*:
       # a test whose ASSERT is its failure mechanism, not production control flow. The original pattern
@@ -156,7 +165,8 @@ count_file() {
       intest = ($2 ~ /-test$/ || $2 ~ /^%?run-/) ? 1 : 0
     }
     { exempt = index($0, macro) || (NR > 1 && index(last, macro)) \
-             || index($0, testm) || (NR > 1 && index(last, testm))
+             || index($0, testm) || (NR > 1 && index(last, testm)) \
+             || index($0, guardm) || (NR > 1 && index(last, guardm))
       # a FULL-COMMENT line (first non-blank char is ;) is not code — a (error ...) MENTIONED in prose is
       # not a signalling form. Only whole-comment lines are skipped; a trailing ; after real code is not,
       # because a signalling token at start-of-form there would be real debt.
@@ -185,13 +195,16 @@ cat > "$tmp/count-canary.lisp" <<'EOF'
 (defun* crash-simulator ()
   (when *debug-fault*   ; NOCOND(TEST): inert in production; the UNWIND is the mechanism under test
     (error "simulated crash")))
+(defun* bounds-guard ()
+  (unless (<= total cap)   ; NOCOND(GUARD): caller pre-sizes; cannot fire on valid input
+    (error 'buffer-overflow)))
 ;;; A prose mention of (error ...) on a full-comment line must NOT be counted.
 EOF
 cn="$(count_file "$tmp/count-canary.lisp")"
 if [[ "$cn" -ne 1 ]]; then
   echo "gate-nocond: FAIL — self-test: the ratchet counter must count EXACTLY the 1 unexempt form in the" >&2
-  echo "             canary (2 NOCOND(MACRO) + 1 NOCOND(TEST) skipped, 2 in-file-test asserts skipped" >&2
-  echo "             incl. the %run- form). Got ${cn}." >&2
+  echo "             canary (2 NOCOND(MACRO) + 1 NOCOND(TEST) + 1 NOCOND(GUARD) skipped, 2 in-file-test" >&2
+  echo "             asserts skipped incl. the %run- form). Got ${cn}." >&2
   echo "             Either the counter is blind or NOCOND(MACRO) is over-matching — a green ratchet" >&2
   echo "             would prove NOTHING." >&2
   exit 1
