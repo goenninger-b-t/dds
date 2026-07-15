@@ -51,7 +51,7 @@
                    (>= (dds.disc:disc-node-matched-count b) min-matches))
         do (sleep 0.01))
   (unless (and (>= (dds.disc:disc-node-matched-count a) min-matches)
-               (>= (dds.disc:disc-node-matched-count b) min-matches))
+               (>= (dds.disc:disc-node-matched-count b) min-matches))   ; NOCOND(BENCH): pure perf-harness precondition — the bench's own failure mechanism, not DDS runtime control flow
     (error "perftest: nodes failed to match (a=~d b=~d, need ~d)"
            (dds.disc:disc-node-matched-count a) (dds.disc:disc-node-matched-count b) min-matches))
   t)
@@ -97,7 +97,7 @@
    advanced past 0) — so the bench PROVES it measured SHMEM, not a silent UDP fallback (FR-LANG-7). A no-op
    on :udp. Signals an error naming LABEL otherwise (e.g. *shmem-enabled* NIL, or the platform SHMEM gate)."
   (when (%shmem-transport-p transport)
-    (assert (plusp (dds.disc::disc-node-shmem-sends node)) ()
+    (assert (plusp (dds.disc::disc-node-shmem-sends node)) ()   ; NOCOND(BENCH): perf-harness invariant — the SHMEM bench asserts its transport engaged
             "WP-SHMEM bench: ~a routed 0 datagrams over SHMEM (shmem-sends=0) — SHMEM did not engage"
             label))
   t)
@@ -111,7 +111,7 @@
    naming LABEL otherwise (e.g. *zerocopy-enabled* NIL or the SHMEM gate suppressed ZC for a large sample)."
   (when (and (%zerocopy-transport-p transport)
              (> payload-bytes dds.disc:*zerocopy-min-payload-bytes*))
-    (assert (plusp (dds.disc::disc-node-zc-sends node)) ()
+    (assert (plusp (dds.disc::disc-node-zc-sends node)) ()   ; NOCOND(BENCH): perf-harness invariant — the ZC bench asserts its transport engaged
             "WP-ZEROCOPY bench: ~a published 0 zero-copy references (zc-sends=0) — ZC did not engage" label))
   t)
 

@@ -38,7 +38,7 @@
   "Handle for a derived DDS-Security §9.5.3 KxKey or KxSalt (32-byte AES-256 key).
    Bytes are held in a dds.pal foreign-backed buffer (non-GC'd, stable address).
    MUST be freed via FREE-KX-KEY when no longer needed."
-  (bytes (error "kx-key-handle: :bytes is required (must be a dds.pal foreign buffer)")
+  (bytes (error 'contract-violation :detail "kx-key-handle: :bytes is required (a dds.pal foreign buffer)")   ; NOCOND(CONTRACT): required-initarg poison default
          :type (simple-array (unsigned-byte 8) (32))))
 
 ;;; --- internal KDF step ---

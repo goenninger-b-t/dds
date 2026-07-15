@@ -1,8 +1,23 @@
 # ADR 0064 — No Lisp conditions in our code: thread `(values result status)`
 
-- **Status:** **ACCEPTED — IN PROGRESS.** Slices 1 (PAL network/SHMEM + consumers), 2 (content-filter /
-  query grammar), 3a (TypeLookup serializers) and 3b (the type-compiler DSL) are landed. **280** production
-  signalling forms remain, ratcheted to zero by `make gate-nocond`.
+- **Status:** **ACCEPTED — IN PROGRESS.** Landed: PAL network/SHMEM, content-filter grammar, TypeLookup
+  serializers, the type-compiler DSL, the Clasp PAL, the IdentityToken + DataHolder parsers, mixed-kind
+  governance, arena exhaustion, and the FIVE exempt classes (below). **220** production signalling forms
+  remain, ratcheted to zero by `make gate-nocond`.
+
+### The five sanctioned exempt classes (each gate-falsified in the canary; a class is documentation for the reader — the reviewer/owner validates the choice)
+
+| class | ruling | what it justifies |
+|---|---|---|
+| `NOCOND(MACRO)` | 2026-07-14 | a form reached ONLY at macroexpansion (fails the build) |
+| `NOCOND(TEST)` | 2026-07-14 | a crash simulator armed by a debug special defaulting NIL, where the UNWIND is the mechanism under test |
+| `NOCOND(GUARD)` | 2026-07-15 | a bounds/security check that CANNOT fire on valid input AND is contained at a named boundary (defense-in-depth) |
+| `NOCOND(CONTRACT)` | 2026-07-15 | a developer-contract poison value: a `defstruct` slot default signalling `dds.lang:contract-violation` when a REQUIRED initarg is omitted, or an unpopulated vtable-slot lambda invoked — fires only on wrong construction/use, a bug caught first test |
+| `NOCOND(BENCH)` | 2026-07-15 | a pure performance-benchmark-harness assertion (`src/dds-bench/`) — the bench's own failure mechanism, like a test assert; `dds-bench` IS our code (not wholesale-excluded like `dds-tests`) but is measurement scaffolding, not the DDS runtime |
+
+The gate matches the sanctioned five via one regex (`NOCOND[(](MACRO|TEST|GUARD|CONTRACT|BENCH)[)]`, literal
+parens via bracket expressions to dodge awk's `-v` backslash-eating); an **unsanctioned `NOCOND(FOO)` is
+NOT exempt** (the canary proves it still counts), so nobody invents a class the owner never ruled on.
 - **Date:** 2026-07-14
 - **Requirements:** FR-LANG-8 (full type contracts), NFR-SEC-POSTURE (a network-facing failure must not
   unwind a receiver thread), the operating contract §4 / §10

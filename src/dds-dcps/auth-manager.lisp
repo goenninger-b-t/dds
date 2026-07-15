@@ -46,7 +46,7 @@
    participant's stateless writer — ONE per-participant counter shared across the AuthRequestMessageToken + all
    handshake tokens (was hardcoded 0, a §7.4.3.3 violation that made a strict RTI Connext stateless reader dedup
    our retransmits). Bumped under LOCK via %am-next-psm-seq; first emitted value is 1 (OpenDDS stateless_sequence_number_)."
-  (identity (error "auth-manager-state: :identity is required (the local identity-handle)")
+  (identity (error 'contract-violation :detail "auth-manager-state: :identity is required (the local identity-handle)")   ; NOCOND(CONTRACT): required-initarg poison default
             :type dds.security:identity-handle)
   (lock (dds.pal:make-lock "auth-manager") :type t)
   (crypto-manager nil :type t)

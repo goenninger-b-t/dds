@@ -12,9 +12,23 @@
    "Language tools (L-1): DEFUN* / DEFSTRUCT* — definition forms that make the full type
     contract (FR-LANG-8) and the mandatory docstring (§5.1) structural rather than a
     convention checked after the fact. Used to define every function and struct in the stack.")
-  (:export #:defun* #:defstruct* #:plusp-length #:try #:bail))
+  (:export #:defun* #:defstruct* #:plusp-length #:try #:bail
+           #:contract-violation #:contract-violation-detail))
 
 (in-package #:net.goenninger.dds.lang)
+
+(define-condition contract-violation (error)
+  ((detail :initarg :detail :initform "" :reader contract-violation-detail))
+  (:report (lambda (c s) (format s "dds contract violation: ~a" (contract-violation-detail c))))
+  (:documentation
+   "A DEVELOPER-CONTRACT violation: a struct constructed without a REQUIRED initarg (the slot's poison
+    DEFAULT signals this), or a placeholder vtable-slot lambda invoked before it was populated. It fires
+    ONLY on wrong construction / wrong use — a programming error caught in the first test run — NEVER on
+    runtime data, so it is not the data-dependent control flow the no-conditions rule (ADR 0064) targets;
+    in correct code the initarg is always supplied and the slot always overridden, so it is UNREACHABLE.
+    Owner-blessed (2026-07-15) as an intentional, exempt category (gate: NOCOND(CONTRACT)) — a proper
+    typed condition class for these poison defaults rather than a bare `(error \"string\")`. DETAIL names
+    the specific slot/argument for the backtrace if a bug ever trips it."))
 
 (declaim (ftype (function (t) t) plusp-length))
 (defun plusp-length (x)

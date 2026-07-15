@@ -263,7 +263,7 @@
                 (sample (make-perf-data :id 1 :data (%perf-payload payload-bytes))))
            (loop with deadline = (+ (get-universal-time) 30)
                  until (and (plusp (dds.dcps:matched-count pw)) (plusp (dds.dcps:matched-count pr)))
-                 do (when (> (get-universal-time) deadline)
+                 do (when (> (get-universal-time) deadline)   ; NOCOND(BENCH): pure perf-harness precondition — a measurement that never matched is the bench's own failure
                       (error "mem-per-sample: the two participants never matched — a measurement that ~
                               never talked to anyone is worse than no measurement"))
                     (sleep 0.05))

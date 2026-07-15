@@ -85,6 +85,27 @@ TEST_MARKER='NOCOND(TEST)'
 # form must be UNREACHABLE on valid input. Each site is annotated + justified per-site, like GUARD on the
 # hot path.
 GUARD_MARKER='NOCOND(GUARD)'
+# NOCOND(CONTRACT) — the FOURTH exempt class (owner ruling 2026-07-15). A DEVELOPER-CONTRACT poison value: a
+# `defstruct` slot DEFAULT that signals (dds.lang:contract-violation) when a REQUIRED initarg is omitted, or
+# a placeholder vtable-slot lambda that signals when an UNPOPULATED slot is invoked. It fires ONLY on wrong
+# CONSTRUCTION / wrong USE — a programming error caught in the first test run — never on runtime data. Like
+# NOCOND(MACRO) it enforces a contract a DEVELOPER must satisfy, not a data-dependent control-flow path: in
+# correct code the initarg is always supplied / the slot always overridden, so the form is UNREACHABLE. The
+# owner blessed a proper condition class (dds.lang:contract-violation) for these; the exemption reflects the
+# category is intentional, not debt.
+CONTRACT_MARKER='NOCOND(CONTRACT)'
+# NOCOND(BENCH) — the FIFTH (and last) exempt class (owner ruling 2026-07-15). A signalling form in the pure
+# PERFORMANCE-BENCHMARK harness (src/dds-bench/): the benchmark's OWN failure mechanism — a measurement
+# precondition/invariant (e.g. "the two participants never matched", "SHMEM did not engage") that aborts a
+# bench run exactly as an `assert` aborts a test. dds-bench IS our code (owner: it is NOT wholesale-excluded
+# like dds-tests), but it is pure measurement scaffolding, not the DDS runtime users call — so its harness
+# assertions are annotated in place rather than converted to status values.
+BENCH_MARKER='NOCOND(BENCH)'
+# All five sanctioned exempt classes, as ONE regex — adding a class is a one-token edit here, and an
+# UNSANCTIONED NOCOND(FOO) is NOT matched (so nobody invents a class the owner never ruled on).
+# Literal parens via bracket expressions [(] / [)] — NOT \( / \) — because awk's -v escape processing eats
+# a backslash before the regex sees it (the same double-escaping trap SIGNAL_RE already sidesteps this way).
+NOCOND_RE='NOCOND[(](MACRO|TEST|GUARD|CONTRACT|BENCH)[)]'
 
 scan() {
   awk -v pat="$SIGNAL_RE" -v marker="$MARKER" '
@@ -154,19 +175,17 @@ CEIL="$(tr -d '[:space:]' < "$CEIL_FILE")"
 # `assert` there IS the test's failure mechanism, not production control flow — 393 of the original 725 were
 # these. The rule targets PRODUCTION code: what a user's call can hit. Everything else counts.
 count_file() {
-  # NOTE: the marker is matched with INDEX (a literal substring), never as a regex — "NOCOND(MACRO)" read
-  # as a regex is "NOCOND" followed by the GROUP "MACRO", i.e. it matches NOCONDMACRO and never the real
-  # annotation. The self-test below caught exactly that; keep it literal.
-  awk -v pat="$SIGNAL_RE" -v macro="$MACRO_MARKER" -v testm="$TEST_MARKER" -v guardm="$GUARD_MARKER" '
+  # An annotated form is exempt when the sanctioned NOCOND(CLASS) marker is on the SAME line or the
+  # IMMEDIATELY-PRECEDING line (the gate looks back exactly one line, mirroring HOTPATH-COND). NOCOND_RE
+  # enumerates the five owner-sanctioned classes, so an UNSANCTIONED NOCOND(FOO) is NOT exempted.
+  awk -v pat="$SIGNAL_RE" -v nocond="$NOCOND_RE" '
     /^\(defun\*?[ \t]+/ {
       # An in-file TEST function. The %-prefixed form (%run-secure-pm, ...) is the SAME thing as run-*:
       # a test whose ASSERT is its failure mechanism, not production control flow. The original pattern
       # missed it and silently counted 19 test asserts in secure-sedp.lisp as production debt.
       intest = ($2 ~ /-test$/ || $2 ~ /^%?run-/) ? 1 : 0
     }
-    { exempt = index($0, macro) || (NR > 1 && index(last, macro)) \
-             || index($0, testm) || (NR > 1 && index(last, testm)) \
-             || index($0, guardm) || (NR > 1 && index(last, guardm))
+    { exempt = ($0 ~ nocond) || (NR > 1 && last ~ nocond)
       # a FULL-COMMENT line (first non-blank char is ;) is not code — a (error ...) MENTIONED in prose is
       # not a signalling form. Only whole-comment lines are skipped; a trailing ; after real code is not,
       # because a signalling token at start-of-form there would be real debt.
@@ -198,15 +217,24 @@ cat > "$tmp/count-canary.lisp" <<'EOF'
 (defun* bounds-guard ()
   (unless (<= total cap)   ; NOCOND(GUARD): caller pre-sizes; cannot fire on valid input
     (error 'buffer-overflow)))
+(defstruct* thing
+  (slot (error 'contract-violation) :type function))   ; NOCOND(CONTRACT): required-initarg poison default
+(defun* bench-harness ()
+  (unless matched   ; NOCOND(BENCH): pure benchmark-harness precondition — the bench's own failure mechanism
+    (error "nodes never matched")))
+(defun* unsanctioned ()
+  (unless x   ; NOCOND(FOO): an UNSANCTIONED class must STILL be counted (nobody invents a class)
+    (error "should count")))
 ;;; A prose mention of (error ...) on a full-comment line must NOT be counted.
 EOF
 cn="$(count_file "$tmp/count-canary.lisp")"
-if [[ "$cn" -ne 1 ]]; then
-  echo "gate-nocond: FAIL — self-test: the ratchet counter must count EXACTLY the 1 unexempt form in the" >&2
-  echo "             canary (2 NOCOND(MACRO) + 1 NOCOND(TEST) + 1 NOCOND(GUARD) skipped, 2 in-file-test" >&2
-  echo "             asserts skipped incl. the %run- form). Got ${cn}." >&2
-  echo "             Either the counter is blind or NOCOND(MACRO) is over-matching — a green ratchet" >&2
-  echo "             would prove NOTHING." >&2
+if [[ "$cn" -ne 2 ]]; then
+  echo "gate-nocond: FAIL — self-test: the ratchet counter must count EXACTLY the 2 unexempt forms in the" >&2
+  echo "             canary — the bare (counted) form AND the NOCOND(FOO) form (an UNSANCTIONED class is" >&2
+  echo "             NOT exempt). Skipped: 2 NOCOND(MACRO) + 1 TEST + 1 GUARD + 1 CONTRACT + 1 BENCH, and" >&2
+  echo "             2 in-file-test asserts (incl. the %run- form). Got ${cn}." >&2
+  echo "             Either the counter is blind, a marker is over-matching, or an unsanctioned NOCOND(FOO)" >&2
+  echo "             was wrongly exempted — a green ratchet would prove NOTHING." >&2
   exit 1
 fi
 

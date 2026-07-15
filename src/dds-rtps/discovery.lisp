@@ -199,7 +199,7 @@
     (function ((simple-array (unsigned-byte 8) (*))) (simple-array (unsigned-byte 8) (16)))
   "Build a 16-octet Locator address from a 4-octet IPv4 vector: 12 leading zeros
    then a.b.c.d at [12..15] (RTPS 2.5 §9.3.2.4)."
-  (assert (= 4 (length ip)))
+  (assert (= 4 (length ip)))   ; NOCOND(GUARD): every caller passes a literal 4-octet vec or %ipv4-octets output (typed (unsigned-byte 8) (4)); CANNOT fire on valid input — defense-in-depth, contained at the announce/receiver boundary
   (let ((address (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)))
     (replace address ip :start1 12 :end1 16 :start2 0 :end2 4)
     address))

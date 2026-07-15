@@ -336,8 +336,8 @@
    ENCODE-KEY-FN resolves the local writer's KeyMaterial by its 16-octet GUID for outgoing samples
    (§9.5.3.3.4.4). DECODE-KEY-FN resolves the remote writer's KeyMaterial by its 16-octet wire GUID
    for incoming samples (§9.5.3.3.4.5). Both return NIL when no key exists — caller MUST fail-closed."
-  (encode-key-fn (error "crypto-keys: :encode-key-fn required") :type function)
-  (decode-key-fn (error "crypto-keys: :decode-key-fn required") :type function))
+  (encode-key-fn (error 'contract-violation :detail "crypto-keys: :encode-key-fn required") :type function)   ; NOCOND(CONTRACT): required-initarg poison default
+  (decode-key-fn (error 'contract-violation :detail "crypto-keys: :decode-key-fn required") :type function))   ; NOCOND(CONTRACT): required-initarg poison default
 
 (defun* make-test-key-material (&key (kind :encrypt))
     (function (&key (:kind (member :sign :encrypt))) key-material)

@@ -14,11 +14,11 @@
    hash: (octets) -> digest-octets — hash for hash_c1/hash_c2/SharedSecret (§9.3.2)."
   (kagree-algo-str "" :type string)
   (dsign-algo-str  "" :type string)
-  (kagree-gen      (lambda () (error "no kagree-gen")) :type function)
-  (kagree-compute  (lambda (h p) (declare (ignore h p)) (error "no kagree-compute")) :type function)
-  (dsign-sign      (lambda (h d) (declare (ignore h d)) (error "no dsign-sign")) :type function)
-  (dsign-verify    (lambda (h d s) (declare (ignore h d s)) (error "no dsign-verify")) :type function)
-  (hash            (lambda (o) (declare (ignore o)) (error "no hash")) :type function))
+  (kagree-gen      (lambda () (error 'contract-violation :detail "cipher-suite: kagree-gen not populated")) :type function)   ; NOCOND(CONTRACT): unpopulated vtable slot — fires only if an unbuilt suite is used
+  (kagree-compute  (lambda (h p) (declare (ignore h p)) (error 'contract-violation :detail "cipher-suite: kagree-compute not populated")) :type function)   ; NOCOND(CONTRACT): unpopulated vtable slot
+  (dsign-sign      (lambda (h d) (declare (ignore h d)) (error 'contract-violation :detail "cipher-suite: dsign-sign not populated")) :type function)   ; NOCOND(CONTRACT): unpopulated vtable slot
+  (dsign-verify    (lambda (h d s) (declare (ignore h d s)) (error 'contract-violation :detail "cipher-suite: dsign-verify not populated")) :type function)   ; NOCOND(CONTRACT): unpopulated vtable slot
+  (hash            (lambda (o) (declare (ignore o)) (error 'contract-violation :detail "cipher-suite: hash not populated")) :type function))   ; NOCOND(CONTRACT): unpopulated vtable slot
 
 (defparameter +suite-ecdh+
     (%make-auth-suite
