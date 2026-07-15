@@ -2,8 +2,9 @@
 
 - **Status:** **ACCEPTED — IN PROGRESS.** Landed: PAL network/SHMEM, content-filter grammar, TypeLookup
   serializers, the type-compiler DSL, the Clasp PAL, the IdentityToken + DataHolder parsers, mixed-kind
-  governance, arena exhaustion, and the FIVE exempt classes (below). **220** production signalling forms
-  remain, ratcheted to zero by `make gate-nocond`.
+  governance, arena exhaustion, the DataHolder/`%dh-fail` wire parser, the durability config + microservice
+  parsers, and the FIVE exempt classes (below). **202** production signalling forms remain, ratcheted to
+  zero by `make gate-nocond`.
 
 ### The five sanctioned exempt classes (each gate-falsified in the canary; a class is documentation for the reader — the reviewer/owner validates the choice)
 
@@ -251,6 +252,49 @@ The measurement is recorded at both `dds.pal::%shm-open-create` and
 Consequently the zero-copy loan-write gate now asks for the **capability** (`shm-attach-by-name-reliable-p`)
 instead of the **implementation name** (`(eq (pal-impl-name) :sbcl)`), so Clasp/Linux takes the loan-write
 path exactly as SBCL does, and only Clasp/macOS-arm64 degrades.
+
+## Slice — the durability microservice parser (`store-microservice.lisp`, 219 -> 202)
+
+The reference-server backend's wire codec. A `MICROSERVICE-PROTOCOL-ERROR` unwound out of every
+bounds-checked reader on a malformed datagram — from a peer, over TCP — exactly the network-facing unwind
+the rule forbids. **17 of the file's 18 protocol-error sites become a status value**; the readers/decoders
+return `(values result status)` and the two op boundaries handle it.
+
+- **The readers, the UTF-8 validator, the frame/record/topic decoders, `%ms-recv-message`, and the
+  server's `%ms-handle-request` are `defun*`s**, so they thread with `TRY`/`BAIL`. Status keywords name the
+  failure: `:SHORT-MESSAGE` (a length exceeds the buffer extent), `:BAD-UTF8` (all seven Table-3-7
+  well-formedness rejections, collapsed — a wire topic is not user-facing text that needs the granular
+  reason a filter expression did), `:MALFORMED-FRAME`, `:COUNT-EXCEEDS-EXTENT`, `:BAD-BODY-LENGTH`,
+  `:SHORT-FOLDED-PAYLOAD`, `:UNKNOWN-OP`, and the client encoder's `:TOPIC-TOO-LONG`.
+- **`%ms-unfold-payload` returns four values** — `(values sealed status mac chain_seq)`. The status rides
+  position 2 and the two extra results ride third/fourth, the same convention the filter-grammar lexer used
+  for its next-index. Its one caller checks the position-2 status before touching the extras.
+- **The `BUILD-FN` / `DECODE-FN` closures CANNOT use `TRY`/`BAIL`.** They are lambdas stored in the
+  durable-store vtable struct and invoked long after `make-microservice-store` returns, so a `TRY` (which
+  expands to `RETURN-FROM make-microservice-store`) would return into a dead extent. They thread the status
+  **manually** with `MULTIPLE-VALUE-BIND`, and — the load-bearing part — a side-effecting decode-fn (the
+  chained put / purge / delete / topic-rewrite that advance the client chain-MAC + put-index) checks the
+  reader status **before** any mutation, so a torn response can never half-advance the chain state.
+- **`%ms-call` is now fully status-based**: it checks BUILD-FN's status, then DECODE-FN's, and re-signals a
+  single `MICROSERVICE-STORE-ERROR` (`clean-protocol`) for either. The `MICROSERVICE-CONN-LOST` reconnect
+  handler **stays a condition** — the bounded single re-dial + idempotent retry is a genuine control-flow
+  transfer, not a data value; it is a separate, harder slice. On the server, `%ms-serve-connection` drops
+  the connection when `%ms-handle-request` returns a status, and its `SERIOUS-CONDITION` backstop **stays**,
+  now guarding only inner-store faults, not the decoder.
+- **One site is deliberately left.** `%ms-encode-open`'s `history-depth-exceeds-u32` guard sits on the
+  `%ms-open` → `store-open` path, whose failure contract is the frozen durable-store vtable's, owned by the
+  separate store-vtable slice. Converting it here is either net-zero churn (convert, then re-signal
+  `store-error` at the `:open` lambda) or a ripple of `store-open`'s return contract out of this file, so
+  the `microservice-protocol-error` condition class survives for that one guard (its docstring records the
+  transitional state). This supersedes the relevant error-handling prose in ADR 0050 §4: the wire codec's
+  `MICROSERVICE-PROTOCOL-ERROR` is now a status everywhere except that guard.
+
+This also demonstrates the store-microservice file is **not** one atomic slice: the wire parser converted
+with **zero change to the vtable methods' return contract** (they still signal `microservice-store-error`
+on failure), so no consumer — `store-encrypted`, the reader, the service — saw a contract change. The fuzz
+posture is preserved: the malformed-UTF-8 battery asserts a `:BAD-UTF8` status where it asserted a caught
+condition, the over-cap-declared-length test asserts `:BAD-BODY-LENGTH`, and the server-survival +
+client-symmetric legs (a garbled response still surfaces `MICROSERVICE-STORE-ERROR`) are unchanged.
 
 ## Order of the remaining work (shallow → deep)
 

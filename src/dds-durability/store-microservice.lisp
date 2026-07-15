@@ -42,9 +42,10 @@
 ;;; and count is validated against the buffer extent BEFORE it is trusted (operating contract §4,
 ;;; NFR-SEC-POSTURE); the topic UTF-8 is well-formedness-validated (Table 3-7 / RFC 3629) before
 ;;; code-char; %parse-frame's own :short/:corrupt guards do the frame-body checking. So a malformed
-;;; message raises a MICROSERVICE-PROTOCOL-ERROR that is caught (server: drop that connection AND keep
-;;; accepting — %ms-serve-connection's SERIOUS-CONDITION backstop means no per-connection fault can kill
-;;; the serve thread; client: re-signal MICROSERVICE-STORE-ERROR) — never an out-of-bounds access, an
+;;; message returns a protocol STATUS value (ADR 0064 — no Lisp conditions in our code) that the op
+;;; boundary handles (server: %ms-handle-request returns (values NIL status) and %ms-serve-connection
+;;; drops that connection AND keeps accepting — its SERIOUS-CONDITION backstop still guards inner-store
+;;; faults; client: %ms-call re-signals MICROSERVICE-STORE-ERROR) — never an out-of-bounds access, an
 ;;; uncaught TYPE-ERROR, a crash, or a hang.
 
 ;;; ---- protocol constants ----
@@ -140,9 +141,14 @@
   ((detail :initarg :detail :reader microservice-protocol-error-detail :initform "protocol error"))
   (:report (lambda (c s) (format s "dds.durability microservice protocol: ~a"
                                  (microservice-protocol-error-detail c))))
-  (:documentation "A wire message was malformed (a length/count/frame exceeded the buffer extent, or an
-    op-code was unknown). Raised by the bounds-checked decoder BEFORE any out-of-bounds access; the
-    server drops the offending connection, a client op surfaces it (operating contract §4)."))
+  (:documentation "A wire-format overflow condition. As of the ADR-0064 no-conditions conversion the message
+    DECODERS return a STATUS VALUE (:SHORT-MESSAGE / :BAD-UTF8 / :MALFORMED-FRAME / :COUNT-EXCEEDS-EXTENT /
+    :BAD-BODY-LENGTH / :SHORT-FOLDED-PAYLOAD / :UNKNOWN-OP) rather than signalling, and the client encoders
+    return :TOPIC-TOO-LONG — threaded to the op boundary (%ms-call re-signals MICROSERVICE-STORE-ERROR;
+    %ms-serve-connection drops the connection). This class REMAINS for the ONE not-yet-converted site —
+    %ms-encode-open's history-depth-exceeds-u32 guard on the store-open path — which belongs to the separate
+    store-open/vtable slice (converting it there changes store-open's frozen return contract, not this
+    parser's). Do not add new signalling sites; add a status value instead (operating contract §4, §10)."))
 
 (defparameter *durability-debug-ms-skip-reclaim-remac* nil
   "Test-only RED control (ADR 0050 §4.4). NIL (default) ⇒ inert: a KEEP_LAST reclaim's chained store-delete
@@ -244,14 +250,16 @@
   t)
 
 (defun* %ms-put-string (b s)
-    (function ((array (unsigned-byte 8) (*)) string) t)
-  "Append S as a u16-length-prefixed UTF-8 field (reuses the file-store %string->utf8 encoder)."
+    (function ((array (unsigned-byte 8) (*)) string) (values (or null (eql t)) (or null keyword)))
+  "Append S as a u16-length-prefixed UTF-8 field (reuses the file-store %string->utf8 encoder):
+   (values T NIL), or (values NIL :TOPIC-TOO-LONG) if the UTF-8 exceeds the u16 length field (ADR 0064 —
+   a status, not a signal). Every encoder TRYs it, so an over-long topic propagates to the op boundary."
   (let ((u (%string->utf8 s)))
     (when (> (length u) #xFFFF)
-      (error 'microservice-protocol-error :detail "topic UTF-8 length exceeds u16"))
+      (bail :topic-too-long))
     (%ms-put-u16 b (length u))
     (%ms-put-bytes b u))
-  t)
+  (values t nil))
 
 (defun* %ms-put-frame (b frame)
     (function ((array (unsigned-byte 8) (*)) (simple-array (unsigned-byte 8) (*))) t)
@@ -289,52 +297,61 @@
   (end 0 :type (integer 0)))
 
 (defun* %rd-need (r n)
-    (function (ms-reader (integer 0)) t)
-  "Assert R has at least N more octets before END; else signal a protocol error (no OOB read)."
+    (function (ms-reader (integer 0)) (values (or null (eql t)) (or null keyword)))
+  "Assert R has at least N more octets before END; else return the :SHORT-MESSAGE status (no OOB read).
+   The no-conditions (ADR 0064) form of the bounds check: (values T NIL) if the octets are present,
+   (values NIL :SHORT-MESSAGE) if the length exceeds the buffer extent — every reader TRYs it, so a
+   truncated wire message propagates a status to the op boundary (%ms-call / %ms-handle-request) instead
+   of unwinding."
   (when (> (+ (ms-reader-pos r) n) (ms-reader-end r))
-    (error 'microservice-protocol-error :detail "truncated message (length exceeds buffer extent)"))
-  t)
+    (bail :short-message))
+  (values t nil))
 
 (defun* %rd-u8 (r)
-    (function (ms-reader) (unsigned-byte 8))
-  "Read one octet from R (bounds-checked)."
-  (%rd-need r 1)
-  (prog1 (aref (ms-reader-buf r) (ms-reader-pos r))
-    (incf (ms-reader-pos r))))
+    (function (ms-reader) (values (or null (unsigned-byte 8)) (or null keyword)))
+  "Read one octet from R (bounds-checked): (values octet NIL), or (values NIL :SHORT-MESSAGE) if truncated."
+  (try (%rd-need r 1))
+  (values (prog1 (aref (ms-reader-buf r) (ms-reader-pos r))
+            (incf (ms-reader-pos r)))
+          nil))
 
 (defun* %rd-u16 (r)
-    (function (ms-reader) (unsigned-byte 16))
-  "Read a little-endian u16 from R (bounds-checked)."
-  (%rd-need r 2)
+    (function (ms-reader) (values (or null (unsigned-byte 16)) (or null keyword)))
+  "Read a little-endian u16 from R (bounds-checked): (values u16 NIL) or (values NIL :SHORT-MESSAGE)."
+  (try (%rd-need r 2))
   (let ((p (ms-reader-pos r)) (b (ms-reader-buf r)))
-    (prog1 (logior (aref b p) (ash (aref b (+ p 1)) 8))
-      (incf (ms-reader-pos r) 2))))
+    (values (prog1 (logior (aref b p) (ash (aref b (+ p 1)) 8))
+              (incf (ms-reader-pos r) 2))
+            nil)))
 
 (defun* %rd-u32 (r)
-    (function (ms-reader) (unsigned-byte 32))
-  "Read a little-endian u32 from R (bounds-checked; reuses the file-store %get-u32-le decode)."
-  (%rd-need r 4)
-  (prog1 (%get-u32-le (ms-reader-buf r) (ms-reader-pos r))
-    (incf (ms-reader-pos r) 4)))
+    (function (ms-reader) (values (or null (unsigned-byte 32)) (or null keyword)))
+  "Read a little-endian u32 from R (bounds-checked; reuses %get-u32-le): (values u32 NIL) or (values NIL :SHORT-MESSAGE)."
+  (try (%rd-need r 4))
+  (values (prog1 (%get-u32-le (ms-reader-buf r) (ms-reader-pos r))
+            (incf (ms-reader-pos r) 4))
+          nil))
 
 (defun* %rd-u64 (r)
-    (function (ms-reader) (integer 0))
-  "Read a little-endian u64 from R (bounds-checked; reuses the file-store %get-u64-le decode)."
-  (%rd-need r 8)
-  (prog1 (%get-u64-le (ms-reader-buf r) (ms-reader-pos r))
-    (incf (ms-reader-pos r) 8)))
+    (function (ms-reader) (values (or null (integer 0)) (or null keyword)))
+  "Read a little-endian u64 from R (bounds-checked; reuses %get-u64-le): (values u64 NIL) or (values NIL :SHORT-MESSAGE)."
+  (try (%rd-need r 8))
+  (values (prog1 (%get-u64-le (ms-reader-buf r) (ms-reader-pos r))
+            (incf (ms-reader-pos r) 8))
+          nil))
 
 (defun* %rd-bytes (r n)
-    (function (ms-reader (integer 0)) (simple-array (unsigned-byte 8) (*)))
-  "Read N octets from R into a fresh simple vector (bounds-checked)."
-  (%rd-need r n)
+    (function (ms-reader (integer 0)) (values (or null (simple-array (unsigned-byte 8) (*))) (or null keyword)))
+  "Read N octets from R into a fresh simple vector (bounds-checked): (values vec NIL) or (values NIL :SHORT-MESSAGE)."
+  (try (%rd-need r n))
   (let ((v (make-array n :element-type '(unsigned-byte 8))))
     (replace v (ms-reader-buf r) :start2 (ms-reader-pos r) :end2 (+ (ms-reader-pos r) n))
     (incf (ms-reader-pos r) n)
-    v))
+    (values v nil)))
 
 (defun* %ms-utf8->string (buf start end)
-    (function ((simple-array (unsigned-byte 8) (*)) (integer 0) (integer 0)) string)
+    (function ((simple-array (unsigned-byte 8) (*)) (integer 0) (integer 0))
+              (values (or null string) (or null keyword)))
   "Decode UTF-8 octets BUF[START..END) into a string — the bounds-checked, WELL-FORMEDNESS-VALIDATING
    inverse of %string->utf8. Enforces the Unicode Standard Table 3-7 / RFC 3629 §4 well-formed byte
    ranges: a lead byte C2..DF / E0..EF / F0..F4, second byte in the sequence-specific range (E0->A0..BF,
@@ -342,15 +359,16 @@
    and each further continuation byte 80..BF. A standalone continuation byte (80..BF), an overlong lead
    (C0/C1), and an invalid lead (F5..FF) are rejected. This rejects overlong encodings, surrogates
    (#xD800-#xDFFF), and scalars > #x10FFFF, so CODE-CHAR is only ever called on a valid Unicode scalar —
-   ANY ill-formed sequence signals MICROSERVICE-PROTOCOL-ERROR BEFORE code-char, never a TYPE-ERROR /
-   out-of-range crash (operating contract §4, the fuzz posture). A well-formed topic (a Unicode scalar
-   string, the only thing %string->utf8 emits) round-trips exactly."
+   ANY ill-formed sequence returns (values NIL :BAD-UTF8) BEFORE code-char (ADR 0064 — a status, not a
+   signal), never a TYPE-ERROR / out-of-range crash (operating contract §4, the fuzz posture). A
+   well-formed topic (a Unicode scalar string, the only thing %string->utf8 emits) round-trips exactly,
+   returning (values string NIL)."
   (let ((out (make-array 0 :element-type 'character :adjustable t :fill-pointer 0))
         (i start))
     (declare (type (integer 0) i))
     (flet ((tail (j)                    ; validate + fold in a trailing continuation byte at index J
              (unless (<= #x80 (aref buf j) #xBF)
-               (error 'microservice-protocol-error :detail "invalid UTF-8 continuation byte"))
+               (bail :bad-utf8))        ; invalid continuation byte — return-from %ms-utf8->string
              (logand (aref buf j) #x3F)))
       (loop while (< i end) do
         (let ((b0 (aref buf i)))
@@ -358,54 +376,57 @@
             ((<= b0 #x7F)                                   ; 1-byte  00..7F
              (vector-push-extend (code-char b0) out) (incf i))
             ((<= #xC2 b0 #xDF)                              ; 2-byte  C2..DF 80..BF
-             (when (> (+ i 2) end) (error 'microservice-protocol-error :detail "truncated UTF-8 (2-byte)"))
+             (when (> (+ i 2) end) (bail :bad-utf8))        ; truncated 2-byte
              (vector-push-extend (code-char (logior (ash (logand b0 #x1F) 6) (tail (+ i 1)))) out)
              (incf i 2))
             ((<= #xE0 b0 #xEF)                              ; 3-byte, second-byte range per lead
-             (when (> (+ i 3) end) (error 'microservice-protocol-error :detail "truncated UTF-8 (3-byte)"))
+             (when (> (+ i 3) end) (bail :bad-utf8))        ; truncated 3-byte
              (let ((b1 (aref buf (+ i 1)))
                    (lo (if (= b0 #xE0) #xA0 #x80))
                    (hi (if (= b0 #xED) #x9F #xBF)))
                (unless (<= lo b1 hi)
-                 (error 'microservice-protocol-error :detail "invalid UTF-8 3-byte sequence"))
+                 (bail :bad-utf8))                          ; invalid 3-byte sequence
                (vector-push-extend (code-char (logior (ash (logand b0 #x0F) 12)
                                                       (ash (logand b1 #x3F) 6) (tail (+ i 2)))) out))
              (incf i 3))
             ((<= #xF0 b0 #xF4)                              ; 4-byte, second-byte range per lead
-             (when (> (+ i 4) end) (error 'microservice-protocol-error :detail "truncated UTF-8 (4-byte)"))
+             (when (> (+ i 4) end) (bail :bad-utf8))        ; truncated 4-byte
              (let ((b1 (aref buf (+ i 1)))
                    (lo (if (= b0 #xF0) #x90 #x80))
                    (hi (if (= b0 #xF4) #x8F #xBF)))
                (unless (<= lo b1 hi)
-                 (error 'microservice-protocol-error :detail "invalid UTF-8 4-byte sequence"))
+                 (bail :bad-utf8))                          ; invalid 4-byte sequence
                (vector-push-extend (code-char (logior (ash (logand b0 #x07) 18) (ash (logand b1 #x3F) 12)
                                                       (ash (tail (+ i 2)) 6) (tail (+ i 3)))) out))
              (incf i 4))
-            (t (error 'microservice-protocol-error :detail "invalid UTF-8 lead byte"))))))   ; 80..BF, C0/C1, F5..FF
-    (coerce out 'string)))
+            (t (bail :bad-utf8))))))                        ; invalid lead: 80..BF, C0/C1, F5..FF
+    (values (coerce out 'string) nil)))
 
 (defun* %rd-string (r)
-    (function (ms-reader) string)
-  "Read a u16-length-prefixed UTF-8 topic field from R (bounds-checked, then UTF-8 decoded)."
-  (let ((n (%rd-u16 r)))
-    (%rd-need r n)
-    (prog1 (%ms-utf8->string (ms-reader-buf r) (ms-reader-pos r) (+ (ms-reader-pos r) n))
-      (incf (ms-reader-pos r) n))))
+    (function (ms-reader) (values (or null string) (or null keyword)))
+  "Read a u16-length-prefixed UTF-8 topic field from R (bounds-checked, then UTF-8 decoded):
+   (values topic NIL), or (values NIL status) on a truncated field (:SHORT-MESSAGE) or malformed UTF-8
+   (:BAD-UTF8)."
+  (let ((n (try (%rd-u16 r))))
+    (try (%rd-need r n))
+    (let ((s (try (%ms-utf8->string (ms-reader-buf r) (ms-reader-pos r) (+ (ms-reader-pos r) n)))))
+      (incf (ms-reader-pos r) n)
+      (values s nil))))
 
 (defun* %rd-frame (r topic)
-    (function (ms-reader string) durable-record)
+    (function (ms-reader string) (values (or null durable-record) (or null keyword)))
   "Read a u32-length-prefixed record frame from R and decode it for TOPIC via the file-store %parse-frame
    (no chain MAC — memory-tier parity). The transport frame-len is validated against the buffer extent
-   first; %parse-frame must return :ok and consume EXACTLY frame-len bytes, else a protocol error."
-  (let ((flen (%rd-u32 r)))
-    (%rd-need r flen)
+   first; %parse-frame must return :ok and consume EXACTLY frame-len bytes, else (values NIL :MALFORMED-FRAME)."
+  (let ((flen (try (%rd-u32 r))))
+    (try (%rd-need r flen))
     (let ((start (ms-reader-pos r))
           (fend  (+ (ms-reader-pos r) flen)))
       (multiple-value-bind (rec next reason) (%parse-frame (ms-reader-buf r) start fend topic)
         (unless (and (eq reason :ok) rec (= next fend))
-          (error 'microservice-protocol-error :detail "malformed record frame"))
+          (bail :malformed-frame))
         (setf (ms-reader-pos r) fend)
-        rec))))
+        (values rec nil)))))
 
 ;;; ---- op payload encoders (client side) ----
 
@@ -413,26 +434,27 @@
     (function (string (simple-array (unsigned-byte 8) (16)) (integer 0)
                (or null (simple-array (unsigned-byte 8) (16)))
                (member :data :dispose :unregister) (simple-array (unsigned-byte 8) (*)))
-              (simple-array (unsigned-byte 8) (*)))
-  "Encode a put op payload: topic (u16-len UTF-8) + one v2 record frame (reused %frame-record)."
+              (values (or null (simple-array (unsigned-byte 8) (*))) (or null keyword)))
+  "Encode a put op payload: topic (u16-len UTF-8) + one v2 record frame (reused %frame-record).
+   (values payload NIL), or (values NIL :TOPIC-TOO-LONG) if the topic overflows the u16 length field."
   (let ((b (%ms-buf))
         (rec (make-durable-record :topic topic :writer-guid writer-guid :sn sn
                                   :key-hash key-hash :kind kind :payload payload)))
-    (%ms-put-string b topic)
+    (try (%ms-put-string b topic))
     (%ms-put-frame b (%frame-record rec))
-    (%ms-finalize b)))
+    (values (%ms-finalize b) nil)))
 
 (defun* %ms-encode-topic (topic)
-    (function (string) (simple-array (unsigned-byte 8) (*)))
-  "Encode a single-topic op payload (get-range / purge)."
-  (let ((b (%ms-buf))) (%ms-put-string b topic) (%ms-finalize b)))
+    (function (string) (values (or null (simple-array (unsigned-byte 8) (*))) (or null keyword)))
+  "Encode a single-topic op payload (get-range / purge): (values payload NIL) or (values NIL :TOPIC-TOO-LONG)."
+  (let ((b (%ms-buf))) (try (%ms-put-string b topic)) (values (%ms-finalize b) nil)))
 
 (defun* %ms-encode-count (topic)
-    (function ((or null string)) (simple-array (unsigned-byte 8) (*)))
-  "Encode a count op payload: u8 has-topic + [topic]."
+    (function ((or null string)) (values (or null (simple-array (unsigned-byte 8) (*))) (or null keyword)))
+  "Encode a count op payload: u8 has-topic + [topic]. (values payload NIL) or (values NIL :TOPIC-TOO-LONG)."
   (let ((b (%ms-buf)))
-    (if topic (progn (%ms-put-u8 b 1) (%ms-put-string b topic)) (%ms-put-u8 b 0))
-    (%ms-finalize b)))
+    (if topic (progn (%ms-put-u8 b 1) (try (%ms-put-string b topic))) (%ms-put-u8 b 0))
+    (values (%ms-finalize b) nil)))
 
 (defun* %ms-encode-open (history-kind history-depth)
     (function ((or null (member :keep-all :keep-last)) (or null (integer 1)))
@@ -450,24 +472,26 @@
 
 (defun* %ms-encode-delete (topic writer-guid sn)
     (function (string (simple-array (unsigned-byte 8) (16)) (integer 0))
-              (simple-array (unsigned-byte 8) (*)))
-  "Encode a delete op payload: topic (u16-len UTF-8) + 16 raw GUID octets + u64 sn."
+              (values (or null (simple-array (unsigned-byte 8) (*))) (or null keyword)))
+  "Encode a delete op payload: topic (u16-len UTF-8) + 16 raw GUID octets + u64 sn.
+   (values payload NIL) or (values NIL :TOPIC-TOO-LONG)."
   (let ((b (%ms-buf)))
-    (%ms-put-string b topic)
+    (try (%ms-put-string b topic))
     (%ms-put-bytes b (coerce writer-guid '(simple-array (unsigned-byte 8) (*))))
     (%ms-put-u64 b sn)
-    (%ms-finalize b)))
+    (values (%ms-finalize b) nil)))
 
 (defun* %ms-encode-topic-rewrite (topic records)
     (function (string list) (simple-array (unsigned-byte 8) (*)))
   "Encode a topic-rewrite op payload: topic (u16-len UTF-8) + u32 count + count × record frames (each the
    REUSED %frame-record of a folded record). The DARE-blind server REPLACES the topic's records with these
-   OPAQUE frames; the mac/chain_seq ride INSIDE each folded payload the server never parses (ADR 0050 §4.4)."
+   OPAQUE frames; the mac/chain_seq ride INSIDE each folded payload the server never parses (ADR 0050 §4.4).
+   (values payload NIL) or (values NIL :TOPIC-TOO-LONG)."
   (let ((b (%ms-buf)))
-    (%ms-put-string b topic)
+    (try (%ms-put-string b topic))
     (%ms-put-u32 b (length records))
     (dolist (rec records) (%ms-put-frame b (%frame-record rec)))
-    (%ms-finalize b)))
+    (values (%ms-finalize b) nil)))
 
 (defun* %ms-empty-payload ()
     (function () (simple-array (unsigned-byte 8) (*)))
@@ -592,8 +616,8 @@
   "Read one length-prefixed message body (op-code/status + payload) from SOCK. Returns (values body NIL),
    (values NIL :EOF) on a clean EOF/peer-close, or (values NIL :TIMEOUT) when a stalled peer trips the
    socket's armed recv timeout. The declared body-len is bounds-checked against
-   +ms-max-message+ BEFORE any body buffer is allocated (resource guard); a zero or over-cap length is a
-   protocol error (refused without allocating). The body is then read INCREMENTALLY (%ms-recv-body) so a
+   +ms-max-message+ BEFORE any body buffer is allocated (resource guard); a zero or over-cap length returns
+   (values NIL :BAD-BODY-LENGTH) (refused without allocating; ADR 0064). The body is then read INCREMENTALLY (%ms-recv-body) so a
    huge DECLARED length never forces a huge up-front allocation (amplification guard, WP-DURABILITY-MS-DOS
    ADR 0050 §4.6). The :TIMEOUT status propagates to the caller (server: %ms-serve-connection drops the
    connection; client: %ms-exchange turns it into conn-lost -> the bounded reconnect). Shared by the client
@@ -602,7 +626,7 @@
     (try (dds.pal:tcp-recv sock hdr 4))
     (let ((body-len (%get-u32-le hdr 0)))
       (when (or (zerop body-len) (> body-len +ms-max-message+))
-        (error 'microservice-protocol-error :detail "message body length out of range"))
+        (bail :bad-body-length))
       (%ms-recv-body sock body-len))))
 
 (defun* %ms-exchange (sock code payload)
@@ -636,8 +660,10 @@
         (error 'microservice-conn-lost :detail "server stalled (client recv timeout)"))
       (unless body (error 'microservice-conn-lost :detail "server closed the connection"))
       (let ((r (%make-ms-reader :buf body :pos 0 :end (length body))))
-        (let ((status (%rd-u8 r)))
-          (unless (= status +ms-status-ok+)
+        ;; body is >= 1 byte (recv rejects a zero declared length), so %rd-u8 always yields the status byte;
+        ;; the (and sbyte ...) guard keeps it type-safe under the ADR-0064 (values octet status) reader.
+        (let ((sbyte (%rd-u8 r)))
+          (unless (and sbyte (= sbyte +ms-status-ok+))
             (error 'microservice-store-error :detail "server returned an error status"))
           r)))))
 
@@ -645,9 +671,9 @@
     (function (ms-conn t (unsigned-byte 8) function function) t)
   "Run one client op under the store LOCK on CONN's open connection: build the request payload (BUILD-FN),
    exchange it, and decode the result (DECODE-FN on the response ms-reader). Signals if the store is not
-   open. A MALFORMED server response (a bounds/well-formedness violation surfaced by the decoder as
-   MICROSERVICE-PROTOCOL-ERROR) is re-signalled as a MICROSERVICE-STORE-ERROR so the client API presents
-   ONE clean error type for any bad/torn response — never a raw decode TYPE-ERROR.
+   open. A MALFORMED server response (a bounds/well-formedness violation surfaced by the decoder as a
+   status VALUE in position 2 of BUILD-FN/DECODE-FN, ADR 0064) is re-signalled as a MICROSERVICE-STORE-ERROR
+   so the client API presents ONE clean error type for any bad/torn response — never a raw decode TYPE-ERROR.
 
    RECONNECT (Slice 3c-1, ADR 0050 §4.5): if the connection DROPPED (MICROSERVICE-CONN-LOST from a send
    failure or a server-closed read), CLOSE+CLEAR the dead socket, RE-DIAL once (%ms-reconnect), and RETRY
@@ -670,17 +696,26 @@
       ((and (ms-conn-ever-connected-p conn) (not *durability-debug-ms-skip-redial-dropped*))
        (%ms-reconnect conn))                                    ; DROPPED — bounded re-dial (clean error if down; NOT terminal)
       (t (error 'microservice-store-error :detail "store is not open")))   ; never opened (or the RED knob)
-    (labels ((clean-protocol (e)
-               (error 'microservice-store-error
-                      :detail (format nil "malformed server response: ~a"
-                                      (microservice-protocol-error-detail e))))
-             (run () (funcall decode-fn (%ms-exchange (ms-conn-sock conn) code (funcall build-fn)))))
-      (handler-case (run)
-        (microservice-conn-lost ()
-          (%ms-reconnect conn)              ; bounded single re-dial (signals store-error if the server is down)
-          (handler-case (run)               ; retry ONCE; a second conn-lost propagates as a clean store-error
-            (microservice-protocol-error (e) (clean-protocol e))))
-        (microservice-protocol-error (e) (clean-protocol e))))))
+    (flet ((clean-protocol (status)
+             (error 'microservice-store-error
+                    :detail (format nil "microservice protocol error: ~a" status)))
+           (run ()
+             ;; BUILD-FN + DECODE-FN are lambdas (stored in the vtable, invoked after make-microservice-store
+             ;; returns), so they thread the protocol status MANUALLY as (values result status) — they CANNOT
+             ;; use defun*'s TRY/BAIL, which would return-from make-microservice-store's dead extent. A CONN
+             ;; drop still SIGNALS microservice-conn-lost from %ms-exchange (the reconnect stays a condition).
+             (multiple-value-bind (payload bstatus) (funcall build-fn)
+               (if bstatus
+                   (values nil bstatus)
+                   (multiple-value-bind (result dstatus)
+                       (funcall decode-fn (%ms-exchange (ms-conn-sock conn) code payload))
+                     (values result dstatus))))))
+      (multiple-value-bind (result status)
+          (handler-case (run)
+            (microservice-conn-lost ()
+              (%ms-reconnect conn)          ; bounded single re-dial (signals store-error if the server is down)
+              (run)))                       ; retry ONCE; a second conn-lost propagates as a clean store-error
+        (if status (clean-protocol status) result)))))
 
 (defun* %ms-open (conn lock history-kind history-depth)
     (function (ms-conn t (or null (member :keep-all :keep-last)) (or null (integer 1)))
@@ -792,15 +827,17 @@
                                                     (%ms-fold-payload
                                                      payload (the (simple-array (unsigned-byte 8) (*)) mac) seq)))))
                             (lambda (r)
-                              (let ((res (%rd-u8 r)))
-                                (cond ((= res +ms-result-t+)
-                                       (unless reput
-                                         (setf (gethash topic chain-macs) new-mac)
-                                         (setf (gethash topic chain-seqs) (1+ new-seq))
-                                         (setf (gethash kkey idx) t))
-                                       t)
-                                      ((= res +ms-result-rejected+) :rejected)
-                                      (t (error 'microservice-store-error :detail "bad put result"))))))
+                              (multiple-value-bind (res rstatus) (%rd-u8 r)
+                                (if rstatus
+                                    (values nil rstatus)
+                                    (cond ((= res +ms-result-t+)
+                                           (unless reput
+                                             (setf (gethash topic chain-macs) new-mac)
+                                             (setf (gethash topic chain-seqs) (1+ new-seq))
+                                             (setf (gethash kkey idx) t))
+                                           (values t nil))
+                                          ((= res +ms-result-rejected+) (values :rejected nil))
+                                          (t (error 'microservice-store-error :detail "bad put result")))))))
                     ;; the exhausted-retry MAY have applied the put but lost the ack — mark the topic STALE so
                     ;; the next chained mutation re-syncs the chain state from the server (Fix 1), then re-signal.
                     (microservice-store-error (e) (setf (gethash topic stale-topics) t) (error e))))
@@ -808,10 +845,12 @@
                 (%ms-call conn lock +ms-op-put+
                           (lambda () (%ms-encode-put topic writer-guid sn key-hash kind payload))
                           (lambda (r)
-                            (let ((res (%rd-u8 r)))
-                              (cond ((= res +ms-result-t+) t)
-                                    ((= res +ms-result-rejected+) :rejected)
-                                    (t (error 'microservice-store-error :detail "bad put result"))))))))
+                            (multiple-value-bind (res rstatus) (%rd-u8 r)
+                              (if rstatus
+                                  (values nil rstatus)
+                                  (cond ((= res +ms-result-t+) (values t nil))
+                                        ((= res +ms-result-rejected+) (values :rejected nil))
+                                        (t (error 'microservice-store-error :detail "bad put result")))))))))
      :get-range (lambda (topic)
                   (if chain-mac-fn
                       (%ms-get-range-verified conn lock topic chain-mac-fn chain-macs chain-seqs put-index)
@@ -831,12 +870,14 @@
                        (%ms-call conn lock +ms-op-purge+
                                  (lambda () (%ms-encode-topic topic))
                                  (lambda (r)
-                                   (%rd-u8 r)
-                                   (remhash topic chain-macs)
-                                   (remhash topic chain-seqs)
-                                   (remhash topic put-index)
-                                   (remhash topic stale-topics)
-                                   t))))
+                                   (multiple-value-bind (v rstatus) (%rd-u8 r)
+                                     (declare (ignore v))
+                                     (cond (rstatus (values nil rstatus))
+                                           (t (remhash topic chain-macs)
+                                              (remhash topic chain-seqs)
+                                              (remhash topic put-index)
+                                              (remhash topic stale-topics)
+                                              (values t nil))))))))
                 ;; chained tier: an exhausted purge MAY have applied server-side but lost the ack (client head
                 ;; NOT cleared) -> mark STALE so the next chained mutation re-syncs (Fix 1, ADR 0050 §4.5).
                 (if chain-mac-fn
@@ -935,36 +976,39 @@
                              ;; the record is already gone, which is the delete's goal — treat rejected as
                              ;; success (T), so an idempotent delete replayed across a drop never false-errors.
                              (lambda (r)
-                               (let ((res (%rd-u8 r)))
-                                 (cond ((= res +ms-result-t+) t)
-                                       ((= res +ms-result-rejected+) t)
+                               (multiple-value-bind (res rstatus) (%rd-u8 r)
+                                 (cond (rstatus (values nil rstatus))
+                                       ((= res +ms-result-t+) (values t nil))
+                                       ((= res +ms-result-rejected+) (values t nil))
                                        (t (error 'microservice-store-error :detail "bad delete result")))))))))))
 
 ;;; ---- client response decoders ----
 
 (defun* %ms-decode-records (r topic)
-    (function (ms-reader string) list)
+    (function (ms-reader string) (values (or null list) (or null keyword)))
   "Decode a get-range response (u32 count + count length-prefixed frames) into DURABLE-RECORDs for
    TOPIC, sorted by (writer-guid, sn) via the shared %record-guid-sn< so the microservice-store honours
    the same ordering contract as memory/file/sqlite (DRY). COUNT is bounded against the remaining buffer
-   (each frame needs >= 1 byte) so a corrupt count cannot spin; each %rd-frame is itself bounds-checked."
-  (let ((count (%rd-u32 r)))
+   (each frame needs >= 1 byte) so a corrupt count cannot spin; each %rd-frame is itself bounds-checked.
+   (values records NIL), or (values NIL status) on a corrupt count (:COUNT-EXCEEDS-EXTENT) / frame."
+  (let ((count (try (%rd-u32 r))))
     (when (> count (- (ms-reader-end r) (ms-reader-pos r)))
-      (error 'microservice-protocol-error :detail "record count exceeds buffer extent"))
+      (bail :count-exceeds-extent))
     (let ((recs '()))
-      (dotimes (i count) (push (%rd-frame r topic) recs))
-      (sort (nreverse recs) #'%record-guid-sn<))))
+      (dotimes (i count) (push (try (%rd-frame r topic)) recs))
+      (values (sort (nreverse recs) #'%record-guid-sn<) nil))))
 
 (defun* %ms-decode-topics (r)
-    (function (ms-reader) list)
+    (function (ms-reader) (values (or null list) (or null keyword)))
   "Decode a topics response (u32 count + count u16-length-prefixed UTF-8 strings) into a list of topic
-   strings. COUNT is bounded against the remaining buffer; each string is bounds-checked."
-  (let ((count (%rd-u32 r)))
+   strings. COUNT is bounded against the remaining buffer; each string is bounds-checked.
+   (values topics NIL) or (values NIL status) on a corrupt count (:COUNT-EXCEEDS-EXTENT) / string."
+  (let ((count (try (%rd-u32 r))))
     (when (> count (- (ms-reader-end r) (ms-reader-pos r)))
-      (error 'microservice-protocol-error :detail "topic count exceeds buffer extent"))
+      (bail :count-exceeds-extent))
     (let ((ts '()))
-      (dotimes (i count) (push (%rd-string r) ts))
-      (nreverse ts))))
+      (dotimes (i count) (push (try (%rd-string r)) ts))
+      (values (nreverse ts) nil))))
 
 ;;; ---- client-side remote-tier chain-MAC (Slice 3b, ADR 0050 §4.3; ADR 0045 log-MAC chain) ----
 ;;; A malicious/compromised REMOTE server that silently DROPS / REORDERS / TAMPERS sealed frames is
@@ -1027,22 +1071,24 @@
 
 (defun* %ms-unfold-payload (folded)
     (function ((simple-array (unsigned-byte 8) (*)))
-              (values (simple-array (unsigned-byte 8) (*)) (simple-array (unsigned-byte 8) (*)) (integer 0)))
+              (values (or null (simple-array (unsigned-byte 8) (*))) (or null keyword)
+                      (or null (simple-array (unsigned-byte 8) (*))) (or null (integer 0))))
   "Strip the folded suffix from FOLDED = sealed ∥ mac(+frame-mac-len+) ∥ chain_seq(u64 LE): return
-   (values sealed mac chain_seq). BOUNDS-CHECKED (operating contract §4, NFR-SEC-POSTURE): a malicious
-   server returning a payload SHORTER than the mac+chain_seq suffix signals MICROSERVICE-PROTOCOL-ERROR (a
-   clean fail-closed), never an out-of-bounds access."
+   (values sealed NIL mac chain_seq) — the STATUS rides position 2 (ADR 0064), the mac + chain_seq the
+   extras (mirroring the filter-grammar lexer's status-then-index convention). BOUNDS-CHECKED (operating
+   contract §4, NFR-SEC-POSTURE): a malicious server returning a payload SHORTER than the mac+chain_seq
+   suffix returns (values NIL :SHORT-FOLDED-PAYLOAD NIL NIL) (a clean fail-closed), never an out-of-bounds
+   access. The caller checks the position-2 status BEFORE using the extras."
   (let ((n (length folded))
         (suffix (+ +frame-mac-len+ 8)))
     (when (< n suffix)
-      (error 'microservice-protocol-error
-             :detail "folded record payload shorter than the mac+chain_seq suffix (malformed/tampered)"))
+      (return-from %ms-unfold-payload (values nil :short-folded-payload nil nil)))
     (let* ((sl     (- n suffix))
            (sealed (make-array sl :element-type '(unsigned-byte 8)))
            (mac    (make-array +frame-mac-len+ :element-type '(unsigned-byte 8))))
       (replace sealed folded :end2 sl)
       (replace mac folded :start2 sl :end2 (+ sl +frame-mac-len+))
-      (values sealed mac (%get-u64-le folded (+ sl +frame-mac-len+))))))
+      (values sealed nil mac (%get-u64-le folded (+ sl +frame-mac-len+))))))
 
 (defun* %ms-chain-walk (topic fn tuples stop-at)
     (function (string function list (or null (integer 0)))
@@ -1104,35 +1150,40 @@
       t)))
 
 (defun* %ms-decode-tuples (r topic)
-    (function (ms-reader string) list)
+    (function (ms-reader string) (values (or null list) (or null keyword)))
   "Decode a get-range response into a list of (clean-record folded-mac chain_seq) tuples — the raw,
    UNVERIFIED input BOTH %ms-decode-strip-verify (open-time full verify) AND the tail-anchor prefix probe
    (%ms-fetch-tuples) consume (DRY). STRIPS the folded (mac ∥ chain_seq) suffix from each record's payload
    (bounds-checked via %ms-unfold-payload — a <suffix-length payload from a malicious server fails cleanly).
    No chain verify + no side effects here — the caller runs %ms-verify-chain / %ms-chain-walk. COUNT is
-   bounded against the remaining buffer (each frame needs ≥ 1 byte); each %rd-frame is itself bounds-checked."
-  (let ((count (%rd-u32 r)))
+   bounded against the remaining buffer (each frame needs ≥ 1 byte); each %rd-frame is itself bounds-checked.
+   (values tuples NIL) or (values NIL status) on a corrupt count/frame or a short folded payload
+   (:SHORT-FOLDED-PAYLOAD)."
+  (let ((count (try (%rd-u32 r))))
     (when (> count (- (ms-reader-end r) (ms-reader-pos r)))
-      (error 'microservice-protocol-error :detail "record count exceeds buffer extent"))
+      (bail :count-exceeds-extent))
     (let ((tuples '()))
       (dotimes (i count)
-        (let ((raw (%rd-frame r topic)))
-          (multiple-value-bind (sealed mac cseq) (%ms-unfold-payload (durable-record-payload raw))
+        (let ((raw (try (%rd-frame r topic))))
+          (multiple-value-bind (sealed ustatus mac cseq) (%ms-unfold-payload (durable-record-payload raw))
+            (when ustatus (bail ustatus))
             (push (list (make-durable-record :topic topic :writer-guid (durable-record-writer-guid raw)
                                              :sn (durable-record-sn raw) :key-hash (durable-record-key-hash raw)
                                              :kind (durable-record-kind raw) :payload sealed)
                         mac cseq)
                   tuples))))
-      tuples)))
+      (values tuples nil))))
 
 (defun* %ms-decode-strip-verify (r topic fn chain-macs chain-seqs put-index)
-    (function (ms-reader string function hash-table hash-table hash-table) list)
+    (function (ms-reader string function hash-table hash-table hash-table)
+              (values (or null list) (or null keyword)))
   "Decode a get-range response (via the shared %ms-decode-tuples), VERIFY the per-topic v3 chain
    (fail-closed), and return the CLEAN (payload=sealed) records (guid,sn)-sorted so the decorator sees only
-   sealed — the mac stripped transparently."
-  (let ((tuples (%ms-decode-tuples r topic)))
+   sealed — the mac stripped transparently. (values records NIL) or (values NIL status) on a corrupt
+   response; a chain-MAC tamper still SIGNALS from %ms-verify-chain (the security fail-closed, ADR 0045)."
+  (let ((tuples (try (%ms-decode-tuples r topic))))
     (%ms-verify-chain topic fn tuples chain-macs chain-seqs put-index)
-    (sort (mapcar #'first tuples) #'%record-guid-sn<)))
+    (values (sort (mapcar #'first tuples) #'%record-guid-sn<) nil)))
 
 (defun* %ms-topics-list (conn lock)
     (function (ms-conn t) list)
@@ -1161,12 +1212,14 @@
   (%ms-call conn lock +ms-op-get-range+
             (lambda () (%ms-encode-topic topic))
             (lambda (r)
-              (let ((tuples (%ms-decode-tuples r topic)))
-                (remhash topic chain-macs)
-                (remhash topic chain-seqs)
-                (remhash topic put-index)
-                (%ms-verify-chain topic fn tuples chain-macs chain-seqs put-index)
-                t))))
+              (multiple-value-bind (tuples tstatus) (%ms-decode-tuples r topic)
+                (cond
+                  (tstatus (values nil tstatus))
+                  (t (remhash topic chain-macs)
+                     (remhash topic chain-seqs)
+                     (remhash topic put-index)
+                     (%ms-verify-chain topic fn tuples chain-macs chain-seqs put-index)
+                     (values t nil)))))))
 
 (defun* %ms-resync-if-stale (conn lock topic fn chain-macs chain-seqs put-index stale-topics)
     (function (ms-conn t string function hash-table hash-table hash-table hash-table) t)
@@ -1257,22 +1310,25 @@
       (%ms-call conn lock +ms-op-topic-rewrite+
                 (lambda () (%ms-encode-topic-rewrite topic folded))
                 (lambda (r)
-                  (let ((res (%rd-u8 r)))
-                    (unless (= res +ms-result-t+)
-                      (error 'microservice-store-error :detail "bad topic-rewrite result"))
-                    ;; the server confirmed the replace: advance the client chain to the dense survivor state
-                    (if (plusp count)
-                        (progn (setf (gethash topic chain-macs) tail)
-                               (setf (gethash topic chain-seqs) count))
-                        (progn (remhash topic chain-macs)
-                               (remhash topic chain-seqs)))
-                    (let ((idx (make-hash-table :test #'equal)))
-                      (dolist (rec survivors)
-                        (setf (gethash (cons (coerce (durable-record-writer-guid rec) 'list)
-                                             (durable-record-sn rec)) idx) t))
-                      (setf (gethash topic put-index) idx))
-                    (remhash topic stale-topics)   ; the rewrite synced TOPIC from server truth -> clear stale
-                    t)))
+                  (multiple-value-bind (res rstatus) (%rd-u8 r)
+                    (cond
+                      (rstatus (values nil rstatus))
+                      (t
+                       (unless (= res +ms-result-t+)
+                         (error 'microservice-store-error :detail "bad topic-rewrite result"))
+                       ;; the server confirmed the replace: advance the client chain to the dense survivor state
+                       (if (plusp count)
+                           (progn (setf (gethash topic chain-macs) tail)
+                                  (setf (gethash topic chain-seqs) count))
+                           (progn (remhash topic chain-macs)
+                                  (remhash topic chain-seqs)))
+                       (let ((idx (make-hash-table :test #'equal)))
+                         (dolist (rec survivors)
+                           (setf (gethash (cons (coerce (durable-record-writer-guid rec) 'list)
+                                                (durable-record-sn rec)) idx) t))
+                         (setf (gethash topic put-index) idx))
+                       (remhash topic stale-topics)   ; the rewrite synced TOPIC from server truth -> clear stale
+                       (values t nil))))))
         (microservice-store-error (e) (setf (gethash topic stale-topics) t) (error e))))))
 
 ;;; ---- reference server (opaque inner-store proxy) ----
@@ -1325,36 +1381,38 @@
   (if (> fails +ms-accept-max-fails+) :stop :retry))
 
 (defun* %ms-handle-request (body inner)
-    (function ((simple-array (unsigned-byte 8) (*)) durable-store) (simple-array (unsigned-byte 8) (*)))
+    (function ((simple-array (unsigned-byte 8) (*)) durable-store)
+              (values (or null (simple-array (unsigned-byte 8) (*))) (or null keyword)))
   "Decode one request BODY (op-code + payload), dispatch it to the opaque INNER store, and return the
-   framed response (status ok + result). Every field is read through the bounds-checked ms-reader, so a
-   malformed request raises MICROSERVICE-PROTOCOL-ERROR (the caller drops the connection) — never an OOB
-   access. The server understands NO DARE/MAC: it just relays the vtable op to its inner store."
+   framed response (status ok + result) as (values response NIL). Every field is read through the
+   bounds-checked ms-reader (each TRYd), so a malformed request returns (values NIL status) (ADR 0064 — the
+   caller %ms-serve-connection drops the connection) — never an OOB access. The server understands NO
+   DARE/MAC: it just relays the vtable op to its inner store."
   (let* ((r (%make-ms-reader :buf body :pos 0 :end (length body)))
-         (code (%rd-u8 r))
+         (code (try (%rd-u8 r)))
          (out (%ms-buf)))
     (cond
       ((= code +ms-op-put+)
-       (let* ((topic (%rd-string r))
-              (rec   (%rd-frame r topic))
+       (let* ((topic (try (%rd-string r)))
+              (rec   (try (%rd-frame r topic)))
               (res   (store-put inner topic (durable-record-writer-guid rec) (durable-record-sn rec)
                                 (durable-record-key-hash rec) (durable-record-kind rec)
                                 (durable-record-payload rec))))
          (%ms-put-u8 out (if (eq res :rejected) +ms-result-rejected+ +ms-result-t+))))
       ((= code +ms-op-get-range+)
-       (let ((recs (store-get-range inner (%rd-string r))))
+       (let ((recs (store-get-range inner (try (%rd-string r)))))
          (%ms-put-u32 out (length recs))
          (dolist (rec recs) (%ms-put-frame out (%frame-record rec)))))
       ((= code +ms-op-topics+)
        (let ((ts (store-topics inner)))
          (%ms-put-u32 out (length ts))
-         (dolist (topic ts) (%ms-put-string out topic))))
+         (dolist (topic ts) (try (%ms-put-string out topic)))))
       ((= code +ms-op-purge+)
-       (store-purge inner (%rd-string r))
+       (store-purge inner (try (%rd-string r)))
        (%ms-put-u8 out +ms-result-t+))
       ((= code +ms-op-count+)
-       (let* ((has (%rd-u8 r))
-              (topic (when (= has 1) (%rd-string r))))
+       (let* ((has (try (%rd-u8 r)))
+              (topic (when (= has 1) (try (%rd-string r)))))
          (%ms-put-u64 out (store-count inner topic))))
       ((= code +ms-op-open+)
        ;; POLICY-CONFIRM / no-op (ADR 0050 Slice 3a): the SERVER owns the inner, opened ONCE at
@@ -1363,17 +1421,17 @@
        ;; wasteful, and leaks/rebuilds the inner's streams; the server-owned tier's history policy is
        ;; set once at server-start, not per client). Still DECODE hk-code + depth so the payload is
        ;; bounds-validated (a malformed open drops the connection) — then just acknowledge.
-       (%rd-u8 r)                       ; hk-code — decoded to bounds-validate, not applied (server owns policy)
-       (%rd-u32 r)                      ; depth
+       (try (%rd-u8 r))                 ; hk-code — decoded to bounds-validate, not applied (server owns policy)
+       (try (%rd-u32 r))                ; depth
        (%ms-put-u8 out +ms-result-t+))
       ((= code +ms-op-close+)
        ;; connection-scoped: acknowledge only. The inner store's lifecycle is the SERVER's, closed at
        ;; microservice-server-stop, not on a client disconnect (Slice-3 reconnect keeps the store alive).
        (%ms-put-u8 out +ms-result-t+))
       ((= code +ms-op-delete+)
-       (let* ((topic (%rd-string r))
-              (guid  (%rd-bytes r 16))
-              (sn    (%rd-u64 r))
+       (let* ((topic (try (%rd-string r)))
+              (guid  (try (%rd-bytes r 16)))
+              (sn    (try (%rd-u64 r)))
               (res   (store-delete inner topic (coerce guid '(simple-array (unsigned-byte 8) (16))) sn)))
          (%ms-put-u8 out (if (eq res t) +ms-result-t+ +ms-result-rejected+))))
       ((= code +ms-op-topic-rewrite+)
@@ -1383,23 +1441,23 @@
        ;; swaps them all-or-nothing (memory: in-process serial; file/SQLite: tmp+rename / transaction).
        ;; COUNT is bounded against the remaining buffer (each frame needs >= 1 byte, mirroring
        ;; %ms-decode-records); each %rd-frame is itself bounds-checked (network-facing, no OOB).
-       (let* ((topic (%rd-string r))
-              (count (%rd-u32 r)))
+       (let* ((topic (try (%rd-string r)))
+              (count (try (%rd-u32 r))))
          (when (> count (- (ms-reader-end r) (ms-reader-pos r)))
-           (error 'microservice-protocol-error :detail "rewrite record count exceeds buffer extent"))
+           (bail :count-exceeds-extent))
          (let ((recs '()))
-           (dotimes (i count) (push (%rd-frame r topic) recs))
+           (dotimes (i count) (push (try (%rd-frame r topic)) recs))
            (store-replace-topic inner topic (nreverse recs))
            (%ms-put-u8 out +ms-result-t+))))
-      (t (error 'microservice-protocol-error :detail "unknown op-code")))
-    (%ms-frame-message +ms-status-ok+ (%ms-finalize out))))
+      (t (bail :unknown-op)))
+    (values (%ms-frame-message +ms-status-ok+ (%ms-finalize out)) nil)))
 
 (defun* %ms-serve-connection (conn inner recv-timeout)
     (function (t durable-store (or null (real 0))) t)
   "Serve one client connection: arm the idle/read RECV-TIMEOUT on CONN (WP-DURABILITY-MS-DOS), then read a
    request, dispatch, reply, repeat until the client closes (EOF) or ANY per-connection fault occurs. A
-   MICROSERVICE-PROTOCOL-ERROR (a bounds/well-formedness violation) is the common clean case — it drops the
-   connection fail-safe. A stalled/slow-loris client (a header then no body, or a bare connect then
+   malformed request (%ms-handle-request returns a non-nil status, ADR 0064) is the common clean case — it
+   drops the connection fail-safe. A stalled/slow-loris client (a header then no body, or a bare connect then
    silence) trips the armed recv timeout so tcp-recv returns :TIMEOUT after RECV-TIMEOUT seconds, which
    ends this loop exactly as an EOF does. The outer SERIOUS-CONDITION handler is the defense-in-depth
    BACKSTOP mandated for a network listener serving untrusted clients: any per-connection error — a decode
@@ -1423,7 +1481,8 @@
           ;; disposition was already identical, and now it is also the same code path.
           (let ((body (%ms-recv-message conn)))
             (when (null body) (return t))
-            (let ((resp (%ms-handle-request body inner)))
+            (multiple-value-bind (resp pstatus) (%ms-handle-request body inner)
+              (when pstatus (return t))                          ; malformed request (ADR 0064): drop THIS connection
               (multiple-value-bind (sent status) (dds.pal:tcp-send conn resp (length resp))
                 (declare (ignore sent))
                 (when status (return t)))))))                   ; torn send: the client is gone

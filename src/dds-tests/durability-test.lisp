@@ -7139,9 +7139,8 @@
                      (octets #xE2 #x28 #xA1)               ; bad continuation byte
                      (octets #xF4 #x90 #x80 #x80)))        ; F4 90.. -> > U+10FFFF
     (%check :ms-fuzz-utf8-reject
-            (eq :caught (handler-case (dds.durability::%ms-utf8->string bad 0 (length bad))
-                          (dds.durability::microservice-protocol-error () :caught)))
-            "malformed UTF-8 topic raises a clean protocol error (no TYPE-ERROR / crash)"))
+            (eq :bad-utf8 (nth-value 1 (dds.durability::%ms-utf8->string bad 0 (length bad))))
+            "malformed UTF-8 topic returns a clean :BAD-UTF8 status (no TYPE-ERROR / crash)"))
   (let ((valid "AZ¿ࠀ\U0001F600"))   ; ASCII + 2/3/4-byte scalars
     (%check :ms-fuzz-utf8-roundtrip
             (string= valid (let ((u (dds.durability::%string->utf8 valid)))
@@ -7647,7 +7646,8 @@
         (pay (lambda (i) (%tms-payload (+ 6 i) (logand (+ 1 i) 255)))))
     (labels
         ((%cseq-of (rec)
-           (nth-value 2 (dds.durability::%ms-unfold-payload
+           ;; chain_seq is nth-value 3 — the ADR-0064 status rides position 2 of %ms-unfold-payload
+           (nth-value 3 (dds.durability::%ms-unfold-payload
                          (dds.durability:durable-record-payload rec))))
          (%topic-of (inner) (first (dds.durability:store-topics inner)))
          (%find-cseq (inner c)
@@ -7921,8 +7921,8 @@
   (let ((g0  (%tms-guid 5))
         (g6  (%tms-guid 6))
         (pay (lambda (i) (%tms-payload (+ 6 i) (logand (+ 1 i) 255)))))
-    (labels ((%cseq-of (rec)
-               (nth-value 2 (dds.durability::%ms-unfold-payload (dds.durability:durable-record-payload rec))))
+    (labels ((%cseq-of (rec)   ; chain_seq is nth-value 3 (the ADR-0064 status rides position 2)
+               (nth-value 3 (dds.durability::%ms-unfold-payload (dds.durability:durable-record-payload rec))))
              (%tail-path (base) (dds.durability::%logmac-tail-path (uiop:ensure-directory-pathname base)))
              (%tamper-tail (base)
                (let* ((tp (%tail-path base))
@@ -9192,9 +9192,8 @@
           (dds.pal:tcp-set-recv-timeout srv 1)
           (dds.pal:tcp-send cli (octets 1 0 0 16) 4)             ; body-len = #x10000001 = +ms-max-message+ + 1 (over-cap)
           (%check :ms-huge-overcap-rejected
-                  (eq :proto (handler-case (progn (dds.durability::%ms-recv-message srv) :no-error)
-                               (dds.durability::microservice-protocol-error () :proto)))
-                  "an OVER-CAP declared body-len is rejected as a protocol error BEFORE any body allocation"))
+                  (eq :bad-body-length (nth-value 1 (dds.durability::%ms-recv-message srv)))
+                  "an OVER-CAP declared body-len is rejected as a protocol status BEFORE any body allocation"))
       (progn (ignore-errors (dds.pal:tcp-close cli)) (ignore-errors (dds.pal:tcp-close srv))
              (ignore-errors (dds.pal:tcp-close ln)))))
   ;; (ii) huge AT-CAP declared length + no body -> incremental read times out, allocation bounded (not 256 MiB)
