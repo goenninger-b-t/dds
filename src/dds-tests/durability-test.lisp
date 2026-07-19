@@ -8423,12 +8423,14 @@
                                              "sqlite" :dir base :key-dir kdir))
                   "\"sqlite\" backend still selects a factory")
           (%check :ms-cfg-port-required
+                  ;; ADR 0064: a missing ms-port returns (VALUES NIL :REQUIRES-MS-PORT) (2nd value non-NIL),
+                  ;; not a signal; a raw error would be a bug (-> :ok, failing the check).
                   (eq :err (handler-case
-                               (progn (dds.durability:make-durability-store-factory
-                                       "microservice" :dir base :key-dir kdir :ms-host "127.0.0.1")
-                                      :ok)
-                             (error () :err)))
-                  "microservice backend without a port signals (DPERSIST_MS_PORT required)"))
+                               (if (nth-value 1 (dds.durability:make-durability-store-factory
+                                                 "microservice" :dir base :key-dir kdir :ms-host "127.0.0.1"))
+                                   :err :ok)
+                             (error () :ok)))
+                  "microservice backend without a port returns a :requires-ms-port status (DPERSIST_MS_PORT required)"))
       (when (uiop:directory-exists-p base) (uiop:delete-directory-tree base :validate t))))
   t)
 

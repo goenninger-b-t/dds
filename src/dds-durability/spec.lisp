@@ -108,7 +108,7 @@
     (function (string &key (:dir (or pathname string)) (:key-dir (or pathname string))
                       (:ms-host (or null string)) (:ms-port (or null (integer 0 65535)))
                       (:history-kind (member :keep-all :keep-last)) (:history-depth (integer 1)))
-              function)
+              (values (or null function) (or null keyword)))
   "Select+construct the 0-arg durable-store factory for a persistent-tier BACKEND — the single
    backend-dispatch seam the durability-persistent drivers (interop/durability-persistent/driver-collect
    + driver-serve) and the DPERSIST_BACKEND config-env share (DRY: one dispatch, not one per driver).
@@ -124,19 +124,26 @@
      anything else   -> make-persistent-store-factory (the file-store default, :dir DIR :key-dir KEY-DIR
                         + HISTORY-KIND/DEPTH).
    Every branch yields the same encrypted-store(inner) 0-arg closure the service-spec :STORE slot consumes;
-   the microservice backend needs :THREAD service mode (a factory does not cross a :PROCESS boundary)."
+   the microservice backend needs :THREAD service mode (a factory does not cross a :PROCESS boundary).
+   Returns (VALUES FACTORY STATUS): STATUS is NIL on success, or :REQUIRES-MS-PORT when BACKEND is
+   \"microservice\" and MS-PORT was omitted (ADR 0064: a config precondition returns a status, never a
+   stack unwind — the CLI path validates the port earlier via %config-error, so this is reached only by a
+   direct caller / test; a caller taking only the primary FACTORY reads NIL on that miss)."
   (cond
     ((string-equal backend "sqlite")
-     (make-sqlite-store-factory :dir dir :key-dir key-dir
-                                :history-kind history-kind :history-depth history-depth))
+     (values (make-sqlite-store-factory :dir dir :key-dir key-dir
+                                        :history-kind history-kind :history-depth history-depth)
+             nil))
     ((string-equal backend "microservice")
      (unless ms-port
-       (error "dds.durability: DPERSIST_BACKEND=microservice requires a remote server port (DPERSIST_MS_PORT)"))
-     (make-microservice-store-factory :host (or ms-host "127.0.0.1") :port ms-port
-                                      :epoch-dir dir :key-dir key-dir))
+       (bail :requires-ms-port))
+     (values (make-microservice-store-factory :host (or ms-host "127.0.0.1") :port ms-port
+                                              :epoch-dir dir :key-dir key-dir)
+             nil))
     (t
-     (make-persistent-store-factory :dir dir :key-dir key-dir
-                                    :history-kind history-kind :history-depth history-depth))))
+     (values (make-persistent-store-factory :dir dir :key-dir key-dir
+                                            :history-kind history-kind :history-depth history-depth)
+             nil))))
 
 (defun* service-spec-matches-p (spec topic type)
     (function (service-spec string string) boolean)

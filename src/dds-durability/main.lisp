@@ -278,8 +278,9 @@
           (%config-error "--backend ~a requires --dir (or env DDS_DURABILITY_DIR): a PERSISTENT backend must name its durable store directory (there is no temp-dir fallback)" backend))
         (let* ((d (or dir (%default-persistence-dir)))    ; only microservice reaches the default (client-local DARE epoch-dir)
                (k (or key-dir (namestring (merge-pathnames "keys/" (uiop:ensure-directory-pathname d))))))
-          ;; make-durability-store-factory (spec.lisp) still SIGNALS on a missing ms-port — UNREACHABLE from
-          ;; here (we validated ms-port above); it is converted with the store-factory slice, not this one.
+          ;; make-durability-store-factory (spec.lisp) returns (VALUES factory :REQUIRES-MS-PORT) on a missing
+          ;; ms-port (ADR 0064 — no signal); UNREACHABLE from here (we validated ms-port above), and we take
+          ;; only its PRIMARY value (the factory), so the status is a benign NIL on this path.
           (values (make-durability-store-factory backend :dir d :key-dir k :ms-host ms-host :ms-port ms-port)
                   nil)))))
 

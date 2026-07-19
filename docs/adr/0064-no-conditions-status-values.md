@@ -475,6 +475,17 @@ clean value at `%ms-call`, parity with the pre-0064 single `microservice-store-e
   `store.lisp` (6 contracts), `store-microservice.lisp` (`%ms-call` + 7 helpers + 6 closures + server), 
   `store-encrypted.lisp` (2 decorator fixes), `service.lisp` (collect loop), `durability-test.lisp`.
 
+## Slice — `make-durability-store-factory` config precondition → status (159 -> 158)
+
+The `DPERSIST_BACKEND=microservice requires a remote server port` precondition in
+`make-durability-store-factory` (`spec.lisp`) was a bare `(error …)`. It becomes `(bail :requires-ms-port)`
+— the factory now returns `(values (or null function) (or null keyword))`. The ripple is BENIGN: the CLI
+path (`main.lisp` `%service-store-factory`) validated `ms-port` earlier via `%config-error` and takes only
+the primary FACTORY value, so its status is a benign `NIL`; the interop drivers always pass a port and
+`funcall` the primary; only the direct-call test (`run-durability-microservice-config-env-test`) reached the
+precondition, and it flips to `nth-value 1`. Mirrors the `make-sqlite-store` / `make-microservice-store`
+constructor-precondition pattern.
+
 ## Order of the remaining work (shallow → deep)
 
 **the durability store vtable — the tamper refusals are now `SECURITY-FAILCLOSED` (contained at the start
