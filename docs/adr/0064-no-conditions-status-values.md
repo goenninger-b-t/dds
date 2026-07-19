@@ -435,6 +435,46 @@ failure (store-open stays boundary-caught at `runner-start`, tamper parity), and
 (no test caught `conn-lost`/`store-error` directly). Commit B widens `store-put`/`get`/`delete` so the closures
 RETURN the failure instead of re-signalling, and updates the collect-loop + server consumers.
 
+## Slice 2 Commit B — microservice op-failure widens the store vtable contract (165 -> 159)
+
+**Owner ruling (2026-07-19), the external half of the internal Commit A above.** The microservice data-plane ops
+no longer re-signal `microservice-store-error` on an operation failure — they RETURN an op-failure status, so the
+`durable-store` vtable contract widens (additive, only the microservice backend produces it — local backends are
+byte-identical). New keyword `:UNAVAILABLE` (server-down / reconnect-exhausted / malformed response, folded to one
+clean value at `%ms-call`, parity with the pre-0064 single `microservice-store-error` type):
+
+- **`store-put` / `store-delete` / `store-purge`** gain `:UNAVAILABLE` on their PRIMARY value (additive to
+  `t|:rejected|:resource-limits`, `t|:unsupported`, `t` respectively — exactly as `:resource-limits` was added).
+- **`store-get-range` / `store-topics` / `store-count`** gain a 2nd value: `(values result (or null keyword))`
+  (get-range/topics read `NIL` list on failure, count reads `0`; a caller taking only the primary is unaffected).
+- **`%ms-call` returns `(values result status)`** — the not-open / dropped-and-reconnect-failed / residual-protocol
+  cases `bail :unavailable` (a `defun*` local return, no signal); the 7 helpers (`%ms-topics-list`,
+  `%ms-get-range-verified`, `%ms-resync-topic`/`-if-stale`/`%ms-reseal-stale-topics`, `%ms-fetch-tuples`,
+  `%ms-delete-rechain`) thread the status; the 6 vtable closures surface it. The three closure re-signal
+  `handler-case`es (put/purge/delete-rechain: catch → mark-stale → re-signal) become status checks (mark-stale on
+  a non-NIL status, return `:UNAVAILABLE`); the Fix-1 stale-topic bookkeeping is preserved exactly.
+- **A genuine chain-MAC TAMPER still SIGNALS** from `%ms-verify-chain` (`SECURITY-FAILCLOSED`, ADR 0045) and flows
+  through `%ms-call` untouched — only conn-lost/protocol failures became status.
+- **The store-open path stays boundary-signalled** (deferred to a later store-open-contract slice): `%ms-open`
+  (open failure) is unchanged, and the `:open` closure's chain-verify loop now checks the helpers' status and
+  **re-signals `microservice-store-error`** on a conn-lost during verify — a verify that cannot reach the server
+  MUST fail the open (a silent skip would be a fail-OPEN regression). `microservice-conn-lost` is DELETED (dead —
+  the drop is the `:CONN-LOST` status keyword); `microservice-store-error` stays for the store-open path.
+- **Two latent defects fell out of the conversion, exactly as predicted.** (1) The epoch decorator's put ran the
+  eviction + settle-window bookkeeping UNCONDITIONALLY after the inner put — safe only while a failed
+  microservice put UNWOUND; with a status return it would evict prior surrogates for a record the server never
+  stored, corrupting the client chain. Now gated on `(eq r t)`. (2) The decorator's `%trim-window-to-depth`
+  rewrote the instance window to the survivors even if a physical delete failed; now it rewrites only when EVERY
+  delete landed (the crash-lower-bar self-heal, preserved). (3) The server's put-result mapping reported any
+  non-`:rejected` (incl. `:resource-limits`) as success; fixed to `(eq res t)` (defensive — the DARE-blind inner
+  never produces it today).
+- **Consumers:** the collect-loop's two `store-put` sites now check the result and route a non-`T` to
+  `*durability-error-hook*` + skip the relay — preserving the pre-0064 unwind semantics exactly (mark-seen already
+  happened; the unwind skipped the relay). `~10` durability tests that caught `microservice-store-error` flip to
+  checking the returned status (`nth-value 1` for the reads, the primary keyword for put/delete). Files:
+  `store.lisp` (6 contracts), `store-microservice.lisp` (`%ms-call` + 7 helpers + 6 closures + server), 
+  `store-encrypted.lisp` (2 decorator fixes), `service.lisp` (collect loop), `durability-test.lisp`.
+
 ## Order of the remaining work (shallow → deep)
 
 **the durability store vtable — the tamper refusals are now `SECURITY-FAILCLOSED` (contained at the start

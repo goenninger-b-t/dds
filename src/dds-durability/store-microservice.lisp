@@ -121,21 +121,15 @@
   ((detail :initarg :detail :reader microservice-store-error-detail :initform "microservice store error"))
   (:report (lambda (c s) (format s "dds.durability microservice store: ~a"
                                  (microservice-store-error-detail c))))
-  (:documentation "A microservice client operation failed at the connection level — the server closed
-    the connection, the store is not open, or the response was unusable. A caller sees a clean Lisp
-    error, never a hang or garbage. MICROSERVICE-CONN-LOST is the connection-drop SUBTYPE that %ms-call
-    attempts ONE bounded reconnect+retry against before surfacing (Slice 3c-1, ADR 0050 §4.5); a caller
-    catching MICROSERVICE-STORE-ERROR catches both."))
-
-(define-condition microservice-conn-lost (microservice-store-error)
-  ()
-  (:documentation "The single TCP connection to the microservice server dropped mid-op — the peer
-    closed / reset (recv returned NIL) or a send failed on a torn socket (tcp-send error). A SUBTYPE of
-    MICROSERVICE-STORE-ERROR (so any store-error handler still catches it) but distinguishable, so
-    %ms-call can CLOSE+CLEAR the dead socket, RE-DIAL once, and RETRY the op once — a bounded single
-    reconnect, never an unbounded loop (ADR 0050 §4.5, Slice 3c-1). The reference server holds ZERO
-    per-session state (open = policy-confirm no-op, close = ack), so re-establishment is a plain
-    re-dial; the ops are idempotent, so a byte-identical retry cannot corrupt/duplicate."))
+  (:documentation "A microservice STORE-OPEN operation failed — the server closed the connection, the
+    store is not open, or open-time chain verification could not reach the server. As of the ADR 0064
+    Slice-2 vtable widening this is signalled ONLY on the store-open path (%ms-open + the :open closure's
+    chain-verify), which stays boundary-caught at the durability start boundary (runner-start); the
+    store-open contract widening to (VALUES store status) is a later slice. The DATA-plane ops (put /
+    get-range / topics / count / purge / delete) NO LONGER signal — they return an op-failure STATUS
+    (:UNAVAILABLE) instead (ADR 0064). The former MICROSERVICE-CONN-LOST subtype is GONE: a dropped
+    connection is now the :CONN-LOST STATUS VALUE from %ms-exchange, driving %ms-call's bounded
+    reconnect+retry (Slice 3c-1, ADR 0050 §4.5) with no condition at all."))
 
 (define-condition microservice-protocol-error (error)
   ((detail :initarg :detail :reader microservice-protocol-error-detail :initform "protocol error"))
@@ -557,26 +551,25 @@
   (values t nil))
 
 (defun* %ms-reconnect (conn)
-    (function (ms-conn) t)
+    (function (ms-conn) (values t (or null keyword)))
   "Bounded SINGLE reconnect after a dropped connection (ADR 0050 §4.5): CLOSE+CLEAR the dead socket, pause
-   one short backoff (*ms-reconnect-backoff-seconds*), and RE-DIAL ONCE. Signals MICROSERVICE-STORE-ERROR if
-   the re-dial fails (server still down) — a fast, clean failure, NOT an unbounded loop or a hang. Caller
-   holds the store lock; on return CONN has a fresh live socket and the caller retries the op ONCE."
+   one short backoff (*ms-reconnect-backoff-seconds*), and RE-DIAL ONCE. Returns (VALUES T NIL) with a fresh
+   live socket on success, or (VALUES NIL :UNAVAILABLE) if the re-dial fails (server still down) — a fast,
+   clean status VALUE (ADR 0064: no MICROSERVICE-STORE-ERROR unwind), NOT an unbounded loop or a hang. The
+   sb-bsd-sockets library condition for a REFUSED connect is still contained at the %ms-dial handler-case
+   boundary (an external library's condition, rule 2) and reported as the :UNAVAILABLE status. Caller holds
+   the store lock; on a non-NIL status the caller surfaces :UNAVAILABLE to the op boundary (no retry)."
   (let ((old (ms-conn-sock conn)))
     (setf (ms-conn-sock conn) nil)
     (when old (ignore-errors (dds.pal:tcp-close old))))
   (sleep *ms-reconnect-backoff-seconds*)
   ;; the re-dial fails in TWO ways now: a PAL status (a refused socket option) and the sb-bsd-sockets
-  ;; library condition for a REFUSED connect (server still down) — contain both, report one.
+  ;; library condition for a REFUSED connect (server still down) — contain both at this boundary, report one.
   (multiple-value-bind (sock reason)
       (handler-case (%ms-dial conn)
         (error (e) (values nil e)))
     (declare (ignore sock))
-    (when reason
-      (error 'microservice-store-error
-             :detail (format nil "reconnect to ~a:~d failed: ~a"
-                             (ms-conn-host conn) (ms-conn-port conn) reason))))
-  t)
+    (if reason (values nil :unavailable) (values t nil))))
 
 (defun* %ms-recv-body (sock body-len)
     (function (t (integer 1))
@@ -669,39 +662,42 @@
           r)))))
 
 (defun* %ms-call (conn lock code build-fn decode-fn)
-    (function (ms-conn t (unsigned-byte 8) function function) t)
+    (function (ms-conn t (unsigned-byte 8) function function) (values t (or null keyword)))
   "Run one client op under the store LOCK on CONN's open connection: build the request payload (BUILD-FN),
-   exchange it, and decode the result (DECODE-FN on the response ms-reader). Signals if the store is not
-   open. A MALFORMED server response (a bounds/well-formedness violation surfaced by the decoder as a
-   status VALUE in position 2 of BUILD-FN/DECODE-FN, ADR 0064) is re-signalled as a MICROSERVICE-STORE-ERROR
-   so the client API presents ONE clean error type for any bad/torn response — never a raw decode TYPE-ERROR.
+   exchange it, and decode the result (DECODE-FN on the response ms-reader). Returns (VALUES RESULT STATUS):
+   RESULT is DECODE-FN's value on success (STATUS NIL); on ANY failure — the store is not open, the
+   connection dropped and the bounded reconnect was exhausted, the server returned a non-ok status byte, or
+   the response was MALFORMED (a bounds/well-formedness violation surfaced by the decoder as a status VALUE
+   in position 2 of BUILD-FN/DECODE-FN, ADR 0064) — it returns (VALUES NIL :UNAVAILABLE) (ADR 0064 Slice-2
+   vtable widening: an op-failure STATUS VALUE, never a MICROSERVICE-STORE-ERROR unwind). ONE clean status
+   for any bad/torn response — never a raw decode TYPE-ERROR — folded to :UNAVAILABLE so the store-op
+   boundary presents one op-failure keyword (parity with the pre-0064 single microservice-store-error type).
 
    RECONNECT (Slice 3c-1, ADR 0050 §4.5): if the connection DROPPED (a :CONN-LOST STATUS from %ms-exchange —
    a send failure or a server-closed read; ADR 0064, no condition, checked in RUN before decode), CLOSE+CLEAR
-   the dead socket, RE-DIAL once (%ms-reconnect), and RETRY
-   the op ONCE — a BOUNDED single reconnect. The retry re-invokes BUILD-FN + DECODE-FN, which is SAFE only
-   because every op is idempotent AND advances client chain/put-index state ONLY in DECODE-FN after a
-   confirmed response: a byte-identical retry re-sends folded frames the DARE-blind server INSERT-OR-IGNOREs
-   (put), replaces with the same survivor set (topic-rewrite), or re-drops (delete/purge). A second
-   consecutive drop (or a failed re-dial) surfaces cleanly as MICROSERVICE-STORE-ERROR (no third attempt,
-   no loop, no hang). A non-drop server error (bad status) is NOT retried.
+   the dead socket, RE-DIAL once (%ms-reconnect, which itself returns a :UNAVAILABLE STATUS if the server is
+   still down — no signal), and RETRY the op ONCE — a BOUNDED single reconnect. The retry re-invokes BUILD-FN
+   + DECODE-FN, which is SAFE only because every op is idempotent AND advances client chain/put-index state
+   ONLY in DECODE-FN after a confirmed response: a byte-identical retry re-sends folded frames the DARE-blind
+   server INSERT-OR-IGNOREs (put), replaces with the same survivor set (topic-rewrite), or re-drops
+   (delete/purge). A second consecutive drop (or a failed re-dial) surfaces as (VALUES NIL :UNAVAILABLE) (no
+   third attempt, no loop, no hang). A non-drop server error (bad status) is NOT retried.
 
    DROPPED-vs-CLOSED (Fix 2, ADR 0050 §4.5): a prior op whose re-dial failed leaves sock NIL but the store
    is NOT closed (EVER-CONNECTED-P set). This op RE-DIALS from that dropped state (bounded) so an op-during-
    outage recovers when the server returns — it is NOT a terminal 'store is not open'. Only %ms-close (which
-   sets CLOSED-P) or a never-opened store is terminal. The exhausted-retry marks the topic STALE at the chain
-   layer (%ms-resync-if-stale) so the NEXT chained mutation re-syncs from the server (no fork; Fix 1)."
+   sets CLOSED-P) or a never-opened store is terminal (both → :UNAVAILABLE). The exhausted-retry marks the
+   topic STALE at the chain layer (%ms-resync-if-stale) so the NEXT chained mutation re-syncs (no fork; Fix 1)."
   (dds.pal:with-lock (lock)
     (cond
-      ((ms-conn-closed-p conn) (error 'microservice-store-error :detail "store is not open"))
-      ((ms-conn-sock conn))                                     ; connected — proceed
+      ((ms-conn-closed-p conn) (bail :unavailable))            ; terminally closed store (no signal, ADR 0064)
+      ((ms-conn-sock conn))                                    ; connected — proceed
       ((and (ms-conn-ever-connected-p conn) (not *durability-debug-ms-skip-redial-dropped*))
-       (%ms-reconnect conn))                                    ; DROPPED — bounded re-dial (clean error if down; NOT terminal)
-      (t (error 'microservice-store-error :detail "store is not open")))   ; never opened (or the RED knob)
-    (flet ((clean-protocol (status)
-             (error 'microservice-store-error
-                    :detail (format nil "microservice protocol error: ~a" status)))
-           (run ()
+       (multiple-value-bind (ok rstatus) (%ms-reconnect conn)  ; DROPPED — bounded re-dial (NOT terminal)
+         (declare (ignore ok))
+         (when rstatus (bail :unavailable))))                  ; re-dial failed (server down): clean status
+      (t (bail :unavailable)))                                 ; never opened (or the RED knob)
+    (flet ((run ()
              ;; BUILD-FN + DECODE-FN are lambdas (stored in the vtable, invoked after make-microservice-store
              ;; returns), so they thread the protocol status MANUALLY as (values result status) — they CANNOT
              ;; use defun*'s TRY/BAIL, which would return-from make-microservice-store's dead extent. A CONN
@@ -716,9 +712,12 @@
                          (funcall decode-fn reader)))))))
       (multiple-value-bind (result status) (run)
         (when (eq status :conn-lost)        ; bounded single re-dial + retry ONCE (ADR 0064)
-          (%ms-reconnect conn)              ; signals store-error if the server is down
-          (multiple-value-setq (result status) (run)))
-        (if status (clean-protocol status) result)))))
+          (multiple-value-bind (ok rstatus) (%ms-reconnect conn)
+            (declare (ignore ok))
+            (if rstatus
+                (setf result nil status :unavailable)   ; re-dial failed (server down): surface, no retry
+                (multiple-value-setq (result status) (run)))))
+        (if status (values nil :unavailable) result)))))   ; fold ANY residual op-failure to one clean keyword
 
 (defun* %ms-open (conn lock history-kind history-depth)
     (function (ms-conn t (or null (member :keep-all :keep-last)) (or null (integer 1)))
@@ -820,51 +819,62 @@
                   ;; Fix 1 (ADR 0050 §4.5): if a prior op EXHAUSTED and left TOPIC stale, re-sync the client
                   ;; chain state from the server BEFORE building this put so it chains from ground truth (the
                   ;; re-sync re-learns whether the exhausted op was applied); mark stale if THIS put exhausts.
-                  (%ms-resync-if-stale conn lock topic chain-mac-fn chain-macs chain-seqs put-index stale-topics)
-                  (handler-case
-                  (%ms-call conn lock +ms-op-put+
-                            (lambda ()
-                              (setf idx (or (gethash topic put-index)
-                                            (setf (gethash topic put-index) (make-hash-table :test #'equal))))
-                              (setf kkey (cons (coerce writer-guid 'list) sn))
-                              (if (gethash kkey idx)
-                                  (progn (setf reput t)
-                                         (%ms-encode-put topic writer-guid sn key-hash kind payload))
-                                  (let* ((prev (or (gethash topic chain-macs) (%chain-seed chain-mac-fn topic)))
-                                         (seq  (the (integer 0) (gethash topic chain-seqs 0)))
-                                         (rec  (make-durable-record :topic topic :writer-guid writer-guid :sn sn
-                                                                    :key-hash key-hash :kind kind :payload payload))
-                                         (mac  (nth-value 1 (%frame-record-versioned
-                                                             rec +frame-version-v3+ prev chain-mac-fn))))
-                                    (setf new-mac mac new-seq seq)
-                                    (%ms-encode-put topic writer-guid sn key-hash kind
-                                                    (%ms-fold-payload
-                                                     payload (the (simple-array (unsigned-byte 8) (*)) mac) seq)))))
-                            (lambda (r)
-                              (multiple-value-bind (res rstatus) (%rd-u8 r)
-                                (if rstatus
-                                    (values nil rstatus)
-                                    (cond ((= res +ms-result-t+)
-                                           (unless reput
-                                             (setf (gethash topic chain-macs) new-mac)
-                                             (setf (gethash topic chain-seqs) (1+ new-seq))
-                                             (setf (gethash kkey idx) t))
-                                           (values t nil))
-                                          ((= res +ms-result-rejected+) (values :rejected nil))
-                                          (t (values nil :bad-put-result)))))))
-                    ;; the exhausted-retry MAY have applied the put but lost the ack — mark the topic STALE so
-                    ;; the next chained mutation re-syncs the chain state from the server (Fix 1), then re-signal.
-                    (microservice-store-error (e) (setf (gethash topic stale-topics) t) (error e))))
+                  ;; ADR 0064 Slice-2: %ms-resync-if-stale now returns (VALUES T STATUS); a non-NIL status means
+                  ;; the server was unreachable to re-sync -> the put ABORTS with :UNAVAILABLE (TOPIC stays stale).
+                  (multiple-value-bind (rs-ok rs-status)
+                      (%ms-resync-if-stale conn lock topic chain-mac-fn chain-macs chain-seqs put-index stale-topics)
+                    (declare (ignore rs-ok))
+                    (if rs-status
+                        :unavailable
+                        (multiple-value-bind (result status)
+                            (%ms-call conn lock +ms-op-put+
+                                      (lambda ()
+                                        (setf idx (or (gethash topic put-index)
+                                                      (setf (gethash topic put-index) (make-hash-table :test #'equal))))
+                                        (setf kkey (cons (coerce writer-guid 'list) sn))
+                                        (if (gethash kkey idx)
+                                            (progn (setf reput t)
+                                                   (%ms-encode-put topic writer-guid sn key-hash kind payload))
+                                            (let* ((prev (or (gethash topic chain-macs) (%chain-seed chain-mac-fn topic)))
+                                                   (seq  (the (integer 0) (gethash topic chain-seqs 0)))
+                                                   (rec  (make-durable-record :topic topic :writer-guid writer-guid :sn sn
+                                                                              :key-hash key-hash :kind kind :payload payload))
+                                                   (mac  (nth-value 1 (%frame-record-versioned
+                                                                       rec +frame-version-v3+ prev chain-mac-fn))))
+                                              (setf new-mac mac new-seq seq)
+                                              (%ms-encode-put topic writer-guid sn key-hash kind
+                                                              (%ms-fold-payload
+                                                               payload (the (simple-array (unsigned-byte 8) (*)) mac) seq)))))
+                                      (lambda (r)
+                                        (multiple-value-bind (res rstatus) (%rd-u8 r)
+                                          (if rstatus
+                                              (values nil rstatus)
+                                              (cond ((= res +ms-result-t+)
+                                                     (unless reput
+                                                       (setf (gethash topic chain-macs) new-mac)
+                                                       (setf (gethash topic chain-seqs) (1+ new-seq))
+                                                       (setf (gethash kkey idx) t))
+                                                     (values t nil))
+                                                    ((= res +ms-result-rejected+) (values :rejected nil))
+                                                    (t (values nil :bad-put-result)))))))
+                          ;; ADR 0064 Slice-2: an op-failure STATUS (was a MICROSERVICE-STORE-ERROR) MAY have
+                          ;; applied the put but lost the ack — mark the topic STALE so the next chained mutation
+                          ;; re-syncs from the server (Fix 1), and surface :UNAVAILABLE on store-put's primary.
+                          (if status
+                              (progn (setf (gethash topic stale-topics) t) :unavailable)
+                              result)))))
                 ;; bare tier: no oracle installed ⇒ no chain (memory parity, Slice 1 unchanged).
-                (%ms-call conn lock +ms-op-put+
-                          (lambda () (%ms-encode-put topic writer-guid sn key-hash kind payload))
-                          (lambda (r)
-                            (multiple-value-bind (res rstatus) (%rd-u8 r)
-                              (if rstatus
-                                  (values nil rstatus)
-                                  (cond ((= res +ms-result-t+) (values t nil))
-                                        ((= res +ms-result-rejected+) (values :rejected nil))
-                                        (t (values nil :bad-put-result)))))))))
+                (multiple-value-bind (result status)
+                    (%ms-call conn lock +ms-op-put+
+                              (lambda () (%ms-encode-put topic writer-guid sn key-hash kind payload))
+                              (lambda (r)
+                                (multiple-value-bind (res rstatus) (%rd-u8 r)
+                                  (if rstatus
+                                      (values nil rstatus)
+                                      (cond ((= res +ms-result-t+) (values t nil))
+                                            ((= res +ms-result-rejected+) (values :rejected nil))
+                                            (t (values nil :bad-put-result)))))))
+                  (if status :unavailable result))))
      :get-range (lambda (topic)
                   (if chain-mac-fn
                       (%ms-get-range-verified conn lock topic chain-mac-fn chain-macs chain-seqs put-index)
@@ -880,7 +890,7 @@
               ;; false-reject/brick; AND a reput to the purged topic in the SAME session would chain from the
               ;; stale tail -> reopen mismatch. Clearing all three (+ the stale mark, since the topic is now
               ;; empty) drops it from the seal and re-seeds a reput from the per-topic head (no false-reject).
-              (flet ((do-purge ()
+              (flet ((do-purge ()   ; returns (VALUES T/NIL STATUS) from %ms-call (ADR 0064 Slice-2)
                        (%ms-call conn lock +ms-op-purge+
                                  (lambda () (%ms-encode-topic topic))
                                  (lambda (r)
@@ -894,10 +904,17 @@
                                               (values t nil))))))))
                 ;; chained tier: an exhausted purge MAY have applied server-side but lost the ack (client head
                 ;; NOT cleared) -> mark STALE so the next chained mutation re-syncs (Fix 1, ADR 0050 §4.5).
+                ;; ADR 0064 Slice-2: an op-failure STATUS (was a MICROSERVICE-STORE-ERROR) -> :UNAVAILABLE on
+                ;; store-purge's primary; success -> T.
                 (if chain-mac-fn
-                    (handler-case (do-purge)
-                      (microservice-store-error (e) (setf (gethash topic stale-topics) t) (error e)))
-                    (do-purge))))
+                    (multiple-value-bind (result status) (do-purge)
+                      (declare (ignore result))
+                      (if status
+                          (progn (setf (gethash topic stale-topics) t) :unavailable)
+                          t))
+                    (multiple-value-bind (result status) (do-purge)
+                      (declare (ignore result))
+                      (if status :unavailable t)))))
      :open (lambda (history-kind history-depth)
              (%ms-open conn lock history-kind history-depth)
              ;; fail-closed-on-OPEN parity (file/SQLite verify EVERY topic at store-open, before any read):
@@ -906,15 +923,33 @@
              ;; is now caught EARLIER by the decorator's sealed high-water tail anchor (the :verify-chain-
              ;; prefix-fn seam, run BEFORE this store-open over the client-trusted sealed topic-SET; ADR 0045
              ;; §7.1) — it no longer depends on this server-provided topic list (closes the ADR 0050 §4.3 gap).
+             ;; ADR 0064 Slice-2: %ms-topics-list / %ms-get-range-verified now return an op-failure STATUS
+             ;; instead of an unwind. A verify that cannot reach the server must FAIL THE OPEN (never silently
+             ;; skip verification — that is a fail-OPEN regression). store-open stays boundary-signalled
+             ;; (%ms-open at 739, caught at runner-start; the store-open contract widening is a later slice), so
+             ;; re-signal MICROSERVICE-STORE-ERROR here. A genuine chain-MAC TAMPER still SIGNALS directly from
+             ;; %ms-verify-chain (SECURITY-FAILCLOSED); this covers only the conn-lost/protocol case.
              (when chain-mac-fn
-               (dolist (tp (%ms-topics-list conn lock))
-                 (%ms-get-range-verified conn lock tp chain-mac-fn chain-macs chain-seqs put-index)))
+               (flet ((open-verify-fail (s)
+                        (error 'microservice-store-error
+                               :detail (format nil "microservice open verify failed: ~a" s))))
+                 (multiple-value-bind (tps tstatus) (%ms-topics-list conn lock)
+                   (when tstatus (open-verify-fail tstatus))
+                   (dolist (tp tps)
+                     (multiple-value-bind (recs gstatus)
+                         (%ms-get-range-verified conn lock tp chain-mac-fn chain-macs chain-seqs put-index)
+                       (declare (ignore recs))
+                       (when gstatus (open-verify-fail gstatus)))))))
              t)
      :close (lambda () (%ms-close conn lock))
      :count-fn (lambda (topic)
-                 (%ms-call conn lock +ms-op-count+
-                           (lambda () (%ms-encode-count topic))
-                           (lambda (r) (%rd-u64 r))))
+                 ;; ADR 0064 Slice-2: fold %ms-call's op-failure STATUS into store-count's (VALUES 0
+                 ;; :UNAVAILABLE) — the primary MUST stay an (integer 0), so a failure reads 0 (never NIL).
+                 (multiple-value-bind (result status)
+                     (%ms-call conn lock +ms-op-count+
+                               (lambda () (%ms-encode-count topic))
+                               (lambda (r) (%rd-u64 r)))
+                   (if status (values 0 :unavailable) (values result nil))))
      ;; :sync LEFT NIL — memory-tier parity (group-commit sync is a local-store concern).
      ;; :set-chain-mac-fn LIVE (Slice 3b, ADR 0045/0050 §4.3): the decorator installs the log-MAC oracle
      ;; client-side BEFORE it drives store-open, arming the remote-tier chain (compute+fold on put,
@@ -982,19 +1017,22 @@
      ;; chain to re-MAC ⇒ the plain server-proxy delete (memory parity, Slice 1 unchanged).
      :delete (lambda (topic writer-guid sn)
                (if (and chain-mac-fn (not *durability-debug-ms-skip-reclaim-remac*))
-                   (%ms-delete-rechain conn lock topic writer-guid sn
+                   (%ms-delete-rechain conn lock topic writer-guid sn       ; returns T / :UNAVAILABLE (single value)
                                        chain-mac-fn chain-macs chain-seqs put-index stale-topics)
-                   (%ms-call conn lock +ms-op-delete+
-                             (lambda () (%ms-encode-delete topic writer-guid sn))
-                             ;; a reconnect-retry of a delete must TOLERATE +ms-result-rejected+ (ADR 0050 §4.5):
-                             ;; the record is already gone, which is the delete's goal — treat rejected as
-                             ;; success (T), so an idempotent delete replayed across a drop never false-errors.
-                             (lambda (r)
-                               (multiple-value-bind (res rstatus) (%rd-u8 r)
-                                 (cond (rstatus (values nil rstatus))
-                                       ((= res +ms-result-t+) (values t nil))
-                                       ((= res +ms-result-rejected+) (values t nil))
-                                       (t (values nil :bad-delete-result)))))))))))
+                   ;; ADR 0064 Slice-2: fold %ms-call's op-failure STATUS into :UNAVAILABLE on store-delete's primary.
+                   (multiple-value-bind (result status)
+                       (%ms-call conn lock +ms-op-delete+
+                                 (lambda () (%ms-encode-delete topic writer-guid sn))
+                                 ;; a reconnect-retry of a delete must TOLERATE +ms-result-rejected+ (ADR 0050 §4.5):
+                                 ;; the record is already gone, which is the delete's goal — treat rejected as
+                                 ;; success (T), so an idempotent delete replayed across a drop never false-errors.
+                                 (lambda (r)
+                                   (multiple-value-bind (res rstatus) (%rd-u8 r)
+                                     (cond (rstatus (values nil rstatus))
+                                           ((= res +ms-result-t+) (values t nil))
+                                           ((= res +ms-result-rejected+) (values t nil))
+                                           (t (values nil :bad-delete-result))))))
+                     (if status :unavailable result)))))))
 
 ;;; ---- client response decoders ----
 
@@ -1201,29 +1239,38 @@
     (values (sort (mapcar #'first tuples) #'%record-guid-sn<) nil)))
 
 (defun* %ms-topics-list (conn lock)
-    (function (ms-conn t) list)
-  "The server's non-empty topic list (the shared body of the :topics slot + the open verify pass)."
+    (function (ms-conn t) (values (or null list) (or null keyword)))
+  "The server's non-empty topic list (the shared body of the :topics slot + the open verify pass), as
+   (VALUES TOPICS STATUS): STATUS is NIL on success or :UNAVAILABLE when the op failed (ADR 0064 Slice-2 —
+   %ms-call now returns an op-failure status, never a MICROSERVICE-STORE-ERROR unwind)."
   (%ms-call conn lock +ms-op-topics+ (lambda () (%ms-empty-payload)) (lambda (r) (%ms-decode-topics r))))
 
 (defun* %ms-get-range-verified (conn lock topic fn chain-macs chain-seqs put-index)
-    (function (ms-conn t string function hash-table hash-table hash-table) list)
+    (function (ms-conn t string function hash-table hash-table hash-table)
+              (values (or null list) (or null keyword)))
   "Chained store-get-range: fetch TOPIC's records over the connection, strip the folded mac/chain_seq, and
-   VERIFY the v3 chain (fail-closed), returning the clean (guid,sn)-ordered records. The shared body of the
-   chained :get-range slot + the open verify pass (DRY)."
+   VERIFY the v3 chain (fail-closed), returning (VALUES RECORDS STATUS) — the clean (guid,sn)-ordered records
+   with STATUS NIL, or (VALUES NIL :UNAVAILABLE) on an op failure (ADR 0064 Slice-2). A genuine chain-MAC
+   TAMPER still SIGNALS from %ms-verify-chain (SECURITY-FAILCLOSED, ADR 0045) and flows through %ms-call
+   untouched. The shared body of the chained :get-range slot + the open verify pass (DRY)."
   (%ms-call conn lock +ms-op-get-range+
             (lambda () (%ms-encode-topic topic))
             (lambda (r) (%ms-decode-strip-verify r topic fn chain-macs chain-seqs put-index))))
 
 (defun* %ms-resync-topic (conn lock topic fn chain-macs chain-seqs put-index)
-    (function (ms-conn t string function hash-table hash-table hash-table) t)
+    (function (ms-conn t string function hash-table hash-table hash-table)
+              (values t (or null keyword)))
   "Rebuild TOPIC's client chain state from the server's ACTUAL records after an exhausted chain-mutating op
    left it possibly-stale (Fix 1, ADR 0050 §4.5): get-range, then CLEAR TOPIC's (possibly stale) chain head
    and REBUILD via %ms-verify-chain — so the empty/purged case stays CLEARED (a bare %ms-get-range-verified
    would LEAVE a purged topic's stale head, since %ms-verify-chain only overwrites on a non-empty result;
    the pre-clear is what makes a purge-exhaust safe). Re-learns whether the exhausted op was applied (server
    has the record -> chain-seqs advances; server empty -> stays cleared). Read-only on the server; fails
-   CLOSED on a genuine server tamper (%ms-verify-chain :mismatch). Clear+verify run in ONE decode-fn under
-   the store lock (atomic). NOT the common-path verify — only reached for a topic a prior op left stale."
+   CLOSED on a genuine server tamper (%ms-verify-chain :mismatch, a SECURITY-FAILCLOSED SIGNAL that flows
+   through %ms-call untouched). Returns (VALUES T STATUS): STATUS NIL on a clean resync, or :UNAVAILABLE when
+   the resync could not reach the server (ADR 0064 Slice-2 — an op-failure status, not an unwind), so the
+   caller leaves TOPIC stale for the next attempt. Clear+verify run in ONE decode-fn under the store lock
+   (atomic). NOT the common-path verify — only reached for a topic a prior op left stale."
   (%ms-call conn lock +ms-op-get-range+
             (lambda () (%ms-encode-topic topic))
             (lambda (r)
@@ -1237,17 +1284,20 @@
                      (values t nil)))))))
 
 (defun* %ms-resync-if-stale (conn lock topic fn chain-macs chain-seqs put-index stale-topics)
-    (function (ms-conn t string function hash-table hash-table hash-table hash-table) t)
+    (function (ms-conn t string function hash-table hash-table hash-table hash-table)
+              (values t (or null keyword)))
   "If TOPIC was marked STALE by a prior EXHAUSTED chain-mutating op (Fix 1, ADR 0050 §4.5), FORCE-re-sync the
    client chain state from the server (%ms-resync-topic) BEFORE the next chained mutation, so the mutation
    chains from ground truth (no fork -> no later-open false-reject brick). Clears the stale mark ONLY on a
-   successful re-sync; a re-sync that cannot reach the server SIGNALS (the mutation aborts, TOPIC stays stale
-   for the next attempt when the server is back). The *durability-debug-ms-skip-stale-resync* RED knob makes
-   this a no-op (reproducing the fork). No-op (fast hash miss) for the common case where TOPIC is not stale."
+   successful re-sync; a re-sync that cannot reach the server returns (VALUES NIL :UNAVAILABLE) (ADR 0064
+   Slice-2 — a status value, not an unwind: the caller aborts the mutation, TOPIC stays stale for the next
+   attempt when the server is back). Returns (VALUES T NIL) when not stale or after a clean re-sync. The
+   *durability-debug-ms-skip-stale-resync* RED knob makes this a no-op (reproducing the fork). No-op (fast
+   hash miss) for the common case where TOPIC is not stale."
   (when (and (gethash topic stale-topics) (not *durability-debug-ms-skip-stale-resync*))
-    (%ms-resync-topic conn lock topic fn chain-macs chain-seqs put-index)
+    (try (%ms-resync-topic conn lock topic fn chain-macs chain-seqs put-index))   ; bails :unavailable, TOPIC stays stale
     (remhash topic stale-topics))
-  t)
+  (values t nil))
 
 (defun* %ms-reseal-stale-topics (conn lock fn chain-macs chain-seqs put-index stale-topics)
     (function (ms-conn t function hash-table hash-table hash-table hash-table) t)
@@ -1269,36 +1319,49 @@
                      (maphash (lambda (k v) (declare (ignore v)) (push k ts)) stale-topics)
                      ts))))
       (dolist (topic stale)
-        (handler-case
-            (progn (%ms-resync-topic conn lock topic fn chain-macs chain-seqs put-index)
-                   (dds.pal:with-lock (lock) (remhash topic stale-topics)))
-          (error ()
-            (dds.pal:with-lock (lock)
-              (remhash topic chain-macs)
-              (remhash topic chain-seqs)
-              (remhash topic put-index)
-              (remhash topic stale-topics)))))))
+        (flet ((drop-from-seal ()   ; skip this topic from the seal (best-effort, ADR 0050 §4.5): drop its head
+                 (dds.pal:with-lock (lock)
+                   (remhash topic chain-macs)
+                   (remhash topic chain-seqs)
+                   (remhash topic put-index)
+                   (remhash topic stale-topics))))
+          ;; %ms-resync-topic now returns (VALUES T STATUS): STATUS non-NIL = server unreachable (ADR 0064
+          ;; Slice-2, no unwind) -> drop from seal. A genuine chain-MAC TAMPER still SIGNALS
+          ;; (SECURITY-FAILCLOSED) — the handler-case boundary keeps catching it (also drop from seal; the
+          ;; real fail-closed is store-open's own %ms-verify-chain over the server topic list).
+          (handler-case
+              (multiple-value-bind (ok rstatus)
+                  (%ms-resync-topic conn lock topic fn chain-macs chain-seqs put-index)
+                (declare (ignore ok))
+                (if rstatus
+                    (drop-from-seal)
+                    (dds.pal:with-lock (lock) (remhash topic stale-topics))))
+            (error () (drop-from-seal)))))))
   t)
 
 (defun* %ms-fetch-tuples (conn lock topic)
-    (function (ms-conn t string) list)
+    (function (ms-conn t string) (values (or null list) (or null keyword)))
   "Fetch TOPIC's records from the server and decode them to raw (clean-record folded-mac chain_seq) tuples
    for the tail-anchor's READ-ONLY prefix probe (store-verify-chain-prefix) — WITHOUT verifying (no side
    effects on chain-macs/chain-seqs/put-index) and WITHOUT signalling on a mismatch (the caller's
    %ms-chain-walk maps that to a reason). CONNECT-ON-DEMAND: the decorator runs %verify-tail-anchor BEFORE
    store-open establishes the connection, so ensure it here (the server owns the inner lifecycle — a
    get-range needs no prior client open op); the dial coordinates ride in CONN. A malicious server's
-   records are network-facing, so %ms-unfold-payload's bounds-check + %rd-frame's guards apply (a
-   short/torn payload fails clean as MICROSERVICE-STORE-ERROR, never OOB)."
-  (dds.pal:with-lock (lock)
-    (%ms-ensure-connected conn))
-  (%ms-call conn lock +ms-op-get-range+
-            (lambda () (%ms-encode-topic topic))
-            (lambda (r) (%ms-decode-tuples r topic))))
+   records are network-facing, so %ms-unfold-payload's bounds-check + %rd-frame's guards apply. Returns
+   (VALUES TUPLES STATUS): STATUS NIL on success, or :UNAVAILABLE when the connect / op failed (ADR 0064
+   Slice-2 — an op-failure status value, never a MICROSERVICE-STORE-ERROR unwind)."
+  (multiple-value-bind (ok cstatus) (dds.pal:with-lock (lock) (%ms-ensure-connected conn))
+    (declare (ignore ok))
+    (if cstatus
+        (values nil :unavailable)   ; first connect failed (server down): clean op-failure status
+        (%ms-call conn lock +ms-op-get-range+
+                  (lambda () (%ms-encode-topic topic))
+                  (lambda (r) (%ms-decode-tuples r topic))))))
 
 (defun* %ms-delete-rechain (conn lock topic writer-guid sn fn chain-macs chain-seqs put-index stale-topics)
     (function (ms-conn t string (simple-array (unsigned-byte 8) (16)) (integer 0)
-               function hash-table hash-table hash-table hash-table) (eql t))
+               function hash-table hash-table hash-table hash-table)
+              (or (eql t) (eql :unavailable)))
   "Chained store-delete = the microservice analogue of SQLite's :delete = DELETE + %sqlite-recompute-topic
    (ADR 0050 §4.4). A KEEP_LAST reclaim removed (WRITER-GUID, SN) from TOPIC; the survivors' stored folded
    MACs are now stale (they chained over the deleted predecessor). FETCH the topic's current folded records
@@ -1310,40 +1373,48 @@
    the next open all see the fresh chain. Serialized by the DECORATOR's lock (store-delete is called under it,
    from %evict-prior-surrogates), so the fetch+rewrite two-step needs no cross-op atomicity here; the client
    state mutation runs UNDER the store lock (the rewrite %ms-call decode-fn). The server stays DARE-BLIND —
-   it replaces OPAQUE frames and never parses the mac/chain_seq. Returns T (store-delete contract)."
-  (let* ((tuples    (%ms-fetch-tuples conn lock topic))
-         (survivors (mapcar #'first
-                            (remove-if (lambda (tp)
-                                         (let ((rec (first tp)))
-                                           (and (equalp (durable-record-writer-guid rec) writer-guid)
-                                                (= (durable-record-sn rec) sn))))
-                                       (sort (copy-list tuples) #'< :key #'third)))))
-    (multiple-value-bind (folded tail count) (%ms-rechain-survivors topic fn survivors)
-      ;; the fetch+rechain re-derived from the server's ACTUAL frames, so the rewrite self-syncs TOPIC (no
-      ;; resync-before needed); an EXHAUSTED rewrite MAY have applied but lost the ack -> mark STALE (Fix 1).
-      (handler-case
-      (%ms-call conn lock +ms-op-topic-rewrite+
-                (lambda () (%ms-encode-topic-rewrite topic folded))
-                (lambda (r)
-                  (multiple-value-bind (res rstatus) (%rd-u8 r)
-                    (cond
-                      (rstatus (values nil rstatus))
-                      ((/= res +ms-result-t+) (values nil :bad-rewrite-result))   ; ADR 0064: server didn't confirm the replace
-                      (t
-                       ;; the server confirmed the replace: advance the client chain to the dense survivor state
-                       (if (plusp count)
-                           (progn (setf (gethash topic chain-macs) tail)
-                                  (setf (gethash topic chain-seqs) count))
-                           (progn (remhash topic chain-macs)
-                                  (remhash topic chain-seqs)))
-                       (let ((idx (make-hash-table :test #'equal)))
-                         (dolist (rec survivors)
-                           (setf (gethash (cons (coerce (durable-record-writer-guid rec) 'list)
-                                                (durable-record-sn rec)) idx) t))
-                         (setf (gethash topic put-index) idx))
-                       (remhash topic stale-topics)   ; the rewrite synced TOPIC from server truth -> clear stale
-                       (values t nil))))))
-        (microservice-store-error (e) (setf (gethash topic stale-topics) t) (error e))))))
+   it replaces OPAQUE frames and never parses the mac/chain_seq. Returns T on success, or :UNAVAILABLE when
+   the fetch or the rewrite failed against a down server (ADR 0064 Slice-2 vtable widening — an op-failure
+   status VALUE on store-delete's primary, never a MICROSERVICE-STORE-ERROR unwind)."
+  (multiple-value-bind (tuples fstatus) (%ms-fetch-tuples conn lock topic)
+    (if fstatus
+        :unavailable                    ; can't fetch to re-chain (server down); nothing mutated server-side yet
+        (let ((survivors (mapcar #'first
+                                 (remove-if (lambda (tp)
+                                              (let ((rec (first tp)))
+                                                (and (equalp (durable-record-writer-guid rec) writer-guid)
+                                                     (= (durable-record-sn rec) sn))))
+                                            (sort (copy-list tuples) #'< :key #'third)))))
+          (multiple-value-bind (folded tail count) (%ms-rechain-survivors topic fn survivors)
+            ;; the fetch+rechain re-derived from the server's ACTUAL frames, so the rewrite self-syncs TOPIC (no
+            ;; resync-before needed); an EXHAUSTED rewrite MAY have applied but lost the ack -> mark STALE (Fix 1).
+            (multiple-value-bind (result status)
+                (%ms-call conn lock +ms-op-topic-rewrite+
+                          (lambda () (%ms-encode-topic-rewrite topic folded))
+                          (lambda (r)
+                            (multiple-value-bind (res rstatus) (%rd-u8 r)
+                              (cond
+                                (rstatus (values nil rstatus))
+                                ((/= res +ms-result-t+) (values nil :bad-rewrite-result))   ; server didn't confirm
+                                (t
+                                 ;; server confirmed the replace: advance the client chain to the dense survivor state
+                                 (if (plusp count)
+                                     (progn (setf (gethash topic chain-macs) tail)
+                                            (setf (gethash topic chain-seqs) count))
+                                     (progn (remhash topic chain-macs)
+                                            (remhash topic chain-seqs)))
+                                 (let ((idx (make-hash-table :test #'equal)))
+                                   (dolist (rec survivors)
+                                     (setf (gethash (cons (coerce (durable-record-writer-guid rec) 'list)
+                                                          (durable-record-sn rec)) idx) t))
+                                   (setf (gethash topic put-index) idx))
+                                 (remhash topic stale-topics)   ; rewrite synced TOPIC from server truth -> clear stale
+                                 (values t nil))))))
+              ;; ADR 0064 Slice-2: an op-failure STATUS (was a MICROSERVICE-STORE-ERROR) -> mark stale (Fix 1),
+              ;; surface :UNAVAILABLE on store-delete's primary; success -> the decode-fn's T.
+              (if status
+                  (progn (setf (gethash topic stale-topics) t) :unavailable)
+                  result)))))))
 
 ;;; ---- reference server (opaque inner-store proxy) ----
 
@@ -1412,7 +1483,11 @@
               (res   (store-put inner topic (durable-record-writer-guid rec) (durable-record-sn rec)
                                 (durable-record-key-hash rec) (durable-record-kind rec)
                                 (durable-record-payload rec))))
-         (%ms-put-u8 out (if (eq res :rejected) +ms-result-rejected+ +ms-result-t+))))
+         ;; ADR 0064 Slice-2: report SUCCESS only on an exact T (mirroring the delete branch below). The prior
+         ;; (eq res :rejected) test reported ANY non-:rejected — including :resource-limits — as +ms-result-t+ =
+         ;; success; the server's inner is DARE-blind (never :resource-limits) so it was unreachable, but the
+         ;; T-exact form is correct if a future inner ever returns another non-persisted keyword.
+         (%ms-put-u8 out (if (eq res t) +ms-result-t+ +ms-result-rejected+))))
       ((= code +ms-op-get-range+)
        (let ((recs (store-get-range inner (try (%rd-string r)))))
          (%ms-put-u32 out (length recs))

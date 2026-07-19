@@ -1158,11 +1158,19 @@
                  (let* ((sorted  (sort (copy-list win) #'%win-entry<))
                         (drop-n  (- (length sorted) eff-hd))
                         (to-drop (subseq sorted 0 drop-n))
-                        (keep    (subseq sorted drop-n)))
+                        (keep    (subseq sorted drop-n))
+                        (all-ok  t))
                    (when del-supported
                      (dolist (e to-drop)
-                       (store-delete inner-store th (third e) 0)))
-                   (setf (gethash wk instance-windows) keep))))
+                       ;; ADR 0064 Slice-2: a microservice inner now returns :UNAVAILABLE on a failed delete
+                       ;; instead of unwinding. Preserve the crash-lower-bar self-heal: rewrite the window to
+                       ;; the survivors ONLY when EVERY physical delete landed — a delete that did not reach
+                       ;; the server leaves the untrimmed window, self-healing on the next put (local tiers
+                       ;; always return T, so their behaviour is byte-identical).
+                       (unless (eq (store-delete inner-store th (third e) 0) t)
+                         (setf all-ok nil))))
+                   (when all-ok
+                     (setf (gethash wk instance-windows) keep)))))
              (%evict-prior-surrogates (th writer-guid key-hash sn guid*)
                ;; Sliver 3a/3b online physical reclaim (caller holds LOCK + del-supported + :keep-last +
                ;; :data + non-NIL key-hash). Append this put's entry to the instance window and trim to
@@ -1323,20 +1331,27 @@
                   (sealed   (dds.dare:seal-payload-v2 current-dek current-epoch nonce th-bytes frame)))
              (setf (gethash th topic-names) topic)
              (let ((r (store-put inner-store th guid* 0 nil :data sealed)))
-               ;; Sliver 3a/3b: physically evict the superseded prior surrogates so the inner physical row
-               ;; count converges to eff-hd (closes the ADR 0025 §10.3 residual for the continuously-open
-               ;; case). Runs for ANY del-supported inner store — SQLite (Sliver 3a) AND the file store
-               ;; (Sliver 3b: it HAS a :delete slot ⇒ del-supported is T, so the file tier physically
-               ;; reclaims too; this on-disk shrink is exactly why the tail anchor is invalidated at open,
-               ;; ADR 0045 §7.1). A backend without :delete (del-supported NIL) stays logical-only.
-               (when (and del-supported (eq :keep-last eff-hk) (eq :data kind) key-hash)
-                 (%evict-prior-surrogates th writer-guid key-hash sn guid*))
-               ;; settled-instance-churn window reclaim (ADR 0025 §10.3): the decorator sees the REAL kind,
-               ;; so a settle here remhashes the instance's window (the inner store only saw :data surrogates
-               ;; and cannot). Same del-supported/:keep-last gate the window itself lives under.
-               (when (and del-supported (eq :keep-last eff-hk) key-hash
-                          (not *durability-debug-disable-settle-trigger*))
-                 (%settle-window-reclaim th key-hash kind))
+               ;; ADR 0064 Slice-2: the eviction + settle bookkeeping advances the decorator's chain/window
+               ;; state and MUST run ONLY when the inner put actually PERSISTED (r = T). Before the
+               ;; microservice tier returned a status, a failed put UNWOUND and skipped these; now it returns
+               ;; :UNAVAILABLE, so gate on (eq r t) — else a not-persisted put would evict prior surrogates /
+               ;; reclaim a window for a record the server never stored, corrupting the client chain state.
+               ;; Local tiers return T on success ⇒ byte-identical (they never produce :UNAVAILABLE).
+               (when (eq r t)
+                 ;; Sliver 3a/3b: physically evict the superseded prior surrogates so the inner physical row
+                 ;; count converges to eff-hd (closes the ADR 0025 §10.3 residual for the continuously-open
+                 ;; case). Runs for ANY del-supported inner store — SQLite (Sliver 3a) AND the file store
+                 ;; (Sliver 3b: it HAS a :delete slot ⇒ del-supported is T, so the file tier physically
+                 ;; reclaims too; this on-disk shrink is exactly why the tail anchor is invalidated at open,
+                 ;; ADR 0045 §7.1). A backend without :delete (del-supported NIL) stays logical-only.
+                 (when (and del-supported (eq :keep-last eff-hk) (eq :data kind) key-hash)
+                   (%evict-prior-surrogates th writer-guid key-hash sn guid*))
+                 ;; settled-instance-churn window reclaim (ADR 0025 §10.3): the decorator sees the REAL kind,
+                 ;; so a settle here remhashes the instance's window (the inner store only saw :data surrogates
+                 ;; and cannot). Same del-supported/:keep-last gate the window itself lives under.
+                 (when (and del-supported (eq :keep-last eff-hk) key-hash
+                            (not *durability-debug-disable-settle-trigger*))
+                   (%settle-window-reclaim th key-hash kind)))
                (when *durability-debug-window-count-hook*
                  (funcall *durability-debug-window-count-hook* (hash-table-count instance-windows)))
                r)))))

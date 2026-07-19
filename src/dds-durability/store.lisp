@@ -118,27 +118,39 @@
                (or null (simple-array (unsigned-byte 8) (16)))
                (member :data :dispose :unregister)
                (simple-array (unsigned-byte 8) (*)))
-              (or (eql t) (eql :rejected) (eql :resource-limits)))
+              (or (eql t) (eql :rejected) (eql :resource-limits) (eql :unavailable)))
   "Persist a sample: returns T on success, :REJECTED when a bounded store is full (transient — a later
-   put may fit), or :RESOURCE-LIMITS when a store hit a TERMINAL resource limit (ADR 0064: the encrypted
+   put may fit), :RESOURCE-LIMITS when a store hit a TERMINAL resource limit (ADR 0064: the encrypted
    backend's epoch-id 2^32 / per-epoch nonce 2^96 exhaustion — a status value, never a stack unwind; the
-   store also emits a diagnostic WARN at the exhaustion site). A caller treats both non-T values as
-   not-persisted. Idempotent on (topic, writer-guid, sn) — a re-put of the same key is a no-op returning T."
+   store also emits a diagnostic WARN at the exhaustion site), or :UNAVAILABLE when a REMOTE backend's
+   operation failed (ADR 0064 Slice-2 vtable widening: the microservice tier's server-down / connection-
+   dropped-and-reconnect-exhausted / malformed-response — an op-failure status VALUE at the store-op
+   boundary, never a MICROSERVICE-STORE-ERROR unwind; only the microservice backend produces it, local
+   backends never do). A caller treats every non-T value as not-persisted. Idempotent on (topic,
+   writer-guid, sn) — a re-put of the same key is a no-op returning T."
   (funcall (durable-store-put store) topic writer-guid sn key-hash kind payload))
 
 (defun* store-get-range (store topic)
-    (function (durable-store string) list)
-  "Return all retained records for TOPIC as a list of DURABLE-RECORD, ordered by (writer-guid, sn)."
+    (function (durable-store string) (values list (or null keyword)))
+  "Return all retained records for TOPIC as a list of DURABLE-RECORD, ordered by (writer-guid, sn), as
+   (VALUES RECORDS STATUS): STATUS is NIL on success, or a keyword (:UNAVAILABLE / a protocol status) when
+   a REMOTE backend's read failed (ADR 0064 Slice-2 vtable widening — a status value, never a
+   MICROSERVICE-STORE-ERROR unwind; local backends always return (VALUES RECORDS NIL)). A caller that
+   ignores the 2nd value reads an empty list on failure — check STATUS wherever a silent empty result
+   would fail OPEN (open-time chain verify / restart seed-relay)."
   (funcall (durable-store-get-range store) topic))
 
 (defun* store-topics (store)
-    (function (durable-store) list)
-  "Return a list of topic strings that have at least one retained record."
+    (function (durable-store) (values list (or null keyword)))
+  "Return a list of topic strings that have at least one retained record, as (VALUES TOPICS STATUS):
+   STATUS is NIL on success, or a keyword when a REMOTE backend's enumeration failed (ADR 0064 Slice-2 —
+   a status value, never an unwind; local backends return (VALUES TOPICS NIL))."
   (funcall (durable-store-topics store)))
 
 (defun* store-purge (store topic)
-    (function (durable-store string) (eql t))
-  "Remove all retained records for TOPIC. Returns T."
+    (function (durable-store string) (or (eql t) (eql :unavailable)))
+  "Remove all retained records for TOPIC. Returns T, or :UNAVAILABLE when a REMOTE backend's purge failed
+   (ADR 0064 Slice-2 — a status value, never an unwind; local backends always return T)."
   (funcall (durable-store-purge store) topic))
 
 (declaim (ftype (function (durable-store &optional
@@ -166,8 +178,11 @@
   (funcall (durable-store-close store)))
 
 (defun* store-count (store &optional topic)
-    (function (durable-store &optional (or null string)) (integer 0))
-  "Return the total record count across all topics, or the per-TOPIC count if TOPIC is supplied."
+    (function (durable-store &optional (or null string)) (values (integer 0) (or null keyword)))
+  "Return the total record count across all topics, or the per-TOPIC count if TOPIC is supplied, as
+   (VALUES COUNT STATUS): STATUS is NIL on success, or a keyword when a REMOTE backend's count failed
+   (ADR 0064 Slice-2 — a status value, never an unwind; local backends return (VALUES COUNT NIL); a caller
+   ignoring the 2nd value reads 0 on failure)."
   (funcall (durable-store-count-fn store) topic))
 
 (defun* store-sync (store)
@@ -226,10 +241,12 @@
 
 (defun* store-delete (store topic writer-guid sn)
     (function (durable-store string (simple-array (unsigned-byte 8) (16)) (integer 0))
-              (or (eql t) (eql :unsupported)))
-  "Physically remove the single record keyed by (TOPIC, WRITER-GUID, SN); return T on delete or
+              (or (eql t) (eql :unsupported) (eql :unavailable)))
+  "Physically remove the single record keyed by (TOPIC, WRITER-GUID, SN); return T on delete,
    :UNSUPPORTED when the backing store has no :delete slot (the same NIL-fallback binding as store-sync
-   / store-set-chain-mac-fn — an additive vtable slot, not a fork). Per-record delete-by-PRIMARY-KEY,
+   / store-set-chain-mac-fn — an additive vtable slot, not a fork), or :UNAVAILABLE when a REMOTE backend's
+   delete failed (ADR 0064 Slice-2 vtable widening — a status value, never a MICROSERVICE-STORE-ERROR
+   unwind; local backends never return it). Per-record delete-by-PRIMARY-KEY,
    NOT evict-instance: the encrypted decorator opens its inner store keyless with a per-sample surrogate
    and knows the EXACT prior surrogate to reclaim (ADR 0025 §10.3 physical reclaim / ADR 0029 §10). A
    backend that omits the slot is byte-identical to pre-slot behavior; the decorator then falls back to

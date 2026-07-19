@@ -272,9 +272,17 @@
                   (%collect-mark-seen! origins-data origin-guid origin-sn)
                   (let ((payload (dds.disc:node-sample node key)))
                     (when payload
-                      (let ((kh (dds.disc:node-sample-key-hash node key))) ; wire PID_KEY_HASH (RTPS 2.5 §9.6.4.8)
-                        (store-put store topic-name origin-guid origin-sn kh :data payload)
-                        (dds.disc:publish-relay-sample node payload origin-guid origin-sn)))))))
+                      (let* ((kh (dds.disc:node-sample-key-hash node key)) ; wire PID_KEY_HASH (RTPS 2.5 §9.6.4.8)
+                             (r  (store-put store topic-name origin-guid origin-sn kh :data payload)))
+                        ;; ADR 0064 Slice-2: store-put now returns an op-failure STATUS (:UNAVAILABLE from the
+                        ;; microservice tier) instead of unwinding to this loop's handler-case. Preserve the
+                        ;; pre-0064 semantics EXACTLY — a not-persisted sample is routed to the error hook and
+                        ;; the relay is SKIPPED (the unwind used to skip publish-relay-sample); only a persisted
+                        ;; sample relays.
+                        (if (eq r t)
+                            (dds.disc:publish-relay-sample node payload origin-guid origin-sn)
+                            (let ((n (incf error-count)))
+                              (ignore-errors (funcall *durability-error-hook* r :collect-loop n))))))))))
             ;; drain lifecycle changes (dispose / unregister)
             ;; key = (writer-guid . sn); dedup on (writer-guid, sn) via origins-lc watermark
             (dolist (key (dds.disc:node-lifecycle-sns node))
@@ -295,10 +303,15 @@
                                        (coerce key-hash '(simple-array (unsigned-byte 8) (16)))
                                        (make-array 16 :element-type '(unsigned-byte 8)
                                                       :initial-element 0))))
-                        (store-put store topic-name orig-guid orig-sn kh16 kind
-                                   (make-array 0 :element-type '(unsigned-byte 8)))
-                        (dds.disc:publish-relay-lifecycle
-                         node kh16 status-flags orig-guid orig-sn))))))))
+                        ;; ADR 0064 Slice-2: preserve the pre-0064 unwind semantics as a status check — a
+                        ;; not-persisted lifecycle change routes to the error hook and skips the relay.
+                        (let ((r (store-put store topic-name orig-guid orig-sn kh16 kind
+                                            (make-array 0 :element-type '(unsigned-byte 8)))))
+                          (if (eq r t)
+                              (dds.disc:publish-relay-lifecycle
+                               node kh16 status-flags orig-guid orig-sn)
+                              (let ((n (incf error-count)))
+                                (ignore-errors (funcall *durability-error-hook* r :collect-loop n))))))))))))
         (error (c)
           (let ((n (incf error-count)))
             (ignore-errors

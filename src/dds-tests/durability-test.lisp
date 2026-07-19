@@ -7088,9 +7088,9 @@
 
 (defun* run-durability-microservice-torn-test ()
     (function () t)
-  "Torn-read gate (ADR 0050): the server closes mid-session; the client's next op must fail cleanly (a
-   MICROSERVICE-STORE-ERROR, no hang, no crash, no garbage) — the full-frame recv returning NIL on
-   peer-close surfaces as a clean signalled error. Both impls."
+  "Torn-read gate (ADR 0050): the server closes mid-session; the client's next op must fail cleanly (an
+   :UNAVAILABLE op-failure STATUS, ADR 0064 Slice-2 — no hang, no crash, no garbage, no unwind) — the
+   full-frame recv returning NIL on peer-close surfaces as the status VALUE. Both impls."
   (let* ((srv (dds.durability:make-microservice-server :port 0))
          (port (dds.durability:microservice-server-port srv))
          (s (dds.durability:make-microservice-store :host "127.0.0.1" :port port)))
@@ -7099,9 +7099,11 @@
     ;; tear the connection down under the client (stop closes the served connection + the listener)
     (dds.durability:microservice-server-stop srv)
     (%check :ms-torn-clean
-            (handler-case (progn (dds.durability:store-count s "A") nil)
-              (error () t))
-            "client op after server stop signals cleanly (no hang/crash)")
+            ;; ADR 0064 Slice-2: the post-tear op returns (VALUES 0 :UNAVAILABLE) (2nd value non-NIL), not a
+            ;; signal; a raw error would be a bug (-> NIL, failing the check).
+            (handler-case (if (nth-value 1 (dds.durability:store-count s "A")) t nil)
+              (error () nil))
+            "client op after server stop returns a clean op-failure status (no hang/crash)")
     ;; store-close is still safe (best-effort) after the tear
     (%check :ms-torn-close-safe (eq t (ignore-errors (dds.durability:store-close s)))
             "store-close is safe after a torn connection")
@@ -7171,7 +7173,7 @@
                     "post-fuzz round-trip intact")
             (dds.durability:store-close s)))
       (dds.durability:microservice-server-stop srv)))
-  ;; (3) CLIENT SYMMETRIC: a garbled server response -> microservice-store-error (not TYPE-ERROR)
+  ;; (3) CLIENT SYMMETRIC: a garbled server response -> a clean :UNAVAILABLE op-failure status (not TYPE-ERROR)
   (let ((ln (dds.pal:tcp-listen "127.0.0.1" 0)))
     (unwind-protect
         (let* ((port (dds.pal:tcp-local-port ln))
@@ -7195,9 +7197,11 @@
           (let ((s (dds.durability:make-microservice-store :host "127.0.0.1" :port port)))
             (dds.durability:store-open s)
             (%check :ms-fuzz-client-clean
-                    (eq :store-err (handler-case (progn (dds.durability:store-topics s) :no-error)
-                                     (dds.durability:microservice-store-error () :store-err)))
-                    "a garbled server response signals microservice-store-error (not a TYPE-ERROR)")
+                    ;; ADR 0064 Slice-2: a garbled response now yields (VALUES NIL :UNAVAILABLE) — a clean
+                    ;; op-failure status (2nd value non-NIL), never a raw decode TYPE-ERROR nor an unwind.
+                    (eq :store-err (handler-case (if (nth-value 1 (dds.durability:store-topics s)) :store-err :no-error)
+                                     (error () :type-error)))
+                    "a garbled server response returns a clean op-failure status (not a TYPE-ERROR)")
             (ignore-errors (dds.durability:store-close s)))
           (ignore-errors (dds.pal:join th)))
       (ignore-errors (dds.pal:tcp-close ln))))
@@ -8867,9 +8871,9 @@
        5-record fixture; STOP server1 (fsync D); START server2 on the SAME P + SAME D (replays); an op then
        RECONNECTS + recovers all records + a further put lands — the transport-level reconnect, DARE-free.
    (B) SEND-SIDE-ERROR-CLEAN + NO-INFINITE-LOOP: with the server STOPPED (stays DOWN), an op fails with a CLEAN
-       dds.durability:microservice-store-error (the send-side raw tcp-send error no longer escapes — the
-       bounded single reconnect re-dials once, fails fast on ECONNREFUSED, surfaces cleanly) AND returns in
-       BOUNDED time (< 5 s — no hang / no infinite reconnect loop).
+       op-failure STATUS (:UNAVAILABLE, ADR 0064 Slice-2 — the send-side raw tcp-send error no longer escapes,
+       and the former microservice-store-error unwind is gone; the bounded single reconnect re-dials once,
+       fails fast on ECONNREFUSED, surfaces the status) AND returns in BOUNDED time (< 5 s — no hang / loop).
    (C) BARE-DELETE-RETRY-TOLERATES-REJECTED: a bare delete whose server inner returns :UNSUPPORTED (-> the
        server sends +ms-result-rejected+) is TOLERATED as success (T), not a false 'bad delete result' error —
        so a reconnect-retry of a delete after the record is already gone never false-errors. Both impls."
@@ -8911,13 +8915,15 @@
     (dds.durability:microservice-server-stop srv)                     ; peer gone + port freed (server down)
     (let* ((t0 (get-internal-real-time))
            (result (handler-case
-                       (progn (dds.durability:store-put c "T" (%tms-guid 1) 2 nil :data (%tms-payload 8 2))
-                              :no-error)
-                     (dds.durability:microservice-store-error () :clean)
+                       ;; ADR 0064 Slice-2: store-put returns an op-failure STATUS (:UNAVAILABLE) against a
+                       ;; down server, not a signal; a non-T result is the clean bounded failure (a raw error
+                       ;; would still be a bug -> :raw).
+                       (let ((r (dds.durability:store-put c "T" (%tms-guid 1) 2 nil :data (%tms-payload 8 2))))
+                         (if (eq r t) :no-error :clean))
                      (error () :raw)))
            (elapsed (/ (float (- (get-internal-real-time) t0)) internal-time-units-per-second)))
       (%check :ms-reconb-clean (eq result :clean)
-              "SEND-SIDE-ERROR-CLEAN: an op against a down server signals a CLEAN microservice-store-error (no raw error escapes)")
+              "SEND-SIDE-ERROR-CLEAN: an op against a down server returns a CLEAN op-failure status (no raw error escapes)")
       (%check :ms-reconb-bounded (< elapsed 5.0)
               (format nil "NO-INFINITE-LOOP: the op fails in BOUNDED time (~,2f s < 5 s, no hang)" elapsed)))
     (ignore-errors (dds.durability:store-close c)))
@@ -8946,14 +8952,16 @@
           (dds.durability:store-open c)
           (dds.durability:microservice-server-stop srv1)              ; server down
           (%check :ms-outage-down-clean
-                  (eq :clean (handler-case (progn (dds.durability:store-count c nil) :no-error)
-                               (dds.durability:microservice-store-error () :clean)
+                  ;; ADR 0064 Slice-2: store-count returns (VALUES 0 :UNAVAILABLE) against a down server (a
+                  ;; non-NIL 2nd value), not a signal; a raw error would still be a bug (-> :raw).
+                  (eq :clean (handler-case (if (nth-value 1 (dds.durability:store-count c nil)) :clean :no-error)
                                (error () :raw)))
-                  "op while server DOWN -> clean microservice-store-error (sock left NIL, not a raw error)")
+                  "op while server DOWN -> clean op-failure status (sock left NIL, not a raw error)")
           (let ((srv2 (dds.durability:make-microservice-server :port port :inner (dds.durability:make-memory-store))))
             (unwind-protect
                 (%check :ms-outage-recovers
-                        (integerp (dds.durability:store-count c nil))
+                        ;; a clean re-dial + success = NIL status (the primary is the real count)
+                        (null (nth-value 1 (dds.durability:store-count c nil)))
                         "OP-DURING-OUTAGE-RECOVERS: after restart, the next op RE-DIALS from the dropped state + succeeds (not terminal)")
               (dds.durability:microservice-server-stop srv2))))
       (ignore-errors (dds.durability:store-close c))))
@@ -8970,8 +8978,8 @@
           (let ((srv2 (dds.durability:make-microservice-server :port port :inner (dds.durability:make-memory-store))))
             (unwind-protect
                 (%check :ms-outage-red-terminal
-                        (eq :terminal (handler-case (progn (dds.durability:store-count c nil) :recovered)
-                                        (dds.durability:microservice-store-error () :terminal)))
+                        ;; ADR 0064 Slice-2: a terminal dropped conn returns (VALUES 0 :UNAVAILABLE), not a signal
+                        (eq :terminal (if (nth-value 1 (dds.durability:store-count c nil)) :terminal :recovered))
                         "RED (skip-redial): a dropped conn stays TERMINAL 'store is not open' even after the server returns")
               (dds.durability:microservice-server-stop srv2))))
       (ignore-errors (dds.durability:store-close c))))
@@ -9008,9 +9016,9 @@
                          (dds.durability:store-open store)
                          ;; R1: the server applies it but both the original + the reconnect-retry lose the ack
                          (let ((dds.durability::*durability-debug-ms-force-recv-drop* 2))
-                           (handler-case
-                               (dds.durability:store-put store "T" (%tms-guid 1) 1 (%tms-guid 9) :data (%tms-payload 24 3))
-                             (dds.durability:microservice-store-error () :expected-exhaust)))
+                           ;; ADR 0064 Slice-2: the exhausted put returns :UNAVAILABLE (marks the topic stale,
+                           ;; Fix 1) — no signal; the return value is irrelevant here (the reopen is the oracle).
+                           (dds.durability:store-put store "T" (%tms-guid 1) 1 (%tms-guid 9) :data (%tms-payload 24 3)))
                          ;; R2 same topic: GREEN re-syncs (chains from R1); RED skips (forks a 2nd seq-0)
                          (dds.durability:store-put store "T" (%tms-guid 2) 2 (%tms-guid 9) :data (%tms-payload 24 5))
                          (dds.durability:store-close store))
@@ -9067,8 +9075,8 @@
                          ;; apply-then-ack-lost PURGE of T (server purges, both acks drop -> T stale + chain head kept)
                          (let ((dds.durability::*durability-debug-ms-force-recv-drop-op* dds.durability::+ms-op-purge+)
                                (dds.durability::*durability-debug-ms-force-recv-drop* 2))
-                           (handler-case (dds.durability:store-purge store "T")
-                             (dds.durability:microservice-store-error () :expected-exhaust)))
+                           ;; ADR 0064 Slice-2: the exhausted purge returns :UNAVAILABLE (marks T stale, Fix 1) — no signal
+                           (dds.durability:store-purge store "T"))
                          (dds.durability:store-close store))       ; CLEAN close -> seal (GREEN reseals T; RED seals stale)
                        (let ((store2 (%mk)))
                          (handler-case
@@ -9219,11 +9227,12 @@
 (defun* run-durability-microservice-client-timeout-test ()
     (function () t)
   "WP-DURABILITY-MS-DOS client gate (ADR 0050 §4.6): a malicious/half-open server that ACCEPTS then STALLS
-   (never responds) must surface via the CLIENT recv-timeout as a clean microservice-store-error (conn-lost
-   -> the bounded reconnect+retry path) instead of an infinite tcp-recv hang. A raw stalling server: accept,
-   read+ack the open, read the next request, then HOLD the connection open (no response) until released. The
-   client (:recv-timeout 1) opens (ok), then a store-count TIMES OUT -> conn-lost -> reconnect -> retry ->
-   times out -> clean store-error, BOUNDED (asserted < 10 s). Bare (non-DARE) transport gate — always runs."
+   (never responds) must surface via the CLIENT recv-timeout as a clean :UNAVAILABLE op-failure status (ADR
+   0064 Slice-2 — conn-lost -> the bounded reconnect+retry path) instead of an infinite tcp-recv hang. A raw
+   stalling server: accept, read+ack the open, read the next request, then HOLD the connection open (no
+   response) until released. The client (:recv-timeout 1) opens (ok), then a store-count TIMES OUT ->
+   conn-lost -> reconnect -> retry -> times out -> clean op-failure status, BOUNDED (asserted < 10 s). Bare
+   (non-DARE) transport gate — always runs."
   (let ((release (list nil))
         (ln (dds.pal:tcp-listen "127.0.0.1" 0)))
     (unwind-protect
@@ -9244,9 +9253,11 @@
             (dds.durability:store-open s)                                ; opens fine (the server acks)
             (let ((t0 (get-internal-real-time)))
               (%check :ms-client-timeout-clean
-                      (eq :store-err (handler-case (progn (dds.durability:store-count s "X") :no-error)
-                                       (dds.durability:microservice-store-error () :store-err)))
-                      "a stalling server surfaces via the client recv-timeout as a clean microservice-store-error (conn-lost -> reconnect -> retry -> clean; no infinite hang)")
+                      ;; ADR 0064 Slice-2: the stalled op surfaces as (VALUES 0 :UNAVAILABLE) (2nd value non-NIL),
+                      ;; not a signal — conn-lost -> reconnect -> retry -> times out -> clean op-failure status.
+                      (eq :store-err (handler-case (if (nth-value 1 (dds.durability:store-count s "X")) :store-err :no-error)
+                                       (error () :raw)))
+                      "a stalling server surfaces via the client recv-timeout as a clean op-failure status (conn-lost -> reconnect -> retry -> clean; no infinite hang)")
               (%check :ms-client-timeout-bounded
                       (< (/ (- (get-internal-real-time) t0) internal-time-units-per-second) 10)
                       "the stalled client op returned BOUNDED (a few seconds via the recv-timeout), not an infinite hang"))
@@ -9483,10 +9494,12 @@
                     "the connection registry is DRAINED to 0 (every serve thread self-removed / was joined — no leak)"))
           ;; a post-stop op on a former connection fails cleanly (server down; bounded reconnect then clean error)
           (%check :ms-stop-clients-closed
-                  (every (lambda (s) (handler-case (progn (dds.durability:store-count s "x") nil)
-                                       (error () t)))
+                  ;; ADR 0064 Slice-2: a post-stop op returns (VALUES 0 :UNAVAILABLE) (2nd value non-NIL), not a
+                  ;; signal; a raw error would be a bug (-> NIL).
+                  (every (lambda (s) (handler-case (if (nth-value 1 (dds.durability:store-count s "x")) t nil)
+                                       (error () nil)))
                          clients)
-                  "every former client connection is closed — a post-stop op signals cleanly (no hang/crash)"))
+                  "every former client connection is closed — a post-stop op returns a clean op-failure status (no hang/crash)"))
       (progn (dolist (s clients) (ignore-errors (dds.durability:store-close s)))
              (ignore-errors (dds.durability:microservice-server-stop srv)))))
   t)

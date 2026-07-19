@@ -116,11 +116,11 @@ Load it by depending on `:dds-durability` in your system.
 (dds.durability:make-memory-store &key (max-samples 0))   ; → durable-store
 
 ;; Dispatch functions
-(dds.durability:store-put    store topic writer-guid sn key-hash kind payload)   ; → T | :REJECTED | :RESOURCE-LIMITS
-(dds.durability:store-get-range store topic)   ; → list of durable-record
-(dds.durability:store-topics store)            ; → list of topic strings
-(dds.durability:store-purge  store topic)      ; → T
-(dds.durability:store-count  store &optional topic)  ; → (integer 0)
+(dds.durability:store-put    store topic writer-guid sn key-hash kind payload)   ; → T | :REJECTED | :RESOURCE-LIMITS | :UNAVAILABLE
+(dds.durability:store-get-range store topic)   ; → (values list-of-durable-record status)
+(dds.durability:store-topics store)            ; → (values list-of-topic-strings status)
+(dds.durability:store-purge  store topic)      ; → T | :UNAVAILABLE
+(dds.durability:store-count  store &optional topic)  ; → (values (integer 0) status)
 (dds.durability:store-open   store &optional history-kind history-depth)  ; → T
 (dds.durability:store-close  store)            ; → T
 ```
@@ -128,6 +128,14 @@ Load it by depending on `:dds-durability` in your system.
 `store-put` is idempotent on `(topic, writer-guid, sn)`. Records sorted by `(writer-guid, sn)` in
 `store-get-range`. The store vtable is extensible — a file-backed or database-backed implementation
 slots in by replacing the function slots (Phase 2/3 follow-up).
+
+**Op-failure status (ADR 0064 Slice-2 vtable widening).** A REMOTE backend (the microservice tier) that
+cannot complete an operation returns an op-failure STATUS instead of signalling — `:UNAVAILABLE` on the
+PRIMARY value of `store-put`/`store-delete`/`store-purge` (additive, like `:RESOURCE-LIMITS`), and a 2nd
+`(or null keyword)` value on the read ops `store-get-range`/`store-topics`/`store-count` (a caller taking
+only the primary reads an empty list / `0` on failure). LOCAL backends (memory / file / SQLite) always
+succeed or return `T`/data with a `NIL` status — byte-identical. A genuine chain-MAC tamper still fails
+CLOSED at store-open (a `SECURITY-FAILCLOSED` unwind, ADR 0045), never a status.
 
 `store-open` accepts optional `history-kind` (`:keep-all` | `:keep-last`) and `history-depth`
 (positive integer) arguments. When supplied they override the store's factory-time defaults
@@ -1632,8 +1640,9 @@ clean behaviour on both impls). No reader conditionals outside `dds-pal/`.
 `get-range`=2, `topics`=3, `purge`=4, `count`=5, `open`=6, `close`=7, `delete`=9. A topic is a
 `u16`-length UTF-8 field; a record REUSES the **file-store frame format verbatim** (`%frame-record` /
 `%parse-frame`) — no new record format is invented. Every length and count is bounds-checked against the
-buffer extent before it is trusted (NFR-SEC-POSTURE): a malformed message raises a clean condition
-(server drops the connection; client signals `microservice-store-error`), never an OOB access or a hang.
+buffer extent before it is trusted (NFR-SEC-POSTURE): a malformed message fails cleanly (server drops the
+connection; the client op returns a clean `:UNAVAILABLE` op-failure STATUS, ADR 0064 Slice-2 — never an
+OOB access, a hang, nor an unwind; a garbled data-plane response is folded to that one status keyword).
 
 **Opaque proxy + DARE composition (Slice 2, built).** The server is **DARE-blind** — it decodes each op
 and dispatches to its inner store's public dispatcher with zero crypto knowledge. Confidentiality
@@ -1742,12 +1751,20 @@ tier: drop/reorder/tamper detected fail-closed on open, server + wire protocol b
 **Slice 3c-1 (built, §8.10.4) = bounded client reconnect + idempotent retry (WP-DURABILITY-MS-RECONNECT):**
 the conn-cell becomes an `ms-conn` struct (host/port/sock), a dropped connection (server restart / network
 blip) triggers a **bounded single reconnect** (close+clear+re-dial-once+retry-once — no unbounded loop / no
-hang) instead of a permanent brick, and the send-side raw-error wart becomes the one clean
-`microservice-store-error`; every op is idempotent so a byte-identical retry cannot dup/lose/corrupt.
+hang) instead of a permanent brick, and the send-side raw-error wart becomes the one clean op-failure
+status; every op is idempotent so a byte-identical retry cannot dup/lose/corrupt.
 Client-side only, zero server/wire change. Deferred: multi-client / read-idle timeout / chunked large
 `get-range` / DoS-hardening / the CLI `--backend` / the live 2-process interop (Slice 3c).
 **Descoped:** HISTORY-QoS-over-the-wire forwarding (the decorator owns retention; the server stays KEEP_ALL —
 above). See ADR 0050.
+
+**ADR 0064 Slice-2 vtable widening (built):** the data-plane ops no longer signal on an operation failure —
+`%ms-call` returns `(values result status)` and the client vtable closures surface `:UNAVAILABLE` (put /
+delete / purge, on the primary) or a 2nd status value (get-range / topics / count). The former
+`microservice-conn-lost` condition is DELETED (a dropped connection is now the `:CONN-LOST` status keyword
+inside `%ms-exchange`, driving the same bounded reconnect); `microservice-store-error` survives ONLY on the
+store-open path (still boundary-caught at `runner-start`, a later store-open-contract slice). A genuine
+chain-MAC TAMPER still fails CLOSED via a `SECURITY-FAILCLOSED` unwind at open.
 
 Every wire length/count is bounds-checked and the topic UTF-8 is well-formedness-validated (Unicode
 Table 3-7 / RFC 3629) before `code-char`, so a malformed message raises a clean `microservice-protocol-
@@ -1759,7 +1776,7 @@ Tests: `run-pal-tcp-loopback-test` (PAL TCP round-trip), `run-durability-microse
 delete, purge), `run-durability-microservice-large-test` (500 KB multi-segment byte-exact),
 `run-durability-microservice-torn-test` (clean failure on peer-close), `run-durability-microservice-fuzz-test`
 (malformed-UTF-8 topics → protocol-error + the serve thread SURVIVES + a subsequent valid client succeeds;
-a garbled server response → a clean client `microservice-store-error`). Slice 2:
+a garbled server response → a clean client `:UNAVAILABLE` op-failure status, ADR 0064 Slice-2). Slice 2:
 `run-durability-microservice-factory-test` (the factory composes `encrypted-store` over
 `microservice-store`, name `:encrypted-persistent`; DARE-free, always runs) and
 `run-durability-microservice-dare-test` (no-plaintext-at-server: topic `"Square"` / GUID / SN / payload
@@ -1883,13 +1900,13 @@ just a re-dial).
 - **The conn-cell becomes a struct.** `ms-conn` (`defstruct*`) carries **host + port + sock** so `%ms-call` /
   `%ms-exchange` can re-dial (host/port previously lived only in the open/fetch closures). Access stays under
   the store lock.
-- **Bounded single reconnect.** `%ms-exchange` translates BOTH drop signals — a failed send (the wart) and a
-  server-closed read (`%ms-recv-message` NIL) — to **`microservice-conn-lost`** (a *subtype* of
-  `microservice-store-error`, so existing handlers still catch it, but distinguishable). On that, `%ms-call`
+- **Bounded single reconnect.** `%ms-exchange` maps BOTH drops — a failed send (the wart) and a
+  server-closed read (`%ms-recv-message` NIL) — to a **`:CONN-LOST` STATUS keyword** (ADR 0064 Slice-2: the
+  former `microservice-conn-lost` condition is gone — a status VALUE, not an unwind). On that, `%ms-call`
   closes+clears the dead socket, **re-dials ONCE** (short bounded backoff then `tcp-connect`), and **retries
   the op ONCE**. A second consecutive drop, or a failed re-dial (server still down → fast `ECONNREFUSED`),
-  surfaces a clean `microservice-store-error` — a **bounded** single reconnect, never an unbounded loop or a
-  hang.
+  surfaces a clean `:UNAVAILABLE` op-failure status — a **bounded** single reconnect, never an unbounded loop
+  or a hang.
 - **Idempotent-retry safety.** The retry re-runs build+decode, safe because every op is idempotent AND advances
   client chain/put-index state **only after a confirmed response**: `put` recomputes a byte-identical folded
   frame the server INSERT-OR-IGNOREs (even if the original succeeded but its response was lost); the chained
@@ -1965,8 +1982,9 @@ holes are closed — **no wire-protocol change, no new crypto, no new dependency
   stay exactly as distinguishable, with no stack unwind.)* The **server** arms it on each accepted socket
   (`make-microservice-server :recv-timeout`, default 30 s), so a stalled recv returns `:timeout`, the serve
   loop **drops** that connection, and the accept loop **survives to serve the next client**. The **client** arms it on its
-  connection (`make-microservice-store :recv-timeout`), so a stalled/half-open server surfaces as a clean
-  `microservice-conn-lost` → the §8.10.4 reconnect path, never an infinite hang.
+  connection (`make-microservice-store :recv-timeout`), so a stalled/half-open server surfaces as a
+  `:CONN-LOST` status → the §8.10.4 reconnect path (a clean `:UNAVAILABLE` op-failure status if it
+  exhausts, ADR 0064 Slice-2), never an infinite hang.
 - **Incremental body allocation (amplification guard).** `%ms-recv-message` used to allocate the **declared**
   body length up front, so a 4-byte header declaring 256 MiB (`+ms-max-message+`) forced a 256 MiB allocation
   *before any body byte arrived*. `%ms-recv-body` now reads the body **incrementally** — the accumulator
@@ -1999,7 +2017,7 @@ slow-loris's cap slot is NOT reclaimed; GREEN with a 1 s timeout it is DROPPED +
 subsequent client is served), `run-durability-microservice-huge-declared-test` (over-cap rejected before alloc; a huge at-cap
 declare with no body times out via the incremental reader and allocates **<< the declared length** — a
 numeric bound on SBCL, a behavioral no-hang/no-OOM proof on Clasp), `run-durability-microservice-client-
-timeout-test` (a stalling server → the client recv-timeout → clean `microservice-store-error`, bounded), and
+timeout-test` (a stalling server → the client recv-timeout → clean `:UNAVAILABLE` op-failure status, bounded), and
 `run-durability-microservice-accept-backoff-test` (the `%ms-accept-backoff` decision + a fault-injected
 backoff-then-recover); the fuzz gate (`run-durability-microservice-fuzz-test`) is extended with slow-loris +
 over-cap arms. Both impls green identically, Clasp first (Suite 503 → 507). The timeouts default to 30 s and
