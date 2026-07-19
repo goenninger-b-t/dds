@@ -143,17 +143,23 @@
        (ignore-errors (service-stop svc))
        (let ((new-svc (make-durability-service spec)))
          (handler-case
-             (progn
-               (service-start new-svc)
-               ;; Orphan guard: recheck running AFTER start, BEFORE install.
-               ;; If supervisor-stop flipped running NIL during the (slow) service-start,
-               ;; stop the just-started service immediately and do not install it.
-               (let ((still-running nil))
-                 (dds.pal:with-lock ((supervisor-lock sup))
-                   (setf still-running (supervisor-running sup)))
-                 (if still-running
-                     (%supervisor-replace-service runner svc new-svc)
-                     (ignore-errors (service-stop new-svc)))))
+             (multiple-value-bind (started st) (service-start new-svc)
+               (declare (ignore started))
+               (if st
+                   ;; a malformed-spec restart is a start failure (ADR 0064): log + replace exactly as the
+                   ;; caught-signal clause below, so the watcher references the dead svc next cycle
+                   (progn
+                     (ignore-errors (funcall *durability-error-hook* st :supervisor-restart-failed 1))
+                     (%supervisor-replace-service runner svc new-svc))
+                   ;; Orphan guard: recheck running AFTER start, BEFORE install.
+                   ;; If supervisor-stop flipped running NIL during the (slow) service-start,
+                   ;; stop the just-started service immediately and do not install it.
+                   (let ((still-running nil))
+                     (dds.pal:with-lock ((supervisor-lock sup))
+                       (setf still-running (supervisor-running sup)))
+                     (if still-running
+                         (%supervisor-replace-service runner svc new-svc)
+                         (ignore-errors (service-stop new-svc))))))
            (error (c)
              ;; start failed; new-svc is dead — watcher will pick it up on next poll
              ;; and decrement the cap further; just log this attempt

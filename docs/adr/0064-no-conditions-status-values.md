@@ -394,6 +394,19 @@ parameter widens from `condition` to `(or condition keyword)` so the same per-sp
 caught condition and a converted status alike (the one test that binds the hook ignores that argument). The
 B1 persistent-refuse test flips from asserting a signal to asserting the status (SBCL-only, as before).
 
+## Slice — service-start topic-resolution precondition → status (176 -> 174)
+
+`%service-topics` rejected a spec that yields no initial topic set — a non-cons list, or a predicate without
+`:auto-discover` — with a bare `error` (caught at the `runner-start` boundary). It now `(bail …)`
+`:MALFORMED-SPEC` / `:PREDICATE-TOPICS` and returns `(values list (or null keyword))`. This threads through
+`service-start`, whose contract widens to `(values durability-service (or null keyword))` — the SERVICE stays
+the primary value even on reject, so there is **no type ripple** and callers using the primary stay
+source-compatible. The three production callers check the status: `runner-start` (thread branch) sheds the
+spec exactly as it does a caught signal; the `%start-process-service` in-thread fallback propagates it; the
+supervisor restart path logs + replaces (identical to its caught-signal clause) so the watcher references the
+dead svc next cycle. The A3 `%service-topics` test flips its `errors-p` probe from a `handler-case` to
+`(nth-value 1 …)`.
+
 ## Order of the remaining work (shallow → deep)
 
 **the durability store vtable — the tamper refusals are now `SECURITY-FAILCLOSED` (contained at the start

@@ -96,8 +96,9 @@
         (format t "~&dds.durability runner: :process mode not available on ~a — starting in-thread~%"
                 (dds.pal:pal-impl-name))
         (let ((svc (make-durability-service spec)))
-          (service-start svc)
-          svc))))
+          (multiple-value-bind (started st) (service-start svc)
+            (declare (ignore started))
+            (if st (values nil st) svc))))))
 
 (defun* %stop-process-service (svc)
     (function (durability-service) (eql t))
@@ -150,7 +151,14 @@
               (setf failed t)
               (ignore-errors (funcall *durability-error-hook* c :runner-start-failed 1))))
           (let ((s (make-durability-service spec)))
-            (handler-case (progn (service-start s) (push s svcs))
+            (handler-case
+                (multiple-value-bind (svc st) (service-start s)
+                  (declare (ignore svc))
+                  (if st
+                      (progn (setf failed t)
+                             (ignore-errors (service-stop s))
+                             (ignore-errors (funcall *durability-error-hook* st :runner-start-failed 1)))
+                      (push s svcs)))
               (error (c)
                 (setf failed t)
                 (ignore-errors (service-stop s))   ; reclaim a partially-started svc: close store, zeroize DEKs

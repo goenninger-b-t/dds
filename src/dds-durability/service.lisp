@@ -97,12 +97,13 @@
 ;;; --- topic resolution ---
 
 (defun* %service-topics (spec)
-    (function (service-spec) list)
-  "Return the list of (topic-name . type-name) conses to build INITIAL nodes for.
-   List form: returns the explicit list directly (must be non-empty unless :auto-discover).
-   Predicate form: error UNLESS :auto-discover — a predicate cannot enumerate concrete topics at start
-   time; supply an explicit (topic . type) list, or set :auto-discover so discovery drives the adds.
-   Empty list: error UNLESS :auto-discover — at least one (topic . type) is required.
+    (function (service-spec) (values list (or null keyword)))
+  "Return (VALUES TOPICS STATUS): the list of (topic-name . type-name) conses to build INITIAL nodes for,
+   or (VALUES NIL STATUS) when the spec yields no initial set (ADR 0064: a status, not an unwind —
+   service-start propagates it). List form: returns the explicit list directly (non-empty unless :auto-discover).
+   Predicate form: :PREDICATE-TOPICS UNLESS :auto-discover — a predicate cannot enumerate concrete topics at
+   start time; supply an explicit (topic . type) list, or set :auto-discover so discovery drives the adds.
+   Empty/malformed list: :MALFORMED-SPEC UNLESS :auto-discover — at least one (topic . type) is required.
    :auto-discover (ADR 0026 Phase-2b) relaxes the non-empty/predicate rejection: an empty or predicate
    start-list returns '() (serve nothing initially; the discovery poll auto-adds matching topics). A
    non-empty concrete list is still honored as the initial set. A non-empty MALFORMED list (not conses)
@@ -114,14 +115,11 @@
        (cond
          ((and (consp f) (consp (car f))) f)   ; valid non-empty concrete start-list
          ((and auto (null f)) '())              ; :auto-discover + empty: serve nothing initially
-         (t (error "dds.durability: service-spec has no explicit (topic . type) cons — ~
-                    at least one concrete (topic . type) is required"))))
+         (t (bail :malformed-spec))))   ; ADR 0064: no concrete (topic . type) cons — service-start returns this status
       (function
        (cond
          (auto '())                             ; :auto-discover + predicate: no initial nodes; discovery drives adds
-         (t (error "dds.durability: service-spec topics is a predicate — cannot enumerate ~
-                    concrete topics at service-start (supply an explicit (topic . type) list; ~
-                    dynamic topic-add after start is a documented deferral per design §6)")))))))
+         (t (bail :predicate-topics)))))))   ; ADR 0064: predicate can't enumerate at start w/o :auto-discover
 
 ;;; --- GUID prefix for the collect node ---
 
@@ -429,7 +427,7 @@
 (declaim (ftype (function (durability-service) t) %service-start-auto-discover))
 
 (defun* service-start (service)
-    (function (durability-service) durability-service)
+    (function (durability-service) (values durability-service (or null keyword)))
   "Resolve the spec's topics to K concrete (topic . type) pairs, then for each pair build a
    disc-node (collect reader reliable/TL/keep-all + replay writer) and spawn a collect-loop
    thread.  K=1 is byte-identical to Phase 1.  All K nodes share the same STORE.
@@ -445,10 +443,14 @@
    *DURABILITY-DEBUG-START-FAULT* when non-NIL: after building the first node, signals an
    error simulating startup failure (test-only fault injector; inert by default).
    Note: concurrent-start re-entrancy is guarded at the runner level (runner-start in runner.lisp);
-   calling service-start concurrently on the same service instance is a caller error."
-  (let* ((spec   (durability-service-spec service))
-         (topics (%service-topics spec))
-         (nodes  '()))
+   calling service-start concurrently on the same service instance is a caller error.
+   Returns (VALUES SERVICE STATUS): STATUS is NIL on success, or a %service-topics reject keyword
+   (:MALFORMED-SPEC / :PREDICATE-TOPICS) when the spec yields no initial topic set. The SERVICE is always
+   the primary value (even on reject) so callers stay source-compatible (ADR 0064)."
+  (let* ((spec   (durability-service-spec service)))
+    (multiple-value-bind (topics tstat) (%service-topics spec)
+      (when tstat (return-from service-start (values service tstat)))   ; ADR 0064: a malformed spec is a status, not an unwind
+      (let* ((nodes  '()))
     ;; open the store: for file-backed tiers this replays logs + re-derives epoch DEKs;
     ;; pass the DURABILITY_SERVICE history QoS from the spec so service-spec is the single
     ;; functional source of compaction policy (DDS 1.4 §2.2.3.5, ADR 0029).
@@ -486,7 +488,7 @@
         (setf (durability-service-thread service) (cdar ordered))))
     ;; opt-in (default NIL, no observable change when off): spin the bare discovery node + poll thread
     (%service-start-auto-discover service)
-    service))
+    service))))
 
 ;;; --- service-stop ---
 

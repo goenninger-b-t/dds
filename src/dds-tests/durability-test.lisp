@@ -2881,8 +2881,7 @@
             (format nil "NIL filter keeps all, de-duped by name (got ~s)" pending-all)))
   ;; A3: %service-topics relaxation — gated STRICTLY on :auto-discover
   (flet ((topics-of (spec) (dds.durability::%service-topics spec))
-         (errors-p (spec) (handler-case (progn (dds.durability::%service-topics spec) nil)
-                            (error () t))))
+         (errors-p (spec) (and (nth-value 1 (dds.durability::%service-topics spec)) t)))   ; ADR 0064: reject is a status now
     (let ((spec-empty-on  (dds.durability:make-service-spec :domain 0 :topics '() :auto-discover t))
           (spec-pred-on   (dds.durability:make-service-spec :domain 0
                             :topics (lambda (topic type) (declare (ignore topic type)) t) :auto-discover t))
@@ -2900,12 +2899,12 @@
       (%check :st-list-auto-kept
               (equal '(("Seed" . "T")) (topics-of spec-list-on))
               ":auto-discover + concrete list must return the list unchanged")
-      (%check :st-empty-off-errors
+      (%check :st-empty-off-rejects
               (errors-p spec-empty-off)
-              "without :auto-discover an empty start-list must still error (byte-identical)")
-      (%check :st-pred-off-errors
+              "without :auto-discover an empty start-list must still reject (:malformed-spec status, ADR 0064)")
+      (%check :st-pred-off-rejects
               (errors-p spec-pred-off)
-              "without :auto-discover a predicate start-list must still error (byte-identical)")))
+              "without :auto-discover a predicate start-list must still reject (:predicate-topics status, ADR 0064)")))
   ;; ============================================================================================
   ;; PART B — DEFAULT-OFF byte-identical (both impls): :auto-discover NIL -> NO discovery node / thread
   ;; ============================================================================================
