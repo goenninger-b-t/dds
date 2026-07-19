@@ -118,9 +118,12 @@
                (or null (simple-array (unsigned-byte 8) (16)))
                (member :data :dispose :unregister)
                (simple-array (unsigned-byte 8) (*)))
-              (or (eql t) (eql :rejected)))
-  "Persist a sample: returns T on success or :REJECTED when a bounded store is full.
-   Idempotent on (topic, writer-guid, sn) — a re-put of the same key is a no-op returning T."
+              (or (eql t) (eql :rejected) (eql :resource-limits)))
+  "Persist a sample: returns T on success, :REJECTED when a bounded store is full (transient — a later
+   put may fit), or :RESOURCE-LIMITS when a store hit a TERMINAL resource limit (ADR 0064: the encrypted
+   backend's epoch-id 2^32 / per-epoch nonce 2^96 exhaustion — a status value, never a stack unwind; the
+   store also emits a diagnostic WARN at the exhaustion site). A caller treats both non-T values as
+   not-persisted. Idempotent on (topic, writer-guid, sn) — a re-put of the same key is a no-op returning T."
   (funcall (durable-store-put store) topic writer-guid sn key-hash kind payload))
 
 (defun* store-get-range (store topic)

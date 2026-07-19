@@ -116,7 +116,7 @@ Load it by depending on `:dds-durability` in your system.
 (dds.durability:make-memory-store &key (max-samples 0))   ; → durable-store
 
 ;; Dispatch functions
-(dds.durability:store-put    store topic writer-guid sn key-hash kind payload)   ; → T | :REJECTED
+(dds.durability:store-put    store topic writer-guid sn key-hash kind payload)   ; → T | :REJECTED | :RESOURCE-LIMITS
 (dds.durability:store-get-range store topic)   ; → list of durable-record
 (dds.durability:store-topics store)            ; → list of topic strings
 (dds.durability:store-purge  store topic)      ; → T

@@ -1266,7 +1266,8 @@
              (let* ((pub    (dds.dare:key-provider-recipient-public-key key-provider))
                     (new-id (1+ max-epoch-id)))
                (unless (<= new-id #xFFFFFFFF)
-                 (error "dds.durability: epoch-id space exhausted (2^32 opens)"))
+                 (warn "dds.durability: epoch-id space exhausted (2^32 opens) — put rejected (:resource-limits)")   ; NOCOND(WARN): terminal resource limit; prints + returns, no control transfer
+                 (return-from %mint-current-epoch :resource-limits))
                (multiple-value-bind (kem-ct ss) (dds.dare:ml-kem-1024-encapsulate pub)
                  ;; derive-dek inside unwind-protect so ss is freed even if derivation throws.
                  (let ((dek (unwind-protect (dds.dare:derive-dek ss)
@@ -1301,13 +1302,17 @@
        :put
        ;; 3c: seal topic/GUID/SN/kind/key-hash INTO the blob; hand the inner store only surrogates.
        (lambda (topic writer-guid sn key-hash kind payload)
+         (block put
          (dds.pal:with-lock (lock)
            (%ensure-logmac)                     ; also derives k_meta on the first put of a fresh store
            (unless current-epoch
-             (%mint-current-epoch))
+             ;; ADR 0064: an epoch-id-exhausted mint returns :resource-limits — propagate it, never unwind
+             (let ((s (%mint-current-epoch)))
+               (unless (eq s t) (return-from put s))))
            (incf counter)
            (when (>= counter +max-nonce-counter+)
-             (error "dds.durability: per-epoch nonce counter exhausted (2^96) — restart to mint a fresh epoch"))
+             (warn "dds.durability: per-epoch nonce counter exhausted (2^96) — put rejected (:resource-limits); restart to mint a fresh epoch")   ; NOCOND(WARN): terminal resource limit; prints + returns, no control transfer
+             (return-from put :resource-limits))
            (let* ((th-bytes (%th-bytes topic))
                   (th       (%meta-hex th-bytes))
                   (guid*    (%meta-guid-surrogate meta-key writer-guid sn))
@@ -1334,7 +1339,7 @@
                  (%settle-window-reclaim th key-hash kind))
                (when *durability-debug-window-count-hook*
                  (funcall *durability-debug-window-count-hook* (hash-table-count instance-windows)))
-               r))))
+               r)))))
        :get-range
        (lambda (topic)
          (dds.pal:with-lock (lock)

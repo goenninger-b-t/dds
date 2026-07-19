@@ -334,9 +334,8 @@ downgrade ×3, `store-file` mid-file-corruption + downgrade ×2, `store-microser
 — the guard deferred by the parser slice, decided here), 3 `WARN` (`store-encrypted`, `service`, `runner`),
 1 `TEST` (the microservice forced-spawn-failure simulator). No tamper site's code changed — they stay bare
 conditions; only their *containment* is now proven. **Deferred, values-conversions still owed** on this
-cluster: the two encrypted resource-exhaustion sites (epoch-id 2³² / nonce 2⁹⁶ → `:resource-limits`) and
-the construction/config preconditions (`store-sqlite` requires-path/kind, `store-file` v3-frame, `service`
-service-spec-shape, `runner` process-mode/argv0, `spec` ms-port).
+cluster: the construction/config preconditions (`store-sqlite` requires-path/kind, `store-file` v3-frame,
+`service` service-spec-shape, `runner` process-mode/argv0, `spec` ms-port).
 
 ## Contract change in this slice — every consumer
 
@@ -346,12 +345,26 @@ service-spec-shape, `runner` process-mode/argv0, `spec` ms-port).
   fail-closed exit above. A second value is ignored by any caller that does not `multiple-value-bind` it, so
   the change is source-compatible for the in-image / test callers that treat the runner as before.
 
+## Slice — encrypted store resource-exhaustion (181 -> 179)
+
+The encrypted epoch backend's two TERMINAL resource limits — epoch-id space `2^32` (opens) and per-epoch
+nonce counter `2^96` (puts) — signalled a bare `error` from the put path. `store-put` already had a
+single-value rejection contract (`T` | `:REJECTED` for a bounded-full store), so these become a third
+rejection keyword, **`:RESOURCE-LIMITS`**, on the primary value — no new convention, consistent with the
+existing idiom. `%mint-current-epoch` (a `labels`-local fn) `return-from`s `:resource-limits`; the put
+closure — a bare `lambda` with no block — is wrapped in `(block put …)` so it can `return-from put` the
+status. Each site keeps a diagnostic `NOCOND(WARN)` (a terminal exhaustion should be loud; it was logged via
+the old signal→handler path). `store-put`'s ftype widens to `(or (eql t) (eql :rejected)
+(eql :resource-limits))`; a caller treats both non-`T` values as not-persisted, so the sole practical
+consumer (the collect loop) is source-unchanged. The two limits are `2^32`/`2^96` — unreachable defence in
+depth, so no test drives them; the value is that the failure mode is now in the type, not a stack unwind.
+
 ## Order of the remaining work (shallow → deep)
 
 **the durability store vtable — the tamper refusals are now `SECURITY-FAILCLOSED` (contained at the start
 boundary); what remains is the VALUES conversions**: `store-microservice` `store-error`/`conn-lost` family
-(the bounded reconnect state machine last), the resource-exhaustion + construction/config preconditions
-listed above, and `dds.pal:fsync-directory` (2 sites × 2 PALs, fail-closed on a failed dirent flush; its 9
+(the bounded reconnect state machine last), the construction/config preconditions listed above, and
+`dds.pal:fsync-directory` (2 sites × 2 PALs, fail-closed on a failed dirent flush; its 9
 callers are these stores). The backends migrate ONE AT A TIME — the vtable slots are closures, so a backend
 still returning one value reads as `(values result NIL)` = success. Then `secure-sedp.lisp` (19) ·
 **`dds-dare/primitives.lisp` (96) LAST** — the OpenSSL FFI failure chains are the biggest and deepest.
