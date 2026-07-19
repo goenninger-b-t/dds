@@ -749,7 +749,7 @@
 (defun* make-microservice-store (&key host port (name :microservice)
                                       (recv-timeout +ms-default-recv-timeout+))
     (function (&key (:host (or null string)) (:port (integer 0 65535)) (:name keyword)
-                    (:recv-timeout (or null (real 0)))) durable-store)
+                    (:recv-timeout (or null (real 0)))) (values (or null durable-store) (or null keyword)))
   "Construct a MICROSERVICE-backed durable-store (ADR 0050) that implements the fixed durable-store
    vtable by proxying every operation over ONE TCP connection to a make-microservice-server holding an
    inner store. HOST defaults to 127.0.0.1; PORT is the server's (ephemeral) port from
@@ -774,11 +774,16 @@
    :RECV-TIMEOUT (seconds, default +ms-default-recv-timeout+ = 30 s; NIL disables) arms SO_RCVTIMEO on the
    client socket (WP-DURABILITY-MS-DOS, ADR 0050 §4.6): a stalled/half-open server surfaces as a clean
    conn-lost (-> the reconnect path), never an infinite tcp-recv hang — closing the Slice-1 loopback-shaped
-   boundedness nit."
+   boundedness nit.
+   Returns (VALUES STORE STATUS): STATUS is NIL on success, or :REQUIRES-PORT when :PORT was omitted
+   (ADR 0064: a construction precondition returns a status, not a signal; the conn dials on demand)."
+  (unless port
+    (bail :requires-port))
   (let* ((lock (dds.pal:make-lock "dds-durability-microservice"))
          (host* (or host "127.0.0.1"))
-         ;; the conn carries host/port so %ms-call can RE-DIAL after a drop (Slice 3c-1); :port is REQUIRED.
-         (port* (or port (error 'microservice-store-error :detail "make-microservice-store requires :port")))
+         ;; the conn carries host/port so %ms-call can RE-DIAL after a drop (Slice 3c-1); :port is REQUIRED
+         ;; (checked up front — bail :requires-port — so PORT is non-NIL here, ADR 0064).
+         (port* port)
          (conn (%make-ms-conn :host host* :port port* :sock nil :recv-timeout recv-timeout))
          ;; client-side remote-tier chain-MAC state (Slice 3b, ADR 0045/0050 §4.3), installed by the
          ;; encrypted decorator via :set-chain-mac-fn; NIL oracle ⇒ chain absent (bare store, memory parity).

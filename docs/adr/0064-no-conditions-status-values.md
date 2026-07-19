@@ -407,6 +407,17 @@ supervisor restart path logs + replaces (identical to its caught-signal clause) 
 dead svc next cycle. The A3 `%service-topics` test flips its `errors-p` probe from a `handler-case` to
 `(nth-value 1 …)`.
 
+## Slice — make-microservice-store construction precondition → status (174 -> 173)
+
+`make-microservice-store`'s "requires `:port`" precondition signalled `microservice-store-error` inside the
+constructor. Per the construction-precondition ruling, it now `(bail :requires-port)` up front and returns
+`(values (or null durable-store) (or null keyword))`. The conn dials **on demand** (`:sock nil` at
+construction), so `:port` is a pure config check, not entangled with the `conn-lost` reconnect family. The
+sole non-test caller (`make-microservice-store-factory`) always passes `:port`, feeding the primary value into
+`make-encrypted-store` as a benign runtime check (no warning), so no caller change. This is the first of the
+microservice family's three sub-slices; the `microservice-store-error` class stays for the non-reconnect
+`store-error` signals (2-B) and the `conn-lost` reconnect state machine (2-C, the hardest).
+
 ## Order of the remaining work (shallow → deep)
 
 **the durability store vtable — the tamper refusals are now `SECURITY-FAILCLOSED` (contained at the start
