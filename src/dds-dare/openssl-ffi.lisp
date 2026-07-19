@@ -133,32 +133,29 @@
 
 ;;; --- version gate ---
 
-(define-condition dare-unavailable (error)
-  ((reason :initarg :reason :reader dare-unavailable-reason))
-  (:report (lambda (c s) (format s "DDS.DARE unavailable: ~a" (dare-unavailable-reason c))))
-  (:documentation
-   "Signalled by DARE-AVAILABLE-P when libcrypto is not loaded, OpenSSL is below 3.5,
-    or ML-KEM-1024 is not fetchable from the default provider."))
+;; ADR 0064: the DARE-UNAVAILABLE condition is GONE — dare-available-p returns (VALUES AVAILABLE REASON)
+;; instead of signalling; the crypto capability probe fails CLOSED by returning NIL, never a plaintext fallback.
 
 (defun* dare-available-p ()
-    (function () boolean)
-  "Return T iff libcrypto is loaded, OpenSSL_version_num >= 3.5.0, and ML-KEM-1024 is
-   fetchable from the default provider (FIPS 203, CNSA 2.0 requirement).
-   Signals DARE-UNAVAILABLE if the library is absent or the version check fails.
-   Note: ML-KEM availability check fully exercised here; Task 3 adds the full
-   wrap/unwrap API on top of the gate this function establishes."
+    (function () (values boolean (or null string)))
+  "Return (VALUES AVAILABLE REASON): AVAILABLE is T iff libcrypto is loaded, OpenSSL_version_num >= 3.5.0,
+   and ML-KEM-1024 is fetchable from the default provider (FIPS 203, CNSA 2.0 requirement); REASON is NIL
+   then, or a human-readable string naming why DARE is unavailable. ADR 0064: the crypto capability probe
+   fails CLOSED by RETURNING NIL (never a DARE-UNAVAILABLE signal, never a plaintext fallback) — a caller
+   checks AVAILABLE and, on NIL, skips/refuses with REASON. The one boundary handler-case catches CFFI's
+   own load-foreign-library-error (an external library condition) and folds it to the REASON string."
   (handler-case
       (progn
         (unless *libcrypto*
-          (error 'dare-unavailable :reason "libcrypto not loaded (no suitable path found)"))
+          (return-from dare-available-p (values nil "libcrypto not loaded (no suitable path found)")))
         (let* ((ver-ptr (%ossl-sym "OpenSSL_version_num"))
                (ver (if ver-ptr
                         (cffi:foreign-funcall-pointer ver-ptr nil :unsigned-long)
-                        (error 'dare-unavailable :reason "OpenSSL_version_num symbol not found"))))
+                        (return-from dare-available-p (values nil "OpenSSL_version_num symbol not found")))))
           ;; 3.5.0 dev threshold = 0x30500000; any release of 3.5+ is >= 0x3050000f
           (unless (>= ver #x30500000)
-            (error 'dare-unavailable
-                   :reason (format nil "OpenSSL version 0x~8,'0x < 3.5.0 (0x30500000)" ver)))
+            (return-from dare-available-p
+              (values nil (format nil "OpenSSL version 0x~8,'0x < 3.5.0 (0x30500000)" ver))))
           (let* ((kem-fetch-ptr (%ossl-sym "EVP_KEM_fetch"))
                  (kem (if kem-fetch-ptr
                           (cffi:foreign-funcall-pointer kem-fetch-ptr nil
@@ -166,15 +163,15 @@
                                                         :string "ML-KEM-1024"
                                                         :pointer (cffi:null-pointer)
                                                         :pointer)
-                          (error 'dare-unavailable :reason "EVP_KEM_fetch symbol not found"))))
+                          (return-from dare-available-p (values nil "EVP_KEM_fetch symbol not found")))))
             (if (cffi:null-pointer-p kem)
-                (error 'dare-unavailable :reason "ML-KEM-1024 not fetchable from default provider")
+                (return-from dare-available-p (values nil "ML-KEM-1024 not fetchable from default provider"))
                 (progn
                   (cffi:foreign-funcall-pointer (%ossl-sym "EVP_KEM_free") nil
                                                 :pointer kem :void)
-                  t)))))
+                  (values t nil))))))
     (cffi:load-foreign-library-error (e)
-      (error 'dare-unavailable :reason (format nil "libcrypto load failed: ~a" e)))))
+      (values nil (format nil "libcrypto load failed: ~a" e)))))
 
 ;;; --- internal helpers ---
 
@@ -625,15 +622,17 @@
             (cffi:foreign-funcall-pointer (%ossl-sym "BIO_free") nil :pointer bio :int)))))))
 
 (defun* pkey-kind (pkey)
-    (function (cffi:foreign-pointer) (member :ec :rsa))
-  "Return :EC or :RSA for the EVP_PKEY* handle via EVP_PKEY_get_id (evp.h line 1364).
-   NID_rsaEncryption=6, NID_X9_62_id_ecPublicKey=408 (obj_mac.h; OpenSSL 3.6.2).
-   Signals on an unrecognized key type."
+    (function (cffi:foreign-pointer) (member :ec :rsa nil))
+  "Return :EC or :RSA for the EVP_PKEY* handle via EVP_PKEY_get_id (evp.h line 1364), or NIL for an
+   unrecognized key type. NID_rsaEncryption=6, NID_X9_62_id_ecPublicKey=408 (obj_mac.h; OpenSSL 3.6.2).
+   ADR 0064: an unrecognized key type is a status VALUE (NIL), not a signal — the sole caller
+   (%cert-algo-string) already maps a non-:ec/:rsa result to its documented fail-closed NIL (§8.7.2.2), so
+   returning NIL here is exactly what a peer cert with an unsupported key type must yield."
   (let ((id (cffi:foreign-funcall-pointer (%ossl-sym "EVP_PKEY_get_id") nil
                                            :pointer pkey :int)))
     (cond ((= id +evp-pkey-nid-rsa+) :rsa)
           ((= id +evp-pkey-nid-ec+)  :ec)
-          (t (error "pkey-kind: unrecognized EVP_PKEY NID ~d" id)))))
+          (t nil))))
 
 (defconstant +cms-text+ #x1
   "OpenSSL CMS_TEXT flag (cms.h:179): require + strip the S/MIME text/plain MIME wrapper from the

@@ -9,8 +9,6 @@
     pluggable key-provider vtable + file-based ML-KEM-1024 provider (Task 5).")
   (:export
    #:dare-available-p
-   #:dare-unavailable
-   #:dare-unavailable-reason
    #:sha-384
    #:hmac-sha256
    #:hkdf-sha384

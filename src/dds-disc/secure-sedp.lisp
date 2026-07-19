@@ -1014,9 +1014,9 @@
      (5) ORIGIN-AUTH (§9.5.3.3.4.3): with :receivers, the CORRECT receiver key decodes+delivers; the WRONG
          receiver key (same key_id) fails-closed (drops) even though the common_mac is valid.
    Requires the AES-GCM primitive (like the other secure tests); skips gracefully if absent. Both impls."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
-      (format t "~&  [rtps-protection] SKIP — AES-GCM not available: ~a~%" (dds.dare:dare-unavailable-reason c))
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
+      (format t "~&  [rtps-protection] SKIP — AES-GCM not available: ~a~%" %dare-reason)
       (return-from run-rtps-protection-test t)))
   (let* ((pa (make-array 12 :element-type '(unsigned-byte 8) :initial-element 81))
          (pb (make-array 12 :element-type '(unsigned-byte 8) :initial-element 82))
@@ -1209,9 +1209,9 @@
      Part B (SHMEM-gated live-segment): the sealed slot holds CIPHERTEXT — the plaintext marker is provably
        ABSENT from the entire pool segment (with a non-secured control whose plaintext IS present), and
        zc-sends advances (the overlay DID take ZC). Both impls (Clasp first; Part B skips cleanly on Clasp/macOS)."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
-      (format t "~&  [zc-shmem-secured-overlay] SKIP — AES-GCM not available: ~a~%" (dds.dare:dare-unavailable-reason c))
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
+      (format t "~&  [zc-shmem-secured-overlay] SKIP — AES-GCM not available: ~a~%" %dare-reason)
       (return-from run-zc-shmem-secured-overlay-test t)))
   (let ((pa (make-array 12 :element-type '(unsigned-byte 8) :initial-element 93))
         (*zerocopy-min-payload-bytes* 8)
@@ -1415,9 +1415,9 @@
      (f) ZERO-ALLOC (RX): a steady-state pooled RX borrow + decode-rtps-message-into conses ~0 GC-heap B/datagram
          (SBCL-exact; Clasp skip, NFR-PORT) — the pooled RX borrow adds no allocation over the pre-review single buffer.
    Requires AES-GCM; skips gracefully if absent. Both impls (Clasp first)."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
-      (format t "~&  [rtps-protection-zeroalloc] SKIP — AES-GCM not available: ~a~%" (dds.dare:dare-unavailable-reason c))
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
+      (format t "~&  [rtps-protection-zeroalloc] SKIP — AES-GCM not available: ~a~%" %dare-reason)
       (return-from run-rtps-protection-zeroalloc-test t)))
   (let* ((pa (make-array 12 :element-type '(unsigned-byte 8) :initial-element 71))
          (pb (make-array 12 :element-type '(unsigned-byte 8) :initial-element 72))
@@ -1575,9 +1575,9 @@
          payload is recovered byte-EXACT (no trailing pad — the SEC_BODY carries the alignment, T10 review fix-2).
      (5) NON-VACUOUS: a receiver WITHOUT A's user EntityCrypto (wrong KM, same key_id) does NOT decode -> fail-closed.
    Requires the AES-GCM primitive; skips gracefully if absent. Both impls."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
-      (format t "~&  [user-submsg] SKIP — AES-GCM not available: ~a~%" (dds.dare:dare-unavailable-reason c))
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
+      (format t "~&  [user-submsg] SKIP — AES-GCM not available: ~a~%" %dare-reason)
       (return-from run-user-submessage-protection-test t)))
   (let* ((pa (make-array 12 :element-type '(unsigned-byte 8) :initial-element 91))
          (pb (make-array 12 :element-type '(unsigned-byte 8) :initial-element 92))
@@ -1644,9 +1644,9 @@
    DROPS it fail-closed (no record); SENDER-EID = NIL (the direct-KM unit path, no resolver installed) RECORDS it
    (no cross-check -> no false-REJECT). The bracket is byte-identical across the three — only the claimed sender
    varies, exactly as the crypto-manager resolver would supply it. Requires AES-GCM; skips gracefully if absent."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
-      (format t "~&  [secure-builtin-xcheck] SKIP — AES-GCM not available: ~a~%" (dds.dare:dare-unavailable-reason c))
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
+      (format t "~&  [secure-builtin-xcheck] SKIP — AES-GCM not available: ~a~%" %dare-reason)
       (return-from run-secure-builtin-sender-crosscheck-test t)))
   (let* ((pa   (make-array 12 :element-type '(unsigned-byte 8) :initial-element 71))
          (node (make-disc-node :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element 72)
@@ -1693,9 +1693,9 @@
    (0xff0003c7 <- 0xff0003c2) NACKing THREE SNs (numBits 3 — nothing received yet); (5) after recording SNs 1..3, a
    second HEARTBEAT [1,3] emits an ACKNACK NACKing ZERO (numBits 0 — a positive ACK, so the reliability count
    RESPONDS to reader state, not a fixed reply). Requires AES-GCM; skips gracefully if absent."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
-      (format t "~&  [secure-builtin-acknack] SKIP — AES-GCM not available: ~a~%" (dds.dare:dare-unavailable-reason c))
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
+      (format t "~&  [secure-builtin-acknack] SKIP — AES-GCM not available: ~a~%" %dare-reason)
       (return-from run-secure-builtin-acknack-count-test t)))
   (flet ((inner-acknack-numbits (dg km reid wid)   ; decode the protected bracket, assert it is the secure-SEDP ACKNACK, return numBits
            (let ((plain (dds.security:decode-datawriter-submessage km (subseq dg 20))))
@@ -1778,9 +1778,9 @@
      (2) NON-VACUOUS two-tier round-trip: decode-serialized-payload(km-payload, recovered) = the original
          non-4-aligned plaintext.
    Requires the AES-GCM primitive; skips gracefully if absent. Both impls (Clasp first)."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
-      (format t "~&  [user-submsg-data-protection] SKIP — AES-GCM not available: ~a~%" (dds.dare:dare-unavailable-reason c))
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
+      (format t "~&  [user-submsg-data-protection] SKIP — AES-GCM not available: ~a~%" %dare-reason)
       (return-from run-user-submessage-data-protection-test t)))
   (let* ((pa (make-array 12 :element-type '(unsigned-byte 8) :initial-element 95))
          (pb (make-array 12 :element-type '(unsigned-byte 8) :initial-element 96))
@@ -1864,9 +1864,9 @@
      (d) EXHAUSTION: with the submessage-scratch pool drained, the SEND wrap returns NIL (fail-closed drop) — never a
          GC fallback (RESOURCE_LIMITS backpressure; NFR-MEM).
    Requires the AES-GCM primitive; skips gracefully if absent."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
-      (format t "~&  [user-submsg-zeroalloc] SKIP — AES-GCM not available: ~a~%" (dds.dare:dare-unavailable-reason c))
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
+      (format t "~&  [user-submsg-zeroalloc] SKIP — AES-GCM not available: ~a~%" %dare-reason)
       (return-from run-user-submessage-protection-zeroalloc-test t)))
   (let* ((pa (make-array 12 :element-type '(unsigned-byte 8) :initial-element 87))
          (pb (make-array 12 :element-type '(unsigned-byte 8) :initial-element 88))
@@ -2016,9 +2016,9 @@
    a GC fallback), and with the bracket-rx pool drained a metadata datagram is DROPPED (its on-data hook never fires — a
    make-array GC fallback would have delivered it) then DELIVERED once the pool is released (non-vacuous). Deterministic,
    no auth handshake (manual KMs). Requires the AES-GCM primitive; skips gracefully if absent. Wired into make mem."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
-      (format t "~&  [secured-dataplane-mem] SKIP — AES-GCM not available: ~a~%" (dds.dare:dare-unavailable-reason c))
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
+      (format t "~&  [secured-dataplane-mem] SKIP — AES-GCM not available: ~a~%" %dare-reason)
       (return-from run-secured-dataplane-mem-test t)))
   (let* ((pa (make-array 12 :element-type '(unsigned-byte 8) :initial-element 71))
          (pb (make-array 12 :element-type '(unsigned-byte 8) :initial-element 72))
@@ -2372,9 +2372,9 @@
          (outer SRTPS decode -> re-dispatch rtps-unwrapped=t -> ENFORCE-RTPS NIL -> user bracket decoded), so
          the fix drops ONLY the bare bracket, never the conformant wrapped one (no false-REJECT).
    Requires the AES-GCM primitive; skips gracefully if absent. Both impls (Clasp first)."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
-      (format t "~&  [rtps-enforce-user-bracket] SKIP — AES-GCM not available: ~a~%" (dds.dare:dare-unavailable-reason c))
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
+      (format t "~&  [rtps-enforce-user-bracket] SKIP — AES-GCM not available: ~a~%" %dare-reason)
       (return-from run-rtps-protection-enforce-user-bracket-test t)))
   (let* ((pa (make-array 12 :element-type '(unsigned-byte 8) :initial-element 97))   ; the :keyed peer A
          (pb (make-array 12 :element-type '(unsigned-byte 8) :initial-element 98))   ; node-b: receiver under enforcement
@@ -2561,9 +2561,9 @@
    Asserts: a SEC_PREFIX bracket WAS emitted (non-vacuous — the secure WLP path, not plain); TAMPER-P NIL -> B
    DETECTS A's liveliness; TAMPER-P T -> B NEVER detects it (the receiver-MAC gates BEYOND the valid common_mac).
    Bounded; requires the AES-GCM primitive (skips gracefully if absent). Both impls."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
-      (format t "~&  [secure-pm] SKIP — AES-GCM not available: ~a~%" (dds.dare:dare-unavailable-reason c))
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
+      (format t "~&  [secure-pm] SKIP — AES-GCM not available: ~a~%" %dare-reason)
       (return-from %run-secure-pm t)))
   (let* ((pa (make-array 12 :element-type '(unsigned-byte 8) :initial-element 61))
          (pb (make-array 12 :element-type '(unsigned-byte 8) :initial-element 62))
@@ -2664,9 +2664,9 @@
    FRESH armed receivers (deterministic, straight into %handle-datagram — no UDP race): the CLEAN datagram records
    A's liveliness (non-vacuous — the path works), a copy with ONE flipped octet in the protected region fails the
    MAC and is DROPPED (no stamp). Requires the AES-GCM primitive (skips gracefully if absent). Both impls."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
-      (format t "~&  [secure-pm-tamper] SKIP — AES-GCM not available: ~a~%" (dds.dare:dare-unavailable-reason c))
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
+      (format t "~&  [secure-pm-tamper] SKIP — AES-GCM not available: ~a~%" %dare-reason)
       (return-from run-secure-participant-message-tamper-test t)))
   (let* ((pa (make-array 12 :element-type '(unsigned-byte 8) :initial-element 63))
          (pb (make-array 12 :element-type '(unsigned-byte 8) :initial-element 64))
@@ -2737,9 +2737,9 @@
      (3) DECODE+RECORD: feeding a captured secure-SPDP bracket into a FRESH peer that has seen NO plain SPDP
          registers A from the protected re-announce ALONE (the secure SPDP decode + %record-participant path).
    Requires the AES-GCM primitive (skips gracefully if absent). Both impls."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
-      (format t "~&  [secure-spdp] SKIP — AES-GCM not available: ~a~%" (dds.dare:dare-unavailable-reason c))
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
+      (format t "~&  [secure-spdp] SKIP — AES-GCM not available: ~a~%" %dare-reason)
       (return-from run-secure-spdp-reannounce-test t)))
   (let* ((pa (make-array 12 :element-type '(unsigned-byte 8) :initial-element 65))
          (pb (make-array 12 :element-type '(unsigned-byte 8) :initial-element 66))

@@ -982,13 +982,13 @@
    Each case MUST return NIL or the CORRECT plaintext — NEVER an error, OOB, or crash. A (safety 0)
    wrapper arm (%dare-open-safety0) confirms the explicit manual bounds guards are safety-independent
    and reaches the SAME verdict. Skips cleanly (returns T) when OpenSSL >= 3.5 is unavailable
-   (dare-unavailable) — the crypto correctness itself is proved by the NIST KATs. Deterministic +
+   (dare-available-p returns NIL, ADR 0064) — the crypto correctness itself is proved by the NIST KATs. Deterministic +
    seeded (reproducible on SBCL + Clasp); N iterations; signals test-failure on any OOB / uncaught
    error / wrong plaintext / verdict disagreement. The DEK foreign secret is freed in unwind-protect."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [dare-open-payload-fuzz] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from fuzz-dare-open-payload t)))
   (let* ((prng   (make-prng #xDA7EC0DE))
          (iters  3000)
@@ -1107,10 +1107,10 @@
    other input decodes to NIL or the correct plaintext, NEVER a tampered plaintext, OOB, crash, or
    escaping signal; all four arms agree (writer==reader, production==safety0). SKIPs cleanly if
    OpenSSL<3.5. N>=2000 iterations, deterministic seed; reproducible on SBCL + Clasp."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [submessage-protection-fuzz] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from fuzz-submessage-protection t)))
   (let* ((prng  (make-prng #x5EC5B2))
          (iters 2500)
@@ -1224,10 +1224,10 @@
    correct plaintext, NEVER a tampered plaintext, OOB, unbounded allocation, crash, or escaping signal;
    the MAC/key_id/hostile-count/truncation families are strictly NIL; production==safety0. SKIPs cleanly
    if OpenSSL<3.5. N>=2000 iterations, deterministic seed; reproducible on SBCL + Clasp."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [submessage-origin-auth-fuzz] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from fuzz-submessage-origin-auth t)))
   (let* ((prng  (make-prng #x0A1A2A3))
          (iters 2500)
@@ -1361,10 +1361,10 @@
    SIGN walk, crash, or escaping signal; the corruption/hostile-count/truncation families are strictly NIL;
    production==safety0. SKIPs cleanly if OpenSSL<3.5. N>=2000 iterations, deterministic seed; reproducible on
    SBCL + Clasp."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [rtps-message-fuzz] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from fuzz-rtps-message t)))
   (let* ((prng   (make-prng #x537A7B5))
          (iters  2500)

@@ -577,6 +577,23 @@ The bar is STRICT: the marker is only for a libcrypto FFI return-code / NULL-poi
 normal reject (a tamper/auth failure MUST stay the NIL-returning fail-closed path). Comment-only + one gate
 regex token; `make gate-build` clean-cache PASS, gate-nocond 148 -> 52.
 
+## Slice — dare-available-p returns (values available reason); pkey-kind returns NIL (52 -> 45)
+
+Owner ruling 2026-07-19: the OpenSSL capability probe converts to a status (it CAN fire — on a box without
+OpenSSL >= 3.5 — so it is not GUARD/CRYPTO-FFI). `dare-available-p` now returns `(values BOOLEAN (or null
+string))` — T + NIL on success, NIL + a human-readable reason when libcrypto is absent / below 3.5 / ML-KEM
+is unfetchable — instead of signalling `DARE-UNAVAILABLE`. The crypto capability probe fails CLOSED by
+returning NIL (never a plaintext fallback); the one boundary handler-case now catches only CFFI's own
+`load-foreign-library-error` (an external library condition) and folds it to the reason string. **The
+`DARE-UNAVAILABLE` condition + its `-reason` accessor are DELETED** (exports removed). ~100 catchers migrate
+by a paren-neutral transform: `(handler-case (dare-available-p) (dare-unavailable (c) BODY))` →
+`(multiple-value-bind (%dare-ok %dare-reason) (dare-available-p) (unless %dare-ok BODY))` with
+`(dare-unavailable-reason c)` → `%dare-reason` (98 dominant-shape sites scripted; 3 `(progn … t)` shape-B
+sites + 1 predicate-wrapper by hand). `pkey-kind` (openssl-ffi) similarly returns **NIL** for an unrecognized
+EVP_PKEY NID instead of signalling — its sole caller `%cert-algo-string` already maps a non-:ec/:rsa result
+to its documented fail-closed NIL, so the signal was dead code that pre-empted the caller's own handling.
+gate-build clean-cache PASS; 567/567 SBCL + Clasp; gate-nocond 52 -> 45.
+
 ## Order of the remaining work (shallow → deep)
 
 **the durability store vtable — the tamper refusals are now `SECURITY-FAILCLOSED` (contained at the start

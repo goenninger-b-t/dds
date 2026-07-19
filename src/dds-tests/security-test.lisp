@@ -14,10 +14,10 @@
    (d) hmac-sha256 matches RFC 4231 HMAC-SHA-256 Test Case 2 (published vector).
    (e) derive-session-key composes 'SessionKey'||salt||session_id under HMAC-SHA256 (§9.5.3.3.4.2; no trailing counter — Fast-DDS/Cyclone-aligned, T-RECONCILE 2026-06-27).
    Requires OpenSSL >= 3.5; skips only if truly absent. Both SBCL and Clasp must pass identically."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [security-secured-payload] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from run-security-secured-payload-corpus-test t)))
 
   ;; (a) byte-exact serialize. Known field set (spike §6 header fields + a fixed ct/tag).
@@ -224,10 +224,10 @@
    SecureDataHeader field's integrity binding (find_key for kind/key_id; the KDF+nonce for session_id/iv_suffix)
    is exercised by a directed byte flip, not left analytical.
    Requires OpenSSL >= 3.5; skips only if truly absent. Both SBCL and Clasp must pass identically."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [security-payload-roundtrip] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from run-security-payload-roundtrip-test t)))
 
   (let* ((km (dds.security:make-test-key-material))
@@ -340,10 +340,10 @@
    (c) decode-serialized-payload-into on an over-short input fails closed (-> NIL, no read/crash).
    All static buffers are freed under unwind-protect so a %check failure never leaks them.
    Requires OpenSSL >= 3.5; skips only if truly absent. Both SBCL and Clasp must pass identically."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [security-payload-into] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from run-security-payload-into-test t)))
   (let* ((km     (dds.security:make-test-key-material))      ; CORE km under test, iv-counter 0
          (km-or  (dds.security:make-test-key-material))      ; ORACLE km, same fixed master key/salt, counter 0
@@ -415,10 +415,10 @@
        core (both dominated by the shared EVP FFI residual; SBCL-exact via dds.pal:bytes-consed, Clasp reports 0).
    (j) the ENCRYPT km is UNCHANGED (byte-3 kind = 4, has the length prefix) — the GMAC branch is additive.
    Requires OpenSSL >= 3.5; skips only if truly absent."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [security-gmac-payload] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from run-security-gmac-payload-test t)))
   (let* ((km   (dds.security:make-test-key-material :kind :sign))   ; GMAC km under test, iv-counter 0
          (pt   (make-array 16 :element-type '(unsigned-byte 8)
@@ -554,10 +554,10 @@
    kind/key_id header (so find_key passes and the GMAC verify itself must reject) → always NIL, never
    a tampered accept / OOB / unbounded alloc. Requires OpenSSL >= 3.5; skips only if truly absent.
    Both SBCL and Clasp must pass identically."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [security-payload-fuzz] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from run-security-payload-fuzz-test t)))
 
   (let* ((km    (dds.security:make-test-key-material))
@@ -670,10 +670,10 @@
    the Connext Security plugins are a separate licensed add-on not installed here.
    Requires OpenSSL >= 3.5 (same gate as the lower-layer security tests above).
    Both SBCL and Clasp must pass identically (Clasp FIRST per the operating contract)."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [security-encrypted-pubsub] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from run-security-encrypted-pubsub-test t)))
 
   ;; ONE shared km instance: both pub and sub share the same iv-counter so nonces never collide.
@@ -799,10 +799,10 @@
    leak); then samples beyond the pool capacity are fed WITHOUT returning, so the pool exhausts and the surplus is
    rejected (decode-pool-rejects increments, node-sample-count capped) — RESOURCE_LIMITS / SAMPLE_REJECTED, never
    a GC-heap fallback. Requires OpenSSL >= 3.5; both impls must pass identically (Clasp FIRST)."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [secured-decode-loan-alloc] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from run-secured-decode-loan-alloc-test t)))
   ;; -- Part 1: the focused decode-path alloc proof (isolated codec + pool; no node) --
   (let* ((km (dds.security:make-test-key-material))
@@ -903,10 +903,10 @@
    buffer is freed immediately); (c) pool-in-use returns to baseline 0 once the app returns the original's loan
    (no leak). No sockets — %deliver-user-sample driven directly (the dup is a second call with the same effective
    GUID+SN, which reader-dedup-accept-p rejects). Requires OpenSSL >= 3.5; both impls must pass identically (Clasp FIRST)."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [secured-decode-loan-dup] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from run-secured-decode-loan-dup-test t)))
   (let* ((km (dds.security:make-test-key-material))
          (pt (make-array 8 :element-type '(unsigned-byte 8)
@@ -964,10 +964,10 @@
      (5) SWEEP: a reader that drained a loan but never returned it -> return-all-loans (reader-close) releases it
          (pool-in-use back to 0) — no lingering plaintext, no leak.
    Requires OpenSSL >= 3.5 (same gate as the lower-layer secured tests); both impls must pass identically (Clasp FIRST)."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [dcps-secured-take-loan] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from run-dcps-secured-take-loan-test t)))
   (let* ((km (dds.security:make-test-key-material))
          (ts (dds.types:find-type-support "shape-type"))
@@ -1110,10 +1110,10 @@
    plaintext (no sample-loss), reader-1's early return DEFERS (the shared handle buffer + (guid,SN) survive
    for reader-2), and only reader-2's return (the last, count -> 0) purges the slot + frees the pooled buffer
    (2C3 return-count purge-defer — no leak, no double-free/UAF). OpenSSL-gated; Clasp FIRST."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [dcps-same-topic-secured-readers] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from run-dcps-same-topic-secured-readers-test t)))
   (let* ((km (dds.security:make-test-key-material))
          (ts (dds.types:find-type-support "shape-type"))
@@ -1189,10 +1189,10 @@
    pool working-set budget and fails closed (RESOURCE_LIMITS / SAMPLE_REJECTED). Skipped if carve-fail is
    unreachable on this impl/platform (the impossibly-large carve unexpectedly succeeded).
    No sockets — %deliver-user-sample driven directly. Requires OpenSSL >= 3.5; both impls pass identically (Clasp FIRST)."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [secured-store-growth] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from run-secured-store-growth-test t)))
   (let* ((km (dds.security:make-test-key-material))
          (pt (make-array 16 :element-type '(unsigned-byte 8) :initial-element #x5A))
@@ -1291,10 +1291,10 @@
    DISTINCT failing SNs never grows the per-writer counter map past the cap (an attacker streaming garbage cannot
    exhaust memory through the counter table), while an already-tracked SN still progresses to suppression.
    Requires OpenSSL >= 3.5; both impls must pass identically (Clasp FIRST)."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [decode-fail-suppress] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from run-decode-fail-suppress-test t)))
   (let* ((km (dds.security:make-test-key-material))
          (pt (make-array 8 :element-type '(unsigned-byte 8)
@@ -1416,10 +1416,10 @@
    Asserts the subscriber receives the EXACT 2000-byte original plaintext byte-exact after
    encode -> fragment -> reassemble -> decode — proving the common-sink decode covers the DATA_FRAG path.
    Requires OpenSSL >= 3.5; skips only if truly absent. Both SBCL and Clasp must pass identically."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [security-encrypted-fragmented] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from run-security-encrypted-fragmented-test t)))
 
   ;; ONE shared km — two instances would collide nonces under the same master key (ADR 0031 §T2).
@@ -1493,10 +1493,10 @@
    the per-sample payload allocation. The win measured here is at least the payload size per sample. SBCL-exact
    (dds.pal:bytes-consed); Clasp reports 0 by the NFR-PORT gap, so the inequality is asserted only on a measuring
    impl. The full live-publish-path 0.0000 proof (publisher AND subscriber) is the T5c gate. Requires OpenSSL >= 3.5."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [security-encode-pool-alloc] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from run-security-encode-pool-alloc-test t)))
   (let* ((km (dds.security:make-test-key-material))
          (pt (make-array 256 :element-type '(unsigned-byte 8) :initial-element 7))
@@ -1557,10 +1557,10 @@
    loans increments disc-node-decode-pool-rejects (SAMPLE_REJECTED), caps node-sample-count at the pool capacity,
    and conses far below one plaintext per rejected sample (no GC fallback).
    Requires OpenSSL >= 3.5; both impls must pass identically (Clasp FIRST)."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [secured-live-zeroalloc] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from run-secured-live-zeroalloc-test t)))
   (let ((km (dds.security:make-test-key-material))
         (sbcl (eq (dds.pal:pal-impl-name) :sbcl)))
@@ -2124,10 +2124,10 @@
        flipped original submessage (SIGN — and NEVER returns the tampered plaintext); truncation;
        a re-ordered bracket; an unknown transformation_kind.
    Requires OpenSSL >= 3.5; skips only if truly absent. Both SBCL and Clasp must pass identically."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [security-submessage] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from run-security-submessage-corpus-test t)))
   (let ((sub (%t2-fixed-plain-submessage)))
     (%t2-corpus-encrypt sub)
@@ -2414,10 +2414,10 @@
        rtps-message}-into with :my-receiver-key-id/:my-receiver-key round-trip identically + fail-closed,
        so the origin-auth 0 B/sample mem arms are non-vacuous.
    Requires OpenSSL >= 3.5; skips only if truly absent. Both SBCL and Clasp must pass identically."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [security-origin-auth] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from run-security-origin-auth-test t)))
   (let ((sub (%t2-fixed-plain-submessage)))
     (%t3-corpus-encode sub)
@@ -2632,10 +2632,10 @@
    (5) origin authentication: encode with 2 receivers; decode verifies its OWN entry — right key -> stream;
        wrong key -> NIL (non-vacuous, common_mac valid); absent key_id -> NIL; off -> stream.
    Requires OpenSSL >= 3.5; skips only if truly absent. Both SBCL and Clasp must pass identically (Clasp FIRST)."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [security-rtps-message] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from run-security-rtps-message-corpus-test t)))
   (let ((stream (%t4-fixed-stream)))
     (%t4-corpus-encrypt stream)
@@ -2765,10 +2765,10 @@
    (c) fail-closed — a too-short input -> NIL, both tiers.
    (d) zero-alloc — the ENCODE core (ENCRYPT, reused out-buffer) conses ~0 B/call on a measuring impl (SBCL).
    Requires OpenSSL >= 3.5; skips only if truly absent. Both SBCL and Clasp must pass identically (Clasp FIRST)."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [security-secured-region-into] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from run-security-secured-region-into-test t)))
   (let ((sub    (%t2-fixed-plain-submessage))
         (stream (%t4-fixed-stream)))
@@ -2822,10 +2822,10 @@
    exact, Clasp reports 0 — NFR-PORT) as a markdown table to STREAM. This is the T4 BASELINE; T10 re-measures
    the integrated send/%handle-datagram path. Encode advances the km iv-counter per call (no nonce reuse);
    decode re-decodes one pre-encoded blob (keyed by the wire iv). SKIPs if OpenSSL<3.5."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format stream "~&  [rtps-message-bench] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from run-rtps-message-bench t)))
   (let ((subs (%t4-bench-stream size)))
     (flet ((bench-encode (kind)
@@ -2872,10 +2872,10 @@
    Clasp reports 0 — NFR-PORT). The T10-send/recv vs T4 delta is the documented residual: the codec's →octets
    return + AEAD intermediates (the inherited T4 carry) PLUS one plain-region subseq per datagram; the node
    send/receive BUFFER is reused in place (no per-datagram message-sized array). SKIPs if OpenSSL<3.5."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format stream "~&  [rtps-protection-bench] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from run-rtps-protection-bench t)))
   (let* ((subs (%t4-bench-stream size))                                   ; the post-header submessage stream
          (km   (dds.security:make-test-key-material))

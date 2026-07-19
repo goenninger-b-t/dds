@@ -251,9 +251,9 @@
    (a) Good: non-nil handle; check-create-participant T; Square allowed; Circle denied.
    (b) validate-remote-permissions: non-nil; check-remote-datawriter/datareader Square/Circle.
    (c) Fail-closed: wrong local-subject → NIL; tampered governance.p7s → NIL. Both SBCL+Clasp."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
-      (format t "~&  [access-plugin-validate] SKIP: ~a~%" (dds.dare:dare-unavailable-reason c))
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
+      (format t "~&  [access-plugin-validate] SKIP: ~a~%" %dare-reason)
       (return-from run-access-plugin-validate-test t)))
   (let* ((perm-ca  (%read-ac-fixture-pem "perm-ca-cert.pem"))
          (gov-p7s  (%read-ac-fixture-pem "governance.p7s"))
@@ -525,10 +525,10 @@
    NON-VACUOUS: sq-b matched-count >= 1 (Square allowed) AND ci-b matched-count = 0 (Circle denied);
    the ONLY difference is the topic name — same identities, same auth :keyed, same QoS/type.
    Requires OpenSSL >= 3.5; skips gracefully if absent. Both SBCL and Clasp must pass."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [ac-allow-deny] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from run-access-control-allow-deny-test t)))
 
   (let* ((ca-pem      (%read-fixture-pem "ca/ca-cert.pem"))
@@ -717,10 +717,10 @@
    (c) create-datareader on a 'Circle' topic SIGNALS access-denied (EC grant denies Circle subscribe).
    (d) create-datareader on a 'Square' topic SUCCEEDS (EC grant allows Square subscribe).
    Both SBCL and Clasp must pass."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [ac-local-deny] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from run-access-control-local-deny-test t)))
 
   (let* ((ca-pem    (%read-fixture-pem "ca/ca-cert.pem"))
@@ -1146,7 +1146,7 @@
                                                   :metadata-protection-kind :none :data-protection-kind :none)
                     (dds.security:make-topic-rule :topic-expr "Circle"    ; data=ENCRYPT (Square rule does not shadow it)
                                                   :metadata-protection-kind :none :data-protection-kind :encrypt))))
-        (dare (handler-case (progn (dds.dare:dare-available-p) t) (dds.dare:dare-unavailable () nil)))
+        (dare (dds.dare:dare-available-p))
         (pt (make-array 8 :element-type '(unsigned-byte 8)
                           :initial-contents '(#x53 #x51 #x55 #x41 #x52 #x45 #x20 #x01))))   ; "SQUARE  "
     (%check :dp-downgrade-effective-most-protective
@@ -1322,7 +1322,7 @@
                                                   :metadata-protection-kind :none :data-protection-kind :sign)
                     (dds.security:make-topic-rule :topic-expr "Triangle"  ; NON-secured (both NONE) — same-topic multi-writer stays allowed (S1)
                                                   :metadata-protection-kind :none :data-protection-kind :none))))
-        (dare (handler-case (progn (dds.dare:dare-available-p) t) (dds.dare:dare-unavailable () nil)))
+        (dare (dds.dare:dare-available-p))
         (ptc (make-array 8 :element-type '(unsigned-byte 8)
                            :initial-contents '(#x43 #x49 #x52 #x43 #x4c #x45 #x20 #x01)))   ; "CIRCLE  "
         (pts (make-array 8 :element-type '(unsigned-byte 8)

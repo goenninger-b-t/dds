@@ -1620,21 +1620,19 @@
     (function () t)
   "T iff DARE is usable, NIL otherwise — a TRUE predicate.
 
-   dds.dare:dare-available-p is named like a predicate but SIGNALS dare-unavailable (its own docstring says
-   so), so the seven `(unless (dare-available-p) ...skip...)` guards in this file did not skip — they ERRORED.
-   Invisible locally (macOS has OpenSSL 3.5) and fatal in CI (ubuntu-latest ships OpenSSL 3.0). Production
-   callers that want the condition still get it; the tests want a predicate."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable () nil)))
+   ADR 0064: dds.dare:dare-available-p now RETURNS (VALUES AVAILABLE REASON) — a true predicate on its primary
+   value — so this wrapper just forwards it (the historical handler-case that turned the old DARE-UNAVAILABLE
+   signal into NIL is gone; the condition no longer exists)."
+  (dds.dare:dare-available-p))
 
 (defun* run-dare-service-transparency-test ()
     (function () t)
   "DARE-wrapped durability service: publisher writes N TL samples; service seals into encrypted store;
    TL late-joiner receives all N byte-exact (DARE transparent to relay path). Domain 107, loopback unicast."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [dare-service-transparency] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from run-dare-service-transparency-test t)))
   (let* ((n 5)
          (tmp-dir (uiop:merge-pathnames*
@@ -2085,10 +2083,10 @@
     (function () t)
   "DARE-wrapped SQLite store: make-encrypted-store over make-sqlite-store seals payloads; put N,
    get-range byte-exact (DARE transparent), and no plaintext sample appears in the DB file."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [sqlite-dare] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from run-durability-sqlite-dare-test t)))
   (let* ((db-path (%sqlite-tmp-db-path "dare"))
          (tmp-dir (uiop:pathname-directory-pathname db-path))
@@ -2505,10 +2503,10 @@
     (function () t)
   "store-sync on the encrypted-store decorator MUST reach the inner store's :sync (the T6
    regression: a dropped :sync delegation = the DARE PERSISTENT config never fsyncs = data loss)."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [sync-delegation] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from run-durability-sync-delegation-test t)))
   (let* ((k1 (uiop:merge-pathnames*
               (make-pathname :directory (list :relative (format nil "dds-syncdel-k1-~a" (get-universal-time))))
@@ -4013,10 +4011,10 @@
        fails loud, never silently skipping verification.
    (6) honest torn tail still truncate-recovers; malicious whole-frame tail truncation is the
        DOCUMENTED deferred-anchor residual (ADR 0045 §7) — asserted here to remain undetected."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [durability-mac-chain] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from run-durability-mac-chain-test t)))
   (let ((g0   (make-array 16 :element-type '(unsigned-byte 8) :initial-element 7))
         (dirs '())
@@ -4341,10 +4339,10 @@
        snapshot, reopen ⇒ fail-closed (count < N).
    (5) NEVER-CLEANLY-CLOSED opens CLEAN (documented): a store whose close skipped the seal (crash before
        the first seal ⇒ no logmac.tail) reopens clean — the anchor only protects SEALED prefixes."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [durability-tail-anchor] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from run-durability-tail-anchor-test t)))
   (let ((g0   (make-array 16 :element-type '(unsigned-byte 8) :initial-element 5))
         (dirs '())
@@ -4528,10 +4526,10 @@
    Arms (a)-(d) assert the EXACT fail path via the condition report text (:diverged / :truncated / the
    epochs.mac self-MAC-mismatch wording), so botched byte-surgery cannot pass via a different error path
    (e.g. the pre-existing mid-file-corruption signal)."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [durability-epochs-mac] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from run-durability-epochs-mac-test t)))
   (let ((g0   (make-array 16 :element-type '(unsigned-byte 8) :initial-element 9))
         (dirs '())
@@ -4691,10 +4689,10 @@
    (5) grandfather: a legacy-v2 SQLite topic (bare store, NULL mac) coexists with a born-chained topic,
        reopens clean (legacy grandfathered), and downgrading the chained topic still fails loud.
    (6) NIL-oracle regression: a bare make-sqlite-store round-trips unchanged (NULL mac column)."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [durability-sqlite-mac-chain] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from run-durability-sqlite-mac-chain-test t)))
   (let ((g0   (make-array 16 :element-type '(unsigned-byte 8) :initial-element 7))
         (kh0  (make-array 16 :element-type '(unsigned-byte 8) :initial-element 3))
@@ -4901,10 +4899,10 @@
        SHORTER than the sealed N; reopen must OPEN CLEAN (non-vacuous: assert the physical shrink).
    (5b) F1 RED (skip-invalidate) — the SAME reclaim-shrink+crash with *durability-debug-skip-tail-invalidate* T
        BRICKS (stale anchor N=5 vs the shrunk log -> :truncated), proving the invalidate is load-bearing for SQLite."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [durability-sqlite-tail-anchor] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from run-durability-sqlite-tail-anchor-test t)))
   (let ((g0   (make-array 16 :element-type '(unsigned-byte 8) :initial-element 9))
         (dirs '())
@@ -7308,10 +7306,10 @@
    four in cleartext. (2) ROUND-TRIP THROUGH DARE — put N over 2 topics with distinct fields; get-range
    recovers the REAL topic/GUID/SN/kind/key-hash/payload byte-exact + (guid,sn)-ordered; idempotent
    re-put no-op; logical count. SKIPs if OpenSSL >= 3.5 is unavailable (the DARE-test pattern)."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [microservice-dare] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from run-durability-microservice-dare-test t)))
   ;; distinctive plaintext needles (multi-byte, collision-negligible)
   (let ((dguid (make-array 16 :element-type '(unsigned-byte 8)
@@ -7545,10 +7543,10 @@
    inner on the SAME D) replays the opaque frames; a client with the SAME LOCAL epoch-dir/key-dir
    store-open + get-range DECRYPTS + recovers the REAL records byte-exact + (guid,sn)-ordered. SKIPs if
    OpenSSL < 3.5 (the DARE-test pattern); the bare cross-restart runs regardless. Both impls."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [microservice-dare-cross-restart] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from run-durability-microservice-dare-cross-restart-test t)))
   (let* ((sdir  (%tms-tmp-dir "dxr-server"))   ; the SERVER's file inner dir D (opaque sealed frames on disk)
          (cbase (%tms-tmp-dir "dxr-client"))   ; the CLIENT-LOCAL DARE state (epochs.dat + ML-KEM key)
@@ -7640,10 +7638,10 @@
    (4) CROSS-RESTART with the chain: a PERSISTENT file inner replays the folded frames across a server
        restart → the reconnecting client re-verifies the chain clean and recovers byte-exact.
    (5) NIL-ORACLE regression: a bare microservice-store (no oracle) round-trips unchanged (Slice 1)."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [microservice-remote-chain] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from run-durability-microservice-remote-chain-test t)))
   (let ((g0  (%tms-guid 5))
         (pay (lambda (i) (%tms-payload (+ 6 i) (logand (+ 1 i) 255)))))
@@ -7916,10 +7914,10 @@
        Slice-3b limitation, ADR 0050 §4.3); the purge shrink leaves a valid chain and demonstrates the SAME
        invalidate-at-open inheritance non-vacuously. SKIP if OpenSSL < 3.5 (the DARE-test pattern). Both impls.
    Completes the sealed high-water tail anchor across ALL 3 durability tiers (file + SQLite + microservice)."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [durability-microservice-tail-anchor] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from run-durability-microservice-tail-anchor-test t)))
   (let ((g0  (%tms-guid 5))
         (g6  (%tms-guid 6))
@@ -8174,10 +8172,10 @@
        (*durability-debug-file-rewrite-fault*) during the reclaim rewrite ROLLS BACK the topic -> reopen
        CLEAN with the pre-reclaim records intact (no partial-topic brick — store-replace-topic is crash-atomic).
    Both impls."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [durability-microservice-keep-last-reclaim] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from run-durability-microservice-keep-last-reclaim-test t)))
   (labels ((%keys (base) (uiop:merge-pathnames* (make-pathname :directory '(:relative "keys")) base))
            (%mk (port base) (funcall (dds.durability:make-microservice-store-factory
@@ -8792,10 +8790,10 @@
        on open (no false-reject), count=2, A+B byte-exact — the put across the drop advanced the chain
        post-confirm so the byte-identical retry neither duplicated, lost, nor corrupted the chain.
    SKIPs if OpenSSL < 3.5 (the DARE-test pattern)."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [microservice-reconnect] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from run-durability-microservice-reconnect-test t)))
   (let* ((sdir  (%tms-tmp-dir "recon-server"))
          (cbase (%tms-tmp-dir "recon-client"))
@@ -8998,10 +8996,10 @@
    RED (*durability-debug-ms-skip-stale-resync*) -> R2 forks a 2nd chain_seq-0 -> the next open BRICKS
    'chain MAC mismatch' -> proving the re-sync is load-bearing (no false-reject of honest data). DARE-wrapped
    (skip if OpenSSL < 3.5)."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [microservice-reconnect-exhausted] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from run-durability-microservice-reconnect-exhausted-test t)))
   (labels ((%reopen-result (skip-resync)
              ;; drive the exhausted R1 + a following R2 (same topic) in one session, then reopen a fresh
@@ -9055,10 +9053,10 @@
        store holding only HONEST data (a pre-existing worst-class false-reject this WP closes cheaply).
    (B) SAME-OBJECT-CLOSE-REOPEN: a close->reopen of the SAME encrypted(microservice) store object works — the
        decorator's PRE-open tail-anchor probe dials (%ms-dial clears closed-p) so its %ms-call is not refused."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [microservice-reconnect-seal] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from run-durability-microservice-reconnect-seal-test t)))
   ;; ---- (A) apply-then-ack-lost PURGE + clean close: reopen must be CLEAN (GREEN) / BRICK (RED) ----
   (labels ((%reopen (skip-resync)

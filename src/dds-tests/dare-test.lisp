@@ -9,10 +9,10 @@
   "SHA-384 (NIST FIPS 180-4 §B.2) + HKDF-SHA384 (Google Wycheproof) known-answer tests.
    Requires OpenSSL >= 3.5 on the host; skips only if truly absent (host without OpenSSL 3.x).
    Both SBCL and Clasp must pass identically when OpenSSL 3.x is installed."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [dare-sha384-hkdf-kat] SKIP — OpenSSL >= 3.5 not available on this host: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from run-dare-sha384-hkdf-kat-test t)))
 
   ;; SHA-384("abc") — NIST FIPS 180-4 §B.2 example, 48-byte digest.
@@ -81,10 +81,10 @@
      A  = feedface...abaddad2 (20 bytes)
      C  = 522dc1f0...bcc9f662 (60 bytes)
      T  = 76fc6ece0f4e1768cddf8853bb2d551b (16 bytes)"
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [dare-aes-gcm-kat] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from run-dare-aes-gcm-kat-test t)))
 
   ;; NIST SP 800-38D Appendix B TC16 key/IV/PT/AAD
@@ -274,10 +274,10 @@
    (b) re-resolves them CORRECTLY: a seal/open through the re-resolved pointers is BYTE-IDENTICAL to the same
    operation through the original (pre-null) pointers, and fail-closed on a tamper. Vectors are self-referential
    (a reference seal captured before nulling), so no KAT constant is duplicated. Requires OpenSSL >= 3.5."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [dare-image-restart-reresolve] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from run-dare-image-restart-reresolve-test t)))
   (let* ((key (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x2a))
          (nonce (make-array 12 :element-type '(unsigned-byte 8) :initial-element #x13))
@@ -340,10 +340,10 @@
    (d) Wrong-key: decapsulate(other-priv, ct) => DIFFERENT ss (ML-KEM implicit rejection,
        FIPS-203 §7.3: always rc=1 but K differs on key mismatch).
    Requires OpenSSL >= 3.5 on the host; skips only if truly absent."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [dare-ml-kem-kat] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from run-dare-ml-kem-kat-test t)))
 
   ;; (b) Byte-exact decaps KAT — deterministic pure function, no hook needed.
@@ -575,10 +575,10 @@
 (defun* run-dare-envelope-test ()
     (function () t)
   "KEM-DEM envelope: derive-dek, seal-payload, open-payload, make-record-aad round-trips and rejection tests."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [dare-envelope] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from run-dare-envelope-test t)))
 
   ;; generate a real ML-KEM shared secret and derive the DEK from it
@@ -683,10 +683,10 @@
    (3) chmod private key to 0644 -> next open REFUSES (signals a clear error).
    (4) *perms-mode-reader* bound to (constantly nil) -> open REFUSES (fail-closed on unverifiable perms).
    Uses unwind-protect to clean up the temp dir."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [dare-key-provider] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from run-dare-key-provider-test t)))
 
   (let* ((tmp-dir (uiop:merge-pathnames*
@@ -775,10 +775,10 @@
 (defun* run-dare-encrypted-store-test ()
     (function () t)
   "Encrypted durable-store decorator: put/get-range round-trip, sealed inner payloads, tamper drop."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [dare-encrypted-store] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from run-dare-encrypted-store-test t)))
 
   (let* ((tmp-dir (uiop:merge-pathnames*
@@ -882,10 +882,10 @@
    store-close frees+zeroizes the DEK, store-open re-derives a fresh DEK, the round-trip still
    works, and a second store-close is safe (no double-free, no error). Exercises the
    foreign-backed static-vector zeroize+free + re-derive paths."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [dare-encrypted-store-lifecycle] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from run-dare-encrypted-store-lifecycle-test t)))
   (let* ((tmp-dir (uiop:merge-pathnames*
                    (make-pathname :directory (list :relative
@@ -932,10 +932,10 @@
    AAD-binding discriminator: patches header epoch to epoch+1 with a lookup that always returns
    the same DEK — GCM must fail, proving epoch-id is bound inside the AEAD (not just the header).
    Regression: v1 seal-payload/open-payload are deterministic (unchanged) + round-trip correctly."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [dare-envelope-v2] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from run-dare-envelope-v2-test t)))
 
   (let* ((shared-secret (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x42))
@@ -1135,10 +1135,10 @@
    Security asserts are epoch-GROUPED (permutation-independent, so deterministic under the run-varying
    raw-store sort): the SET of distinct sealed epoch-ids == {1,2}, and nonces are distinct WITHIN each
    epoch only (per-epoch counter uniqueness — cross-epoch nonce values may coincide under distinct DEKs)."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [dare-persistent-store] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from run-dare-persistent-store-test t)))
 
   (let* ((d-dir (uiop:merge-pathnames*
@@ -1332,10 +1332,10 @@
    frame field) — it round-trips byte-exact AND is GCM-authenticated. Control: the keyed record
    round-trips (key-hash recovered). Tamper: a flipped sealed blob re-injected into the inner store
    under the same topic-hash + surrogate guid' is DROPPED fail-closed (the GCM tag catches it)."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [dare-keyhash-aad] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from run-dare-keyhash-aad-test t)))
   (let* ((d-dir (uiop:merge-pathnames* (make-pathname :directory (list :relative (format nil "dds-khaad-d-~a" (get-universal-time)))) (uiop:temporary-directory)))
          (k-dir (uiop:merge-pathnames* (make-pathname :directory (list :relative (format nil "dds-khaad-k-~a" (get-universal-time)))) (uiop:temporary-directory)))
@@ -1477,10 +1477,10 @@
   "WP-DURABILITY-METADATA-CONF-3c headline matrix over BOTH backends (file + SQLite): at-rest sealing
    of topic/GUID/SN/kind/key-hash. Byte-exact round-trip of every field, query-preserved (guid,sn)
    order, idempotency, NO plaintext topic-name/guid/sn/key-hash on disk, and cross-restart recovery."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [dare-metadata-conf-3c] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from run-dare-metadata-conf-3c-test t)))
   (let* ((base (uiop:temporary-directory))
          (fd (uiop:merge-pathnames* (make-pathname :directory (list :relative (format nil "dds-m3c-fd-~a" (get-universal-time)))) base))

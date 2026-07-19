@@ -175,10 +175,10 @@
    Returns (values IDENTITY-HANDLE NIL) on success, (values NIL reason-string) on failure.
    All foreign handles are owned by the returned identity-handle; caller MUST call
    FREE-IDENTITY-HANDLE when done (DDS-Security 1.1 §8.7.2 / §9.3.1)."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (return-from validate-local-identity
-        (values nil (format nil "OpenSSL unavailable: ~a" (dds.dare:dare-unavailable-reason c))))))
+        (values nil (format nil "OpenSSL unavailable: ~a" %dare-reason)))))
   (let ((ca-store nil) (cert nil) (pkey nil))
     (handler-case
         (progn

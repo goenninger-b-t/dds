@@ -1709,7 +1709,7 @@ A signalled `%shmem-send` hard fault is caught in `%send-raw-buf` (`dds.disc`), 
   (KEM-DEM envelope, the HKDF domain-separator label, counter-nonce discipline, AAD) per NIST
   guidance and implement no primitive ourselves. The version verified on this host is **OpenSSL
   3.6.2 (7 Apr 2026)**; **≥ 3.5 is a hard requirement** (ML-KEM landed in the 3.5 LTS),
-  runtime-checked at startup (`dare-available-p` → hard error, never a plaintext fallback).
+  runtime-checked at startup (`dare-available-p` → `(values NIL reason)` fail-closed status, ADR 0064; never a plaintext fallback).
 - **No OpenSSL source/headers were copied.** The CFFI bindings (`src/dds-dare/openssl-ffi.lisp`)
   are clean-room: each EVP signature is **pinned against the installed OpenSSL 3.6.2 public headers**
   (`evp.h`/`kdf.h`/`core.h`/`crypto.h`, file + line cited in-source) and verified by **published

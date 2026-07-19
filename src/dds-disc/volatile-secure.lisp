@@ -664,9 +664,9 @@
    concurrent %on-volatile-secure decode). Asserts: resolvable before; the pruned KM returned; its master secrets
    zero after; unresolvable after (bounded); the handle retired for teardown; a second prune a no-op (idempotent);
    an UNRELATED peer untouched. Requires AES-GCM (the derived bootstrap KM); skips gracefully if absent."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
-      (format t "~&  [pvms-prune] SKIP — AES-GCM not available: ~a~%" (dds.dare:dare-unavailable-reason c))
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
+      (format t "~&  [pvms-prune] SKIP — AES-GCM not available: ~a~%" %dare-reason)
       (return-from run-pvms-peer-loss-prune-test t)))
   (let* ((p1    (make-array 12 :element-type '(unsigned-byte 8) :initial-element 33))
          (node  (make-disc-node :guid-prefix p1 :host "127.0.0.1" :port 0))

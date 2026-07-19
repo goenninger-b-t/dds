@@ -152,9 +152,9 @@
    keyed status, and a final SUMMARY + RESULT line the orchestrator greps. The receiver thread does the
    §8.7 handshake, PVMS crypto-token exchange, secure SEDP and rtps_protection decode; this loop drives
    the outbound side. Fail-soft: a peer-config error is reported, never crashes the harness."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
-      (format t "~&RESULT: SKIP — OpenSSL >= 3.5 unavailable: ~a~%" (dds.dare:dare-unavailable-reason c))
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
+      (format t "~&RESULT: SKIP — OpenSSL >= 3.5 unavailable: ~a~%" %dare-reason)
       (finish-output) (return-from run-secure-interop-peer t)))
   ;; Surface §8.7 handshake / crypto-token events from the receiver thread (global, not a dynamic
   ;; binding: the handshake runs on the receiver thread) — the cross-vendor reject-reason diagnostic.

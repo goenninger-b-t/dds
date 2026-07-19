@@ -4419,7 +4419,7 @@
                      (%deliver-user-sample n2 #x00000102 1 payl src-pl gpl 1)   ; plaintext to the PLAIN reader
                      (assert (equalp payl (node-sample n2 (cons gpl 1))) ()
                              "S4 GATE: the plain reader must RECEIVE its plaintext under its OWN NONE tier — a node-single ENCRYPT upgrade would decode-attempt + DROP it (false-REJECT)")
-                     (when (handler-case (progn (dds.dare:dare-available-p) t) (dds.dare:dare-unavailable () nil))
+                     (when (dds.dare:dare-available-p)   ; ADR 0064: dare-available-p returns AVAILABLE directly
                        (let* ((src-sec (make-array 12 :element-type '(unsigned-byte 8) :initial-element #x6A))
                               (gsec (%source-guid src-sec #x00000102))
                               (sealed (dds.security:encode-serialized-payload km payl)))

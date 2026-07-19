@@ -429,9 +429,9 @@
   "Measured zero-alloc data_protection AEAD encode + decode (NFR-MEM, security-ON). SBCL asserts
    bytes-consed/iter < 1.0; Clasp smokes (bytes-consed is 0). Closes the gap that make mem never
    covered the security path (ADR-0036 Carry-3)."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
-      (format t "~&  [mem-secure] SKIP — AES-GCM not available: ~a~%" (dds.dare:dare-unavailable-reason c))
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
+      (format t "~&  [mem-secure] SKIP — AES-GCM not available: ~a~%" %dare-reason)
       (return-from run-mem-test-secure t)))
   (let* ((km (dds.security:make-test-key-material))
          (pt (map '(simple-array (unsigned-byte 8) (*)) #'char-code "zero-alloc steady-state payload"))

@@ -54,10 +54,10 @@
    (c) wrong-CA cert with the test CA -> (values nil reason) (chain-verify fail-closed).
    (d) validate-remote-identity between two distinct-GUID handles -> :ok + :requester/:replier.
    Requires OpenSSL >= 3.5; skips gracefully if absent. Both SBCL and Clasp must pass."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [auth-identity] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from run-auth-identity-test t)))
 
   (let* ((ca-pem       (%read-fixture-pem "ca/ca-cert.pem"))
@@ -130,9 +130,9 @@
     (function () t)
   "SHA-256 NIST known-answer test: SHA-256('') = e3b0c44298fc1c14... (NIST FIPS 180-4 §6.2).
    Verifies dds.dare:sha-256 against the NIST FIPS 180-4 empty-string test vector. Both impls must pass."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
-      (format t "~&  [sha256-kat] SKIP: ~a~%" (dds.dare:dare-unavailable-reason c))
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
+      (format t "~&  [sha256-kat] SKIP: ~a~%" %dare-reason)
       (return-from run-auth-sha256-kat t)))
   (let* ((empty    (make-array 0 :element-type '(unsigned-byte 8)))
          (result   (dds.dare:sha-256 empty))
@@ -158,9 +158,9 @@
      Source: https://www.rfc-editor.org/rfc/rfc6979.txt §A.2.5
      ecdsa-verify takes the raw message and hashes SHA-256 internally (EVP_DigestVerify).
    Both SBCL and Clasp must pass."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
-      (format t "~&  [ecdsa-kat] SKIP: ~a~%" (dds.dare:dare-unavailable-reason c))
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
+      (format t "~&  [ecdsa-kat] SKIP: ~a~%" %dare-reason)
       (return-from run-auth-ecdsa-kat t)))
 
   ;;; --- RFC 5903 §8.1 ECDH KAT (Group 19, P-256) ---
@@ -312,9 +312,9 @@
    tcId=62: msg=313233343030, invalid signature (wrong salt / tampered).
    Key: RSA-2048 public key (n, e=010001) from Wycheproof test group 1.
    Both SBCL and Clasp must pass."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
-      (format t "~&  [rsa-pss-kat] SKIP: ~a~%" (dds.dare:dare-unavailable-reason c))
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
+      (format t "~&  [rsa-pss-kat] SKIP: ~a~%" %dare-reason)
       (return-from run-auth-rsa-pss-kat t)))
 
   ;; SubjectPublicKeyInfo DER for Wycheproof testGroups[0].key (RSA-2048, e=65537).
@@ -433,9 +433,9 @@
      ffdh-compute(A-priv, B-pub) == ffdh-compute(B-priv, A-pub) (DH commutativity property).
    Also asserts the shared secret length = 256 bytes (MODP-2048 group order, RFC 3526 §3)
    and that SHA-256 of the shared secret is 32 bytes (DDS-Security §9.3.3). Both SBCL/Clasp."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
-      (format t "~&  [ffdh-kat] SKIP: ~a~%" (dds.dare:dare-unavailable-reason c))
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
+      (format t "~&  [ffdh-kat] SKIP: ~a~%" %dare-reason)
       (return-from run-auth-ffdh-kat t)))
   (multiple-value-bind (pub-a priv-a)
       (dds.dare:ffdh-gen-keypair dds.security::+modp-2048-p+ dds.security::+modp-2048-g+)
@@ -508,9 +508,9 @@
    Happy-path: participant_rsa (GUID-A < GUID-B) is requester; participant_rsa_b is replier.
    Full Request->Reply->Final: both handles -> :authenticated; SharedSecrets byte-equal (32 bytes).
    Negative: tampered reply -> requester :rejected. Both SBCL and Clasp must pass."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
-      (format t "~&  [auth-handshake-rsa] SKIP: ~a~%" (dds.dare:dare-unavailable-reason c))
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
+      (format t "~&  [auth-handshake-rsa] SKIP: ~a~%" %dare-reason)
       (return-from run-auth-handshake-rsa-test t)))
   (let* ((ca-pem     (%read-fixture-pem "ca/ca-cert.pem"))
          (rsa-cert-a (%read-fixture-pem "participant_rsa/identity_cert.pem"))
@@ -641,10 +641,10 @@
    Each is paired with a matching positive-control so the test cannot pass by always-rejecting.
    Internal token format is the in-process tagged binary (not CDR DataHolder wire — Slice 5).
    Requires OpenSSL >= 3.5; skips gracefully if absent. Both SBCL and Clasp must pass."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [auth-negatives] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from run-auth-negatives-test t)))
 
   (let* ((ca-pem        (%read-fixture-pem "ca/ca-cert.pem"))
@@ -1009,10 +1009,10 @@
      (e) ABSENCE-TOLERANCE: replier with EXPECTED-CHALLENGE1=NIL (no auth_request seen) still ACCEPTS the
          bound request — §8.7.2.3-optional, absence must NOT false-reject a conformant peer.
    Requires OpenSSL >= 3.5; skips gracefully if absent. Both SBCL and Clasp must pass."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [auth-challenge-binding] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from run-auth-challenge-binding-test t)))
   (let* ((ca-pem    (%read-fixture-pem "ca/ca-cert.pem"))
          (ec-cert-a (%read-fixture-pem "participant_ec/identity_cert.pem"))
@@ -1150,10 +1150,10 @@
    No trust gate is weakened: A2/A5 show the binding still fires on a match and the strict API still rejects a
    supplied mismatch; the downgrade only ever falls back to the cert-chain+Sign path a Fast DDS peer already
    takes. Requires OpenSSL >= 3.5; skips gracefully if absent. Both SBCL and Clasp must pass."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [auth-forged-request-hardening] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from run-auth-forged-request-hardening-test t)))
   (let* ((ca-pem    (%read-fixture-pem "ca/ca-cert.pem"))
          (ec-cert-a (%read-fixture-pem "participant_ec/identity_cert.pem"))
@@ -1272,10 +1272,10 @@
    Nonces and ephemeral DH keys are non-deterministic; we assert structural invariants +
    round-trip identity rather than full byte-exact vectors.
    Both SBCL and Clasp must pass."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [auth-token-corpus] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from run-auth-token-corpus-test t)))
 
   (let* ((ca-pem    (%read-fixture-pem "ca/ca-cert.pem"))
@@ -1452,10 +1452,10 @@
    Invariant: every input returns (:rejected NIL) or equivalent — never OOB, never crash, never throw.
    Uses a deterministic seed (make-random-state nil, xorshift-like index-based fill, no Date.now).
    Requires OpenSSL >= 3.5; skips gracefully if absent. Both SBCL and Clasp must pass."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [auth-token-fuzz] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from run-auth-token-fuzz-test t)))
 
   (let* ((ca-pem    (%read-fixture-pem "ca/ca-cert.pem"))
@@ -1564,9 +1564,9 @@
    Full Request->Reply->Final: both handles -> :authenticated; SharedSecrets byte-equal.
    Negative (a): tampered reply signature -> requester returns :rejected.
    Negative (b): tampered Final -> replier returns :rejected. Both SBCL and Clasp must pass."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
-      (format t "~&  [auth-handshake-ecdh] SKIP: ~a~%" (dds.dare:dare-unavailable-reason c))
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
+      (format t "~&  [auth-handshake-ecdh] SKIP: ~a~%" %dare-reason)
       (return-from run-auth-handshake-ecdh-test t)))
   (let* ((ca-pem    (%read-fixture-pem "ca/ca-cert.pem"))
          (ec-cert-a (%read-fixture-pem "participant_ec/identity_cert.pem"))
@@ -1679,10 +1679,10 @@
    (b) DEFAULT-OFF byte-identical: identity-token-octets NIL -> no PID_IDENTITY_TOKEN in
        the serialized bytes, and the parsed builtin-endpoint-set lacks both PSM bits.
    Requires OpenSSL >= 3.5 for the fixture IdentityToken; skips gracefully if absent."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [auth-spdp-identity-token] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from run-auth-spdp-identity-token-test t)))
 
   ;; Acquire a fixture IdentityToken from validate-local-identity on the EC fixture.
@@ -1808,10 +1808,10 @@
    (c) Self-consistency prefix: DataHolder leading bytes match the T0-pinned CDR-LE layout
        (the locked +dataholder-req-prefix-vector+ above).
    Requires OpenSSL >= 3.5; skips gracefully if absent. Both SBCL and Clasp must pass."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [auth-wire-codec] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from run-auth-wire-codec-test t)))
 
   (let* ((ca-pem    (%read-fixture-pem "ca/ca-cert.pem"))
@@ -2204,10 +2204,10 @@
    (e) Node-B receives the Final -> process-handshake -> :authenticated.
    (f) Both reach :authenticated with byte-equal SharedSecrets (bounded 4 s poll).
    Requires OpenSSL >= 3.5; skips gracefully if absent. Both SBCL and Clasp must pass."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [auth-handshake-over-wire] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from run-auth-handshake-over-wire-test t)))
 
   (let* ((ca-pem    (%read-fixture-pem "ca/ca-cert.pem"))
@@ -2421,10 +2421,10 @@
    (d) T8 (migrated off auth-remote-remote-km): each crypto-manager installed the OTHER's ParticipantCrypto
        (§8.5.2) — the per-writer/entity KeyMaterial now lives in the crypto-manager registries.
    Requires OpenSSL >= 3.5; skips gracefully if absent. Both SBCL and Clasp must pass."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [auth-manager-handshake] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from run-auth-manager-handshake-test t)))
 
   (let* ((ca-pem    (%read-fixture-pem "ca/ca-cert.pem"))
@@ -2514,10 +2514,10 @@
      (e)  B receives EXACTLY the original plaintext PT (encode+decode round-trip byte-exact).
    No make-test-key-material is used anywhere in this test.
    Requires OpenSSL >= 3.5; skips gracefully if absent. Both SBCL and Clasp must pass."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [auth-encrypted-pubsub-keyx] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from run-auth-encrypted-pubsub-keyx-test t)))
 
   (let* ((ca-pem    (%read-fixture-pem "ca/ca-cert.pem"))
@@ -2692,10 +2692,10 @@
      (e) NONCE-DISJOINTNESS (safety-critical, HARD CONSTRAINT #1): %pvms-role-session-id is DIFFERENT for the
          two directions (A->B vs B->A), so the symmetric bootstrap KM never reuses a (key, nonce) pair.
    Requires OpenSSL >= 3.5; skips gracefully if absent. Both SBCL and Clasp must pass."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [secure-discovery-keyed] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from run-secure-discovery-keyed-test t)))
   (let* ((ca-pem    (%read-fixture-pem "ca/ca-cert.pem"))
          (ec-cert-a (%read-fixture-pem "participant_ec/identity_cert.pem"))
@@ -2795,10 +2795,10 @@
    No fabricated composed KxKey expected-value is asserted (spike §5.5 — none published).
    Clasp and SBCL cross-check on identical fixed inputs is the composition conformance method.
    Requires OpenSSL >= 3.5; skips gracefully if absent. Both impls must pass."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [kxkey-kat] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from run-auth-kxkey-kat t)))
 
   ;;; --- (a) RFC 4231 §4.2 TC1: HMAC-SHA256 primitive KAT ---
@@ -2945,10 +2945,10 @@
    (e) make-crypto-token-message / parse-crypto-token-message envelope round-trip.
    (f) 2-DataHolder message -> NIL (cap enforced, spike §6.3).
    Requires OpenSSL >= 3.5; skips gracefully if absent. Both SBCL and Clasp must pass."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [auth-keymaterial-roundtrip] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from run-auth-keymaterial-roundtrip t)))
 
   (let* ((kx  (dds.security:derive-kx-key *kat-shared-secret* *kat-challenge1* *kat-challenge2*))
@@ -3130,10 +3130,10 @@
    Every result must be NIL and nothing must crash or signal (fail-closed).
    Blob sizes: 0..299 bytes (covers truncations and near-valid lengths).
    Requires OpenSSL >= 3.5; skips gracefully if absent. Both SBCL and Clasp must pass."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [auth-cryptotoken-fuzz] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from run-auth-cryptotoken-fuzz t)))
 
   ;; A fixed but non-trivial KxKey for fuzz parsing (not used for anything real)
@@ -3213,10 +3213,10 @@
    NON-VACUOUS: plain participants C and D on the SAME topic/type/QoS DO match (matched-count >=1),
    proving the SEC<->PLAIN non-match is the auth-gate, not a topic/type/QoS mismatch.
    Requires OpenSSL >= 3.5 (identity load); skips gracefully if absent. Both SBCL and Clasp must pass."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [auth-secured-refuses-plain] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from run-auth-secured-refuses-plain-test t)))
 
   (let* ((ca-pem    (%read-fixture-pem "ca/ca-cert.pem"))
@@ -3435,10 +3435,10 @@
          per-receiver MAC was emitted by A and verified by B (decode fails closed without it, even on a valid
          common_mac). The wrong-receiver-key fail-closed control is run-secure-sedp-origin-auth-tamper-test.
    Requires OpenSSL >= 3.5; skips gracefully if absent. Both SBCL and Clasp must pass."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [secure-discovery-e2e ~a] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              gov-p7s-name (dds.dare:dare-unavailable-reason c))
+              gov-p7s-name %dare-reason)
       (return-from %run-secure-discovery-e2e t)))
   (let* ((ca-pem    (%read-fixture-pem "ca/ca-cert.pem"))
          (ec-cert-a (%read-fixture-pem "participant_ec/identity_cert.pem"))
@@ -3662,9 +3662,9 @@
    (b) Tampered: 1-byte-flipped governance.p7s -> NIL (CMS signature invalid, fail-closed).
    (c) Wrong CA: governance.p7s + identity CA -> NIL (chain verify fails, fail-closed).
    Both SBCL and Clasp must pass."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
-      (format t "~&  [cms-verify-kat] SKIP: ~a~%" (dds.dare:dare-unavailable-reason c))
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
+      (format t "~&  [cms-verify-kat] SKIP: ~a~%" %dare-reason)
       (return-from run-cms-verify-kat t)))
   (let* ((p7s-octets     (%read-ac-fixture-pem "governance.p7s"))
          (perm-ca-octets (%read-ac-fixture-pem "perm-ca-cert.pem"))
@@ -3977,10 +3977,10 @@
    / inner GUID for entity), each fail-closed on a miss, with a light concurrency smoke over the
    single manager lock. Requires OpenSSL >= 3.5 (random KeyMaterial); skips only if truly absent.
    Both SBCL and Clasp must pass identically."
-  (handler-case (dds.dare:dare-available-p)
-    (dds.dare:dare-unavailable (c)
+  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+    (unless %dare-ok
       (format t "~&  [security-crypto-manager] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              (dds.dare:dare-unavailable-reason c))
+              %dare-reason)
       (return-from run-security-crypto-manager-test t)))
   (%cm-generator-units)
   (%cm-participant-registry)

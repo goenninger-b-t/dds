@@ -129,8 +129,9 @@ material now lives in foreign-backed `static-vectors`, never a GC-heap array** (
 - The decorator's `get-range` **drops** a record that fails to open (increments a counter, fires the
   bindable `*dare-error-hook*`), and never delivers unauthenticated data.
 - A provider that cannot decapsulate ⇒ the store **fails to open**.
-- **OpenSSL < 3.5 / ML-KEM absent ⇒ a hard startup error (`dare-unavailable`), never a silent
-  plaintext fallback** (the arena-exhaustion principle: no silent downgrade).
+- **OpenSSL < 3.5 / ML-KEM absent ⇒ `dare-available-p` returns `(values NIL reason)` (ADR 0064: a
+  fail-closed status value, no longer the `dare-unavailable` signal), and the store REFUSES to open —
+  never a silent plaintext fallback** (the arena-exhaustion principle: no silent downgrade).
 
 ### Per-session DEK and the 3a/3b key-epoch boundary
 
