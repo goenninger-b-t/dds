@@ -613,6 +613,22 @@ sites split three ways by their nature:
   key-provider-open first": the decorator always opens before use, so they cannot fire in correct use and are
   contained. 567/567 SBCL + Clasp; gate-build/types green.
 
+## Slice — crypto.lisp: parse-secured-payload → status; %require-len → GUARD (38 -> 31)
+
+The DDS-Security payload codec (`crypto.lisp`) split by input trust:
+- **`parse-secured-payload` (6 sites) → status.** It parses a bare §9.5.3.3 SecuredPayload from the WIRE — a
+  malformed peer payload CAN fire, so it converts. It now returns a 7th value `(or null keyword)`: NIL on a
+  well-formed payload, or a defect keyword (`:too-short` / `:truncated-header` /
+  `:crypto-content-overflows-input` / `:crypto-content-length-inconsistent` / `:truncated-tag` /
+  `:receiver-specific-macs-unsupported`) with the six field values NIL — a fail-closed status VALUE, never a
+  `SECURED-PAYLOAD-MALFORMED` unwind. A local `macrolet %malformed` threads the six `return-from`s. It has no
+  production callers (transform.lisp does its own byte-exact parse); the 2 test catchers flip to `nth-value 6`.
+- **`%require-len` (1 site) → GUARD.** A fixed-size INTERNAL invariant: every caller passes our own key
+  material / handshake-derived secrets / serialize inputs (fixed-size by construction) or an upstream-validated
+  4-byte session-id — it cannot fire on valid input; defense-in-depth in the crypto layer. The
+  `SECURED-PAYLOAD-MALFORMED` condition SURVIVES (still raised by this GUARD site).
+567/567 SBCL + Clasp; gate-build/types green.
+
 ## Order of the remaining work (shallow → deep)
 
 **the durability store vtable — the tamper refusals are now `SECURITY-FAILCLOSED` (contained at the start

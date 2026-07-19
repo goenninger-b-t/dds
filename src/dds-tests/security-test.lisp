@@ -60,21 +60,21 @@
       (%check :parse-ct     (equalp p-ct ciphertext)         "parse: ciphertext round-trip")
       (%check :parse-tag    (equalp p-tag tag)               "parse: common_mac round-trip"))
 
-    ;; (c) fail-closed: truncated inputs (< 44-octet minimum) must SIGNAL, never OOB-read.
+    ;; (c) fail-closed: truncated inputs (< 44-octet minimum) must return a malformed STATUS (ADR 0064), never OOB-read.
     (dolist (short-len '(0 1 19 20 24 43))
       (let ((short (make-array short-len :element-type '(unsigned-byte 8) :initial-element #x00)))
         (%check :parse-truncated
-                (handler-case (progn (dds.security:parse-secured-payload short) nil)
-                  (dds.security:secured-payload-malformed () t))
-                (format nil "parse truncated (len=~d) must signal secured-payload-malformed" short-len))))
-    ;; (c) fail-closed: a crypto_content.length that overflows the buffer must SIGNAL.
+                (handler-case (if (nth-value 6 (dds.security:parse-secured-payload short)) t nil)
+                  (error () nil))   ; a raw error would be a bug
+                (format nil "parse truncated (len=~d) must return a malformed status (7th value)" short-len))))
+    ;; (c) fail-closed: a crypto_content.length that overflows the buffer must return a status.
     (let ((over (copy-seq got)))
       ;; SecureDataHeader is 20 bytes; ct_len uint32 BE lives at offset 20. Inflate it to 0xffffffff (endian-invariant).
       (setf (aref over 20) #xff (aref over 21) #xff (aref over 22) #xff (aref over 23) #xff)
       (%check :parse-overdeclared
-              (handler-case (progn (dds.security:parse-secured-payload over) nil)
-                (dds.security:secured-payload-malformed () t))
-              "parse with over-declared crypto_content.length must signal (no OOB read)")))
+              (handler-case (if (nth-value 6 (dds.security:parse-secured-payload over)) t nil)
+                (error () nil))
+              "parse with over-declared crypto_content.length must return a status (no OOB read)")))
 
   ;; (d) HMAC-SHA256 KAT — RFC 4231 §4.3 Test Case 2 (AUTHENTIC published vector).
   ;;   Key  = "Jefe"                              = 4a656665                      (4 octets)

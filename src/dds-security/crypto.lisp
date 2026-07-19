@@ -87,7 +87,12 @@
 (defun* %require-len (octets n field)
     (function ((simple-array (unsigned-byte 8) (*)) fixnum string) t)
   "Signal SECURED-PAYLOAD-MALFORMED unless OCTETS is exactly N long; names FIELD in the message."
-  (unless (= (length octets) n)
+  ;; A fixed-size INTERNAL invariant, not a wire-input check — every caller passes our own key material /
+  ;; handshake-derived secrets / serialize inputs (all fixed-size by construction; the docs say "caller
+  ;; validates length") OR a session-id already validated 4-byte by the upstream parse. Defense-in-depth
+  ;; contained in the dds-security crypto layer. (The WIRE parser parse-secured-payload converts to a status
+  ;; instead — that path CAN fire on a malformed peer payload.)
+  (unless (= (length octets) n)   ; NOCOND(GUARD): fixed-size internal invariant; cannot fire on valid input; contained in the crypto layer
     (error 'secured-payload-malformed
            :reason (format nil "~a must be ~d octets, got ~d" field n (length octets))))
   t)
@@ -136,49 +141,45 @@
 
 (defun* parse-secured-payload (octets)
     (function ((simple-array (unsigned-byte 8) (*)))
-              (values (simple-array (unsigned-byte 8) (*))
-                      (simple-array (unsigned-byte 8) (*))
-                      (simple-array (unsigned-byte 8) (*))
-                      (simple-array (unsigned-byte 8) (*))
-                      (simple-array (unsigned-byte 8) (*))
-                      (simple-array (unsigned-byte 8) (*))))
+              (values (or null (simple-array (unsigned-byte 8) (*)))
+                      (or null (simple-array (unsigned-byte 8) (*)))
+                      (or null (simple-array (unsigned-byte 8) (*)))
+                      (or null (simple-array (unsigned-byte 8) (*)))
+                      (or null (simple-array (unsigned-byte 8) (*)))
+                      (or null (simple-array (unsigned-byte 8) (*)))
+                      (or null keyword)))
   "Parse a bare DDS-Security §9.5.3.3 SecuredPayload (no CDR header; the serialize-secured-payload
-   inverse). Returns (values KIND KEY-ID SESSION-ID IV-SUFFIX CIPHERTEXT TAG).
-   Every field read is bounds-checked against the input length BEFORE allocating: a too-short input
-   or a declared crypto_content length that overflows the remaining bytes signals
-   SECURED-PAYLOAD-MALFORMED, never an OOB read or a partial parse (NFR-SEC-POSTURE), even at
-   (safety 0). crypto_content.length and receiver_specific_macs_count are read BIG-ENDIAN (§9.5.3.3.3/.4.4;
-   via %get-u32-be, independent of the cursor's little-endian stream — Fast-DDS/Cyclone-aligned)."
-  (let ((n (length octets)))
-    (when (< n (+ +secure-data-header-len+ +crypto-content-length-len+
-                  +secure-data-tag-len+))
-      (error 'secured-payload-malformed
-             :reason (format nil "input ~d octets < minimum ~d (header+ct_len+tag)"
-                             n (+ +secure-data-header-len+ +crypto-content-length-len+
-                                  +secure-data-tag-len+))))
-    (let ((cur (dds.core.buffer:cursor (dds.core.buffer:octet-buffer-over octets) :endianness :little)))
-      ;; DRY: delegate field extraction to the §7.3.7 codec; re-assert the Slice-1 invariants (exact length consistency + rsm_count=0).
-      (multiple-value-bind (kind key-id session-id iv-suffix) (parse-crypto-header cur)
-        (unless kind
-          (error 'secured-payload-malformed :reason "truncated SecureDataHeader (CryptoHeader)"))
-        (let ((ciphertext (parse-crypto-content cur)))
-          (unless ciphertext
-            (error 'secured-payload-malformed
-                   :reason "crypto_content.length overflows the input (truncated or over-declared)"))
-          (unless (= (length ciphertext)
-                     (- n +secure-data-header-len+ +crypto-content-length-len+ +secure-data-tag-len+
-                        (mod (- (length ciphertext)) 4)))   ; the §9.5.3.3.3 SecureDataTag 4-align pad
-            (error 'secured-payload-malformed
-                   :reason (format nil "crypto_content.length ~d inconsistent with input length ~d"
-                                   (length ciphertext) n)))
-          (multiple-value-bind (tag receiver-macs) (parse-crypto-footer cur)
-            (unless tag
-              (error 'secured-payload-malformed :reason "truncated SecureDataTag (CryptoFooter)"))
-            (unless (= (length receiver-macs) +receiver-specific-macs-count-payload-protection+)
-              (error 'secured-payload-malformed
-                     :reason (format nil "receiver_specific_macs_count ~d unsupported (expected ~d)"
-                                     (length receiver-macs) +receiver-specific-macs-count-payload-protection+)))
-            (values kind key-id session-id iv-suffix ciphertext tag)))))))
+   inverse). Returns (values KIND KEY-ID SESSION-ID IV-SUFFIX CIPHERTEXT TAG STATUS): STATUS is NIL on a
+   well-formed payload, or a keyword naming the defect (ADR 0064 — a malformed WIRE payload is a fail-closed
+   STATUS VALUE, never a SECURED-PAYLOAD-MALFORMED unwind; on a defect the six field values are NIL).
+   Every field read is bounds-checked against the input length BEFORE allocating: a too-short input or a
+   declared crypto_content length that overflows the remaining bytes returns a status, never an OOB read or a
+   partial parse (NFR-SEC-POSTURE), even at (safety 0). crypto_content.length and receiver_specific_macs_count
+   are read BIG-ENDIAN (§9.5.3.3.3/.4.4; via %get-u32-be, independent of the cursor's little-endian stream)."
+  (macrolet ((%malformed (reason)
+               `(return-from parse-secured-payload (values nil nil nil nil nil nil ,reason))))
+    (let ((n (length octets)))
+      (when (< n (+ +secure-data-header-len+ +crypto-content-length-len+
+                    +secure-data-tag-len+))
+        (%malformed :too-short))
+      (let ((cur (dds.core.buffer:cursor (dds.core.buffer:octet-buffer-over octets) :endianness :little)))
+        ;; DRY: delegate field extraction to the §7.3.7 codec; re-assert the Slice-1 invariants (exact length consistency + rsm_count=0).
+        (multiple-value-bind (kind key-id session-id iv-suffix) (parse-crypto-header cur)
+          (unless kind
+            (%malformed :truncated-header))
+          (let ((ciphertext (parse-crypto-content cur)))
+            (unless ciphertext
+              (%malformed :crypto-content-overflows-input))
+            (unless (= (length ciphertext)
+                       (- n +secure-data-header-len+ +crypto-content-length-len+ +secure-data-tag-len+
+                          (mod (- (length ciphertext)) 4)))   ; the §9.5.3.3.3 SecureDataTag 4-align pad
+              (%malformed :crypto-content-length-inconsistent))
+            (multiple-value-bind (tag receiver-macs) (parse-crypto-footer cur)
+              (unless tag
+                (%malformed :truncated-tag))
+              (unless (= (length receiver-macs) +receiver-specific-macs-count-payload-protection+)
+                (%malformed :receiver-specific-macs-unsupported))
+              (values kind key-id session-id iv-suffix ciphertext tag nil))))))))
 
 ;;; --- derive-session-key (§9.5.3.3.4.2; spike §3.1) ---
 
