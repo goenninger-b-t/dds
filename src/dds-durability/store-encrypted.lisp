@@ -218,10 +218,12 @@
   (%hmac-labeled logmac-key %logmac-gf-label signed))
 
 (defun* %write-anchor-file (path signed mac)
-    (function (pathname (simple-array (unsigned-byte 8) (*)) (simple-array (unsigned-byte 8) (*))) t)
+    (function (pathname (simple-array (unsigned-byte 8) (*)) (simple-array (unsigned-byte 8) (*)))
+              (values (or null (eql t)) (or null keyword)))
   "Persist a signed anchor image at PATH: SIGNED ∥ MAC(32) ∥ crc32(4), content-fsynced + dir-fsynced on
    first create so it survives power loss. Shared by the write-once grandfather anchor and the mutable
-   sealed high-water tail anchor (both :supersede; ADR 0045 §3.2/§7.1). DRY: one serialize+CRC+fsync."
+   sealed high-water tail anchor (both :supersede; ADR 0045 §3.2/§7.1). DRY: one serialize+CRC+fsync.
+   Returns (VALUES T STATUS): :FSYNC-FAILED on a content/dirent flush failure (ADR 0064 — TRY bails it)."
   (let* ((slen  (length signed))
          (entry (make-array (+ slen +frame-mac-len+ 4) :element-type '(unsigned-byte 8))))
     (replace entry signed :end1 slen)
@@ -233,21 +235,24 @@
       (with-open-file (s path :direction :output :element-type '(unsigned-byte 8)
                               :if-exists :supersede :if-does-not-exist :create)
         (write-sequence entry s)
-        (dds.pal:fsync-stream s))
+        (try (dds.pal:fsync-stream s)))
       (unless existed
-        (dds.pal:fsync-directory (uiop:pathname-directory-pathname path)))))
-  t)
+        (try (dds.pal:fsync-directory (uiop:pathname-directory-pathname path))))))
+  (values t nil))
 
 (defun* %write-logmac-anchor (dir signed gf-mac)
-    (function (pathname (simple-array (unsigned-byte 8) (*)) (simple-array (unsigned-byte 8) (*))) t)
-  "Persist the write-once grandfather anchor: SIGNED ∥ gf-mac(32) ∥ crc32(4), fsynced (ADR 0045 §3.2)."
+    (function (pathname (simple-array (unsigned-byte 8) (*)) (simple-array (unsigned-byte 8) (*)))
+              (values (or null (eql t)) (or null keyword)))
+  "Persist the write-once grandfather anchor: SIGNED ∥ gf-mac(32) ∥ crc32(4), fsynced (ADR 0045 §3.2).
+   Returns %write-anchor-file's (VALUES T STATUS) (ADR 0064)."
   (%write-anchor-file (%logmac-anchor-path dir) signed gf-mac))
 
 (defun* %write-logmac-tail (dir signed tail-mac)
-    (function (pathname (simple-array (unsigned-byte 8) (*)) (simple-array (unsigned-byte 8) (*))) t)
+    (function (pathname (simple-array (unsigned-byte 8) (*)) (simple-array (unsigned-byte 8) (*)))
+              (values (or null (eql t)) (or null keyword)))
   "Persist the MUTABLE sealed high-water tail anchor D/logmac.tail: SIGNED ∥ anchor-mac(32) ∥ crc32(4),
    fsynced (ADR 0045 §7.1). Re-written (:supersede) on every clean close — UNLIKE the write-once
-   grandfather anchor."
+   grandfather anchor. Returns %write-anchor-file's (VALUES T STATUS) (ADR 0064)."
   (%write-anchor-file (%logmac-tail-path dir) signed tail-mac))
 
 (defun* %read-logmac-anchor (dir)
@@ -303,7 +308,7 @@
 (defun* %mint-logmac-anchor (key-provider dir grandfather-ids)
     (function (dds.dare:key-provider pathname list)
               (values (simple-array (unsigned-byte 8) (*)) (simple-array (unsigned-byte 8) (*))
-                      (simple-array (unsigned-byte 8) (*))))
+                      (simple-array (unsigned-byte 8) (*)) (or null keyword)))
   "Mint the log-MAC anchor ONCE (first v3 put): encapsulate to the recipient key, derive the log-MAC
    key, the at-rest metadata key k_meta AND the epochs.dat MAC key k_epochs (THREE siblings from the SAME
    shared secret, distinct info labels; ADR 0045 §4.3 / §7.2 / ADR 0025 §10 3c), authenticate
@@ -322,8 +327,11 @@
             (dds.dare:free-secret-octets ss))
         (let* ((signed (%assemble-anchor-signed kem-ct grandfather-ids))
                (gf-mac (%compute-gf-mac key signed)))
-          (%write-logmac-anchor dir signed gf-mac))
-        (values key mkey ekey)))))
+          ;; ADR 0064: surface the anchor-persist fsync status as the 4th value (the caller frees the keys
+          ;; regardless, so return the derived keys AND the status).
+          (multiple-value-bind (ok wstatus) (%write-logmac-anchor dir signed gf-mac)
+            (declare (ignore ok))
+            (values key mkey ekey wstatus)))))))
 
 (defun* %load-logmac-anchor (key-provider dir)
     (function (dds.dare:key-provider pathname)
@@ -488,7 +496,8 @@
               (values (nreverse entries) signed anchor-mac))))))))
 
 (defun* %seal-tail-anchor (inner-store dir logmac-key)
-    (function (durable-store pathname (simple-array (unsigned-byte 8) (*))) t)
+    (function (durable-store pathname (simple-array (unsigned-byte 8) (*)))
+              (values (or null (eql t)) (or null keyword)))
   "Seal the store-level high-water tail anchor at CLEAN CLOSE (ADR 0045 §7.1): gather each chained
    topic's (v3-count N . tail-MAC M_N) via the read-only chain-tails seam, HMAC the per-topic tail set
    under the log-MAC key (label ∥ region, mirroring %compute-gf-mac), and persist DIR/logmac.tail
@@ -496,14 +505,17 @@
    bytes. A backend without the chain-tails seam (SQLite/microservice — the tail anchor is a FILE-tier
    feature this slice) writes NO anchor. Committing the PREFIX (N, M_N) makes rolling the log back to a
    shorter valid prefix — whole-tail truncation, whole-topic drop, whole-store rollback — contradict the
-   anchor at the next open (prefix-containment), while a forward crash-append stays clean."
-  (when (durable-store-chain-tails-fn inner-store)
-    (store-sync inner-store)
-    (let ((tails (store-chain-tails inner-store)))
-      (let* ((signed (%assemble-tail-signed tails))
-             (mac    (%hmac-labeled logmac-key %logmac-tail-label signed)))
-        (%write-logmac-tail dir signed mac))))
-  t)
+   anchor at the next open (prefix-containment), while a forward crash-append stays clean. Returns
+   (VALUES T STATUS): :FSYNC-FAILED on the inner group-commit flush or the logmac.tail persist (ADR 0064)."
+  (if (durable-store-chain-tails-fn inner-store)
+      (let ((sync-status (nth-value 1 (store-sync inner-store))))
+        (let ((tails (store-chain-tails inner-store)))
+          (let* ((signed (%assemble-tail-signed tails))
+                 (mac    (%hmac-labeled logmac-key %logmac-tail-label signed)))
+            (multiple-value-bind (ok wstatus) (%write-logmac-tail dir signed mac)
+              (declare (ignore ok))
+              (values t (or sync-status wstatus))))))
+      (values t nil)))
 
 (defun* %verify-tail-anchor (inner-store dir logmac-key)
     (function (durable-store pathname (simple-array (unsigned-byte 8) (*))) t)
@@ -534,7 +546,7 @@
     t))
 
 (defun* %invalidate-tail-anchor (dir)
-    (function (pathname) t)
+    (function (pathname) (values (or null (eql t)) (or null keyword)))
   "Delete DIR/logmac.tail, fsyncing the dirent removal so a crash cannot resurrect a stale anchor
    (ADR 0045 §7.1). Called at OPEN, AFTER %verify-tail-anchor has checked the at-rest sealed state and
    BEFORE store-open's compaction sweep / the session's puts mutate the log. The tail anchor commits the
@@ -546,11 +558,12 @@
    OFFLINE truncation of the clean-closed state is still detected (verify ran first). The anchor is
    RE-SEALED at the next clean close over the final state — so it protects only the at-rest (clean-closed)
    state, never the mutating in-session log."
-  (let ((path (%logmac-tail-path dir)))
+  (let ((path (%logmac-tail-path dir))
+        (fsync-st nil))
     (when (probe-file path)
       (delete-file path)
-      (dds.pal:fsync-directory (uiop:pathname-directory-pathname path))))
-  t)
+      (setf fsync-st (nth-value 1 (dds.pal:fsync-directory (uiop:pathname-directory-pathname path)))))
+    (values t fsync-st)))
 
 (defun* %frame-epoch-entry (epoch-id kem-ct)
     (function ((unsigned-byte 32) (simple-array (unsigned-byte 8) (*)))
@@ -596,13 +609,15 @@
           (values epoch-id ct entry-end :ok))))))
 
 (defun* %load-epoch-table (dir)
-    (function (pathname) hash-table)
-  "Load epochs.dat from DIR into an epoch-id -> kem-ct hash-table (empty if absent).
+    (function (pathname) (values hash-table (or null keyword)))
+  "Load epochs.dat from DIR into an epoch-id -> kem-ct hash-table (empty if absent), as (VALUES TABLE STATUS).
    Replay + tail-truncate-recover: a short trailing entry is truncated and recovery proceeds;
    a full-but-bad-crc (mid-file) entry signals an error (a lost epoch is unrecoverable; only a
-   torn TAIL is recoverable). Mirrors %replay-log's torn-vs-corrupt discipline (store-file.lisp)."
+   torn TAIL is recoverable). Mirrors %replay-log's torn-vs-corrupt discipline (store-file.lisp). STATUS is
+   :FSYNC-FAILED when a torn-tail recovery truncation's flush failed (ADR 0064 — a 2nd status value)."
   (let ((tbl  (make-hash-table :test #'eql))
-        (path (%epochs-dat-path dir)))
+        (path (%epochs-dat-path dir))
+        (trunc-status nil))
     (unless (probe-file path)
       (return-from %load-epoch-table tbl))
     (let* ((size (with-open-file (s path :element-type '(unsigned-byte 8)) (file-length s)))
@@ -621,23 +636,25 @@
              (setf pos next))
             ((eq reason :short)
              (when (< last-valid size)
-               (%truncate-file path last-valid))
+               (setf trunc-status (nth-value 1 (%truncate-file path last-valid))))
              (return))
             (t
              ;; NOCOND(SECURITY-FAILCLOSED): mid-file corruption; fail-closed at store-open, caught at the durability start boundary
              (error "dds.durability: mid-file corruption in ~a at offset ~d (last valid ~d; reason ~s)"
                     path pos last-valid reason)))))
       (when (and (zerop last-valid) (plusp size))
-        (%truncate-file path 0))
-      tbl)))
+        (setf trunc-status (or trunc-status (nth-value 1 (%truncate-file path 0)))))
+      (values tbl trunc-status))))
 
 (defun* %append-epoch (dir epoch-id kem-ct)
-    (function (pathname (unsigned-byte 32) (simple-array (unsigned-byte 8) (*))) t)
+    (function (pathname (unsigned-byte 32) (simple-array (unsigned-byte 8) (*)))
+              (values (or null (eql t)) (or null keyword)))
   "Append one {epoch-id -> kem-ct} entry to epochs.dat in DIR and fsync it to the OS before
    returning (open→write→dds.pal:fsync-stream→close — SBCL fdatasync(2), Clasp finish-output per
    the NFR-PORT split; same group-commit primitive the file store uses, no #+sbcl/#+clasp here).
    Caller MUST call this BEFORE writing any record that references EPOCH-ID, so the ordering
-   invariant holds — every record's epoch-id resolves after a crash (spec §9, ADR 0026)."
+   invariant holds — every record's epoch-id resolves after a crash (spec §9, ADR 0026). Returns
+   (VALUES T STATUS): :FSYNC-FAILED on a content/dirent flush failure (ADR 0064 — TRY bails it)."
   (let ((entry (%frame-epoch-entry epoch-id kem-ct))
         (path  (%epochs-dat-path dir)))
     (let ((existed (probe-file path)))
@@ -645,12 +662,12 @@
       (with-open-file (s path :direction :output :element-type '(unsigned-byte 8)
                               :if-exists :append :if-does-not-exist :create)
         (write-sequence entry s)
-        (dds.pal:fsync-stream s))
+        (try (dds.pal:fsync-stream s)))
       ;; a NEW epochs.dat's dirent must be fsynced into its dir to survive power loss (ADR 0026 §10.10);
       ;; without this the first epoch's record could reference an epoch whose dirent never persisted
       (unless existed
-        (dds.pal:fsync-directory (uiop:pathname-directory-pathname path)))))
-  t)
+        (try (dds.pal:fsync-directory (uiop:pathname-directory-pathname path))))))
+  (values t nil))
 
 (defun* %free-epoch-dek-map (dek-map)
     (function (hash-table) t)
@@ -663,13 +680,14 @@
   t)
 
 (defun* %load-epoch-deks (key-provider dir dek-map)
-    (function (dds.dare:key-provider pathname hash-table) (integer 0))
+    (function (dds.dare:key-provider pathname hash-table) (values (integer 0) (or null keyword)))
   "Decapsulate each persisted epoch's kem-ct via KEY-PROVIDER and derive its DEK into DEK-MAP
    (epoch-id -> foreign DEK). Each transient shared secret is freed once its DEK is derived;
-   each DEK is a foreign secret the map owns for the store lifetime. Returns the max epoch-id
-   loaded (0 if none) so the next mint can pick max+1."
-  (let ((table   (%load-epoch-table dir))
-        (max-id  0)
+   each DEK is a foreign secret the map owns for the store lifetime. Returns (VALUES MAX-EPOCH-ID STATUS):
+   MAX-EPOCH-ID is the max epoch-id loaded (0 if none) so the next mint can pick max+1; STATUS is
+   :FSYNC-FAILED when the epochs.dat torn-tail recovery flush failed (ADR 0064, threaded from %load-epoch-table)."
+  (multiple-value-bind (table load-status) (%load-epoch-table dir)
+   (let ((max-id  0)
         (ok      nil))
     ;; free any DEKs already derived if a later decapsulate/derive throws (no secret leak on a
     ;; partial load that escapes :open and abandons the store before the next-open reclamation).
@@ -684,8 +702,8 @@
                 (when (> epoch-id max-id) (setf max-id epoch-id))))
             table)
            (setf ok t)
-           max-id)
-      (unless ok (%free-epoch-dek-map dek-map)))))
+           (values max-id load-status))
+      (unless ok (%free-epoch-dek-map dek-map))))))
 
 ;;; --- sealed epochs.dat MAC (ADR 0045 §7.2): a keyed MAC over the DARE per-epoch KEM-ciphertext table
 ;;; that closes the epochs.dat tamper/rollback/reorder hole (an offline disk adversary can flip a stored
@@ -772,21 +790,22 @@
         #'< :key #'car))
 
 (defun* %seal-epochs-mac (dir epochs-mac-key)
-    (function (pathname (simple-array (unsigned-byte 8) (*))) t)
+    (function (pathname (simple-array (unsigned-byte 8) (*))) (values (or null (eql t)) (or null keyword)))
   "Seal DIR/epochs.mac at CLEAN CLOSE (ADR 0045 §7.2): re-read the epoch table (close is not hot-path),
    assemble the canonical signed image over ALL present entries (sorted ascending), HMAC it under
    EPOCHS-MAC-KEY (epochs-label ∥ region, mirroring %seal-tail-anchor), and persist (signed ∥ mac ∥ CRC,
    fsynced) via the shared %write-anchor-file. An empty table seals nothing (returns t). Committing the
    full present count makes an offline ct-tamper / rollback / reorder contradict the sealed image at the
-   next open (prefix-containment)."
+   next open (prefix-containment). Returns (VALUES T STATUS): :FSYNC-FAILED on the epochs.mac persist flush
+   (ADR 0064). The table load takes the primary — no torn-tail recovery happens here (epochs.dat only
+   grows by atomic appends after open, and any at-open torn tail was already recovered by %load-epoch-deks)."
   (let ((table (%load-epoch-table dir)))
     (when (zerop (hash-table-count table))
-      (return-from %seal-epochs-mac t))
+      (return-from %seal-epochs-mac (values t nil)))
     (let* ((sorted (%epoch-table->sorted table))
            (signed (%assemble-epochs-signed sorted))
            (mac    (%hmac-labeled epochs-mac-key %logmac-epochs-label signed)))
-      (%write-anchor-file (%epochs-mac-path dir) signed mac)))
-  t)
+      (%write-anchor-file (%epochs-mac-path dir) signed mac))))
 
 (defun* %verify-epochs-mac (dir epochs-mac-key)
     (function (pathname (simple-array (unsigned-byte 8) (*))) t)
@@ -1281,12 +1300,16 @@
                  (let ((dek (unwind-protect (dds.dare:derive-dek ss)
                               (dds.dare:free-secret-octets ss))))
                    ;; fsync epochs.dat ONLY after derive-dek succeeds (no duplicate-id on throw).
-                   (%append-epoch epoch-dir new-id kem-ct)
-                   (setf (gethash new-id dek-map) dek)
-                   (setf current-epoch new-id)
-                   (setf current-dek   dek)
-                   (setf max-epoch-id  new-id)
-                   (setf counter       0))))
+                   ;; ADR 0064: the epoch is committed (append+rename) but its flush may have failed —
+                   ;; advance the in-memory state, then surface :FSYNC-FAILED (a non-T mint result, which
+                   ;; :put propagates via (unless (eq s t) (return-from put s))).
+                   (let ((astatus (nth-value 1 (%append-epoch epoch-dir new-id kem-ct))))
+                     (setf (gethash new-id dek-map) dek)
+                     (setf current-epoch new-id)
+                     (setf current-dek   dek)
+                     (setf max-epoch-id  new-id)
+                     (setf counter       0)
+                     (when astatus (return-from %mint-current-epoch astatus))))))
              t)
            (%ensure-logmac ()
              ;; lazily mint the log-MAC anchor + derive the key + install the oracle on the FIRST v3
@@ -1299,11 +1322,13 @@
              ;; v3->v2 downgrade. A fresh store has no such logs ⇒ empty set ⇒ full protection (§3.2).
              (unless logmac-key
                (let ((gf-ids (%store-grandfather-ids inner-store epoch-dir)))
-                 (multiple-value-bind (lk mk ek) (%mint-logmac-anchor key-provider epoch-dir gf-ids)
+                 (multiple-value-bind (lk mk ek astatus) (%mint-logmac-anchor key-provider epoch-dir gf-ids)
                    (setf logmac-key     lk)
                    (setf meta-key       mk)
-                   (setf epochs-mac-key ek))
-                 (%install-logmac-oracle inner-store logmac-key gf-ids)))
+                   (setf epochs-mac-key ek)
+                   (%install-logmac-oracle inner-store logmac-key gf-ids)
+                   ;; ADR 0064: the anchor is written but its flush may have failed — surface :FSYNC-FAILED
+                   (when astatus (return-from %ensure-logmac astatus)))))
              t))
       (%make-durable-store
        :name :encrypted-persistent
@@ -1312,7 +1337,9 @@
        (lambda (topic writer-guid sn key-hash kind payload)
          (block put
          (dds.pal:with-lock (lock)
-           (%ensure-logmac)                     ; also derives k_meta on the first put of a fresh store
+           ;; ADR 0064: capture the anchor-persist fsync status (%ensure-logmac also derives k_meta on the
+           ;; first put of a fresh store); combined with the inner put result at the return.
+           (let ((es-status (%ensure-logmac)))
            (unless current-epoch
              ;; ADR 0064: an epoch-id-exhausted mint returns :resource-limits — propagate it, never unwind
              (let ((s (%mint-current-epoch)))
@@ -1354,7 +1381,9 @@
                    (%settle-window-reclaim th key-hash kind)))
                (when *durability-debug-window-count-hook*
                  (funcall *durability-debug-window-count-hook* (hash-table-count instance-windows)))
-               r)))))
+               ;; ADR 0064: the inner put PERSISTED (r = T) but the DARE anchor's flush failed -> :FSYNC-FAILED;
+               ;; a non-T inner r (e.g. :UNAVAILABLE / :REJECTED / its own :FSYNC-FAILED) passes through.
+               (if (and (eq r t) (not (eq es-status t))) es-status r)))))))
        :get-range
        (lambda (topic)
          (dds.pal:with-lock (lock)
@@ -1424,7 +1453,8 @@
            ;; microservice inner's server-down / conn-lost, :UNAVAILABLE) propagates as THIS decorator's
            ;; store-open status; a local file/SQLite inner always returns (values t nil) here (its failures are
            ;; tamper SECURITY-FAILCLOSED signals), so the local tiers are byte-identical.
-           (let ((inner-status
+           (let* ((dare-status nil)   ; ADR 0064: the DARE anchor-invalidate + epochs.dat recovery fsync status
+                  (inner-status
                   (if (probe-file (%logmac-anchor-path epoch-dir))
                       (multiple-value-bind (key gf-ids mkey ekey)
                           (progn
@@ -1442,14 +1472,17 @@
                         ;; state). Verify FIRST keeps detection; invalidate SECOND kills the reclaim-crash brick.
                         (%verify-tail-anchor inner-store epoch-dir key)
                         (unless *durability-debug-skip-tail-invalidate*
-                          (%invalidate-tail-anchor epoch-dir))
+                          (setf dare-status (nth-value 1 (%invalidate-tail-anchor epoch-dir))))
                         (nth-value 1 (store-open inner-store :keep-all nil)))
                       (multiple-value-prog1
                           (nth-value 1 (store-open inner-store :keep-all nil))
                         (dds.dare:key-provider-open key-provider)))))
-             (when inner-status (return-from enc-open (values nil inner-status))))
-           ;; re-derive every persisted epoch's DEK; current stays NIL until the first put
-           (setf max-epoch-id (%load-epoch-deks key-provider epoch-dir dek-map))
+             (when inner-status (return-from enc-open (values nil inner-status)))
+           ;; re-derive every persisted epoch's DEK; current stays NIL until the first put. ADR 0064: capture
+           ;; the epochs.dat torn-tail recovery flush status.
+           (multiple-value-bind (mid ldstatus) (%load-epoch-deks key-provider epoch-dir dek-map)
+             (setf max-epoch-id mid)
+             (setf dare-status (or dare-status ldstatus)))
            ;; sealed epochs.dat MAC (ADR 0045 §7.2): VERIFY the DARE per-epoch kem-ct table by prefix-
            ;; containment, AFTER %load-epoch-deks has run epochs.dat's torn-tail truncate-recovery so verify
            ;; composes with it. GUARDED on epochs-mac-key non-NIL: a legacy pre-0045 store (epochs.dat but no
@@ -1463,21 +1496,26 @@
            ;; surviving newest-D so post-restart online eviction is correct (cross-restart == continuously-
            ;; open). No-op for :keep-all or a not-yet-chained (meta-key NIL) store; ADR 0025 §10.3.
            (%open-sweep)
-           (values t nil))))
+           ;; ADR 0064: a DARE anchor-invalidate / epochs.dat recovery flush failure fails the open with a
+           ;; STATUS (service-start sheds); the inner store-open status was handled above; a TAMPER still SIGNALS.
+           (if dare-status (values nil dare-status) (values t nil))))))
        :close
        (lambda ()
          (dds.pal:with-lock (lock)
+           (let ((close-status nil))   ; ADR 0064: seal + inner-close durability-barrier status
            ;; sealed high-water tail anchor (ADR 0045 §7.1): seal the per-topic (N, M_N) BEFORE freeing
            ;; the log-MAC key + dropping the oracle (both needed to MAC the anchor + re-walk the chain).
            ;; SEAL-ON-CLOSE only (prefix-containment makes a stale anchor safe on crash — a forward
            ;; extension is CLEAN); a store that never chained (logmac-key NIL) has no tail to seal.
            (when (and logmac-key (not *durability-debug-skip-tail-seal*))
-             (%seal-tail-anchor inner-store epoch-dir logmac-key))
+             (setf close-status (or close-status
+                                     (nth-value 1 (%seal-tail-anchor inner-store epoch-dir logmac-key)))))
            ;; sealed epochs.dat MAC (ADR 0045 §7.2): re-seal D/epochs.mac over ALL present epochs BEFORE
            ;; freeing k_epochs. SEAL-ON-CLOSE only (prefix-containment makes a stale epochs.mac safe on a
            ;; forward crash-append — CLEAN). A store that never chained (epochs-mac-key NIL) has nothing to seal.
            (when (and epochs-mac-key (not *durability-debug-skip-epochs-seal*))
-             (%seal-epochs-mac epoch-dir epochs-mac-key))
+             (setf close-status (or close-status
+                                     (nth-value 1 (%seal-epochs-mac epoch-dir epochs-mac-key)))))
            ;; free every DEK in the map (the current DEK is held in the map ⇒ freed once); §6
            (%free-epoch-dek-map dek-map)
            (setf current-epoch nil)
@@ -1491,9 +1529,10 @@
            (setf epochs-mac-key (dds.dare:free-secret-octets epochs-mac-key))
            (store-set-chain-mac-fn inner-store nil)
            (dds.dare:key-provider-close key-provider)
-           ;; close the inner store last: flush + persist its streams/topics.map (spec §5)
-           (store-close inner-store)
-           t))
+           ;; close the inner store last: flush + persist its streams/topics.map (spec §5); ADR 0064: surface
+           ;; a close-time persist-flush failure (the inner's topics.map dirent + the DARE seals) as store-close's status
+           (setf close-status (or close-status (nth-value 1 (store-close inner-store))))
+           (values t close-status))))
        :count-fn
        ;; 3c: per-topic count is LOGICAL (post-compaction, matching get-range), since the inner store
        ;; retains superseded blobs physically (KEEP_ALL); total count (NIL) is the inner physical count.

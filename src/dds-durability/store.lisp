@@ -118,8 +118,10 @@
                (or null (simple-array (unsigned-byte 8) (16)))
                (member :data :dispose :unregister)
                (simple-array (unsigned-byte 8) (*)))
-              (or (eql t) (eql :rejected) (eql :resource-limits) (eql :unavailable)))
-  "Persist a sample: returns T on success, :REJECTED when a bounded store is full (transient — a later
+              (or (eql t) (eql :rejected) (eql :resource-limits) (eql :unavailable) (eql :fsync-failed)))
+  "Persist a sample: returns T on success, :FSYNC-FAILED when the durable backend persisted the record but a
+   durability-barrier flush (fdatasync / dirent fsync) failed (ADR 0064 — a status value, not an unwind; a
+   non-T result = not-durably-persisted), :REJECTED when a bounded store is full (transient — a later
    put may fit), :RESOURCE-LIMITS when a store hit a TERMINAL resource limit (ADR 0064: the encrypted
    backend's epoch-id 2^32 / per-epoch nonce 2^96 exhaustion — a status value, never a stack unwind; the
    store also emits a diagnostic WARN at the exhaustion site), or :UNAVAILABLE when a REMOTE backend's
@@ -148,9 +150,10 @@
   (funcall (durable-store-topics store)))
 
 (defun* store-purge (store topic)
-    (function (durable-store string) (or (eql t) (eql :unavailable)))
-  "Remove all retained records for TOPIC. Returns T, or :UNAVAILABLE when a REMOTE backend's purge failed
-   (ADR 0064 Slice-2 — a status value, never an unwind; local backends always return T)."
+    (function (durable-store string) (or (eql t) (eql :unavailable) (eql :fsync-failed)))
+  "Remove all retained records for TOPIC. Returns T, :UNAVAILABLE when a REMOTE backend's purge failed
+   (ADR 0064 Slice-2), or :FSYNC-FAILED when the file backend's unlink-dirent flush failed (ADR 0064 — a
+   status value, never an unwind; the in-memory backend always returns T)."
   (funcall (durable-store-purge store) topic))
 
 (declaim (ftype (function (durable-store &optional
@@ -179,8 +182,11 @@
   (funcall (durable-store-open store) history-kind history-depth))
 
 (defun* store-close (store)
-    (function (durable-store) (eql t))
-  "Close the backing store and release resources. No-op for the in-memory implementation. Returns T."
+    (function (durable-store) (values (eql t) (or null keyword)))
+  "Close the backing store and release resources. No-op for the in-memory implementation. Returns
+   (VALUES T STATUS): STATUS is NIL on a clean close, or :FSYNC-FAILED when a backend's close-time persist
+   flush (e.g. the file store's topics.map dirent) failed (ADR 0064 — a status value, never an unwind; the
+   in-memory / SQLite / microservice / encrypted backends return (VALUES T NIL))."
   (funcall (durable-store-close store)))
 
 (defun* store-count (store &optional topic)
@@ -192,11 +198,12 @@
   (funcall (durable-store-count-fn store) topic))
 
 (defun* store-sync (store)
-    (function (durable-store) (eql t))
-  "Flush+fsync any buffered writes; no-op when the backing store has no :sync slot."
+    (function (durable-store) (values (eql t) (or null keyword)))
+  "Flush+fsync any buffered writes; no-op when the backing store has no :sync slot. Returns (VALUES T STATUS):
+   STATUS is NIL on success, or :FSYNC-FAILED when a backend's group-commit flush failed (ADR 0064 — a status
+   value, never an unwind; the collect-loop group-commit tick surfaces it via *durability-error-hook*)."
   (let ((f (durable-store-sync store)))
-    (when f (funcall f)))
-  t)
+    (if f (values t (nth-value 1 (funcall f))) (values t nil))))
 
 (defun* store-set-chain-mac-fn (store fn &optional required grandfather-set)
     (function (durable-store (or null function) &optional t (or null hash-table)) (eql t))
@@ -247,8 +254,9 @@
 
 (defun* store-delete (store topic writer-guid sn)
     (function (durable-store string (simple-array (unsigned-byte 8) (16)) (integer 0))
-              (or (eql t) (eql :unsupported) (eql :unavailable)))
-  "Physically remove the single record keyed by (TOPIC, WRITER-GUID, SN); return T on delete,
+              (or (eql t) (eql :unsupported) (eql :unavailable) (eql :fsync-failed)))
+  "Physically remove the single record keyed by (TOPIC, WRITER-GUID, SN); return T on delete, :FSYNC-FAILED
+   when the file backend's reclaim-rewrite dirent flush failed (ADR 0064 — a status value, never an unwind),
    :UNSUPPORTED when the backing store has no :delete slot (the same NIL-fallback binding as store-sync
    / store-set-chain-mac-fn — an additive vtable slot, not a fork), or :UNAVAILABLE when a REMOTE backend's
    delete failed (ADR 0064 Slice-2 vtable widening — a status value, never a MICROSERVICE-STORE-ERROR
@@ -261,8 +269,10 @@
     (if f (funcall f topic writer-guid sn) :unsupported)))
 
 (defun* store-replace-topic (store topic records)
-    (function (durable-store string list) (eql t))
+    (function (durable-store string list) (values (eql t) (or null keyword)))
   "Atomically REPLACE every record of TOPIC with RECORDS (a list of DURABLE-RECORD), all-or-nothing.
+   Returns (VALUES T STATUS): STATUS is :FSYNC-FAILED when the file backend's atomic rewrite dirent flush
+   failed (ADR 0064 — a status value, never an unwind; other backends / the NIL-fallback return (VALUES T NIL)).
    The microservice server's +ms-op-topic-rewrite+ replaces a topic's opaque frames after a KEEP_LAST
    reclaim re-MACs the survivors client-side (ADR 0050 §4.4) — a partial topic would brick the re-MAC'd
    chain, so the swap must be atomic. EVERY in-tree backend SUPPLIES a NATIVE atomic :replace-topic-fn:

@@ -392,16 +392,16 @@
 ;;; Topics.map I/O.
 
 (defun* %write-topics-map (dir topic-map)
-    (function (pathname hash-table) t)
-  "Write the topics.map file: one 'topic-id TAB topic-name' line per entry."
+    (function (pathname hash-table) (values (or null (eql t)) (or null keyword)))
+  "Write the topics.map file: one 'topic-id TAB topic-name' line per entry. Returns (VALUES T STATUS):
+   :FSYNC-FAILED if the topics.map dirent flush fails (ADR 0064 — a status value, not an unwind)."
   (with-open-file (s (%topics-map-path dir)
                      :direction :output :if-exists :supersede :if-does-not-exist :create)
     (maphash (lambda (id name)
                (format s "~a~c~a~%" id #\Tab name))
              topic-map))
-  ;; persist the topics.map dirent (create/replace) across power loss (ADR 0026 §10.10)
-  (dds.pal:fsync-directory dir)
-  t)
+  ;; persist the topics.map dirent (create/replace) across power loss (ADR 0026 §10.10); return its status
+  (dds.pal:fsync-directory dir))
 
 (defun* %read-topics-map (dir)
     (function (pathname) hash-table)
@@ -421,14 +421,16 @@
 ;;; File truncation: portable via open-for-output + copy.
 
 (defun* %truncate-file (path offset)
-    (function (pathname (integer 0)) t)
-  "Truncate PATH to OFFSET bytes by rewriting via a temp file (portable CL, no #+)."
+    (function (pathname (integer 0)) (values (or null (eql t)) (or null keyword)))
+  "Truncate PATH to OFFSET bytes by rewriting via a temp file (portable CL, no #+). Returns (VALUES T STATUS):
+   :FSYNC-FAILED if a content or dirent flush fails (ADR 0064 — a durability-barrier failure is a status,
+   not an unwind; TRY bails it to the caller)."
   (when (zerop offset)
     (with-open-file (s path :direction :output :if-exists :supersede :element-type '(unsigned-byte 8))
       (declare (ignore s)))
     ;; persist the truncated (possibly re-created) dirent (ADR 0026 §10.10)
-    (dds.pal:fsync-directory (uiop:pathname-directory-pathname path))
-    (return-from %truncate-file t))
+    (try (dds.pal:fsync-directory (uiop:pathname-directory-pathname path)))
+    (return-from %truncate-file (values t nil)))
   (let ((tmp (merge-pathnames (make-pathname :name (concatenate 'string (pathname-name path) ".tmp")
                                               :type (pathname-type path))
                                (pathname path))))
@@ -445,13 +447,13 @@
                        (decf remaining got))))
           ;; fsync the temp CONTENT before the rename so the durable rename never points at
           ;; unsynced bytes (mirrors %rewrite-topic-log; ADR 0026 §10.10)
-          (dds.pal:fsync-stream out))))
+          (try (dds.pal:fsync-stream out)))))
     ;; delete destination first (rename-file is not atomic-replace on all platforms)
     (when (probe-file path) (delete-file path))
     (rename-file tmp path)
     ;; fsync the containing dir so the delete+rename dirents survive power loss (ADR 0026 §10.10)
-    (dds.pal:fsync-directory (uiop:pathname-directory-pathname path))
-    t))
+    (try (dds.pal:fsync-directory (uiop:pathname-directory-pathname path)))
+    (values t nil)))
 
 (defun* %chain-walk (path topic mac-fn stop-at)
     (function (pathname string function (or null (integer 0)))
@@ -502,8 +504,10 @@
 
 (defun* %replay-log (path topic &optional chain-mac-fn chain-required)
     (function (pathname string &optional (or null function) t)
-              (values list (or null (simple-array (unsigned-byte 8) (*)))))
-  "Replay frames from PATH for TOPIC into (values records tail-mac).
+              (values list (or null (simple-array (unsigned-byte 8) (*))) (or null keyword)))
+  "Replay frames from PATH for TOPIC into (values records tail-mac status). STATUS is :FSYNC-FAILED when a
+   torn-tail truncation-recovery's dirent/content flush failed (ADR 0064 — a durability-barrier failure is a
+   3rd status value, threaded to the caller; NIL on a clean replay).
    A :short reason at the trailing position truncates to last-valid and recovers.
    A :corrupt reason at any position signals an error (ADR 0026 §File-store on-disk format).
    When CHAIN-MAC-FN is supplied (keyed store, ADR 0045) the per-topic running chain MAC is verified:
@@ -523,7 +527,8 @@
          (seed    (when chain-mac-fn (%chain-seed chain-mac-fn topic)))
          (running seed)                                        ; prev-mac for the next v3 frame
          (started nil)
-         (tail-mac nil))
+         (tail-mac nil)
+         (trunc-status nil))                                  ; ADR 0064: a recovery-truncation fsync failure
     (with-open-file (s path :element-type '(unsigned-byte 8) :direction :input)
       (read-sequence buf s))
     (loop
@@ -542,7 +547,7 @@
           ;; :short → not enough bytes for the full declared frame; torn tail if at last-valid
           ((eq reason :short)
            (when (< last-valid size)
-             (%truncate-file path last-valid))
+             (setf trunc-status (nth-value 1 (%truncate-file path last-valid))))
            (return))
           ;; :corrupt → full frame bytes present but magic/kind/CRC/MAC invalid; fail loud
           (t
@@ -551,7 +556,7 @@
                   path pos last-valid reason)))))
     (when (and (zerop last-valid) (plusp size))
       ;; file had bytes but the very first frame was :short (all-garbage file) → truncate
-      (%truncate-file path 0))
+      (setf trunc-status (or trunc-status (nth-value 1 (%truncate-file path 0)))))
     ;; downgrade defense (ADR 0045 §3.2): a chain-committed store whose non-empty log carries NO v3
     ;; frame has been rolled back to keyless v2 — refuse the open (like a mid-log chain break), and
     ;; do it HERE so the caller's compaction rewrite can never launder the tampered set into a fresh chain.
@@ -560,7 +565,7 @@
       (error "dds.durability: chain-required log ~a has ~d record(s) but NO v3 chain frame — ~
               refusing to open (full v3->v2 downgrade / tamper; ADR 0045 §3.2)"
              path (length records)))
-    (values (nreverse records) tail-mac)))
+    (values (nreverse records) tail-mac trunc-status)))
 
 ;;; Compaction: drop settled (dispose+unregister both present) instances.
 
@@ -657,8 +662,12 @@
 
 (defun* %rewrite-topic-log (dir tid records &optional chain-mac-fn topic)
     (function (pathname string list &optional (or null function) (or null string))
-              (or null (simple-array (unsigned-byte 8) (*))))
-  "Atomically rewrite the log for TID under DIR with RECORDS; return the new tail chain MAC (or NIL).
+              (values (or null (simple-array (unsigned-byte 8) (*))) (or null keyword)))
+  "Atomically rewrite the log for TID under DIR with RECORDS; return (values tail-chain-MAC status).
+   STATUS is :FSYNC-FAILED on a durability-barrier failure (ADR 0064). A CONTENT-flush failure returns
+   (values NIL :FSYNC-FAILED) BEFORE the atomic rename (fail-closed — the original log stays intact, never a
+   commit of un-synced bytes); a DIRENT-flush failure after the rename returns (values tail-mac :FSYNC-FAILED)
+   (the rewrite committed but its dirent is unsynced — surfaced, not swallowed).
    Writes to <log>.tmp, fsyncs, then renames .tmp over the original in one atomic step
    (uiop:rename-file-overwriting-target is POSIX rename(2) — no crash window).
    When CHAIN-MAC-FN is supplied (keyed store, ADR 0045) the compacted records are re-emitted as a
@@ -682,16 +691,18 @@
               (write-sequence frame stm)
               (setf running mac tail-mac mac))
             (write-sequence (%frame-record r) stm)))
-      (dds.pal:fsync-stream stm))
+      ;; ADR 0064: a content-flush failure bails (values NIL :FSYNC-FAILED) — fail-closed BEFORE the rename,
+      ;; so an un-synced .tmp is never committed over the original (same posture as the old signal-before-rename).
+      (try (dds.pal:fsync-stream stm)))
     ;; crash-consistency fault seam (ADR 0029 §10): the <log>.tmp is fully written + fsynced; a crash
     ;; HERE (before the rename) leaves the ORIGINAL log intact (rename is the atomic commit point).
     (when *durability-debug-file-rewrite-fault*   ; NOCOND(TEST): inert in production; the UNWIND dies mid-rename — the mechanism under test
       (error "dds.durability: *durability-debug-file-rewrite-fault* — simulated crash after ~a.tmp ~
               fsync, before the atomic rename (crash-before-commit; original log intact)" tid))
     (uiop:rename-file-overwriting-target tmp-path log-path)
-    ;; fsync the containing dir so the compaction rename's dirent survives power loss (ADR 0026 §10.10 / 0029)
-    (dds.pal:fsync-directory (%topics-dir dir))
-    tail-mac))
+    ;; fsync the containing dir so the compaction rename's dirent survives power loss (ADR 0026 §10.10 / 0029);
+    ;; the rewrite is already COMMITTED (renamed), so surface a dirent-flush failure alongside the valid tail MAC.
+    (values tail-mac (nth-value 1 (dds.pal:fsync-directory (%topics-dir dir))))))
 
 ;;; File-store make-file-store.
 
@@ -752,20 +763,23 @@
                (maphash (lambda (k v) (declare (ignore k)) (incf n (hash-table-count v))) outer)
                n))
            (%ensure-stream (topic-id)
-             (or (gethash topic-id streams)
-                 (let* ((log-path (%topic-log-path store-dir topic-id))
-                        (existed  (probe-file log-path))
-                        (s (open log-path
-                                 :direction :output
-                                 :element-type '(unsigned-byte 8)
-                                 :if-exists :append
-                                 :if-does-not-exist :create)))
-                   (setf (gethash topic-id streams) s)
-                   ;; a NEW log file's dirent must be fsynced into topics/ to survive power loss
-                   ;; (ADR 0026 §10.10); a re-opened existing log needs no new dirent
-                   (unless existed
-                     (dds.pal:fsync-directory (%topics-dir store-dir)))
-                   s)))
+             ;; ADR 0064: returns (VALUES STREAM STATUS) — a NEW log's dirent fsync failure is the 2nd value
+             ;; (a cached/re-opened stream needs no new dirent, so STATUS is NIL there).
+             (let ((existing (gethash topic-id streams)))
+               (if existing
+                   (values existing nil)
+                   (let* ((log-path (%topic-log-path store-dir topic-id))
+                          (existed  (probe-file log-path))
+                          (s (open log-path
+                                   :direction :output
+                                   :element-type '(unsigned-byte 8)
+                                   :if-exists :append
+                                   :if-does-not-exist :create)))
+                     (setf (gethash topic-id streams) s)
+                     ;; a NEW log file's dirent must be fsynced into topics/ to survive power loss
+                     ;; (ADR 0026 §10.10); a re-opened existing log needs no new dirent
+                     (values s (unless existed
+                                 (nth-value 1 (dds.pal:fsync-directory (%topics-dir store-dir)))))))))
            (%record-key (writer-guid sn)
              (cons (coerce writer-guid 'list) sn))
            (%topic-logical-records (topic-id)
@@ -816,30 +830,39 @@
              ;; machinery) + rebuild the in-memory index + reseed counters + carry the fresh tail chain MAC
              ;; (ADR 0045). RESET-THUNK clears the per-topic trigger last (super-pending / pending-delete);
              ;; a rewrite fault propagates BEFORE it, leaving the trigger armed so the next call retries.
+             ;; ADR 0064: %compact-topic-log returns the fsync status of the replay-recovery + rewrite (or NIL);
+             ;; the 833 pre-rewrite flush stays ignore-errors (best-effort — the rewrite re-reads the log).
              (let ((log-path (%topic-log-path store-dir topic-id))
-                   (stm      (gethash topic-id streams)))
+                   (stm      (gethash topic-id streams))
+                   (fsync-status nil))
                (when stm
                  (ignore-errors (dds.pal:fsync-stream stm))
                  (ignore-errors (close stm))
                  (remhash topic-id streams))
-               (let* ((recs      (%replay-log log-path topic chain-mac-fn nil))
-                      (filtered  (funcall pre-filter recs))
-                      (compacted (%compact-topic-records filtered (car eff-hk-cell) (car eff-hd-cell))))
-                 (when (and recs (< (length compacted) (length recs)))
-                   (let ((tail (%rewrite-topic-log store-dir topic-id compacted chain-mac-fn topic)))
-                     ;; carry the rewritten tail so the next appended v3 frame chains from it (ADR 0045)
-                     (if tail
-                         (setf (gethash topic-id chain-macs) tail)
-                         (remhash topic-id chain-macs))
-                     (let ((inn (%inner topic-id)))
-                       (clrhash inn)
-                       (dolist (r compacted)
-                         (setf (gethash (%record-key (durable-record-writer-guid r)
-                                                     (durable-record-sn r))
-                                        inn)
-                               r)))
-                     (%init-topic-counts topic-id compacted)))
-                 (funcall reset-thunk))))
+               (multiple-value-bind (recs rmac replay-status)
+                   (%replay-log log-path topic chain-mac-fn nil)
+                 (declare (ignore rmac))
+                 (setf fsync-status replay-status)
+                 (let* ((filtered  (funcall pre-filter recs))
+                        (compacted (%compact-topic-records filtered (car eff-hk-cell) (car eff-hd-cell))))
+                   (when (and recs (< (length compacted) (length recs)))
+                     (multiple-value-bind (tail rewrite-status)
+                         (%rewrite-topic-log store-dir topic-id compacted chain-mac-fn topic)
+                       (setf fsync-status (or fsync-status rewrite-status))
+                       ;; carry the rewritten tail so the next appended v3 frame chains from it (ADR 0045)
+                       (if tail
+                           (setf (gethash topic-id chain-macs) tail)
+                           (remhash topic-id chain-macs))
+                       (let ((inn (%inner topic-id)))
+                         (clrhash inn)
+                         (dolist (r compacted)
+                           (setf (gethash (%record-key (durable-record-writer-guid r)
+                                                       (durable-record-sn r))
+                                          inn)
+                                 r)))
+                       (%init-topic-counts topic-id compacted)))
+                   (funcall reset-thunk)
+                   fsync-status))))
            (%threshold-compact (topic-id topic)
              ;; Sliver 2 (ADR 0029 §10): the append-only KEEP_LAST log compacts MID-RUN — each superseding
              ;; put bumps super-pending, and crossing the threshold runs the shared atomic core (identity
@@ -883,7 +906,10 @@
                 (let* ((rec   (make-durable-record :topic topic :writer-guid writer-guid
                                                    :sn sn :key-hash key-hash
                                                    :kind kind :payload payload))
-                       (stm   (%ensure-stream tid)))
+                       ;; ADR 0064: fold every put-path fsync failure (new-log dirent + threshold compaction)
+                       ;; into :FSYNC-FAILED on store-put's primary (a non-T result = not-durably-persisted).
+                       (fsync-st nil)
+                       (stm   (multiple-value-bind (s st) (%ensure-stream tid) (setf fsync-st st) s)))
                   (if chain-mac-fn
                       ;; keyed store: write a v3 frame chained from this topic's running MAC
                       ;; (seeded per topic on the first put), then advance the running state.
@@ -925,7 +951,7 @@
                                 (settle-tally-superseded tally) 0)
                           (when (>= (incf (gethash tid super-pending 0) reclaim)
                                     *compaction-superseded-threshold*)
-                            (%threshold-compact tid topic))))))
+                            (setf fsync-st (or fsync-st (%threshold-compact tid topic))))))))
                   ;; runtime threshold compaction (Sliver 2, ADR 0029 §10): O(1) supersede detection —
                   ;; a :data put that pushes a KEEP_LAST instance PAST depth D makes an older record
                   ;; droppable; bump the per-topic superseded counter and, on crossing
@@ -947,8 +973,10 @@
                               (when tally (incf (settle-tally-superseded tally))))))
                         (when (>= (incf (gethash tid super-pending 0))
                                   *compaction-superseded-threshold*)
-                          (%threshold-compact tid topic)))))
-                  t))))))
+                          (setf fsync-st (or fsync-st (%threshold-compact tid topic)))))))
+                  ;; ADR 0064: a put-path durability-barrier failure surfaces as :FSYNC-FAILED on store-put's
+                  ;; primary (a non-T result = not-durably-persisted); success is T.
+                  (or fsync-st t)))))))
 
        :get-range
        (lambda (topic)
@@ -971,7 +999,8 @@
        :purge
        (lambda (topic)
          (dds.pal:with-lock (lock)
-           (let ((tid (gethash topic id-map)))
+           (let ((tid (gethash topic id-map))
+                 (fsync-st nil))
              (when tid
                ;; close + delete the topic log
                (let ((stm (gethash tid streams)))
@@ -981,23 +1010,24 @@
                (let ((log-path (%topic-log-path store-dir tid)))
                  (when (probe-file log-path)
                    (delete-file log-path)
-                   ;; fsync the unlink dirent so a purged topic cannot reappear after
-                   ;; power loss (ADR 0026 §10.10)
-                   (dds.pal:fsync-directory (%topics-dir store-dir))))
+                   ;; fsync the unlink dirent so a purged topic cannot reappear after power loss (ADR 0026
+                   ;; §10.10); ADR 0064: surface a flush failure as :FSYNC-FAILED on store-purge's primary
+                   (setf fsync-st (nth-value 1 (dds.pal:fsync-directory (%topics-dir store-dir))))))
                (remhash tid outer)
                (remhash tid pending-delete)   ; Sliver-3b: drop any pending physical deletes for the purged topic
                (remhash tid settle-tallies)   ; drop the purged topic's settle tally (ADR 0029 §10.1; mirrors pending-delete)
                ;; drop the stale running chain head so a reput re-seeds from the per-topic head, not the
                ;; pre-purge tail — else reopen's re-seeded replay mismatches the first frame (no false-reject; ADR 0045)
                (remhash tid chain-macs)
-               (remhash topic id-map)))
-           t))
+               (remhash topic id-map))
+             (or fsync-st t))))
 
        :open
        (lambda (open-hk open-hd)
          ;; effective policy: caller override wins when non-NIL; fall back to factory default
          (let ((eff-hk (or open-hk history-kind))
-               (eff-hd (or open-hd history-depth)))
+               (eff-hd (or open-hd history-depth))
+               (open-fsync-status nil))   ; ADR 0064: a replay-recovery / compaction / topics.map flush failure
            ;; stash the effective policy so the :put path can drive Sliver-2 threshold compaction
            (setf (car eff-hk-cell) eff-hk
                  (car eff-hd-cell) eff-hd)
@@ -1044,14 +1074,17 @@
                             (topic-required (and chain-required
                                                  (not (and chain-grandfather
                                                            (gethash tid chain-grandfather))))))
-                       (multiple-value-bind (recs tail-mac)
+                       (multiple-value-bind (recs tail-mac replay-status)
                            (%replay-log log-path topic chain-mac-fn topic-required) ; verifies + downgrade-guards
+                        (setf open-fsync-status (or open-fsync-status replay-status))
                         (let ((compacted (%compact-topic-records recs eff-hk eff-hd)))
                          ;; rewrite the log when compaction dropped at least one record (a keyed
                          ;; rewrite re-emits a fresh v3 chain and returns its new tail MAC, ADR 0045)
                          (when (and recs (< (length compacted) (length recs)))
-                           (setf tail-mac
-                                 (%rewrite-topic-log store-dir tid compacted chain-mac-fn topic)))
+                           (multiple-value-bind (rmac rewrite-status)
+                               (%rewrite-topic-log store-dir tid compacted chain-mac-fn topic)
+                             (setf tail-mac rmac
+                                   open-fsync-status (or open-fsync-status rewrite-status))))
                          ;; carry the replayed (or rewritten) tail into the running chain state
                          (when tail-mac (setf (gethash tid chain-macs) tail-mac))
                          (when compacted
@@ -1067,12 +1100,16 @@
                  (when (plusp (hash-table-count id-map))
                    (let ((new-map (make-hash-table :test #'equal)))
                      (maphash (lambda (topic tid) (setf (gethash tid new-map) topic)) id-map)
-                     (%write-topics-map store-dir new-map))))))
-           t))
+                     (setf open-fsync-status
+                           (or open-fsync-status (nth-value 1 (%write-topics-map store-dir new-map)))))))))
+           ;; ADR 0064: a durability-barrier failure during open (torn-tail recovery / compaction rewrite /
+           ;; topics.map flush) fails the open with a STATUS — service-start sheds; a TAMPER already SIGNALS.
+           (if open-fsync-status (values nil open-fsync-status) (values t nil))))
 
        :close
        (lambda ()
-         ;; fsync + close all open topic streams
+         ;; fsync + close all open topic streams (the per-stream flush stays best-effort ignore-errors;
+         ;; ADR 0064: surface the topics.map persist flush as store-close's status).
          (maphash (lambda (tid stm)
                     (declare (ignore tid))
                     (ignore-errors (dds.pal:fsync-stream stm))
@@ -1080,23 +1117,24 @@
                   streams)
          (clrhash streams)
          ;; persist topics.map
-         (when (plusp (hash-table-count id-map))
-           (let ((tmap (make-hash-table :test #'equal)))
-             (maphash (lambda (topic tid) (setf (gethash tid tmap) topic)) id-map)
-             (%write-topics-map store-dir tmap)))
-         t)
+         (if (plusp (hash-table-count id-map))
+             (let ((tmap (make-hash-table :test #'equal)))
+               (maphash (lambda (topic tid) (setf (gethash tid tmap) topic)) id-map)
+               (values t (nth-value 1 (%write-topics-map store-dir tmap))))
+             (values t nil)))
 
        :sync
        (lambda ()
-         ;; group-commit: fsync every open stream after a drain tick. A fsync failure PROPAGATES
-         ;; (no ignore-errors) so the collect loop surfaces it via *durability-error-hook* — a
-         ;; failed flush must never be silently treated as durable (fail-closed, NFR-SEC-POSTURE).
-         (dds.pal:with-lock (lock)
-           (maphash (lambda (tid stm)
-                      (declare (ignore tid))
-                      (dds.pal:fsync-stream stm))
-                    streams))
-         t)
+         ;; group-commit: fsync every open stream after a drain tick. A fsync failure PROPAGATES as a STATUS
+         ;; (ADR 0064, no signal) so the collect loop surfaces it via *durability-error-hook* — a failed flush
+         ;; must never be silently treated as durable (fail-closed, NFR-SEC-POSTURE).
+         (let ((sync-status nil))
+           (dds.pal:with-lock (lock)
+             (maphash (lambda (tid stm)
+                        (declare (ignore tid))
+                        (setf sync-status (or sync-status (nth-value 1 (dds.pal:fsync-stream stm)))))
+                      streams))
+           (values t sync-status)))
 
        :count-fn
        ;; per-topic count is LOGICAL (post-compaction, matching get-range + the encrypted decorator),
@@ -1179,7 +1217,8 @@
        (lambda (topic writer-guid sn)
          (dds.pal:with-lock (lock)
            (let* ((tid (gethash topic id-map))
-                  (inn (and tid (gethash tid outer))))
+                  (inn (and tid (gethash tid outer)))
+                  (fsync-st nil))
              (when inn
                (let ((k (%record-key writer-guid sn)))
                  (when (remhash k inn)
@@ -1188,8 +1227,9 @@
                                        (make-hash-table :test #'equal)))))
                      (setf (gethash k pd) t)
                      (when (>= (hash-table-count pd) *compaction-superseded-threshold*)
-                       (%reclaim-deleted-topic tid topic)))))))
-           t))
+                       ;; ADR 0064: a reclaim-rewrite fsync failure surfaces as :FSYNC-FAILED on store-delete
+                       (setf fsync-st (%reclaim-deleted-topic tid topic)))))))
+             (or fsync-st t))))
 
        :replace-topic-fn
        ;; atomic whole-topic REPLACE (ADR 0050 §4.4): the microservice server calls this after a KEEP_LAST
@@ -1210,7 +1250,9 @@
                (ignore-errors (dds.pal:fsync-stream stm))
                (ignore-errors (close stm))
                (remhash tid streams))
-             (let ((tail (%rewrite-topic-log store-dir tid records chain-mac-fn topic)))
+             ;; ADR 0064: surface the rewrite's durability-barrier status on store-replace-topic
+             (multiple-value-bind (tail rewrite-status)
+                 (%rewrite-topic-log store-dir tid records chain-mac-fn topic)
                (if tail
                    (setf (gethash tid chain-macs) tail)
                    (remhash tid chain-macs))
@@ -1219,13 +1261,13 @@
                  (dolist (r records)
                    (setf (gethash (%record-key (durable-record-writer-guid r)
                                                (durable-record-sn r)) inn) r)))
-               (%init-topic-counts tid records)))
-           t))))))
+               (%init-topic-counts tid records)
+               (values t rewrite-status)))))))))
 
 (defun* file-store-sync (store)
-    (function (durable-store) (eql t))
-  "Group-commit sync: call the store's :sync vtable slot if present, else no-op.
+    (function (durable-store) (values (eql t) (or null keyword)))
+  "Group-commit sync: call the store's :sync vtable slot if present, else no-op. Returns (VALUES T STATUS)
+   mirroring store-sync — :FSYNC-FAILED on a group-commit flush failure (ADR 0064).
    Intended for the collect-loop drain tick (group-commit fsync per tick, not per put)."
   (let ((fn (durable-store-sync store)))
-    (when fn (funcall fn)))
-  t)
+    (if fn (values t (nth-value 1 (funcall fn))) (values t nil))))

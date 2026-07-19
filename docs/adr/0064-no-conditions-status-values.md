@@ -524,6 +524,37 @@ its contract, so runner-start maps it to a ReturnCode and sheds (same path as th
 memory / file / SQLite `:open` closures are UNCHANGED (they return `t` = `(values t nil)`), and the microservice
 SERVER's `(store-open inner …)` is unchanged (its inner is a local store — never a status, only a tamper signal).
 
+## Slice — the fsync PAL threads `:fsync-failed` through every durable-store op (153 -> 148)
+
+`dds.pal:fsync-stream` and `dds.pal:fsync-directory` (a FROZEN M0 contract, both impls) signalled on a failed
+durability barrier; they now return `(values (or null (eql t)) (or null keyword))` — `:FSYNC-FAILED` on failure,
+never an unwind. A dropped durability-barrier status silently treats un-synced data as durable (NFR-SEC-POSTURE),
+so every non-`ignore-errors` call site fail-closes by threading the status to its store-op boundary. This is the
+widest slice in the durability cluster: ~17 call sites through 20+ helpers to seven store-op boundaries.
+
+- **Boundary contracts widened.** `store-put`/`store-delete`/`store-purge` gain `:FSYNC-FAILED` on the PRIMARY
+  value; `store-sync`/`store-close`/`store-replace-topic` widen from bare `(eql t)` to `(values t status)`
+  (`store-open` already `(values t status)`; the read ops are unaffected).
+- **File store.** The leaf helpers thread it: `%truncate-file` (TRY-bails), `%replay-log` (status = 3rd value),
+  `%rewrite-topic-log` (status = 2nd value; a CONTENT-flush failure fail-closes BEFORE the commit rename, a
+  DIRENT failure surfaces WITH the tail MAC), `%write-topics-map`. `%compact-topic-log` folds replay+rewrite
+  status and every vtable closure (`:put`/`:open`/`:purge`/`:delete`/`:sync`/`:close`/`:replace-topic-fn`)
+  surfaces it. The three deliberate `ignore-errors` flushes (pre-rewrite fd flush, per-stream close flush) stay
+  best-effort.
+- **Encrypted decorator.** The DARE anchor/epoch persistence threads it: `%write-anchor-file` (TRY),
+  `%append-epoch` (TRY), `%mint-logmac-anchor` (status = 4th value), `%invalidate-tail-anchor`, `%seal-tail-anchor`,
+  `%seal-epochs-mac`, `%load-epoch-table` (status = 2nd value) → `%load-epoch-deks`. The `:put` folds the
+  anchor-persist status with the inner put result; `:open` folds anchor-invalidate + epochs.dat recovery; `:close`
+  folds both seals + the inner close. `%verify-epochs-mac` takes the table's primary — the torn-tail recovery
+  already ran (+ threaded) via `%load-epoch-deks` earlier at open, so no truncation occurs there.
+- **Consumer.** The collect-loop group-commit tick (`service.lisp`) checks `store-sync`'s status and routes a
+  `:FSYNC-FAILED` to `*durability-error-hook*` (was a caught signal). A genuine chain-MAC/anchor TAMPER still
+  fails CLOSED as a SECURITY-FAILCLOSED unwind — unchanged.
+
+Contract-table row (frozen PAL, ADR 0064): `fsync-stream (stream) → (values (or null (eql t)) (or null keyword))`;
+`fsync-directory ((or pathname string)) → (values (or null (eql t)) (or null keyword))`. Reader conditionals stay
+inside `dds-pal`. 567/567 SBCL + Clasp; gate-build/types/nocond green.
+
 ## Order of the remaining work (shallow → deep)
 
 **the durability store vtable — the tamper refusals are now `SECURITY-FAILCLOSED` (contained at the start

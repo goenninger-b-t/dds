@@ -380,12 +380,13 @@
   `(progn ,@body))
 
 (defun* fsync-stream (stream)
-    (function (stream) (eql t))
+    (function (stream) (values (or null (eql t)) (or null keyword)))
   "Flush CL stream buffers. Clasp has no direct fdatasync path (NFR-PORT gap);
-   finish-output + force-output is the documented fallback."
+   finish-output + force-output is the documented fallback. Returns (VALUES T STATUS) for contract parity
+   with the SBCL impl (ADR 0064); Clasp cannot observe an fdatasync failure, so STATUS is always NIL."
   (finish-output stream)
   (force-output stream)
-  t)
+  (values t nil))
 
 (defun* fsync-directory (path)
     (function ((or pathname string)) (eql t))
@@ -395,14 +396,15 @@
    impl-agnostic (identical body in pal-sbcl.lisp — unlike fsync-stream this needs no NFR-PORT split,
    since it targets a raw directory fd, not a CL fd-stream). O_RDONLY = 0 on Linux and macOS. On
    macOS fsync(2) on a directory fd is valid and flushes the dirent; F_FULLFSYNC is a stronger
-   guarantee not required here. SIGNALS an error on open/fsync failure — a dirent flush the OS
-   reports as failed must NOT be reported as success (fail-closed, NFR-SEC-POSTURE)."
+   guarantee not required here. Returns (VALUES T STATUS): STATUS is NIL on success, or :FSYNC-FAILED on
+   open/fsync failure — a dirent flush the OS reports as failed must NOT be reported as success (ADR 0064:
+   a status VALUE, never an unwind; fail-closed, NFR-SEC-POSTURE). return-from through unwind-protect still runs close."
   (let* ((native (uiop:native-namestring (uiop:ensure-directory-pathname path)))
          (fd     (cffi:foreign-funcall "open" :string native :int 0 :int))) ; O_RDONLY = 0 (POSIX)
     (when (minusp (the (signed-byte 32) fd))
-      (error "dds.pal:fsync-directory: open(~a, O_RDONLY) failed" native))
+      (return-from fsync-directory (values nil :fsync-failed)))
     (unwind-protect
          (when (minusp (the (signed-byte 32) (cffi:foreign-funcall "fsync" :int fd :int)))
-           (error "dds.pal:fsync-directory: fsync(fd=~d, ~a) failed" fd native))
+           (return-from fsync-directory (values nil :fsync-failed)))
       (cffi:foreign-funcall "close" :int fd :int))
-    t))
+    (values t nil)))

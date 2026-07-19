@@ -265,19 +265,20 @@
   `(progn ,@body))
 
 (defun* fsync-stream (stream)
-    (function (stream) (eql t))
+    (function (stream) (values (or null (eql t)) (or null keyword)))
   "Flush CL stream buffers then fdatasync the underlying fd on SBCL fd-streams.
    Falls back to finish-output when the stream is not an SBCL fd-stream (NFR-PORT).
-   SIGNALS an error if fdatasync(2) returns -1 (EIO/ENOSPC): a durability flush that the OS
-   reports as failed must NOT be reported as success — the caller surfaces it (fail-closed,
-   NFR-SEC-POSTURE: never silently treat un-synced data as durable)."
+   Returns (VALUES T STATUS): STATUS is NIL on success, or :FSYNC-FAILED when fdatasync(2) returns -1
+   (EIO/ENOSPC) — a durability flush the OS reports as failed must NOT be reported as success (ADR 0064: a
+   status VALUE, never a stack unwind; fail-closed, NFR-SEC-POSTURE — the caller surfaces it so un-synced
+   data is never silently treated as durable)."
   (finish-output stream)
   #+sbcl
   (let ((fd (when (typep stream 'sb-sys:fd-stream) (sb-sys:fd-stream-fd stream))))
     (when (and fd (minusp (the (signed-byte 32)
                                (cffi:foreign-funcall "fdatasync" :int fd :int))))
-      (error "dds.pal:fsync-stream: fdatasync(fd=~d) failed" fd)))
-  t)
+      (return-from fsync-stream (values nil :fsync-failed))))
+  (values t nil))
 
 (defun* fsync-directory (path)
     (function ((or pathname string)) (eql t))
@@ -287,14 +288,15 @@
    impl-agnostic (identical body in pal-clasp.lisp — no NFR-PORT split needed, unlike fsync-stream).
    O_RDONLY = 0 on Linux and macOS. On macOS fsync(2) on a directory fd is valid and flushes the
    dirent to the drive; F_FULLFSYNC (full platter flush) is a stronger guarantee not required here.
-   SIGNALS an error on open/fsync failure — a dirent flush the OS reports as failed must NOT be
-   reported as success (fail-closed, NFR-SEC-POSTURE)."
+   Returns (VALUES T STATUS): STATUS is NIL on success, or :FSYNC-FAILED on open/fsync failure — a dirent
+   flush the OS reports as failed must NOT be reported as success (ADR 0064: a status VALUE, never an unwind;
+   fail-closed, NFR-SEC-POSTURE). A return-from through the unwind-protect still runs close(fd)."
   (let* ((native (uiop:native-namestring (uiop:ensure-directory-pathname path)))
          (fd     (cffi:foreign-funcall "open" :string native :int 0 :int))) ; O_RDONLY = 0 (POSIX)
     (when (minusp (the (signed-byte 32) fd))
-      (error "dds.pal:fsync-directory: open(~a, O_RDONLY) failed" native))
+      (return-from fsync-directory (values nil :fsync-failed)))
     (unwind-protect
          (when (minusp (the (signed-byte 32) (cffi:foreign-funcall "fsync" :int fd :int)))
-           (error "dds.pal:fsync-directory: fsync(fd=~d, ~a) failed" fd native))
+           (return-from fsync-directory (values nil :fsync-failed)))
       (cffi:foreign-funcall "close" :int fd :int))
-    t))
+    (values t nil)))

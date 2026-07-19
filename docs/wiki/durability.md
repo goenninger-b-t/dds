@@ -122,7 +122,7 @@ Load it by depending on `:dds-durability` in your system.
 (dds.durability:store-purge  store topic)      ; → T | :UNAVAILABLE
 (dds.durability:store-count  store &optional topic)  ; → (values (integer 0) status)
 (dds.durability:store-open   store &optional history-kind history-depth)  ; → (values t status)
-(dds.durability:store-close  store)            ; → T
+(dds.durability:store-close  store)            ; → (values t status)
 ```
 
 `store-put` is idempotent on `(topic, writer-guid, sn)`. Records sorted by `(writer-guid, sn)` in
@@ -138,6 +138,13 @@ surfaced to `service-start`'s `(values service status)` contract, mapped to a Re
 caller taking only the primary reads an empty list / `0` / `NIL` on failure. LOCAL backends (memory / file /
 SQLite) always succeed or return `T`/data with a `NIL` status — byte-identical. A genuine chain-MAC tamper
 still fails CLOSED at store-open (a `SECURITY-FAILCLOSED` unwind, ADR 0045), never a status.
+
+**Durability-barrier status (ADR 0064 fsync slice).** A failed fsync (fdatasync / dirent flush) — which must
+never be reported as durable (NFR-SEC-POSTURE) — is now a `:FSYNC-FAILED` STATUS rather than a signal. It rides
+`store-put`/`store-delete`/`store-purge`'s PRIMARY value and a 2nd status value on `store-sync`/`store-close`/
+`store-replace-topic`/`store-open`; the collect-loop group-commit tick routes it to `*durability-error-hook*`.
+`dds.pal:fsync-stream`/`fsync-directory` return `(values t status)` (`:FSYNC-FAILED` on failure); the Clasp
+`fsync-stream` cannot observe a failure so it always returns `NIL` status.
 
 `store-open` accepts optional `history-kind` (`:keep-all` | `:keep-last`) and `history-depth`
 (positive integer) arguments. When supplied they override the store's factory-time defaults

@@ -319,7 +319,13 @@
       ;; group-commit: fsync all open log streams once per drain tick. A sync failure is SURFACED
       ;; via the error hook (not silently swallowed) so a failing disk is observable; the thread
       ;; survives (a transient fsync error must not kill the collect loop) — fail-closed + alive.
-      (handler-case (store-sync store)
+      ;; ADR 0064: store-sync now returns (values t status) — a :FSYNC-FAILED status routes to the hook
+      ;; (was a signal); a raw error (unexpected) is still caught + routed.
+      (handler-case
+          (let ((ss (nth-value 1 (store-sync store))))
+            (when ss
+              (let ((n (incf error-count)))
+                (ignore-errors (funcall *durability-error-hook* ss :group-commit n)))))
         (error (c)
           (let ((n (incf error-count)))
             (ignore-errors (funcall *durability-error-hook* c :group-commit n)))))
