@@ -555,6 +555,28 @@ Contract-table row (frozen PAL, ADR 0064): `fsync-stream (stream) → (values (o
 `fsync-directory ((or pathname string)) → (values (or null (eql t)) (or null keyword))`. Reader conditionals stay
 inside `dds-pal`. 567/567 SBCL + Clasp; gate-build/types/nocond green.
 
+## Slice — NOCOND(CRYPTO-FFI), the 8th exempt class; the DARE primitives (148 -> 52)
+
+Owner ruling 2026-07-19. The ~96 signalling forms in `dds-dare/primitives.lisp` are OpenSSL libcrypto FFI
+operation-failure checks — an `EVP_*` / `RAND_*` / `i2d_*` call returning `NULL` or `rc != 1`. Each is a
+library/system FAULT (OOM, a broken or FIPS-disabled OpenSSL, a hardware crypto error) that CANNOT fire on
+valid, well-formed input with a working provider; the security-relevant failure paths (auth-tag mismatch /
+tamper) already fail CLOSED by RETURNING NIL (the caller-handled path), so these signals are the SEPARATE
+"the library itself broke" path. Converting them would thread a status through 300-500 security-critical call
+sites for a fault a correct system never produces — the exact low-value, high-risk churn GUARD exists to
+avoid. The owner granted a dedicated 8th exempt class **`NOCOND(CRYPTO-FFI)`** (the crypto analogue of GUARD),
+matched by the one gate regex and falsified in the canary. Classification of the 96:
+- **~89 CRYPTO-FFI** — the EVP/RAND/i2d library faults + one cleanup-reraise of a caught fault.
+- **5 GUARD** — the AES-GCM O(1) output-extent bounds checks (OUT/PT-OUT/AAD region), and 3 fixed-size
+  input-format `assert`s (our own callers pass 32-byte scalars / 65-byte points).
+- **2 CRYPTO-FFI (annotated with a nuance note)** — the `d2i_PUBKEY`-returns-NULL peer-DER parses in
+  `%ecdh-import-peer-pub` / `ffdh-compute`: the ONE input-facing pair (a malformed peer key CAN fire), but a
+  fail-closed REJECT reached only via the `kagree-compute` handshake seam and contained at the handshake
+  boundary; flagged for a possible future NIL-returning-reject conversion.
+The bar is STRICT: the marker is only for a libcrypto FFI return-code / NULL-pointer fault check, never a
+normal reject (a tamper/auth failure MUST stay the NIL-returning fail-closed path). Comment-only + one gate
+regex token; `make gate-build` clean-cache PASS, gate-nocond 148 -> 52.
+
 ## Order of the remaining work (shallow → deep)
 
 **the durability store vtable — the tamper refusals are now `SECURITY-FAILCLOSED` (contained at the start

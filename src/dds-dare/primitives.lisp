@@ -37,6 +37,7 @@
             (unless (= rc 1)
               (dotimes (i +sha384-digest-len+)
                 (setf (cffi:mem-aref md-ptr :uint8 i) 0))
+              ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
               (error "EVP_Q_digest(SHA-384) failed (rc=~a)" rc))
             (dotimes (i +sha384-digest-len+)
               (setf (aref out i) (cffi:mem-aref md-ptr :uint8 i)))
@@ -83,6 +84,7 @@
               (dotimes (i key-n)
                 (setf (cffi:mem-aref key-ptr :uint8 i) 0))
               (when (cffi:null-pointer-p rc)
+                ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                 (error "EVP_Q_mac(HMAC-SHA256) returned NULL"))
               (dotimes (i +hmac-sha256-mac-len+)
                 (setf (aref out i) (cffi:mem-aref out-ptr :uint8 i))))))))
@@ -123,12 +125,14 @@
                                                :pointer (cffi:null-pointer)
                                                :pointer)))
                 (when (cffi:null-pointer-p kdf)
+                  ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                   (error "EVP_KDF_fetch(HKDF) returned NULL"))
                 (let ((ctx (cffi:foreign-funcall-pointer (%ossl-sym "EVP_KDF_CTX_new") nil
                                                :pointer kdf :pointer)))
                   (cffi:foreign-funcall-pointer (%ossl-sym "EVP_KDF_free") nil
                                                :pointer kdf :void)
                   (when (cffi:null-pointer-p ctx)
+                    ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                     (error "EVP_KDF_CTX_new failed"))
                   (let ((rc (cffi:foreign-funcall-pointer (%ossl-sym "EVP_KDF_derive") nil
                                                   :pointer ctx
@@ -141,6 +145,7 @@
                     (unless (= rc 1)
                       (dotimes (i out-len)
                         (setf (cffi:mem-aref out-ptr :uint8 i) 0))
+                      ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                       (error "EVP_KDF_derive(HKDF-SHA384) failed (rc=~a)" rc))))
                 t))))))))
 
@@ -182,6 +187,7 @@
                     (when (cffi:null-pointer-p ctx)
                       (dotimes (i +aes-256-gcm-key-len+)
                         (setf (cffi:mem-aref key-ptr :uint8 i) 0))
+                      ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                       (error "EVP_CIPHER_CTX_new returned NULL"))
                     (unwind-protect
                          (progn
@@ -195,6 +201,7 @@
                                       :pointer (cffi:null-pointer)
                                       :int)))
                              (unless (= rc 1)
+                               ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                                (error "EVP_EncryptInit_ex(EVP_aes_256_gcm) failed (rc=~a)" rc)))
                            ;; set 12-byte nonce length
                            (let ((rc (cffi:foreign-funcall-pointer
@@ -203,6 +210,7 @@
                                       :int +aes-gcm-nonce-len+
                                       :pointer (cffi:null-pointer) :int)))
                              (unless (= rc 1)
+                               ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                                (error "EVP_CIPHER_CTX_ctrl(SET_IVLEN) failed (rc=~a)" rc)))
                            ;; init key and nonce
                            (let ((rc (cffi:foreign-funcall-pointer
@@ -214,6 +222,7 @@
                                       :pointer nonce-ptr
                                       :int)))
                              (unless (= rc 1)
+                               ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                                (error "EVP_EncryptInit_ex(key,nonce) failed (rc=~a)" rc)))
                            ;; feed AAD (outl is discarded for AAD)
                            (when (> aad-len 0)
@@ -224,6 +233,7 @@
                                         :pointer aad-ptr :int aad-len
                                         :int)))
                                (unless (= rc 1)
+                                 ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                                  (error "EVP_EncryptUpdate(AAD) failed (rc=~a)" rc))))
                            ;; encrypt plaintext
                            (when (> pt-len 0)
@@ -234,6 +244,7 @@
                                         :pointer pt-ptr :int pt-len
                                         :int)))
                                (unless (= rc 1)
+                                 ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                                  (error "EVP_EncryptUpdate(PT) failed (rc=~a)" rc))))
                            ;; finalize (GCM final produces no additional output)
                            (let ((rc (cffi:foreign-funcall-pointer
@@ -241,6 +252,7 @@
                                       :pointer ctx :pointer ct-ptr :pointer outl-ptr
                                       :int)))
                              (unless (= rc 1)
+                               ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                                (error "EVP_EncryptFinal_ex failed (rc=~a)" rc)))
                            ;; extract 16-byte tag
                            (let ((rc (cffi:foreign-funcall-pointer
@@ -249,6 +261,7 @@
                                       :int +aes-gcm-tag-len+
                                       :pointer tag-ptr :int)))
                              (unless (= rc 1)
+                               ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                                (error "EVP_CIPHER_CTX_ctrl(GET_TAG) failed (rc=~a)" rc)))
                            ;; copy results out before zeroizing key
                            (dotimes (i pt-len)
@@ -299,6 +312,7 @@
                     (when (cffi:null-pointer-p ctx)
                       (dotimes (i +aes-256-gcm-key-len+)
                         (setf (cffi:mem-aref key-ptr :uint8 i) 0))
+                      ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                       (error "EVP_CIPHER_CTX_new returned NULL"))
                     (unwind-protect
                          (progn
@@ -311,6 +325,7 @@
                                       :pointer (cffi:null-pointer)
                                       :int)))
                              (unless (= rc 1)
+                               ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                                (error "EVP_DecryptInit_ex(EVP_aes_256_gcm) failed (rc=~a)" rc)))
                            (let ((rc (cffi:foreign-funcall-pointer
                                       (%ossl-sym "EVP_CIPHER_CTX_ctrl") nil
@@ -318,6 +333,7 @@
                                       :int +aes-gcm-nonce-len+
                                       :pointer (cffi:null-pointer) :int)))
                              (unless (= rc 1)
+                               ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                                (error "EVP_CIPHER_CTX_ctrl(SET_IVLEN) failed (rc=~a)" rc)))
                            (let ((rc (cffi:foreign-funcall-pointer
                                       (%ossl-sym "EVP_DecryptInit_ex") nil
@@ -328,6 +344,7 @@
                                       :pointer nonce-ptr
                                       :int)))
                              (unless (= rc 1)
+                               ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                                (error "EVP_DecryptInit_ex(key,nonce) failed (rc=~a)" rc)))
                            ;; set expected tag BEFORE Final
                            (let ((rc (cffi:foreign-funcall-pointer
@@ -336,6 +353,7 @@
                                       :int +aes-gcm-tag-len+
                                       :pointer tag-ptr :int)))
                              (unless (= rc 1)
+                               ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                                (error "EVP_CIPHER_CTX_ctrl(SET_TAG) failed (rc=~a)" rc)))
                            ;; feed AAD
                            (when (> aad-len 0)
@@ -346,6 +364,7 @@
                                         :pointer aad-ptr :int aad-len
                                         :int)))
                                (unless (= rc 1)
+                                 ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                                  (error "EVP_DecryptUpdate(AAD) failed (rc=~a)" rc))))
                            ;; decrypt ciphertext
                            (when (> ct-len 0)
@@ -356,6 +375,7 @@
                                         :pointer ct-ptr :int ct-len
                                         :int)))
                                (unless (= rc 1)
+                                 ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                                  (error "EVP_DecryptUpdate(CT) failed (rc=~a)" rc))))
                            ;; final — returns <=0 on auth failure
                            (let ((rc (cffi:foreign-funcall-pointer
@@ -418,13 +438,16 @@
     (declare (type fixnum aad-off aad-len))
     ;; O(1) AAD-region bounds (safety-0-safe; NFR-SEC-POSTURE) — mirror aes-256-gcm-open-into
     (unless (<= (+ aad-off aad-len) (length aad))
+      ;; NOCOND(GUARD): O(1) output-extent bounds check; caller pre-sizes; cannot fire on valid input
       (error "aes-256-gcm-seal-into: AAD region [~d,+~d) out of bounds (vector length ~d)"
              aad-off aad-len (length aad)))
     ;; O(1) output-extent bounds: unconditional, safety-0-safe (the operating contract §4)
     (unless (<= (+ ct-off pt-len) (dds.pal:static-length out))
+      ;; NOCOND(GUARD): O(1) output-extent bounds check; caller pre-sizes; cannot fire on valid input
       (error "aes-256-gcm-seal-into: OUT too small for CT region (need ~d, have ~d)"
              (+ ct-off pt-len) (dds.pal:static-length out)))
     (unless (<= (+ tag-off +aes-gcm-tag-len+) (dds.pal:static-length out))
+      ;; NOCOND(GUARD): O(1) output-extent bounds check; caller pre-sizes; cannot fire on valid input
       (error "aes-256-gcm-seal-into: OUT too small for TAG region (need ~d, have ~d)"
              (+ tag-off +aes-gcm-tag-len+) (dds.pal:static-length out)))
     ;; stage plaintext into OUT's CT region for in-place GCM (EVP in==out; static-vector aref, 0 cons)
@@ -445,6 +468,7 @@
               (when (cffi:null-pointer-p ctx)
                 (dotimes (i +aes-256-gcm-key-len+)
                   (setf (cffi:mem-aref key-ptr :uint8 i) 0))
+                ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                 (error "EVP_CIPHER_CTX_new returned NULL"))
               (unwind-protect
                    (progn
@@ -458,6 +482,7 @@
                                 :pointer *%null-ptr*
                                 :int)))
                        (unless (= rc 1)
+                         ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                          (error "EVP_EncryptInit_ex(EVP_aes_256_gcm) failed (rc=~a)" rc)))
                      ;; set 12-byte nonce length
                      (let ((rc (cffi:foreign-funcall-pointer
@@ -466,6 +491,7 @@
                                 :int +aes-gcm-nonce-len+
                                 :pointer *%null-ptr* :int)))
                        (unless (= rc 1)
+                         ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                          (error "EVP_CIPHER_CTX_ctrl(SET_IVLEN) failed (rc=~a)" rc)))
                      ;; init key and nonce
                      (let ((rc (cffi:foreign-funcall-pointer
@@ -477,6 +503,7 @@
                                 :pointer nonce-ptr
                                 :int)))
                        (unless (= rc 1)
+                         ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                          (error "EVP_EncryptInit_ex(key,nonce) failed (rc=~a)" rc)))
                      ;; feed AAD sub-range [aad-off, aad-off+aad-len) via cffi:inc-pointer offset (outl discarded for AAD)
                      (when (> aad-len 0)
@@ -487,6 +514,7 @@
                                   :pointer (cffi:inc-pointer aad-ptr aad-off) :int aad-len
                                   :int)))
                          (unless (= rc 1)
+                           ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                            (error "EVP_EncryptUpdate(AAD) failed (rc=~a)" rc))))
                      ;; encrypt plaintext in place at OUT[CT-OFF] (EVP in==out via inline non-boxing SAP)
                      (when (> pt-len 0)
@@ -497,6 +525,7 @@
                                   :pointer (dds.pal:static-sap+ out ct-off) :int pt-len
                                   :int)))
                          (unless (= rc 1)
+                           ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                            (error "EVP_EncryptUpdate(PT) failed (rc=~a)" rc))))
                      ;; finalize (GCM final produces no additional output)
                      (let ((rc (cffi:foreign-funcall-pointer
@@ -504,6 +533,7 @@
                                 :pointer ctx :pointer (dds.pal:static-sap+ out ct-off) :pointer outl-ptr
                                 :int)))
                        (unless (= rc 1)
+                         ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                          (error "EVP_EncryptFinal_ex failed (rc=~a)" rc)))
                      ;; extract 16-byte tag directly into OUT's SAP at TAG-OFF
                      (let ((rc (cffi:foreign-funcall-pointer
@@ -512,6 +542,7 @@
                                 :int +aes-gcm-tag-len+
                                 :pointer (dds.pal:static-sap+ out tag-off) :int)))
                        (unless (= rc 1)
+                         ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                          (error "EVP_CIPHER_CTX_ctrl(GET_TAG) failed (rc=~a)" rc)))
                      (setf sealed t))   ; tag written: encryption complete, OUT holds ciphertext
                 ;; always: zeroize key, free ctx; on error-path only: wipe staged plaintext (defense-in-depth)
@@ -562,9 +593,11 @@
   (let ()
     ;; O(1) output-extent bounds: unconditional, safety-0-safe (the operating contract §4)
     (unless (<= (+ pt-off ct-len) (dds.pal:static-length pt-out))
+      ;; NOCOND(GUARD): O(1) output-extent bounds check; caller pre-sizes; cannot fire on valid input
       (error "aes-256-gcm-open-into: PT-OUT too small for plaintext region (need ~d, have ~d)"
              (+ pt-off ct-len) (dds.pal:static-length pt-out)))
     (unless (<= (+ aad-off aad-len) (length aad))
+      ;; NOCOND(GUARD): O(1) output-extent bounds check; caller pre-sizes; cannot fire on valid input
       (error "aes-256-gcm-open-into: AAD region [~d,+~d) out of bounds (vector length ~d)"
              aad-off aad-len (length aad)))
     (cffi:with-foreign-pointer (key-ptr +aes-256-gcm-key-len+)
@@ -585,6 +618,7 @@
                 (when (cffi:null-pointer-p ctx)
                   (dotimes (i +aes-256-gcm-key-len+)
                     (setf (cffi:mem-aref key-ptr :uint8 i) 0))
+                  ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                   (error "EVP_CIPHER_CTX_new returned NULL"))
                 ;; stage AFTER the CTX-NULL check (ADR 0038 residual f): on OOM PT-OUT is never written -> holds no ciphertext
                 (dotimes (i ct-len)
@@ -600,6 +634,7 @@
                                   :pointer *%null-ptr*
                                   :int)))
                          (unless (= rc 1)
+                           ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                            (error "EVP_DecryptInit_ex(EVP_aes_256_gcm) failed (rc=~a)" rc)))
                        (let ((rc (cffi:foreign-funcall-pointer
                                   (%ossl-sym "EVP_CIPHER_CTX_ctrl") nil
@@ -607,6 +642,7 @@
                                   :int +aes-gcm-nonce-len+
                                   :pointer *%null-ptr* :int)))
                          (unless (= rc 1)
+                           ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                            (error "EVP_CIPHER_CTX_ctrl(SET_IVLEN) failed (rc=~a)" rc)))
                        (let ((rc (cffi:foreign-funcall-pointer
                                   (%ossl-sym "EVP_DecryptInit_ex") nil
@@ -617,6 +653,7 @@
                                   :pointer nonce-ptr
                                   :int)))
                          (unless (= rc 1)
+                           ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                            (error "EVP_DecryptInit_ex(key,nonce) failed (rc=~a)" rc)))
                        ;; set expected tag BEFORE Final
                        (let ((rc (cffi:foreign-funcall-pointer
@@ -625,6 +662,7 @@
                                   :int +aes-gcm-tag-len+
                                   :pointer tag-ptr :int)))
                          (unless (= rc 1)
+                           ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                            (error "EVP_CIPHER_CTX_ctrl(SET_TAG) failed (rc=~a)" rc)))
                        ;; feed AAD sub-range [aad-off, aad-off+aad-len) via cffi:inc-pointer offset
                        (when (> aad-len 0)
@@ -635,6 +673,7 @@
                                     :pointer (cffi:inc-pointer aad-ptr aad-off) :int aad-len
                                     :int)))
                            (unless (= rc 1)
+                             ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                              (error "EVP_DecryptUpdate(AAD) failed (rc=~a)" rc))))
                        ;; decrypt ciphertext in place at PT-OUT[PT-OFF] (EVP in==out via inline non-boxing SAP)
                        (when (> ct-len 0)
@@ -645,6 +684,7 @@
                                     :pointer (dds.pal:static-sap+ pt-out pt-off) :int ct-len
                                     :int)))
                            (unless (= rc 1)
+                             ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                              (error "EVP_DecryptUpdate(CT) failed (rc=~a)" rc))))
                        ;; final — returns <=0 on auth failure
                        (let ((rc (cffi:foreign-funcall-pointer
@@ -739,6 +779,7 @@
                                             :pointer (cffi:null-pointer)
                                             :pointer)))
     (when (cffi:null-pointer-p ctx)
+      ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
       (error "EVP_PKEY_CTX_new_from_pkey returned NULL"))
     ctx))
 
@@ -820,6 +861,7 @@
     (let ((rc (cffi:foreign-funcall-pointer (%ossl-sym "RAND_bytes") nil
                                              :pointer buf :int n :int)))
       (unless (= rc 1)
+        ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
         (error "RAND_bytes(~a) failed (rc=~a)" n rc))
       (%foreign->octets buf n))))
 
@@ -841,12 +883,14 @@
                                              :pointer (cffi:null-pointer)
                                              :pointer)))
     (when (cffi:null-pointer-p kctx)
+      ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
       (error "EVP_PKEY_CTX_new_from_name(ML-KEM-1024) returned NULL"))
     (unwind-protect
          (progn
            (let ((rc (cffi:foreign-funcall-pointer (%ossl-sym "EVP_PKEY_keygen_init") nil
                                                     :pointer kctx :int)))
              (unless (= rc 1)
+               ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                (error "EVP_PKEY_keygen_init(ML-KEM-1024) failed (rc=~a)" rc)))
            (cffi:with-foreign-pointer (ppkey (cffi:foreign-type-size :pointer))
              (setf (cffi:mem-ref ppkey :pointer) (cffi:null-pointer))
@@ -855,6 +899,7 @@
                                                       :pointer ppkey
                                                       :int)))
                (unless (= rc 1)
+                 ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                  (error "EVP_PKEY_generate(ML-KEM-1024) failed (rc=~a)" rc)))
              (let ((pkey (cffi:mem-ref ppkey :pointer)))
                (unwind-protect
@@ -871,6 +916,7 @@
                                        :pointer pub-len-ptr
                                        :int)))
                               (unless (= rc 1)
+                                ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                                 (error "EVP_PKEY_get_raw_public_key(ML-KEM-1024) failed (rc=~a)" rc)))
                             (let ((rc (cffi:foreign-funcall-pointer
                                        (%ossl-sym "EVP_PKEY_get_raw_private_key") nil
@@ -880,6 +926,7 @@
                                        :int)))
                               (unless (= rc 1)
                                 (%zeroize-foreign priv-ptr +ml-kem-1024-priv-len+)
+                                ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                                 (error "EVP_PKEY_get_raw_private_key(ML-KEM-1024) failed (rc=~a)" rc)))
                             (let ((pub  (%foreign->octets pub-ptr  +ml-kem-1024-pub-len+))
                                   (priv (%foreign->secret priv-ptr +ml-kem-1024-priv-len+)))
@@ -913,6 +960,7 @@
                                                :size +ml-kem-1024-pub-len+
                                                :pointer)))
       (when (cffi:null-pointer-p pkey)
+        ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
         (error "EVP_PKEY_new_raw_public_key_ex(ML-KEM-1024) returned NULL"))
       (unwind-protect
            (let ((ctx (%evp-pkey-ctx-from-pkey pkey)))
@@ -924,6 +972,7 @@
                                :pointer (cffi:null-pointer)
                                :int)))
                       (unless (= rc 1)
+                        ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                         (error "EVP_PKEY_encapsulate_init(ML-KEM-1024) failed (rc=~a)" rc)))
                     (cffi:with-foreign-pointer (ct-ptr +ml-kem-1024-ct-len+)
                       (cffi:with-foreign-pointer (ss-ptr +ml-kem-1024-ss-len+)
@@ -939,6 +988,7 @@
                                        :int)))
                               (unless (= rc 1)
                                 (%zeroize-foreign ss-ptr +ml-kem-1024-ss-len+)
+                                ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                                 (error "EVP_PKEY_encapsulate(ML-KEM-1024) failed (rc=~a)" rc)))
                             (let ((ct (%foreign->octets ct-ptr +ml-kem-1024-ct-len+))
                                   (ss (%foreign->secret ss-ptr +ml-kem-1024-ss-len+)))
@@ -976,6 +1026,7 @@
             (unless (= rc 1)
               (dotimes (i +sha256-digest-len+)
                 (setf (cffi:mem-aref md-ptr :uint8 i) 0))
+              ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
               (error "EVP_Q_digest(SHA-256) failed (rc=~a)" rc))
             (dotimes (i +sha256-digest-len+)
               (setf (aref out i) (cffi:mem-aref md-ptr :uint8 i)))
@@ -1033,8 +1084,8 @@
    via PKEY-FREE). The scalar is reversed to little-endian before passing to the UNSIGNED_INTEGER
    OSSL_PARAM (OpenSSL BN native byte order on LE hosts; core_dispatch.h + crypto/params.c).
    Uses EVP_PKEY_fromdata(KEYPAIR=0x87) (evp.h line 2079, OpenSSL 3.6.2). Signals on failure."
-  (assert (= (length scalar-octets) 32))
-  (assert (and (= (length point-octets) 65) (= (aref point-octets 0) #x04)))
+  (assert (= (length scalar-octets) 32))   ; NOCOND(GUARD): input-format precondition; our own callers pass the fixed-size octets; cannot fire on valid use
+  (assert (and (= (length point-octets) 65) (= (aref point-octets 0) #x04)))   ; NOCOND(GUARD): input-format precondition; our own callers pass the fixed-size octets; cannot fire on valid use
   (cffi:with-foreign-pointer (scalar-le 32)
     (cffi:with-foreign-pointer (pub-ptr 65)
       (dotimes (i 32)
@@ -1056,12 +1107,14 @@
                                                            :pointer (cffi:null-pointer)
                                                            :pointer)))
                   (when (cffi:null-pointer-p kctx)
+                    ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                     (error "EVP_PKEY_CTX_new_from_name(EC) returned NULL"))
                   (unwind-protect
                        (progn
                          (let ((rc (cffi:foreign-funcall-pointer (%ossl-sym "EVP_PKEY_fromdata_init") nil
                                                                   :pointer kctx :int)))
                            (unless (= rc 1)
+                             ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                              (error "EVP_PKEY_fromdata_init failed (rc=~a)" rc)))
                          (cffi:with-foreign-pointer (ppkey (cffi:foreign-type-size :pointer))
                            (setf (cffi:mem-ref ppkey :pointer) (cffi:null-pointer))
@@ -1073,6 +1126,7 @@
                                                                     :int)))
                              (unless (= rc 1)
                                (%zeroize-foreign scalar-le 32)
+                               ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                                (error "EVP_PKEY_fromdata(EC KEYPAIR) failed (rc=~a)" rc))
                              (%zeroize-foreign scalar-le 32)
                              (cffi:mem-ref ppkey :pointer))))
@@ -1084,7 +1138,7 @@
    Returns EVP_PKEY* (caller MUST release via PKEY-FREE).
    Uses EVP_PKEY_fromdata(PUBLIC_KEY=0x86) with OSSL_PARAM 'pub' (OCTET_STRING).
    (evp.h line 2079, core_names.h, OpenSSL 3.6.2). Signals on failure."
-  (assert (and (= (length point-octets) 65) (= (aref point-octets 0) #x04)))
+  (assert (and (= (length point-octets) 65) (= (aref point-octets 0) #x04)))   ; NOCOND(GUARD): input-format precondition; our own callers pass the fixed-size octets; cannot fire on valid use
   (cffi:with-foreign-pointer (pub-ptr 65)
     (dotimes (i 65)
       (setf (cffi:mem-aref pub-ptr :uint8 i) (aref point-octets i)))
@@ -1101,12 +1155,14 @@
                                                        :pointer (cffi:null-pointer)
                                                        :pointer)))
               (when (cffi:null-pointer-p kctx)
+                ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                 (error "EVP_PKEY_CTX_new_from_name(EC) returned NULL"))
               (unwind-protect
                    (progn
                      (let ((rc (cffi:foreign-funcall-pointer (%ossl-sym "EVP_PKEY_fromdata_init") nil
                                                               :pointer kctx :int)))
                        (unless (= rc 1)
+                         ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                          (error "EVP_PKEY_fromdata_init failed (rc=~a)" rc)))
                      (cffi:with-foreign-pointer (ppkey (cffi:foreign-type-size :pointer))
                        (setf (cffi:mem-ref ppkey :pointer) (cffi:null-pointer))
@@ -1117,6 +1173,7 @@
                                                                 :pointer params
                                                                 :int)))
                          (unless (= rc 1)
+                           ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                            (error "EVP_PKEY_fromdata(EC PUBLIC_KEY) failed (rc=~a)" rc))
                          (cffi:mem-ref ppkey :pointer))))
                 (%evp-pkey-ctx-free kctx)))))))))
@@ -1148,14 +1205,14 @@
                                              :pointer pkey :string "pub"
                                              :pointer (cffi:null-pointer) :size 0
                                              :pointer outlen :int)))
-      (unless (= rc 1) (error "EVP_PKEY_get_octet_string_param(pub size) failed (rc=~a)" rc)))
+      (unless (= rc 1) (error "EVP_PKEY_get_octet_string_param(pub size) failed (rc=~a)" rc)))   ; NOCOND(CRYPTO-FFI): libcrypto FFI fault; cannot fire on valid input; contained in dds-dare
     (let ((plen (cffi:mem-ref outlen :size)))
       (cffi:with-foreign-pointer (pub-ptr plen)
         (let ((rc (cffi:foreign-funcall-pointer (%ossl-sym "EVP_PKEY_get_octet_string_param") nil
                                                  :pointer pkey :string "pub"
                                                  :pointer pub-ptr :size plen
                                                  :pointer outlen :int)))
-          (unless (= rc 1) (error "EVP_PKEY_get_octet_string_param(pub) failed (rc=~a)" rc)))
+          (unless (= rc 1) (error "EVP_PKEY_get_octet_string_param(pub) failed (rc=~a)" rc)))   ; NOCOND(CRYPTO-FFI): libcrypto FFI fault; cannot fire on valid input; contained in dds-dare
         (%foreign->octets pub-ptr (cffi:mem-ref outlen :size))))))
 
 (defun* ecdh-gen-keypair ()
@@ -1170,12 +1227,14 @@
                                              :pointer (cffi:null-pointer)
                                              :pointer)))
     (when (cffi:null-pointer-p kctx)
+      ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
       (error "EVP_PKEY_CTX_new_from_name(EC) returned NULL"))
     (unwind-protect
          (progn
            (let ((rc (cffi:foreign-funcall-pointer (%ossl-sym "EVP_PKEY_keygen_init") nil
                                                     :pointer kctx :int)))
              (unless (= rc 1)
+               ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                (error "EVP_PKEY_keygen_init(EC) failed (rc=~a)" rc)))
            (cffi:with-foreign-pointer (params (* 2 +ossl-param-size+))
              (cffi:with-foreign-string (p-group "group")
@@ -1187,18 +1246,20 @@
                  (let ((rc (cffi:foreign-funcall-pointer (%ossl-sym "EVP_PKEY_CTX_set_params") nil
                                                           :pointer kctx :pointer params :int)))
                    (unless (= rc 1)
+                     ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                      (error "EVP_PKEY_CTX_set_params(group=prime256v1) failed (rc=~a)" rc)))))
              (cffi:with-foreign-pointer (ppkey (cffi:foreign-type-size :pointer))
                (setf (cffi:mem-ref ppkey :pointer) (cffi:null-pointer))
                (let ((rc (cffi:foreign-funcall-pointer (%ossl-sym "EVP_PKEY_generate") nil
                                                         :pointer kctx :pointer ppkey :int)))
                  (unless (= rc 1)
+                   ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                    (error "EVP_PKEY_generate(EC P-256) failed (rc=~a)" rc)))
                (let ((pkey (cffi:mem-ref ppkey :pointer)))
                  ;; dh1/dh2 = raw uncompressed EC point 0x04||X||Y (Fast DDS o2i_ECPublicKey form,
                  ;; §9.3.2.1); free pkey if the point extraction signals.
                  (handler-case (values (%evp-pkey-ec-pub-point pkey) pkey)
-                   (error (e) (%evp-pkey-free pkey) (error e)))))))
+                   (error (e) (%evp-pkey-free pkey) (error e)))))))   ; NOCOND(CRYPTO-FFI): re-raises a caught libcrypto fault after freeing the pkey (cleanup+reraise); contained in dds-dare
       (%evp-pkey-ctx-free kctx))))
 
 ;;; ECDH key agreement — EVP_PKEY_derive_init + EVP_PKEY_derive_set_peer + EVP_PKEY_derive.
@@ -1226,7 +1287,11 @@
                                                             :pointer pp
                                                             :long peer-n
                                                             :pointer)))
-              (when (cffi:null-pointer-p peer-pkey)
+              ;; NOCOND(CRYPTO-FFI): d2i_PUBKEY returns NULL. This is the ONE input-facing site in the cluster
+              ;; (a malformed peer SubjectPublicKeyInfo DER, not a pure library fault), but it is a fail-closed
+              ;; REJECT of a bad peer key, reached only via the kagree-compute handshake seam and contained at
+              ;; the handshake boundary; a follow-up may convert it to a NIL-returning reject.
+              (when (cffi:null-pointer-p peer-pkey)   ; NOCOND(CRYPTO-FFI): d2i_PUBKEY NULL (peer-DER reject, see above)
                 (error "d2i_PUBKEY failed (malformed peer SubjectPublicKeyInfo DER)"))
               peer-pkey))))))
 
@@ -1246,10 +1311,12 @@
                   (let ((rc (cffi:foreign-funcall-pointer (%ossl-sym "EVP_PKEY_derive_init") nil
                                                            :pointer ctx :int)))
                     (unless (= rc 1)
+                      ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                       (error "EVP_PKEY_derive_init failed (rc=~a)" rc)))
                   (let ((rc (cffi:foreign-funcall-pointer (%ossl-sym "EVP_PKEY_derive_set_peer") nil
                                                            :pointer ctx :pointer peer-pkey :int)))
                     (unless (= rc 1)
+                      ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                       (error "EVP_PKEY_derive_set_peer failed (rc=~a)" rc)))
                   (cffi:with-foreign-pointer (keylen-ptr (cffi:foreign-type-size :size))
                     (setf (cffi:mem-ref keylen-ptr :size) 0)
@@ -1259,6 +1326,7 @@
                                                              :pointer keylen-ptr
                                                              :int)))
                       (unless (= rc 1)
+                        ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                         (error "EVP_PKEY_derive(size-query) failed (rc=~a)" rc)))
                     (let ((klen (cffi:mem-ref keylen-ptr :size)))
                       (cffi:with-foreign-pointer (key-ptr klen)
@@ -1269,6 +1337,7 @@
                                                                  :int)))
                           (unless (= rc 1)
                             (%zeroize-foreign key-ptr klen)
+                            ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                             (error "EVP_PKEY_derive failed (rc=~a)" rc)))
                         (let ((result (%foreign->octets key-ptr klen)))
                           (%zeroize-foreign key-ptr klen)
@@ -1291,11 +1360,13 @@
   (let* ((data-n (length data))
          (md-ctx (cffi:foreign-funcall-pointer (%ossl-sym "EVP_MD_CTX_new") nil :pointer)))
     (when (cffi:null-pointer-p md-ctx)
+      ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
       (error "EVP_MD_CTX_new returned NULL"))
     (unwind-protect
          (progn
            (let ((sha256 (cffi:foreign-funcall-pointer (%ossl-sym "EVP_sha256") nil :pointer)))
              (when (cffi:null-pointer-p sha256)
+               ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                (error "EVP_sha256 returned NULL"))
              (let ((rc (cffi:foreign-funcall-pointer (%ossl-sym "EVP_DigestSignInit") nil
                                                       :pointer md-ctx
@@ -1305,6 +1376,7 @@
                                                       :pointer priv-handle
                                                       :int)))
                (unless (= rc 1)
+                 ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                  (error "EVP_DigestSignInit failed (rc=~a)" rc))))
            (cffi:with-foreign-pointer (data-ptr (max 1 data-n))
              (dotimes (i data-n)
@@ -1315,6 +1387,7 @@
                                                       :size data-n
                                                       :int)))
                (unless (= rc 1)
+                 ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                  (error "EVP_DigestSignUpdate failed (rc=~a)" rc))))
            (cffi:with-foreign-pointer (siglen-ptr (cffi:foreign-type-size :size))
              (setf (cffi:mem-ref siglen-ptr :size) 0)
@@ -1324,6 +1397,7 @@
                                                       :pointer siglen-ptr
                                                       :int)))
                (unless (= rc 1)
+                 ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                  (error "EVP_DigestSignFinal(size-query) failed (rc=~a)" rc)))
              (let ((max-siglen (cffi:mem-ref siglen-ptr :size)))
                (cffi:with-foreign-pointer (sig-ptr max-siglen)
@@ -1333,6 +1407,7 @@
                                                           :pointer siglen-ptr
                                                           :int)))
                    (unless (= rc 1)
+                     ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                      (error "EVP_DigestSignFinal failed (rc=~a)" rc)))
                  ;; Re-read siglen-ptr: actual written length may be less than max-siglen
                  (let ((actual-siglen (cffi:mem-ref siglen-ptr :size)))
@@ -1462,25 +1537,28 @@
    per Fast DDS PKIDH.cpp i2d_PUBKEY); PRIV-PKEY = EVP_PKEY* (caller MUST release via PKEY-FREE).
    Designed for DH+MODP-2048-256 (DDS-Security 1.1 §9.3, RFC 3526 §3 Group 14)."
   (let ((tmpl (%dh-build-params-pkey p-octets g-octets)))
-    (unless tmpl (error "ffdh-gen-keypair: failed to build DH parameter template"))
+    (unless tmpl (error "ffdh-gen-keypair: failed to build DH parameter template"))   ; NOCOND(CRYPTO-FFI): libcrypto FFI fault; cannot fire on valid input; contained in dds-dare
     (unwind-protect
          (let ((gctx (cffi:foreign-funcall-pointer (%ossl-sym "EVP_PKEY_CTX_new") nil
                                                     :pointer tmpl
                                                     :pointer (cffi:null-pointer)
                                                     :pointer)))
            (when (cffi:null-pointer-p gctx)
+             ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
              (error "ffdh-gen-keypair: EVP_PKEY_CTX_new returned NULL"))
            (unwind-protect
                 (progn
                   (let ((rc (cffi:foreign-funcall-pointer (%ossl-sym "EVP_PKEY_keygen_init") nil
                                                            :pointer gctx :int)))
                     (unless (= rc 1)
+                      ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                       (error "ffdh-gen-keypair: EVP_PKEY_keygen_init failed (rc=~a)" rc)))
                   (cffi:with-foreign-pointer (ppkey (cffi:foreign-type-size :pointer))
                     (setf (cffi:mem-ref ppkey :pointer) (cffi:null-pointer))
                     (let ((rc (cffi:foreign-funcall-pointer (%ossl-sym "EVP_PKEY_keygen") nil
                                                              :pointer gctx :pointer ppkey :int)))
                       (unless (= rc 1)
+                        ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                         (error "ffdh-gen-keypair: EVP_PKEY_keygen failed (rc=~a)" rc)))
                     (let ((pkey (cffi:mem-ref ppkey :pointer)))
                       (cffi:with-foreign-pointer (pp (cffi:foreign-type-size :pointer))
@@ -1489,6 +1567,7 @@
                                                                      :pointer pkey :pointer pp :int)))
                           (when (< derlen 0)
                             (%evp-pkey-free pkey)
+                            ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                             (error "ffdh-gen-keypair: i2d_PUBKEY failed (rc=~a)" derlen))
                           (let ((der-ptr (cffi:mem-ref pp :pointer)))
                             (unwind-protect
@@ -1520,7 +1599,10 @@
                                                         :pointer pp
                                                         :long peer-n
                                                         :pointer)))
-          (when (cffi:null-pointer-p peer-pkey)
+          ;; NOCOND(CRYPTO-FFI): d2i_PUBKEY returns NULL — the ffdh peer-DER parse (see %ecdh-import-peer-pub):
+          ;; a fail-closed REJECT of a malformed peer key, reached only via the kagree-compute handshake seam,
+          ;; contained at the handshake boundary; a follow-up may convert it to a NIL-returning reject.
+          (when (cffi:null-pointer-p peer-pkey)   ; NOCOND(CRYPTO-FFI): d2i_PUBKEY NULL (peer-DER reject, see above)
             (error "ffdh-compute: d2i_PUBKEY failed (malformed DH SubjectPublicKeyInfo DER)"))
           (unwind-protect
                (let ((ctx (%evp-pkey-ctx-from-pkey priv-handle)))
@@ -1529,10 +1611,12 @@
                         (let ((rc (cffi:foreign-funcall-pointer (%ossl-sym "EVP_PKEY_derive_init") nil
                                                                  :pointer ctx :int)))
                           (unless (= rc 1)
+                            ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                             (error "ffdh-compute: EVP_PKEY_derive_init failed (rc=~a)" rc)))
                         (let ((rc (cffi:foreign-funcall-pointer (%ossl-sym "EVP_PKEY_derive_set_peer") nil
                                                                  :pointer ctx :pointer peer-pkey :int)))
                           (unless (= rc 1)
+                            ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                             (error "ffdh-compute: EVP_PKEY_derive_set_peer failed (rc=~a)" rc)))
                         (cffi:with-foreign-pointer (keylen-ptr (cffi:foreign-type-size :size))
                           (setf (cffi:mem-ref keylen-ptr :size) 0)
@@ -1542,6 +1626,7 @@
                                                                    :pointer keylen-ptr
                                                                    :int)))
                             (unless (= rc 1)
+                              ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                               (error "ffdh-compute: EVP_PKEY_derive(size-query) failed (rc=~a)" rc)))
                           (let ((klen (cffi:mem-ref keylen-ptr :size)))
                             (cffi:with-foreign-pointer (key-ptr klen)
@@ -1552,6 +1637,7 @@
                                                                        :int)))
                                 (unless (= rc 1)
                                   (%zeroize-foreign key-ptr klen)
+                                  ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                                   (error "ffdh-compute: EVP_PKEY_derive failed (rc=~a)" rc)))
                               (let ((result (%foreign->octets key-ptr klen)))
                                 (%zeroize-foreign key-ptr klen)
@@ -1597,6 +1683,7 @@
   (let* ((data-n (length data))
          (md-ctx (cffi:foreign-funcall-pointer (%ossl-sym "EVP_MD_CTX_new") nil :pointer)))
     (when (cffi:null-pointer-p md-ctx)
+      ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
       (error "rsa-pss-sign: EVP_MD_CTX_new returned NULL"))
     (unwind-protect
          (progn
@@ -1628,6 +1715,7 @@
                                                                   :pointer params-buf
                                                                   :int)))
                            (unless (= rc 1)
+                             ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                              (error "rsa-pss-sign: EVP_DigestSignInit_ex failed (rc=~a)" rc))))))))))
            (cffi:with-foreign-pointer (data-ptr (max 1 data-n))
              (dotimes (i data-n)
@@ -1638,6 +1726,7 @@
                                                       :size data-n
                                                       :int)))
                (unless (= rc 1)
+                 ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                  (error "rsa-pss-sign: EVP_DigestSignUpdate failed (rc=~a)" rc))))
            (cffi:with-foreign-pointer (siglen-ptr (cffi:foreign-type-size :size))
              (setf (cffi:mem-ref siglen-ptr :size) 0)
@@ -1647,6 +1736,7 @@
                                                       :pointer siglen-ptr
                                                       :int)))
                (unless (= rc 1)
+                 ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                  (error "rsa-pss-sign: EVP_DigestSignFinal(size-query) failed (rc=~a)" rc)))
              (let ((max-siglen (cffi:mem-ref siglen-ptr :size)))
                (cffi:with-foreign-pointer (sig-ptr max-siglen)
@@ -1656,6 +1746,7 @@
                                                           :pointer siglen-ptr
                                                           :int)))
                    (unless (= rc 1)
+                     ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                      (error "rsa-pss-sign: EVP_DigestSignFinal failed (rc=~a)" rc)))
                  (let ((actual-siglen (cffi:mem-ref siglen-ptr :size)))
                    (%foreign->octets sig-ptr actual-siglen))))))
@@ -1760,6 +1851,7 @@
                                                    :pointer)))
           (%zeroize-foreign priv-ptr +ml-kem-1024-priv-len+)
           (when (cffi:null-pointer-p pkey)
+            ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
             (error "EVP_PKEY_new_raw_private_key_ex(ML-KEM-1024) returned NULL"))
           (unwind-protect
                (let ((ctx (%evp-pkey-ctx-from-pkey pkey)))
@@ -1771,6 +1863,7 @@
                                    :pointer (cffi:null-pointer)
                                    :int)))
                           (unless (= rc 1)
+                            ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                             (error "EVP_PKEY_decapsulate_init(ML-KEM-1024) failed (rc=~a)" rc)))
                         (cffi:with-foreign-pointer (ss-len-ptr (cffi:foreign-type-size :size))
                           (setf (cffi:mem-ref ss-len-ptr :size) +ml-kem-1024-ss-len+)
@@ -1782,6 +1875,7 @@
                                      :int)))
                             (unless (= rc 1)
                               (%zeroize-foreign ss-ptr +ml-kem-1024-ss-len+)
+                              ;; NOCOND(CRYPTO-FFI): libcrypto FFI fault (EVP_*/RAND_*/i2d); cannot fire on valid input; contained in dds-dare
                               (error "EVP_PKEY_decapsulate(ML-KEM-1024) failed (rc=~a)" rc)))
                           (let ((ss (%foreign->secret ss-ptr +ml-kem-1024-ss-len+)))
                             (%zeroize-foreign ss-ptr +ml-kem-1024-ss-len+)

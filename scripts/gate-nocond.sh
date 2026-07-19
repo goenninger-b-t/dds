@@ -121,11 +121,23 @@ SECURITY_FAILCLOSED_MARKER='NOCOND(SECURITY-FAILCLOSED)'
 # form up the stack turns the warning into a control transfer (a `warn` under a `handler-case (warning …)`
 # would be a disguised non-local exit and is NOT exempt).
 WARN_MARKER='NOCOND(WARN)'
-# All seven sanctioned exempt classes, as ONE regex — adding a class is a one-token edit here, and an
+# NOCOND(CRYPTO-FFI) — the EIGHTH exempt class (owner ruling 2026-07-19). An OpenSSL libcrypto FFI
+# operation-failure check in dds-dare (an EVP_* / RAND_* / OSSL_* call returning NULL / rc != 1): a
+# library/system FAULT (OOM, a broken or FIPS-disabled OpenSSL, a hardware crypto error) that CANNOT fire on
+# valid, well-formed input with a working provider. It is the crypto analogue of GUARD: (a) it cannot fire on
+# valid input (the security-relevant failure paths — auth-tag mismatch / tamper — already fail CLOSED by
+# RETURNING NIL, the caller-handled path; these signals are the SEPARATE "the library itself broke" path), and
+# (b) it is contained at the dds-dare crypto boundary. Converting the ~96 sites would ripple a status through
+# 300-500 security-critical call sites for a fault that a correct system never produces — the exact low-value,
+# high-risk churn GUARD exists to avoid. The bar is STRICT: the marker is only for a libcrypto FFI return-code /
+# NULL-pointer fault check, never a normal reject (a tamper/auth failure MUST stay the NIL-returning fail-closed
+# path, not become a signal). Annotated + justified per-site.
+CRYPTO_FFI_MARKER='NOCOND(CRYPTO-FFI)'
+# All eight sanctioned exempt classes, as ONE regex — adding a class is a one-token edit here, and an
 # UNSANCTIONED NOCOND(FOO) is NOT matched (so nobody invents a class the owner never ruled on).
 # Literal parens via bracket expressions [(] / [)] — NOT \( / \) — because awk's -v escape processing eats
 # a backslash before the regex sees it (the same double-escaping trap SIGNAL_RE already sidesteps this way).
-NOCOND_RE='NOCOND[(](MACRO|TEST|GUARD|CONTRACT|BENCH|SECURITY-FAILCLOSED|WARN)[)]'
+NOCOND_RE='NOCOND[(](MACRO|TEST|GUARD|CONTRACT|BENCH|SECURITY-FAILCLOSED|WARN|CRYPTO-FFI)[)]'
 
 scan() {
   awk -v pat="$SIGNAL_RE" -v marker="$MARKER" '
@@ -253,6 +265,9 @@ cat > "$tmp/count-canary.lisp" <<'EOF'
     (error "chain MAC mismatch — refusing to open a tampered store")))
 (defun* diagnostic-hook ()
   (warn "rate-limited operational diagnostic — does not unwind"))   ; NOCOND(WARN): non-unwinding diagnostic
+(defun* crypto-ffi-fault ()
+  (when (cffi-null-pointer-p ctx)   ; NOCOND(CRYPTO-FFI): libcrypto fault; cannot fire on valid input; contained in dds-dare
+    (error "EVP_CIPHER_CTX_new returned NULL")))
 (defun* unsanctioned ()
   (unless x   ; NOCOND(FOO): an UNSANCTIONED class must STILL be counted (nobody invents a class)
     (error "should count")))
@@ -263,7 +278,7 @@ if [[ "$cn" -ne 2 ]]; then
   echo "gate-nocond: FAIL — self-test: the ratchet counter must count EXACTLY the 2 unexempt forms in the" >&2
   echo "             canary — the bare (counted) form AND the NOCOND(FOO) form (an UNSANCTIONED class is" >&2
   echo "             NOT exempt). Skipped: 2 NOCOND(MACRO) + 1 TEST + 1 GUARD + 1 CONTRACT + 1 BENCH +" >&2
-  echo "             1 SECURITY-FAILCLOSED + 1 WARN, and 2 in-file-test asserts (incl. the %run- form). Got ${cn}." >&2
+  echo "             1 SECURITY-FAILCLOSED + 1 WARN + 1 CRYPTO-FFI, and 2 in-file-test asserts (incl. %run-). Got ${cn}." >&2
   echo "             Either the counter is blind, a marker is over-matching, or an unsanctioned NOCOND(FOO)" >&2
   echo "             was wrongly exempted — a green ratchet would prove NOTHING." >&2
   exit 1
