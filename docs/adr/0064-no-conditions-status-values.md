@@ -594,6 +594,25 @@ EVP_PKEY NID instead of signalling — its sole caller `%cert-algo-string` alrea
 to its documented fail-closed NIL, so the signal was dead code that pre-empted the caller's own handling.
 gate-build clean-cache PASS; 567/567 SBCL + Clasp; gate-nocond 52 -> 45.
 
+## Slice — key-provider: perm refusals SECURITY-FAILCLOSED, :DIR → status, not-open → GUARD (45 -> 38)
+
+Completes the DARE cluster (110 sites: 96 primitives + 7 openssl-ffi + 7 key-provider). The 7 key-provider
+sites split three ways by their nature:
+- **4 permission refusals → SECURITY-FAILCLOSED** (owner ruling 2026-07-19). `assert-directory-perms-0700`
+  (dir 0700) and `%assert-key-perms` (key 0600) refuse to open when perms are loose or unverifiable. They CAN
+  fire on a misconfigured system, but they are fail-closed SECURITY refusals at the durability store-open /
+  key-provider-open boundary (contained at runner-start, gate-asserted) where a forgotten status would open a
+  store with a world-readable key — the exact unforgeable-refusal hazard SECURITY-FAILCLOSED exists for; and a
+  store WE create has enforced-tight perms (chmod on first create), so loose perms at open is an
+  externally-introduced tamper-like condition. Extends the class from tamper/corruption to filesystem-perm
+  fail-closed refusals at a durability/key-open boundary.
+- **1 construction precondition → status.** `make-file-key-provider` `:DIR is required` → `(bail :requires-dir)`;
+  returns `(values (or null key-provider) (or null keyword))`. Benign ripple (every caller passes :dir and
+  takes the primary, feeding it to make-encrypted-store — the make-sqlite-store constructor pattern).
+- **2 API-order preconditions → GUARD.** `fn-recipient-pub-key` / `fn-decapsulate` "not open — call
+  key-provider-open first": the decorator always opens before use, so they cannot fire in correct use and are
+  contained. 567/567 SBCL + Clasp; gate-build/types green.
+
 ## Order of the remaining work (shallow → deep)
 
 **the durability store vtable — the tamper refusals are now `SECURITY-FAILCLOSED` (contained at the start

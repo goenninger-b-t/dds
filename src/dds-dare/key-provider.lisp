@@ -145,11 +145,11 @@
    *perms-mode-reader* — the exact mechanism that guards the key dir K (DRY; ADR 0026 §10.12)."
   (let* ((reader (or *perms-mode-reader* #'%ls-mode-string))
          (mode   (funcall reader dir-path)))
-    (unless (and mode (>= (length mode) 9))
+    (unless (and mode (>= (length mode) 9))   ; NOCOND(SECURITY-FAILCLOSED): fail-closed perm refusal at the durability store-open/key-provider-open boundary; caught at runner-start; a store we create has enforced-tight perms so loose perms is externally-introduced
       (error "durability store dir ~a: cannot verify permissions ~
               (ls unavailable or output unparseable); refusing to open (fail-closed)"
              dir-path))
-    (when (%perms-too-loose-p mode)
+    (when (%perms-too-loose-p mode)   ; NOCOND(SECURITY-FAILCLOSED): fail-closed perm refusal at the durability store-open/key-provider-open boundary; caught at runner-start; a store we create has enforced-tight perms so loose perms is externally-introduced
       (error "durability store dir ~a has unsafe permissions (~a); refusing to open — ~
               must be 0700 (no group or other read/write access)"
              dir-path mode)))
@@ -171,11 +171,11 @@
    the key is never loaded unless perms are positively verified as tight.  Never logs key bytes."
   (let* ((reader (or *perms-mode-reader* #'%ls-mode-string))
          (mode   (funcall reader priv-path)))
-    (unless (and mode (>= (length mode) 9))
+    (unless (and mode (>= (length mode) 9))   ; NOCOND(SECURITY-FAILCLOSED): fail-closed perm refusal at the durability store-open/key-provider-open boundary; caught at runner-start; a store we create has enforced-tight perms so loose perms is externally-introduced
       (error "DARE key-provider: cannot verify permissions on ~a ~
               (ls unavailable or output unparseable); refusing to load private key"
              priv-path))
-    (when (%perms-too-loose-p mode)
+    (when (%perms-too-loose-p mode)   ; NOCOND(SECURITY-FAILCLOSED): fail-closed perm refusal at the durability store-open/key-provider-open boundary; caught at runner-start; a store we create has enforced-tight perms so loose perms is externally-introduced
       (error "DARE key-provider: private key ~a has unsafe permissions (~a); ~
               refusing to load — must be 0600 (no group or other read/write)"
              priv-path mode)))
@@ -184,8 +184,10 @@
 ;;; File-based key-provider constructor.
 
 (defun* make-file-key-provider (&key dir)
-    (function (&key (:dir t)) key-provider)
-  "Construct a file-based ML-KEM-1024 key provider backed by files in DIR.
+    (function (&key (:dir t)) (values (or null key-provider) (or null keyword)))
+  "Construct a file-based ML-KEM-1024 key provider backed by files in DIR. Returns (VALUES PROVIDER STATUS):
+   STATUS is :REQUIRES-DIR when :DIR was omitted (ADR 0064: a construction precondition returns a status, not
+   a signal); every in-tree caller passes :dir and takes the primary PROVIDER, so STATUS is a benign NIL there.
    Files: `<dir>/ml-kem-1024.pub` (public key, 1568 B) + `<dir>/ml-kem-1024.key` (private key, 3168 B).
    On KEY-PROVIDER-OPEN:
      - Both files exist: check private-key perms (refuse if looser than 0600), then load.
@@ -197,7 +199,7 @@
    KEY-PROVIDER-DECAPSULATE returns a foreign secret shared-secret the CALLER owns + must free."
   (let* ((dir-path  (uiop:ensure-directory-pathname
                      (cond ((null dir)
-                            (error "make-file-key-provider: :DIR is required"))
+                            (bail :requires-dir))
                            ((stringp dir) (pathname dir))
                            (t dir))))
          (pub-key   nil)
@@ -231,12 +233,12 @@
        t)
      :fn-recipient-pub-key
      (lambda ()
-       (unless pub-key
+       (unless pub-key   ; NOCOND(GUARD): "call key-provider-open first" invariant; the decorator always opens before use; cannot fire in correct use
          (error "DARE key-provider: not open — call key-provider-open first"))
        pub-key)
      :fn-decapsulate
      (lambda (kem-ciphertext)
-       (unless priv-key
+       (unless priv-key   ; NOCOND(GUARD): "call key-provider-open first" invariant; the decorator always opens before use; cannot fire in correct use
          (error "DARE key-provider: not open — call key-provider-open first"))
        (ml-kem-1024-decapsulate priv-key kem-ciphertext))
      :fn-close
