@@ -234,7 +234,7 @@
                                 (history-kind :keep-all) (history-depth 1))
     (function (&key (:path (or null pathname string)) (:max-samples (integer 0))
                     (:history-kind (member :keep-all :keep-last)) (:history-depth (integer 1)))
-              durable-store)
+              (values (or null durable-store) (or null keyword)))
   "Construct a SQLite-backed durable-store implementing the fixed durable-store vtable (ADR 0049).
    PATH is the DB file (required). MAX-SAMPLES 0 = unbounded; positive caps total records across all
    topics (store-put returns :REJECTED when full). HISTORY-KIND / HISTORY-DEPTH govern per-instance
@@ -253,7 +253,11 @@
    is ALSO filled: at the encrypted decorator's clean close the per-topic (chained-count N . tail-MAC M_N)
    is sealed into D/logmac.tail, and at open prefix-containment closes the whole-tail-truncation /
    whole-topic-drop / whole-store-rollback residuals for the SQLite tier — reusing the SAME
-   %sqlite-chain-walk as verify-on-open (no new crypto; the (N . M_N) contract matches the file tier)."
+   %sqlite-chain-walk as verify-on-open (no new crypto; the (N . M_N) contract matches the file tier).
+   Returns (VALUES STORE STATUS): STATUS is NIL on success, or :REQUIRES-PATH when :PATH was omitted
+   (ADR 0064: a construction precondition returns a status here instead of a deferred unwind on first use)."
+  (unless path
+    (bail :requires-path))
   (let* ((db-path (when path (pathname path)))
          (lock    (dds.pal:make-lock "dds-sqlite-store"))
          (db-cell (list nil))                 ; car = live connection or NIL when closed
@@ -270,8 +274,7 @@
              (sqlite:execute-single (car db-cell) "SELECT COUNT(*) FROM record")))
       (labels ((%ensure-db ()
                  (unless (car db-cell)
-                   (unless db-path
-                     (error "dds.durability: make-sqlite-store requires :path"))
+                   ;; db-path is guaranteed non-NIL: make-sqlite-store bails :requires-path up front (ADR 0064)
                    (let ((dir (uiop:pathname-directory-pathname db-path)))
                      (let ((existed (uiop:directory-exists-p dir)))
                        (ensure-directories-exist db-path)

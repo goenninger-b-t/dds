@@ -359,6 +359,29 @@ the old signal→handler path). `store-put`'s ftype widens to `(or (eql t) (eql 
 consumer (the collect loop) is source-unchanged. The two limits are `2^32`/`2^96` — unreachable defence in
 depth, so no test drives them; the value is that the failure mode is now in the type, not a stack unwind.
 
+## Slice — `make-sqlite-store` construction precondition (179 -> 178)
+
+The SQLite constructor's "requires `:path`" precondition was a lazy `error` deferred to first use (inside
+`%ensure-db`). Owner ruling (2026-07-19): a construction precondition converts via a `make-*` returning
+`(VALUES STORE STATUS)`. `make-sqlite-store` now bails **`:REQUIRES-PATH`** eagerly (`(unless path (bail
+…))`, fail-fast, no deferred unwind) and its ftype widens to `(values (or null durable-store) (or null
+keyword))`; the lazy `%ensure-db` check is deleted (`db-path` is now provably non-NIL). Both non-test callers
+(`make-sqlite-store-factory`, `%make-server-inner`) always pass `:path`, so the added second value is `NIL`
+and the primary value is unchanged — SBCL derives the nested `(make-encrypted-store (make-sqlite-store …))`
+as a benign runtime check (`durable-store` ⊂ `(or null durable-store)`, not disjoint → no warning), so no
+caller changes were needed. The sibling constructor precondition `make-microservice-store` "requires `:port`"
+signals the *typed* `microservice-store-error` and is entangled with the deferred `conn-lost`/`store-error`
+family, so it converts with that slice, not here.
+
+**On the rest of the "construction/config preconditions".** Investigation reclassified them: `runner`
+`process-mode`/`argv0` and `service` `service-spec-shape` are function-body preconditions inside
+`%start-process-service` / `%service-topics`, both reached only from `service-start` → `runner-start`, whose
+per-spec handler (the `SECURITY-FAILCLOSED` slice) already catches them at the boundary — converting them to
+status is a `service-start` return-contract change (a separate cascade, not a leaf). `spec`'s `DPERSIST_*`
+check sits in the store-factory *builder* (a factory-closure cascade). `store-sqlite`'s "unassigned kind" is
+not a precondition at all — it is a read-path validation of a corrupt stored `kind` byte (a data-integrity
+refusal on replay, closer to `SECURITY-FAILCLOSED`). Each is its own slice.
+
 ## Order of the remaining work (shallow → deep)
 
 **the durability store vtable — the tamper refusals are now `SECURITY-FAILCLOSED` (contained at the start
