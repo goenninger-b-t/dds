@@ -629,6 +629,24 @@ The DDS-Security payload codec (`crypto.lisp`) split by input trust:
   `SECURED-PAYLOAD-MALFORMED` condition SURVIVES (still raised by this GUARD site).
 567/567 SBCL + Clasp; gate-build/types green.
 
+## Slice — NOCOND(FAILFAST), the 9th exempt class; the key-material zeroize guards (31 -> 26)
+
+Owner ruling 2026-07-19. The DDS-Security key-material use-after-free guards (`%km-session-key-at`,
+`km-receiver-descriptor-list`, `%km-receiver-session-key-at`) `(error 'key-material-zeroized-error)` if key
+material is used past teardown (zeroize). They CANNOT fire in correct code (a KM is zeroized only at teardown,
+after all uses); the design DELIBERATELY signals rather than returns NIL because a NIL descriptor reads as
+"origin-auth disabled" — a returned status a caller forgot to check would be a fail-OPEN security bypass
+(ADR-0034); and they sit on the zero-alloc per-datagram hot path (a threaded status would cost there). They
+are not caught (on the send path an unwind reaches the DDS write API, a ReturnCode boundary; on receive, the
+crypto-manager). GUARD's "contained-and-recovered" does not fit and would be unsafe here. So a dedicated 9th
+exempt class **`NOCOND(FAILFAST)`**: a can't-happen invariant (use-after-free / corruption) where a loud
+fail-fast UNWIND is the correct response and a status would be unsafe (fail-open) or meaningless — if it fires
+the program is already in an impossible state and continuing is worse than dying. The bar is STRICT: it cannot
+fire in correct code (a bug, not attacker input or a normal reject — a wire/input reject MUST stay a status)
+AND it is not debug-gated (that is TEST). Annotated: the 3 zeroize guards + the 2 companion bounds asserts
+(`(assert (<= (+ session-id-off 4) …))` on an already-length-validated secured payload). Comment-only + one
+gate regex token; canary falsifies the class; gate-nocond 31 -> 26.
+
 ## Order of the remaining work (shallow → deep)
 
 **the durability store vtable — the tamper refusals are now `SECURITY-FAILCLOSED` (contained at the start

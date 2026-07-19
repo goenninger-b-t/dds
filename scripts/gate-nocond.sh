@@ -133,11 +133,22 @@ WARN_MARKER='NOCOND(WARN)'
 # NULL-pointer fault check, never a normal reject (a tamper/auth failure MUST stay the NIL-returning fail-closed
 # path, not become a signal). Annotated + justified per-site.
 CRYPTO_FFI_MARKER='NOCOND(CRYPTO-FFI)'
-# All eight sanctioned exempt classes, as ONE regex — adding a class is a one-token edit here, and an
+# NOCOND(FAILFAST) — the NINTH exempt class (owner ruling 2026-07-19). A CAN'T-HAPPEN invariant: a
+# use-after-free (a zeroized/freed secret used past teardown), a corruption / internal-consistency check that
+# CANNOT fire in correct code, where a loud fail-fast UNWIND is the correct response and a status value would
+# be either UNSAFE or meaningless. UNSAFE: the DDS-Security key-material zeroize guards deliberately signal
+# rather than return NIL because a NIL descriptor reads as "origin-auth disabled" — a returned status a caller
+# forgot to check would be a fail-OPEN security bypass (ADR-0034). Unlike GUARD, FAILFAST does NOT require
+# containment-and-recovery: if it fires the program is already in an impossible/corrupt state and continuing
+# is worse than dying, so a bare unwind (to the DDS API / crypto-manager) is the intended fail-closed
+# behavior. The bar is STRICT: (a) it cannot fire in correct code (a bug, not attacker input or a normal
+# reject — a wire/input reject MUST stay a status), and (b) it is NOT debug-gated (that is TEST). Per-site.
+FAILFAST_MARKER='NOCOND(FAILFAST)'
+# All nine sanctioned exempt classes, as ONE regex — adding a class is a one-token edit here, and an
 # UNSANCTIONED NOCOND(FOO) is NOT matched (so nobody invents a class the owner never ruled on).
 # Literal parens via bracket expressions [(] / [)] — NOT \( / \) — because awk's -v escape processing eats
 # a backslash before the regex sees it (the same double-escaping trap SIGNAL_RE already sidesteps this way).
-NOCOND_RE='NOCOND[(](MACRO|TEST|GUARD|CONTRACT|BENCH|SECURITY-FAILCLOSED|WARN|CRYPTO-FFI)[)]'
+NOCOND_RE='NOCOND[(](MACRO|TEST|GUARD|CONTRACT|BENCH|SECURITY-FAILCLOSED|WARN|CRYPTO-FFI|FAILFAST)[)]'
 
 scan() {
   awk -v pat="$SIGNAL_RE" -v marker="$MARKER" '
@@ -268,6 +279,9 @@ cat > "$tmp/count-canary.lisp" <<'EOF'
 (defun* crypto-ffi-fault ()
   (when (cffi-null-pointer-p ctx)   ; NOCOND(CRYPTO-FFI): libcrypto fault; cannot fire on valid input; contained in dds-dare
     (error "EVP_CIPHER_CTX_new returned NULL")))
+(defun* failfast-invariant ()
+  (when (key-material-zeroized km)   ; NOCOND(FAILFAST): use-after-free; cannot fire in correct code; a NIL return would be a fail-open bypass
+    (error 'key-material-zeroized-error)))
 (defun* unsanctioned ()
   (unless x   ; NOCOND(FOO): an UNSANCTIONED class must STILL be counted (nobody invents a class)
     (error "should count")))
@@ -278,7 +292,7 @@ if [[ "$cn" -ne 2 ]]; then
   echo "gate-nocond: FAIL — self-test: the ratchet counter must count EXACTLY the 2 unexempt forms in the" >&2
   echo "             canary — the bare (counted) form AND the NOCOND(FOO) form (an UNSANCTIONED class is" >&2
   echo "             NOT exempt). Skipped: 2 NOCOND(MACRO) + 1 TEST + 1 GUARD + 1 CONTRACT + 1 BENCH +" >&2
-  echo "             1 SECURITY-FAILCLOSED + 1 WARN + 1 CRYPTO-FFI, and 2 in-file-test asserts (incl. %run-). Got ${cn}." >&2
+  echo "             1 SECURITY-FAILCLOSED + 1 WARN + 1 CRYPTO-FFI + 1 FAILFAST, and 2 in-file-test asserts (incl. %run-). Got ${cn}." >&2
   echo "             Either the counter is blind, a marker is over-matching, or an unsanctioned NOCOND(FOO)" >&2
   echo "             was wrongly exempted — a green ratchet would prove NOTHING." >&2
   exit 1

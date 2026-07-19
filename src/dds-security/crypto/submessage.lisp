@@ -210,8 +210,8 @@
    leak un-wiped keys on session_id rotation; ADR-0034). FAIL-CLOSED: a zeroized KM signals
    KEY-MATERIAL-ZEROIZED-ERROR before touching the freed master_salt (a single flag check off the zero-alloc hit
    path)."
-  (when (key-material-zeroized km) (error 'key-material-zeroized-error))
-  (assert (<= (+ session-id-off 4) (length session-id-vec)))
+  (when (key-material-zeroized km) (error 'key-material-zeroized-error))   ; NOCOND(FAILFAST): use-after-free (KM used past zeroize/teardown); cannot fire in correct code; a NIL return would be a fail-open origin-auth bypass (ADR-0034) so it fail-fasts
+  (assert (<= (+ session-id-off 4) (length session-id-vec)))   ; NOCOND(FAILFAST): bounds invariant on an already-length-validated secured payload; cannot fire in correct code; fail-fast on a corrupt/too-short vector
   (let ((sc (key-material-cached-recv-session km)))   ; ONE load of the published (discriminant, key) object (ADR 0059)
     (if (and sc
              (%recv-key-id-eq-at recv-key-id 0 (session-cache-recv-key-id sc))

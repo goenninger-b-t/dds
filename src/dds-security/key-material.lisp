@@ -232,8 +232,8 @@
    uses an acquire fence (id match → fence → key load) to guarantee barrier-safe cache publication on weak-memory
    platforms (arm64/Apple Silicon; operating contract §4). A benign concurrent same-value miss race is still
    harmless — both missers derive the identical deterministic key."
-  (when (key-material-zeroized km) (error 'key-material-zeroized-error))
-  (assert (<= (+ session-id-off 4) (length session-id-vec)))
+  (when (key-material-zeroized km) (error 'key-material-zeroized-error))   ; NOCOND(FAILFAST): use-after-free (KM used past zeroize/teardown); cannot fire in correct code; a NIL return would be a fail-open origin-auth bypass (ADR-0034) so it fail-fasts
+  (assert (<= (+ session-id-off 4) (length session-id-vec)))   ; NOCOND(FAILFAST): bounds invariant on an already-length-validated secured payload; cannot fire in correct code; fail-fast on a corrupt/too-short vector
   (let ((sc (key-material-cached-send-session km)))   ; ONE load of the published pair (ADR 0059) — id + key cannot disagree
     (if (and sc (%session-id-eq-at (session-cache-id sc) session-id-vec session-id-off))
         (progn
@@ -275,7 +275,7 @@
    KEY-MATERIAL-ZEROIZED-ERROR (its master_receiver_specific_key is freed) rather than returning NIL — a NIL
    descriptor reads as origin-auth-disabled, so returning it for a zeroized origin-auth KM would be a fail-OPEN
    gate bypass (ADR-0034); the flag check is off the zero-alloc hit path."
-  (when (key-material-zeroized km) (error 'key-material-zeroized-error))
+  (when (key-material-zeroized km) (error 'key-material-zeroized-error))   ; NOCOND(FAILFAST): use-after-free (KM used past zeroize/teardown); cannot fire in correct code; a NIL return would be a fail-open origin-auth bypass (ADR-0034) so it fail-fasts
   (let ((cached (key-material-cached-receiver-descriptor-list km)))
     (if cached
         (progn (dds.pal:fence :acquire) cached)
