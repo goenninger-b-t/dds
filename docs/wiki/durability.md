@@ -170,6 +170,7 @@ of that open. `service-start` calls `store-open` with the service-spec's `histor
 ;; Error hook — bind to observe collect-loop errors
 ;; signature: (condition context count) → T
 ;; context: :collect-loop | :supervisor-shed | :supervisor-restart-failed
+;;          | :runner-start-failed | :server-start-failed   ; a spec / server store-open failed at start
 (dds.durability:*durability-error-hook*)
 ```
 
@@ -180,7 +181,10 @@ of that open. `service-start` calls `store-open` with the service-spec's `histor
 (dds.durability:make-service-runner specs)   ; → service-runner
 
 ;; Start all services (double-start is a no-op)
-(dds.durability:runner-start runner)  ; → runner
+;; → (values runner status): status NIL on success, or :service-start-failed if a spec failed to
+;;   start (e.g. a tampered store refused to open, ADR 0045). The failed spec is caught + shed at this
+;;   boundary (never unwinds); the toplevel maps a non-NIL status to a fail-closed non-zero exit.
+(dds.durability:runner-start runner)  ; → (values runner status)
 ;; Stop all services; nulls the services list; runner may be restarted after stop
 (dds.durability:runner-stop  runner)  ; → T
 ;; (name . alive-p) pairs for each service

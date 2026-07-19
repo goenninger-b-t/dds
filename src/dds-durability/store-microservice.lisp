@@ -1133,6 +1133,7 @@
    analogue of the file store rebuilding its in-memory index on replay — needed for idempotent re-put detection)."
   (multiple-value-bind (chained running reason) (%ms-chain-walk topic fn tuples nil)
     (when (eq reason :mismatch)
+      ;; NOCOND(SECURITY-FAILCLOSED): remote chain MAC mismatch (tamper); fail-closed at store-open/reopen, caught at the durability start boundary
       (error "dds.durability: microservice chain MAC mismatch in topic ~a — a remote server ~
               dropped/reordered/tampered a sealed frame (refusing to open; ADR 0045/0050 §4.3)" topic))
     (let ((idx    (make-hash-table :test #'equal))
@@ -1560,7 +1561,7 @@
                          (progn
                            (when (plusp *durability-debug-ms-force-spawn-fail*)   ; test-only forced spawn failure
                              (decf *durability-debug-ms-force-spawn-fail*)
-                             (error "dds.durability microservice: forced serve-thread spawn failure (test-only)"))
+                             (error "dds.durability microservice: forced serve-thread spawn failure (test-only)"))   ; NOCOND(TEST): inert in production; the UNWIND is the forced-spawn-failure mechanism under test
                            (setf (ms-conn-slot-thread slot)
                                  (dds.pal:spawn
                                   (lambda ()

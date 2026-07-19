@@ -101,11 +101,31 @@ CONTRACT_MARKER='NOCOND(CONTRACT)'
 # like dds-tests), but it is pure measurement scaffolding, not the DDS runtime users call — so its harness
 # assertions are annotated in place rather than converted to status values.
 BENCH_MARKER='NOCOND(BENCH)'
-# All five sanctioned exempt classes, as ONE regex — adding a class is a one-token edit here, and an
+# NOCOND(SECURITY-FAILCLOSED) — the SIXTH exempt class (owner ruling 2026-07-19). A fail-closed SECURITY
+# tamper refusal at a durability STORE boundary: a store detects a broken/mismatched authentication chain
+# (log-MAC anchor, tail anchor, epochs.mac, per-topic chain MAC — ADR 0045/0050) or mid-file corruption
+# while OPENING a persisted store, and refuses to open. The UNWIND is the security property: a tamper signal
+# is UNFORGEABLE, whereas a status value a caller forgot to check would turn a REJECTED (tampered) store into
+# an ACCEPTED one — the exact hazard this campaign has already caught twice (a dropped status re-admitted a
+# short/tampered payload as an OOB read). The bar mirrors GUARD but at a store boundary: (a) the form is a
+# fail-closed tamper/corruption refusal that CANNOT fire on an authentic, untampered store, and (b) it is
+# contained — every such signal is caught at the durability toplevel boundary (asserted in check B) and
+# turned into a DDS ReturnCode_t, so nothing escapes to a thread's top level. Annotated + justified per-site.
+SECURITY_FAILCLOSED_MARKER='NOCOND(SECURITY-FAILCLOSED)'
+# NOCOND(WARN) — the SEVENTH exempt class (owner ruling 2026-07-19). A `warn` DIAGNOSTIC that does NOT
+# transfer control: `warn` signals a WARNING, whose default handler prints and RETURNS — execution continues
+# past it. None of the three reasons for the no-conditions rule apply: it does not unwind a thread, does not
+# hide a failure in a predicate (the code carries on and returns its normal value), and the sites are cold
+# (a rate-limited operational-diagnostic hook, a redundant-call notice). It is not a control-flow condition;
+# it is logging that happens to use the condition system. Annotated per-site; the bar is that no `handler-*`
+# form up the stack turns the warning into a control transfer (a `warn` under a `handler-case (warning …)`
+# would be a disguised non-local exit and is NOT exempt).
+WARN_MARKER='NOCOND(WARN)'
+# All seven sanctioned exempt classes, as ONE regex — adding a class is a one-token edit here, and an
 # UNSANCTIONED NOCOND(FOO) is NOT matched (so nobody invents a class the owner never ruled on).
 # Literal parens via bracket expressions [(] / [)] — NOT \( / \) — because awk's -v escape processing eats
 # a backslash before the regex sees it (the same double-escaping trap SIGNAL_RE already sidesteps this way).
-NOCOND_RE='NOCOND[(](MACRO|TEST|GUARD|CONTRACT|BENCH)[)]'
+NOCOND_RE='NOCOND[(](MACRO|TEST|GUARD|CONTRACT|BENCH|SECURITY-FAILCLOSED|WARN)[)]'
 
 scan() {
   awk -v pat="$SIGNAL_RE" -v marker="$MARKER" '
@@ -164,6 +184,12 @@ boundary() {   # boundary <file> <regex> <what>
 echo "gate-nocond: boundary handlers (rule 2 — nothing escapes to a thread's top level):"
 boundary src/dds-xport/udp.lisp   'handler-case \(funcall on-datagram' 'UDP + multicast receiver catches its sink'
 boundary src/dds-xport/shmem.lisp 'handler-case \(shmem-receive-drain' 'SHMEM receiver catches its drain'
+# SECURITY-FAILCLOSED (rule 2): a durability store's tamper/corruption refusal at store-open MUST be caught
+# at a durability start boundary and mapped to a ReturnCode_t (a non-zero process exit / a start status),
+# never unwound to the service's Lisp toplevel. The anchors are the *durability-error-hook* categories the
+# handlers log with — present iff the handler is.
+boundary src/dds-durability/runner.lisp ':runner-start-failed' 'durability runner catches a spec store-open tamper (SECURITY-FAILCLOSED)'
+boundary src/dds-durability/main.lisp   ':server-start-failed' 'durability server-mode catches its store-open tamper (SECURITY-FAILCLOSED)'
 
 [[ "$violations" -ne 0 ]] && { echo "gate-nocond: FAIL — see above." >&2; exit 1; }
 
@@ -222,6 +248,11 @@ cat > "$tmp/count-canary.lisp" <<'EOF'
 (defun* bench-harness ()
   (unless matched   ; NOCOND(BENCH): pure benchmark-harness precondition — the bench's own failure mechanism
     (error "nodes never matched")))
+(defun* store-open-failclosed ()
+  (unless mac-ok   ; NOCOND(SECURITY-FAILCLOSED): fail-closed tamper refusal at a store boundary
+    (error "chain MAC mismatch — refusing to open a tampered store")))
+(defun* diagnostic-hook ()
+  (warn "rate-limited operational diagnostic — does not unwind"))   ; NOCOND(WARN): non-unwinding diagnostic
 (defun* unsanctioned ()
   (unless x   ; NOCOND(FOO): an UNSANCTIONED class must STILL be counted (nobody invents a class)
     (error "should count")))
@@ -231,8 +262,8 @@ cn="$(count_file "$tmp/count-canary.lisp")"
 if [[ "$cn" -ne 2 ]]; then
   echo "gate-nocond: FAIL — self-test: the ratchet counter must count EXACTLY the 2 unexempt forms in the" >&2
   echo "             canary — the bare (counted) form AND the NOCOND(FOO) form (an UNSANCTIONED class is" >&2
-  echo "             NOT exempt). Skipped: 2 NOCOND(MACRO) + 1 TEST + 1 GUARD + 1 CONTRACT + 1 BENCH, and" >&2
-  echo "             2 in-file-test asserts (incl. the %run- form). Got ${cn}." >&2
+  echo "             NOT exempt). Skipped: 2 NOCOND(MACRO) + 1 TEST + 1 GUARD + 1 CONTRACT + 1 BENCH +" >&2
+  echo "             1 SECURITY-FAILCLOSED + 1 WARN, and 2 in-file-test asserts (incl. the %run- form). Got ${cn}." >&2
   echo "             Either the counter is blind, a marker is over-matching, or an unsanctioned NOCOND(FOO)" >&2
   echo "             was wrongly exempted — a green ratchet would prove NOTHING." >&2
   exit 1

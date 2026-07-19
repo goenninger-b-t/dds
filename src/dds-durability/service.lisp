@@ -37,7 +37,7 @@
   "Default *DURABILITY-ERROR-HOOK*: clockless rate-limited WARN to *ERROR-OUTPUT* when COUNT is
    a power of ten (1, 10, 100, …). Mirrors the shape of dds.disc::%default-sender-emit-error-hook."
   (when (%durability-error-count-p count)
-    (warn "dds.durability collect loop (~a) error #~d: ~a" context count condition))
+    (warn "dds.durability collect loop (~a) error #~d: ~a" context count condition))   ; NOCOND(WARN): rate-limited diagnostic; returns normally, no control transfer
   t)
 
 (defparameter *durability-error-hook* #'%default-durability-error-hook

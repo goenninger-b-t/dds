@@ -548,22 +548,30 @@
    BLOCKS until a signal, then microservice-server-stop (the clean §4.8 tcp-shutdown wake — no hang, no
    leak), logs 'MS-SERVER-STOPPED port=P ... stopped cleanly', and calls UIOP:QUIT 0. When NIL (in-process /
    testing): returns the running MICROSERVICE-SERVER for the caller to microservice-server-stop itself."
-  (let* ((inner (%make-server-inner inner-backend inner-dir))
-         (srv (make-microservice-server :host host :port port :inner inner
-                                        :max-connections max-connections :recv-timeout recv-timeout))
-         (bound (microservice-server-port srv)))
-    (format stream "~&MS-SERVER-LISTENING port=~d — durability microservice server listening (inner: ~(~a~) ~a, host ~a)~%"
-            bound inner-backend (uiop:ensure-directory-pathname inner-dir) host)
-    (force-output stream)
-    (if block
-        (let ((stop (list nil)))
-          (dds.pal:install-signal-handler '(:term :int) (lambda () (setf (car stop) t)))
-          (loop until (car stop) do (sleep 0.2))
-          (microservice-server-stop srv)
-          (format stream "~&MS-SERVER-STOPPED port=~d — durability microservice server stopped cleanly~%" bound)
-          (finish-output stream)
-          (uiop:quit 0))
-        srv)))
+  (let ((srv (handler-case
+                 (let ((inner (%make-server-inner inner-backend inner-dir)))
+                   (make-microservice-server :host host :port port :inner inner
+                                             :max-connections max-connections :recv-timeout recv-timeout))
+               (error (c)
+                 ;; SECURITY-FAILCLOSED boundary (ADR 0064 rule 2 / ADR 0045): a tamper/corruption refusal
+                 ;; at the server's inner store-open is CONTAINED here — logged via *DURABILITY-ERROR-HOOK*,
+                 ;; then fail closed (exit non-zero in operator/driver mode, NIL in-process). It never
+                 ;; unwinds to the Lisp toplevel. Only STARTUP is wrapped; the serve loop is unchanged.
+                 (ignore-errors (funcall *durability-error-hook* c :server-start-failed 1))
+                 (if block (uiop:quit 1) (return-from %run-microservice-server nil))))))
+    (let ((bound (microservice-server-port srv)))
+      (format stream "~&MS-SERVER-LISTENING port=~d — durability microservice server listening (inner: ~(~a~) ~a, host ~a)~%"
+              bound inner-backend (uiop:ensure-directory-pathname inner-dir) host)
+      (force-output stream)
+      (if block
+          (let ((stop (list nil)))
+            (dds.pal:install-signal-handler '(:term :int) (lambda () (setf (car stop) t)))
+            (loop until (car stop) do (sleep 0.2))
+            (microservice-server-stop srv)
+            (format stream "~&MS-SERVER-STOPPED port=~d — durability microservice server stopped cleanly~%" bound)
+            (finish-output stream)
+            (uiop:quit 0))
+          srv))))
 
 ;;; --- main entrypoint ---
 
@@ -585,6 +593,10 @@
    When BLOCK is T (subprocess body), installs a SIGTERM/SIGINT handler, polls a shutdown flag,
    then tears down in order (supervisor-stop -> runner-stop) and calls UIOP:QUIT 0.
    When NIL, returns (CONS runner sup).
+   FAIL-CLOSED START (ADR 0045/0064): if a spec fails to start — a tampered/corrupt store refusing to open
+   is the security case — RUNNER-START sheds that spec and returns :SERVICE-START-FAILED; the started specs
+   are then torn down (zeroizing their DEKs) and the process fails closed: UIOP:QUIT 1 (BLOCK T, the exit
+   code is the ReturnCode_t) or (VALUES (CONS runner sup) status) (BLOCK NIL).
 
    SERVICE PERSISTENCE BACKEND (semantics A, ADR 0050 §4.9): in the default SERVICE mode,
    --backend {file|sqlite|microservice} (env DDS_DURABILITY_BACKEND) selects the service's own persistence
@@ -627,7 +639,17 @@
                     (sup    (make-supervisor runner
                                             :max-restarts max-restarts
                                             :window-seconds window-seconds)))
-               (runner-start runner)
+               (multiple-value-bind (r start-status) (runner-start runner)
+                 (declare (ignore r))
+                 (when start-status
+                   ;; SECURITY-FAILCLOSED toplevel (ADR 0064/0045): a spec's store-open refused
+                   ;; (tamper/corruption). Tear the started specs down (join threads, close stores,
+                   ;; zeroize DEKs) and fail closed — the exit code IS the ReturnCode_t (mirrors
+                   ;; %durability-config-fail); nothing unwinds to the Lisp toplevel.
+                   (ignore-errors (runner-stop runner))
+                   (if block
+                       (uiop:quit 1)
+                       (return-from durability-service-main (values (cons runner sup) start-status)))))
                (supervisor-start sup)
                (if block
                    (progn

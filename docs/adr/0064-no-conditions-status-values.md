@@ -6,7 +6,7 @@
   parsers, and the FIVE exempt classes (below). **202** production signalling forms remain, ratcheted to
   zero by `make gate-nocond`.
 
-### The five sanctioned exempt classes (each gate-falsified in the canary; a class is documentation for the reader — the reviewer/owner validates the choice)
+### The seven sanctioned exempt classes (each gate-falsified in the canary; a class is documentation for the reader — the reviewer/owner validates the choice)
 
 | class | ruling | what it justifies |
 |---|---|---|
@@ -15,10 +15,13 @@
 | `NOCOND(GUARD)` | 2026-07-15 | a bounds/security check that CANNOT fire on valid input AND is contained at a named boundary (defense-in-depth) |
 | `NOCOND(CONTRACT)` | 2026-07-15 | a developer-contract poison value: a `defstruct` slot default signalling `dds.lang:contract-violation` when a REQUIRED initarg is omitted, or an unpopulated vtable-slot lambda invoked — fires only on wrong construction/use, a bug caught first test |
 | `NOCOND(BENCH)` | 2026-07-15 | a pure performance-benchmark-harness assertion (`src/dds-bench/`) — the bench's own failure mechanism, like a test assert; `dds-bench` IS our code (not wholesale-excluded like `dds-tests`) but is measurement scaffolding, not the DDS runtime |
+| `NOCOND(SECURITY-FAILCLOSED)` | 2026-07-19 | a fail-closed SECURITY tamper/corruption refusal at a durability STORE boundary (a broken authentication chain — log-MAC anchor, tail anchor, epochs.mac, per-topic chain MAC — or mid-file corruption detected while OPENING a persisted store; ADR 0045/0050). The UNWIND is the security property: a tamper signal is unforgeable, whereas a status a caller forgot to check would re-admit a tampered store. Contained at the durability start boundary (asserted in gate check B) and mapped to a `ReturnCode_t`; cannot fire on an authentic store. |
+| `NOCOND(WARN)` | 2026-07-19 | a `warn` DIAGNOSTIC that does not transfer control — `warn` prints and RETURNS, execution continues past it. Not a control-flow condition; logging that happens to use the condition system. Exempt only where no `handler-*` up the stack turns the warning into a non-local exit. |
 
-The gate matches the sanctioned five via one regex (`NOCOND[(](MACRO|TEST|GUARD|CONTRACT|BENCH)[)]`, literal
-parens via bracket expressions to dodge awk's `-v` backslash-eating); an **unsanctioned `NOCOND(FOO)` is
-NOT exempt** (the canary proves it still counts), so nobody invents a class the owner never ruled on.
+The gate matches the sanctioned seven via one regex
+(`NOCOND[(](MACRO|TEST|GUARD|CONTRACT|BENCH|SECURITY-FAILCLOSED|WARN)[)]`, literal parens via bracket
+expressions to dodge awk's `-v` backslash-eating); an **unsanctioned `NOCOND(FOO)` is NOT exempt** (the
+canary proves it still counts), so nobody invents a class the owner never ruled on.
 - **Date:** 2026-07-14
 - **Requirements:** FR-LANG-8 (full type contracts), NFR-SEC-POSTURE (a network-facing failure must not
   unwind a receiver thread), the operating contract §4 / §10
@@ -296,13 +299,61 @@ posture is preserved: the malformed-UTF-8 battery asserts a `:BAD-UTF8` status w
 condition, the over-cap-declared-length test asserts `:BAD-BODY-LENGTH`, and the server-survival +
 client-symmetric legs (a garbled response still surfaces `MICROSERVICE-STORE-ERROR`) are unchanged.
 
+## Slice — durability store tamper: two new classes + the durability start boundary (202 -> 181)
+
+The durability stores refuse to open a **tampered / corrupted** persisted store (a broken authentication
+chain or mid-file corruption; ADR 0045/0050) with a bare `error`. The owner ruled (2026-07-19) these
+**keep the unwind** — a tamper signal is *unforgeable*, whereas a status a caller forgot to check would
+re-admit a tampered store (the exact hazard this campaign caught twice: a dropped status re-admitted a
+short/tampered payload). So they become the sixth exempt class, `NOCOND(SECURITY-FAILCLOSED)`, on the
+strict condition that each is **contained at a boundary and mapped to a `ReturnCode_t`**. The `warn`
+operational diagnostics — which print and *return*, transferring no control — become the seventh,
+`NOCOND(WARN)`.
+
+The boundary did not exist. The durability service has no `ReturnCode_t` keyword: its failure idiom is
+OTP-style (`*durability-error-hook*` + supervisor crash/restart/shed) plus, at the process toplevel,
+`uiop:quit N` (the config-parser slice already established `%durability-config-fail` → `uiop:quit 1` as
+the process's ReturnCode). The **supervisor restart** path already caught `service-start` (`supervisor.lisp`),
+but the **initial-start** path (`durability-service-main` → `runner-start` → `service-start` → `store-open`)
+let a tamper unwind to the Lisp toplevel. This slice closes it, mirroring the two existing patterns:
+
+- **`runner-start` gains a per-spec boundary handler** and returns `(VALUES RUNNER STATUS)` — a tamper (or
+  any start failure) is caught, logged via `*durability-error-hook*`, the spec is **shed** (a
+  partially-started service is reclaimed with `service-stop`, zeroizing its DEKs), and `STATUS` becomes
+  `:SERVICE-START-FAILED`. Nothing escapes to the caller's thread.
+- **`durability-service-main`** checks that status: a non-NIL status tears the started specs down
+  (`runner-stop` — join + close + zeroize) and **fails closed with `uiop:quit 1`** (the exit code IS the
+  ReturnCode_t), or returns it in the in-process (`block NIL`) path.
+- **`%run-microservice-server`** wraps its startup (the DARE-blind inner store-open) in the same handler —
+  `:SERVER-START-FAILED` → `uiop:quit 1` / NIL. Only startup is wrapped; the serve loop is unchanged.
+- **Gate check B** now asserts both handlers exist (anchored on the `*durability-error-hook*` categories
+  `:runner-start-failed` / `:server-start-failed`), so a refactor cannot silently delete them.
+
+**21 sites annotated**: 17 `SECURITY-FAILCLOSED` (`store-encrypted` ×11, `store-sqlite` chain-break/mismatch/
+downgrade ×3, `store-file` mid-file-corruption + downgrade ×2, `store-microservice` reopen chain-MAC ×1
+— the guard deferred by the parser slice, decided here), 3 `WARN` (`store-encrypted`, `service`, `runner`),
+1 `TEST` (the microservice forced-spawn-failure simulator). No tamper site's code changed — they stay bare
+conditions; only their *containment* is now proven. **Deferred, values-conversions still owed** on this
+cluster: the two encrypted resource-exhaustion sites (epoch-id 2³² / nonce 2⁹⁶ → `:resource-limits`) and
+the construction/config preconditions (`store-sqlite` requires-path/kind, `store-file` v3-frame, `service`
+service-spec-shape, `runner` process-mode/argv0, `spec` ms-port).
+
+## Contract change in this slice — every consumer
+
+- **`runner-start`** `(function (service-runner) service-runner)` → `(function (service-runner) (values
+  service-runner (or null keyword)))`. The added second value is `NIL` on full success or
+  `:SERVICE-START-FAILED`. Sole non-test consumer: `durability-service-main` (`main.lisp`), updated to the
+  fail-closed exit above. A second value is ignored by any caller that does not `multiple-value-bind` it, so
+  the change is source-compatible for the in-image / test callers that treat the runner as before.
+
 ## Order of the remaining work (shallow → deep)
 
-**the durability store vtable — ONE ATOMIC SLICE, 74 sites across 8 files** (`store-microservice` 38,
-`store-encrypted` 14, `store-sqlite` 9, `store-file` 4, `service` 4, `runner` 3, `spec` 1, `main` 1). The
-backends all implement the SAME `durable-store` vtable, so converting one alone leaves the vtable with two
-contracts and does not build; `dds.pal:fsync-directory` (2 sites x 2 PALs, fail-closed on a failed dirent
-flush) belongs with it, since its 9 callers are these stores. Then `secure-sedp.lisp` (19) ·
+**the durability store vtable — the tamper refusals are now `SECURITY-FAILCLOSED` (contained at the start
+boundary); what remains is the VALUES conversions**: `store-microservice` `store-error`/`conn-lost` family
+(the bounded reconnect state machine last), the resource-exhaustion + construction/config preconditions
+listed above, and `dds.pal:fsync-directory` (2 sites × 2 PALs, fail-closed on a failed dirent flush; its 9
+callers are these stores). The backends migrate ONE AT A TIME — the vtable slots are closures, so a backend
+still returning one value reads as `(values result NIL)` = success. Then `secure-sedp.lisp` (19) ·
 **`dds-dare/primitives.lisp` (96) LAST** — the OpenSSL FFI failure chains are the biggest and deepest.
 
 **Convert ONE FILE at a time; update EVERY caller; re-run the suite after EACH file. Never batch.**

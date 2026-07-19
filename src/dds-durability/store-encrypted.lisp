@@ -23,7 +23,7 @@
     (function (t t (integer 1)) t)
   "Default *DARE-ERROR-HOOK*: power-of-ten rate-limited WARN (mirrors %default-durability-error-hook)."
   (when (%durability-error-count-p count)
-    (warn "dds.durability dare (~a) open-payload failure #~d: ~a" context count condition))
+    (warn "dds.durability dare (~a) open-payload failure #~d: ~a" context count condition))   ; NOCOND(WARN): rate-limited diagnostic; returns normally, no control transfer
   t)
 
 (eval-when (:load-toplevel :execute)
@@ -266,7 +266,7 @@
            (buf  (make-array size :element-type '(unsigned-byte 8))))
       (with-open-file (s path :element-type '(unsigned-byte 8) :direction :input)
         (read-sequence buf s))
-      (flet ((bad (why) (error "dds.durability: corrupt log-MAC anchor ~a (~a; ADR 0045 §3.2)" path why)))
+      (flet ((bad (why) (error "dds.durability: corrupt log-MAC anchor ~a (~a; ADR 0045 §3.2)" path why)))   ; NOCOND(SECURITY-FAILCLOSED): corrupt log-MAC anchor; fail-closed at store-open, caught at the durability start boundary
         (when (< size 13) (bad "truncated"))
         (unless (= (aref buf 0) +logmac-anchor-version+) (bad "version"))
         (let ((ctlen (%get-u32-le buf 1)))
@@ -339,6 +339,7 @@
    contents of epochs.dat — circular; ADR 0045 §7.2)."
   (multiple-value-bind (kem-ct gf-ids gf-mac signed) (%read-logmac-anchor dir)
     (unless kem-ct
+      ;; NOCOND(SECURITY-FAILCLOSED): anchor missing; fail-closed at store-open, caught at the durability start boundary
       (error "dds.durability: log-MAC anchor missing in ~a" dir))
     (let ((ss (dds.dare:key-provider-decapsulate key-provider kem-ct)))
       (multiple-value-bind (key mkey ekey)
@@ -350,6 +351,7 @@
           (dds.dare:free-secret-octets key)
           (dds.dare:free-secret-octets mkey)
           (dds.dare:free-secret-octets ekey)
+          ;; NOCOND(SECURITY-FAILCLOSED): grandfather-set MAC mismatch (tamper); fail-closed at store-open, caught at the durability start boundary
           (error "dds.durability: log-MAC anchor grandfather-set MAC mismatch in ~a ~
                   (tamper — refusing to open; ADR 0045 §3.2)" dir))
         (values key gf-ids mkey ekey)))))
@@ -452,7 +454,7 @@
            (buf  (make-array size :element-type '(unsigned-byte 8))))
       (with-open-file (s path :element-type '(unsigned-byte 8) :direction :input)
         (read-sequence buf s))
-      (flet ((bad (why) (error "dds.durability: corrupt tail anchor ~a (~a; ADR 0045 §7.1)" path why)))
+      (flet ((bad (why) (error "dds.durability: corrupt tail anchor ~a (~a; ADR 0045 §7.1)" path why)))   ; NOCOND(SECURITY-FAILCLOSED): corrupt tail anchor; fail-closed at store-open, caught at the durability start boundary
         (when (< size (+ 5 +frame-mac-len+ 4)) (bad "truncated"))
         (unless (= (aref buf 0) +logmac-tail-version+) (bad "version"))
         (let ((count (%get-u32-le buf 1))
@@ -518,12 +520,14 @@
     (unless signed
       (return-from %verify-tail-anchor t))
     (unless (equalp (%hmac-labeled logmac-key %logmac-tail-label signed) anchor-mac)
+      ;; NOCOND(SECURITY-FAILCLOSED): tail-anchor MAC mismatch (tamper); fail-closed at store-open, caught at the durability start boundary
       (error "dds.durability: tail anchor MAC mismatch in ~a (tamper — refusing to open; ADR 0045 §7.1)"
              dir))
     (dolist (e entries)
       (destructuring-bind (tid n . macv) e
         (let ((r (store-verify-chain-prefix inner-store tid n macv)))
           (unless (eq r t)
+            ;; NOCOND(SECURITY-FAILCLOSED): tail-anchor prefix-containment (truncation/rollback); fail-closed at store-open, caught at the durability start boundary
             (error "dds.durability: tail anchor prefix-containment FAILED for topic-id ~a (~a — whole-tail ~
                     truncation / whole-topic drop / whole-store rollback; refusing to open; ADR 0045 §7.1)"
                    tid r)))))
@@ -620,6 +624,7 @@
                (%truncate-file path last-valid))
              (return))
             (t
+             ;; NOCOND(SECURITY-FAILCLOSED): mid-file corruption; fail-closed at store-open, caught at the durability start boundary
              (error "dds.durability: mid-file corruption in ~a at offset ~d (last valid ~d; reason ~s)"
                     path pos last-valid reason)))))
       (when (and (zerop last-valid) (plusp size))
@@ -731,7 +736,7 @@
            (buf  (make-array size :element-type '(unsigned-byte 8))))
       (with-open-file (s path :element-type '(unsigned-byte 8) :direction :input)
         (read-sequence buf s))
-      (flet ((bad (why) (error "dds.durability: corrupt epochs MAC ~a (~a; ADR 0045 §7.2)" path why)))
+      (flet ((bad (why) (error "dds.durability: corrupt epochs MAC ~a (~a; ADR 0045 §7.2)" path why)))   ; NOCOND(SECURITY-FAILCLOSED): corrupt epochs MAC; fail-closed at store-open, caught at the durability start boundary
         ;; minimum = version(1) + count(4) + mac(32) + crc(4) = 41 (count may be 0)
         (when (< size (+ 5 +frame-mac-len+ 4)) (bad "truncated"))
         (unless (= (aref buf 0) +epochs-mac-version+) (bad "version"))
@@ -799,6 +804,7 @@
     (unless signed-stored
       (return-from %verify-epochs-mac t))
     (unless (equalp (%hmac-labeled epochs-mac-key %logmac-epochs-label signed-stored) mac-stored)
+      ;; NOCOND(SECURITY-FAILCLOSED): epochs.mac MAC mismatch (tamper); fail-closed at store-open, caught at the durability start boundary
       (error "dds.durability: epochs.mac MAC mismatch in ~a (tamper — refusing to open; ADR 0045 §7.2)" dir))
     (let* ((n     (%get-u32-le signed-stored 1))
            (table (%load-epoch-table dir)))
@@ -808,6 +814,7 @@
         ;; shrink, and would land here looking like an attack. Whoever hits this while implementing retirement
         ;; must rework the seal lifecycle (invalidate-before-shrink + re-seal at clean close, tail-anchor style)
         ;; — not weaken this check.
+        ;; NOCOND(SECURITY-FAILCLOSED): epochs.mac prefix-containment (:truncated rollback); fail-closed at store-open, caught at the durability start boundary
         (error "dds.durability: epochs.mac prefix-containment FAILED in ~a (:truncated — the table has ~d ~
                 epochs but ~d were sealed; refusing to open; ADR 0045 §7.2). This is rollback/truncation ~
                 tampering UNLESS you are implementing the epoch-table-RETIREMENT follow-on: retirement is an ~
@@ -819,6 +826,7 @@
              (prefix     (subseq sorted 0 n))
              (recomputed (%assemble-epochs-signed prefix)))
         (unless (equalp recomputed signed-stored)
+          ;; NOCOND(SECURITY-FAILCLOSED): epochs.mac prefix-containment (:diverged ct-tamper); fail-closed at store-open, caught at the durability start boundary
           (error "dds.durability: epochs.mac prefix-containment FAILED in ~a (:diverged — ct-tamper/reorder ~
                   within the committed prefix; refusing to open; ADR 0045 §7.2)" dir))))
     t))

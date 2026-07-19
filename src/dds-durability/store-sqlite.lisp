@@ -127,13 +127,16 @@
   (multiple-value-bind (chained running reason nrows) (%sqlite-chain-walk db topic fn nil)
     (case reason
       (:break
+       ;; NOCOND(SECURITY-FAILCLOSED): SQLite MAC chain break (tamper); fail-closed at store-open, caught at the durability start boundary
        (error "dds.durability: SQLite MAC chain break in topic ~a — unchained row after a ~
                chained row (tamper — refusing to open; ADR 0045)" topic))
       (:mismatch
+       ;; NOCOND(SECURITY-FAILCLOSED): SQLite chain MAC mismatch (tamper); fail-closed at store-open, caught at the durability start boundary
        (error "dds.durability: SQLite chain MAC mismatch in topic ~a ~
                (tamper — refusing to open; ADR 0045)" topic)))
     (when (and required (plusp nrows) (zerop chained)
                (not (and grandfather (gethash (%topic->id topic) grandfather))))
+      ;; NOCOND(SECURITY-FAILCLOSED): SQLite v3->v2 downgrade (tamper); fail-closed at store-open, caught at the durability start boundary
       (error "dds.durability: SQLite chain-required topic ~a has ~d row(s) but ZERO chained rows — ~
               refusing to open (full v3->v2 downgrade / tamper; ADR 0045 §3.2)" topic nrows))
     (and (plusp chained) running)))

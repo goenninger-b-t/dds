@@ -541,6 +541,7 @@
            (return))
           ;; :corrupt → full frame bytes present but magic/kind/CRC/MAC invalid; fail loud
           (t
+           ;; NOCOND(SECURITY-FAILCLOSED): mid-file corruption; fail-closed at store-open, caught at the durability start boundary
            (error "dds.durability: mid-file corruption in ~a at offset ~d (last valid ~d; reason ~s)"
                   path pos last-valid reason)))))
     (when (and (zerop last-valid) (plusp size))
@@ -550,6 +551,7 @@
     ;; frame has been rolled back to keyless v2 — refuse the open (like a mid-log chain break), and
     ;; do it HERE so the caller's compaction rewrite can never launder the tampered set into a fresh chain.
     (when (and chain-required records (not started))
+      ;; NOCOND(SECURITY-FAILCLOSED): file v3->v2 downgrade (tamper); fail-closed at store-open, caught at the durability start boundary
       (error "dds.durability: chain-required log ~a has ~d record(s) but NO v3 chain frame — ~
               refusing to open (full v3->v2 downgrade / tamper; ADR 0045 §3.2)"
              path (length records)))

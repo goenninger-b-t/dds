@@ -114,34 +114,46 @@
   t)
 
 (defun* runner-start (runner)
-    (function (service-runner) service-runner)
+    (function (service-runner) (values service-runner (or null keyword)))
   "Instantiate and start a DURABILITY-SERVICE for each spec in RUNNER.
    :THREAD mode: service runs in-image (ADR 0021 cap. 1).
    :PROCESS mode: subprocess launched via UIOP:LAUNCH-PROGRAM of this Lisp invoking
    DURABILITY-SERVICE-MAIN with %SPEC->ARGV CLI args; a monitor thread tracks liveness
    (ADR 0021 cap. 5).
    Concurrent or double-start is a no-op: the second call returns the runner unchanged.
-   After runner-stop, the runner may be runner-started again (started flag is reset)."
+   After runner-stop, the runner may be runner-started again (started flag is reset).
+   Returns (VALUES RUNNER STATUS): STATUS is NIL on full success, or :SERVICE-START-FAILED if one or
+   more specs failed to start. A tamper/corruption refusal at store-open (ADR 0045, a SECURITY-FAILCLOSED
+   signal) — or any other per-spec start failure — is CAUGHT at this boundary (ADR 0064 rule 2: nothing
+   escapes to the caller's thread), logged via *DURABILITY-ERROR-HOOK*, and the offending spec is SHED
+   (not installed); the surviving specs run. The toplevel (DURABILITY-SERVICE-MAIN) maps a non-NIL STATUS
+   to a fail-closed non-zero process exit."
   (let ((already nil))
     (dds.pal:with-lock ((service-runner-lock runner))
       (if (service-runner-started runner)
           (setf already t)
           (setf (service-runner-started runner) t)))
     (when already
-      (warn "dds.durability runner: runner-start called on an already-started runner; ignoring.")
-      (return-from runner-start runner)))
-  ;; Build and start services outside the lock (service-start spawns threads — slow).
-  (let ((svcs '()))
+      (warn "dds.durability runner: runner-start called on an already-started runner; ignoring.")   ; NOCOND(WARN): non-unwinding diagnostic; the runner is returned unchanged
+      (return-from runner-start (values runner nil))))
+  ;; Build and start services outside the lock (service-start spawns threads — slow). Each spec's start
+  ;; is wrapped so a store-open tamper (or any start error) is contained here, not unwound to the caller.
+  (let ((svcs '()) (failed nil))
     (dolist (spec (service-runner-specs runner))
-      (let ((svc (if (eq (service-spec-mode spec) :process)
-                     (%start-process-service spec)
-                     (let ((s (make-durability-service spec)))
-                       (service-start s)
-                       s))))
-        (push svc svcs)))
+      (if (eq (service-spec-mode spec) :process)
+          (handler-case (push (%start-process-service spec) svcs)
+            (error (c)
+              (setf failed t)
+              (ignore-errors (funcall *durability-error-hook* c :runner-start-failed 1))))
+          (let ((s (make-durability-service spec)))
+            (handler-case (progn (service-start s) (push s svcs))
+              (error (c)
+                (setf failed t)
+                (ignore-errors (service-stop s))   ; reclaim a partially-started svc: close store, zeroize DEKs
+                (ignore-errors (funcall *durability-error-hook* c :runner-start-failed 1)))))))
     (dds.pal:with-lock ((service-runner-lock runner))
-      (setf (service-runner-services runner) (nreverse svcs))))
-  runner)
+      (setf (service-runner-services runner) (nreverse svcs)))
+    (values runner (when failed :service-start-failed))))
 
 (defun* %runner-stop-service (svc)
     (function (durability-service) t)
