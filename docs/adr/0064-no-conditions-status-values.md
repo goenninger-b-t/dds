@@ -502,6 +502,28 @@ Neither is a status conversion — both are already-sanctioned exempt classes:
   never fires in correct code, so a threaded status would be pure churn with no runtime path reaching it (this
   is the GUARD carve-out's purpose — an internal cannot-fire invariant, contained under store-open/store-put).
 
+## Slice — the store-open contract widens to `(values t status)` (156 -> 153)
+
+`store-open` now returns `(values (or null (eql t)) (or null keyword))`. A NON-tamper open failure is a STATUS;
+a genuine TAMPER / corruption refusal still fails CLOSED as a `SECURITY-FAILCLOSED` unwind (ADR 0045, caught at
+runner-start) — an unforgeable refusal must never be re-admittable by a forgotten status check. This clears the
+three remaining microservice open-path signals and unblocks the fsync-PAL slice (its open-path callers land here):
+
+- **`%ms-encode-open`** history-depth-over-u32 → `(bail :history-depth-too-big)` (a config precondition on the depth).
+- **`%ms-open`** server-down / conn-lost-during-open → `(bail :unavailable)` (the former `microservice-store-error`
+  open-fail signal is GONE); it now returns `(values t status)`.
+- The microservice **`:open` closure** threads `%ms-open`'s status and the open-time chain-verify status
+  (`%ms-topics-list` / `%ms-get-range-verified`) — the former open-verify re-signal is now a returned status; a
+  chain-MAC TAMPER still SIGNALS from `%ms-verify-chain` (SECURITY-FAILCLOSED).
+
+Ripple: the **encrypted epoch decorator's `:open`** captures its inner `store-open` status and propagates a
+non-NIL one (`return-from enc-open`) — for a local file/SQLite inner this is always `NIL` (their failures are
+tamper signals), so the local tiers are byte-identical; only a microservice inner produces a status. **service-start**
+(the top-level durability entry, already `(values service status)`) checks the store-open status and returns it on
+its contract, so runner-start maps it to a ReturnCode and sheds (same path as the `%service-topics` reject). The
+memory / file / SQLite `:open` closures are UNCHANGED (they return `t` = `(values t nil)`), and the microservice
+SERVER's `(store-open inner …)` is unchanged (its inner is a local store — never a status, only a tamper signal).
+
 ## Order of the remaining work (shallow → deep)
 
 **the durability store vtable — the tamper refusals are now `SECURITY-FAILCLOSED` (contained at the start

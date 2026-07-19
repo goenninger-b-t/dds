@@ -156,17 +156,23 @@
 (declaim (ftype (function (durable-store &optional
                                           (or null (member :keep-all :keep-last))
                                           (or null (integer 1)))
-                          t)
+                          (values (or null (eql t)) (or null keyword)))
                 store-open))
 (defun* store-open (store &optional history-kind history-depth)
     (function (durable-store &optional
                (or null (member :keep-all :keep-last)) (or null (integer 1)))
-              t)
+              (values (or null (eql t)) (or null keyword)))
   "Open STORE; HISTORY-KIND and HISTORY-DEPTH override the factory default when non-NIL.
    A non-NIL HISTORY-DEPTH must be a positive integer (>= 1); NIL defers to the store factory default.
    The in-memory backend stashes the overrides for future per-instance eviction.
    The file backend applies the effective policy at compaction-on-open (DDS 1.4 §2.2.3.5).
-   The encrypted backend delegates to the inner store. Returns T."
+   The encrypted backend delegates to the inner store. Returns (VALUES T STATUS): STATUS is NIL on a clean
+   open, or a keyword when a REMOTE backend's open FAILED for a NON-tamper reason (ADR 0064 Slice-2/store-open
+   contract: the microservice tier's server-down / connection-dropped-during-open [:UNAVAILABLE] or a
+   history-depth exceeding the wire u32 [:HISTORY-DEPTH-TOO-BIG] — an op-failure status VALUE, never an
+   unwind; the local backends return (VALUES T NIL)). A genuine TAMPER / corruption refusal still fails
+   CLOSED as a SECURITY-FAILCLOSED unwind (ADR 0045, caught at the durability start boundary / runner-start),
+   NOT a status — an unforgeable refusal must never be re-admittable by a forgotten status check."
   (declare (type durable-store store)
            (type (or null (member :keep-all :keep-last)) history-kind)
            (type (or null (integer 1)) history-depth))

@@ -121,7 +121,7 @@ Load it by depending on `:dds-durability` in your system.
 (dds.durability:store-topics store)            ; → (values list-of-topic-strings status)
 (dds.durability:store-purge  store topic)      ; → T | :UNAVAILABLE
 (dds.durability:store-count  store &optional topic)  ; → (values (integer 0) status)
-(dds.durability:store-open   store &optional history-kind history-depth)  ; → T
+(dds.durability:store-open   store &optional history-kind history-depth)  ; → (values t status)
 (dds.durability:store-close  store)            ; → T
 ```
 
@@ -132,10 +132,12 @@ slots in by replacing the function slots (Phase 2/3 follow-up).
 **Op-failure status (ADR 0064 Slice-2 vtable widening).** A REMOTE backend (the microservice tier) that
 cannot complete an operation returns an op-failure STATUS instead of signalling — `:UNAVAILABLE` on the
 PRIMARY value of `store-put`/`store-delete`/`store-purge` (additive, like `:RESOURCE-LIMITS`), and a 2nd
-`(or null keyword)` value on the read ops `store-get-range`/`store-topics`/`store-count` (a caller taking
-only the primary reads an empty list / `0` on failure). LOCAL backends (memory / file / SQLite) always
-succeed or return `T`/data with a `NIL` status — byte-identical. A genuine chain-MAC tamper still fails
-CLOSED at store-open (a `SECURITY-FAILCLOSED` unwind, ADR 0045), never a status.
+`(or null keyword)` value on the read ops `store-get-range`/`store-topics`/`store-count` and on **`store-open`**
+(a NON-tamper open failure — a microservice tier's server-down `:UNAVAILABLE` / `:HISTORY-DEPTH-TOO-BIG` —
+surfaced to `service-start`'s `(values service status)` contract, mapped to a ReturnCode at runner-start). A
+caller taking only the primary reads an empty list / `0` / `NIL` on failure. LOCAL backends (memory / file /
+SQLite) always succeed or return `T`/data with a `NIL` status — byte-identical. A genuine chain-MAC tamper
+still fails CLOSED at store-open (a `SECURITY-FAILCLOSED` unwind, ADR 0045), never a status.
 
 `store-open` accepts optional `history-kind` (`:keep-all` | `:keep-last`) and `history-depth`
 (positive integer) arguments. When supplied they override the store's factory-time defaults

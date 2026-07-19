@@ -1382,6 +1382,7 @@
        :open
        (lambda (history-kind history-depth)
          (dds.pal:with-lock (lock)
+           (block enc-open
            ;; defensive: a re-open must not leak prior-run secrets (idempotent on empty/NIL); §6
            (%free-epoch-dek-map dek-map)
            (setf current-epoch nil)
@@ -1419,28 +1420,34 @@
            ;;    at replay via key-absent, never opening as bogus migration.)
            ;; 3c: the inner store is ALWAYS opened KEEP_ALL (it cannot order/interpret the hashed
            ;; surrogates); the decorator applies eff-hk/eff-hd at get-range post-decrypt.
-           (if (probe-file (%logmac-anchor-path epoch-dir))
-               (multiple-value-bind (key gf-ids mkey ekey)
-                   (progn
-                     (dds.dare:key-provider-open key-provider)
-                     (%load-logmac-anchor key-provider epoch-dir))
-                 (setf logmac-key     key)
-                 (setf meta-key       mkey)
-                 (setf epochs-mac-key ekey)   ; ADR 0045 §7.2: k_epochs for the epochs.dat MAC verify below
-                 (%install-logmac-oracle inner-store key gf-ids)
-                 ;; sealed high-water tail anchor (ADR 0045 §7.1): VERIFY the at-rest sealed state (detect
-                 ;; an OFFLINE truncation / whole-topic drop / rollback) BEFORE store-open, then INVALIDATE
-                 ;; the anchor BEFORE store-open's compaction sweep + this session's puts AUTHORIZED-SHRINK
-                 ;; the log — so an authorized shrink + a crash (no clean re-seal) leaves NO stale anchor to
-                 ;; FALSE-REJECT (the store reopens clean; re-sealed at the next clean close over the final
-                 ;; state). Verify FIRST keeps detection; invalidate SECOND kills the reclaim-crash brick.
-                 (%verify-tail-anchor inner-store epoch-dir key)
-                 (unless *durability-debug-skip-tail-invalidate*
-                   (%invalidate-tail-anchor epoch-dir))
-                 (store-open inner-store :keep-all nil))
-               (progn
-                 (store-open inner-store :keep-all nil)
-                 (dds.dare:key-provider-open key-provider)))
+           ;; ADR 0064 store-open contract: capture the inner store-open STATUS. A NON-tamper open failure (a
+           ;; microservice inner's server-down / conn-lost, :UNAVAILABLE) propagates as THIS decorator's
+           ;; store-open status; a local file/SQLite inner always returns (values t nil) here (its failures are
+           ;; tamper SECURITY-FAILCLOSED signals), so the local tiers are byte-identical.
+           (let ((inner-status
+                  (if (probe-file (%logmac-anchor-path epoch-dir))
+                      (multiple-value-bind (key gf-ids mkey ekey)
+                          (progn
+                            (dds.dare:key-provider-open key-provider)
+                            (%load-logmac-anchor key-provider epoch-dir))
+                        (setf logmac-key     key)
+                        (setf meta-key       mkey)
+                        (setf epochs-mac-key ekey)   ; ADR 0045 §7.2: k_epochs for the epochs.dat MAC verify below
+                        (%install-logmac-oracle inner-store key gf-ids)
+                        ;; sealed high-water tail anchor (ADR 0045 §7.1): VERIFY the at-rest sealed state (detect
+                        ;; an OFFLINE truncation / whole-topic drop / rollback) BEFORE store-open, then INVALIDATE
+                        ;; the anchor BEFORE store-open's compaction sweep + this session's puts AUTHORIZED-SHRINK
+                        ;; the log — so an authorized shrink + a crash (no clean re-seal) leaves NO stale anchor to
+                        ;; FALSE-REJECT (the store reopens clean; re-sealed at the next clean close over the final
+                        ;; state). Verify FIRST keeps detection; invalidate SECOND kills the reclaim-crash brick.
+                        (%verify-tail-anchor inner-store epoch-dir key)
+                        (unless *durability-debug-skip-tail-invalidate*
+                          (%invalidate-tail-anchor epoch-dir))
+                        (nth-value 1 (store-open inner-store :keep-all nil)))
+                      (multiple-value-prog1
+                          (nth-value 1 (store-open inner-store :keep-all nil))
+                        (dds.dare:key-provider-open key-provider)))))
+             (when inner-status (return-from enc-open (values nil inner-status))))
            ;; re-derive every persisted epoch's DEK; current stays NIL until the first put
            (setf max-epoch-id (%load-epoch-deks key-provider epoch-dir dek-map))
            ;; sealed epochs.dat MAC (ADR 0045 §7.2): VERIFY the DARE per-epoch kem-ct table by prefix-
@@ -1456,7 +1463,7 @@
            ;; surviving newest-D so post-restart online eviction is correct (cross-restart == continuously-
            ;; open). No-op for :keep-all or a not-yet-chained (meta-key NIL) store; ADR 0025 §10.3.
            (%open-sweep)
-           t))
+           (values t nil))))
        :close
        (lambda ()
          (dds.pal:with-lock (lock)

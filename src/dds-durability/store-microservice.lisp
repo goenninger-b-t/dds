@@ -452,17 +452,19 @@
 
 (defun* %ms-encode-open (history-kind history-depth)
     (function ((or null (member :keep-all :keep-last)) (or null (integer 1)))
-              (simple-array (unsigned-byte 8) (*)))
-  "Encode an open op payload: u8 history-kind code + u32 depth (0 = NIL, defer to factory default)."
+              (values (or null (simple-array (unsigned-byte 8) (*))) (or null keyword)))
+  "Encode an open op payload: u8 history-kind code + u32 depth (0 = NIL, defer to factory default).
+   Returns (VALUES PAYLOAD NIL), or (VALUES NIL :HISTORY-DEPTH-TOO-BIG) when HISTORY-DEPTH exceeds the wire
+   u32 (ADR 0064 store-open contract: a config precondition on the depth is a status, not an unwind)."
   (let ((b (%ms-buf))
         (hk (ecase history-kind
               ((nil) +ms-hk-nil+) (:keep-all +ms-hk-keep-all+) (:keep-last +ms-hk-keep-last+)))
         (depth (or history-depth 0)))
     (when (> depth #xFFFFFFFF)
-      (error 'microservice-protocol-error :detail "history-depth exceeds u32"))
+      (bail :history-depth-too-big))
     (%ms-put-u8 b hk)
     (%ms-put-u32 b depth)
-    (%ms-finalize b)))
+    (values (%ms-finalize b) nil)))
 
 (defun* %ms-encode-delete (topic writer-guid sn)
     (function (string (simple-array (unsigned-byte 8) (16)) (integer 0))
@@ -721,22 +723,26 @@
 
 (defun* %ms-open (conn lock history-kind history-depth)
     (function (ms-conn t (or null (member :keep-all :keep-last)) (or null (integer 1)))
-              (eql t))
-  "store-open: connect-on-demand to CONN's HOST:PORT (%ms-ensure-connected) and drive the inner store's
-   open with the effective history policy. A dropped connection surfaces as a clean MICROSERVICE-CONN-LOST
-   (a MICROSERVICE-STORE-ERROR subtype); mid-session reconnect is %ms-call's bounded path (the post-restart
-   op that reconnects goes through %ms-call, not a re-open)."
+              (values (or null (eql t)) (or null keyword)))
+  "store-open: connect-on-demand to CONN's HOST:PORT (%ms-ensure-connected) and drive the inner store's open
+   with the effective history policy. Returns (VALUES T STATUS): STATUS is NIL on a clean open, :UNAVAILABLE
+   when the connect / open exchange failed against a down server (ADR 0064 store-open contract — a status
+   VALUE, never a MICROSERVICE-STORE-ERROR unwind; the former open-fail signal is gone), or
+   :HISTORY-DEPTH-TOO-BIG when the depth exceeds the wire u32. Mid-session reconnect is %ms-call's bounded
+   path (the post-restart op that reconnects goes through %ms-call, not a re-open)."
   (dds.pal:with-lock (lock)
     (setf (ms-conn-closed-p conn) nil)              ; store-open (re-)opens — clear any prior terminal close
-    (%ms-ensure-connected conn)
-    (multiple-value-bind (reader status)
-        (%ms-exchange (ms-conn-sock conn) +ms-op-open+ (%ms-encode-open history-kind history-depth))
-      (declare (ignore reader))
-      ;; store-open failure (conn-lost / server-error during open) stays a store-error SIGNAL, caught at the
-      ;; durability start boundary (runner-start) — the store-open-is-boundary-caught model (tamper parity).
-      (when status
-        (error 'microservice-store-error :detail (format nil "microservice open failed: ~a" status))))
-    t))
+    (multiple-value-bind (ok cstatus) (%ms-ensure-connected conn)
+      (declare (ignore ok))
+      (when cstatus (bail :unavailable)))           ; first connect failed (server down): clean status
+    (let ((payload (try (%ms-encode-open history-kind history-depth))))   ; bails :history-depth-too-big
+      (multiple-value-bind (reader status)
+          (%ms-exchange (ms-conn-sock conn) +ms-op-open+ payload)
+        (declare (ignore reader))
+        ;; conn-lost / server-error during open -> a clean op-failure status (ADR 0064), surfaced by the
+        ;; :open closure to store-open -> service-start -> runner-start (which maps it to a ReturnCode).
+        (when status (bail :unavailable)))))
+  (values t nil))
 
 (defun* %ms-close (conn lock)
     (function (ms-conn t) (eql t))
@@ -916,31 +922,29 @@
                       (declare (ignore result))
                       (if status :unavailable t)))))
      :open (lambda (history-kind history-depth)
-             (%ms-open conn lock history-kind history-depth)
-             ;; fail-closed-on-OPEN parity (file/SQLite verify EVERY topic at store-open, before any read):
-             ;; with the oracle installed (the decorator installs it BEFORE store-open), get-range-verify
-             ;; each topic — a dropped/reordered/tampered chain FAILS THE OPEN loudly. A WHOLE dropped topic
-             ;; is now caught EARLIER by the decorator's sealed high-water tail anchor (the :verify-chain-
-             ;; prefix-fn seam, run BEFORE this store-open over the client-trusted sealed topic-SET; ADR 0045
-             ;; §7.1) — it no longer depends on this server-provided topic list (closes the ADR 0050 §4.3 gap).
-             ;; ADR 0064 Slice-2: %ms-topics-list / %ms-get-range-verified now return an op-failure STATUS
-             ;; instead of an unwind. A verify that cannot reach the server must FAIL THE OPEN (never silently
-             ;; skip verification — that is a fail-OPEN regression). store-open stays boundary-signalled
-             ;; (%ms-open at 739, caught at runner-start; the store-open contract widening is a later slice), so
-             ;; re-signal MICROSERVICE-STORE-ERROR here. A genuine chain-MAC TAMPER still SIGNALS directly from
-             ;; %ms-verify-chain (SECURITY-FAILCLOSED); this covers only the conn-lost/protocol case.
-             (when chain-mac-fn
-               (flet ((open-verify-fail (s)
-                        (error 'microservice-store-error
-                               :detail (format nil "microservice open verify failed: ~a" s))))
-                 (multiple-value-bind (tps tstatus) (%ms-topics-list conn lock)
-                   (when tstatus (open-verify-fail tstatus))
-                   (dolist (tp tps)
-                     (multiple-value-bind (recs gstatus)
-                         (%ms-get-range-verified conn lock tp chain-mac-fn chain-macs chain-seqs put-index)
-                       (declare (ignore recs))
-                       (when gstatus (open-verify-fail gstatus)))))))
-             t)
+             ;; ADR 0064 store-open contract: %ms-open returns (VALUES T STATUS) — a NON-tamper open failure
+             ;; (server down / conn-lost during open / history-depth overflow) is a STATUS surfaced to
+             ;; store-open -> service-start -> runner-start, never an unwind.
+             (block ms-store-open
+               (multiple-value-bind (ok ostatus) (%ms-open conn lock history-kind history-depth)
+                 (declare (ignore ok))
+                 (when ostatus (return-from ms-store-open (values nil ostatus)))
+                 ;; fail-closed-on-OPEN parity (file/SQLite verify EVERY topic at store-open, before any read):
+                 ;; with the oracle installed (the decorator installs it BEFORE store-open), get-range-verify
+                 ;; each topic — a dropped/reordered/tampered chain FAILS THE OPEN. A WHOLE dropped topic is
+                 ;; caught EARLIER by the decorator's sealed high-water tail anchor (ADR 0045 §7.1). A verify
+                 ;; that cannot reach the server must FAIL THE OPEN (a silent skip is a fail-OPEN regression);
+                 ;; ADR 0064: it now returns the op-failure STATUS to store-open (was a re-signal). A genuine
+                 ;; chain-MAC TAMPER still SIGNALS directly from %ms-verify-chain (SECURITY-FAILCLOSED).
+                 (when chain-mac-fn
+                   (multiple-value-bind (tps tstatus) (%ms-topics-list conn lock)
+                     (when tstatus (return-from ms-store-open (values nil tstatus)))
+                     (dolist (tp tps)
+                       (multiple-value-bind (recs gstatus)
+                           (%ms-get-range-verified conn lock tp chain-mac-fn chain-macs chain-seqs put-index)
+                         (declare (ignore recs))
+                         (when gstatus (return-from ms-store-open (values nil gstatus)))))))
+                 (values t nil))))
      :close (lambda () (%ms-close conn lock))
      :count-fn (lambda (topic)
                  ;; ADR 0064 Slice-2: fold %ms-call's op-failure STATUS into store-count's (VALUES 0

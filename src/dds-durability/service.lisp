@@ -467,9 +467,17 @@
     ;; open the store: for file-backed tiers this replays logs + re-derives epoch DEKs;
     ;; pass the DURABILITY_SERVICE history QoS from the spec so service-spec is the single
     ;; functional source of compaction policy (DDS 1.4 §2.2.3.5, ADR 0029).
-    (store-open (durability-service-store service)
-                (service-spec-history-kind spec)
-                (service-spec-history-depth spec))
+    ;; ADR 0064 store-open contract: a NON-tamper open failure (a microservice tier's server-down,
+    ;; :UNAVAILABLE / :HISTORY-DEPTH-TOO-BIG) is a STATUS — surface it on service-start's (values service
+    ;; status) contract (same shape as the %service-topics reject above); runner-start maps it to a
+    ;; ReturnCode + sheds. A genuine TAMPER still fails CLOSED as a SECURITY-FAILCLOSED signal past here,
+    ;; caught at runner-start (unchanged).
+    (multiple-value-bind (ok ostatus)
+        (store-open (durability-service-store service)
+                    (service-spec-history-kind spec)
+                    (service-spec-history-depth spec))
+      (declare (ignore ok))
+      (when ostatus (return-from service-start (values service ostatus))))
     (dds.pal:with-lock ((durability-service-lock service))
       (setf (durability-service-running service) t)
       ;; register all initial topic names so service-add-topic idempotency check covers them

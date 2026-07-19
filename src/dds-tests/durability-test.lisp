@@ -9595,13 +9595,17 @@
                   "the cap (2) is filled by connections A + B")
           ;; C is over the cap: the server accepts then closes it, so C's store-open fails cleanly (bounded)
           (%check :ms-cap-reject
+                  ;; ADR 0064 store-open contract: the over-cap connection (server accepts then closes it)
+                  ;; makes store-open return (VALUES NIL :UNAVAILABLE) — an op-failure status, not a signal;
+                  ;; a raw error would be a bug (-> NIL, failing the check).
                   (handler-case
                       (let ((c (dds.durability:make-microservice-store :host "127.0.0.1" :port port :recv-timeout 5)))
-                        (dds.durability:store-open c)
-                        (dds.durability:store-count c "x")   ; force a round-trip if open somehow slipped through
-                        nil)
-                    (error () t))
-                  "a connection past the cap is REJECTED — its op signals cleanly (no unbounded thread growth)")
+                        (if (nth-value 1 (dds.durability:store-open c))
+                            t
+                            ;; open slipped through: force a round-trip — it too must return a status
+                            (if (nth-value 1 (dds.durability:store-count c "x")) t nil)))
+                    (error () nil))
+                  "a connection past the cap is REJECTED — its op returns a clean op-failure status (no unbounded thread growth)")
           (%check :ms-cap-still-2 (= 2 (%tms-live-conns srv))
                   "the rejected connection did NOT add a registry slot (still 2 live)")
           ;; existing connection A keeps working while the cap is full
