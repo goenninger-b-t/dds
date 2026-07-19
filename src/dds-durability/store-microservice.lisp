@@ -630,20 +630,21 @@
       (%ms-recv-body sock body-len))))
 
 (defun* %ms-exchange (sock code payload)
-    (function (t (unsigned-byte 8) (simple-array (unsigned-byte 8) (*))) ms-reader)
-  "Send request (CODE + PAYLOAD) on SOCK, read the response, verify status ok, and return an ms-reader
-   positioned just after the status byte (at the op result). A DROPPED connection — a failed send
-   (tcp-send returns :SEND-FAILED on a torn socket) OR a server-closed read (%ms-recv-message :EOF) OR a
-   STALLED server (:TIMEOUT — it never answered within the armed recv timeout, so a malicious/half-open
-   server can never hang us; WP-DURABILITY-MS-DOS, ADR 0050 §4.6) — is translated to MICROSERVICE-CONN-LOST
-   so %ms-call attempts one bounded reconnect. A non-ok STATUS BYTE is a legit server rejection, NOT a drop,
-   so it stays MICROSERVICE-STORE-ERROR (never retried). Caller holds the store lock."
+    (function (t (unsigned-byte 8) (simple-array (unsigned-byte 8) (*)))
+              (values (or null ms-reader) (or null keyword)))
+  "Send request (CODE + PAYLOAD) on SOCK, read the response, verify status ok, and return
+   (VALUES MS-READER STATUS): the reader positioned just after the status byte (at the op result), or
+   (VALUES NIL STATUS) on failure (ADR 0064 — a status value, never a signal). A DROPPED connection —
+   a failed send (tcp-send returns :SEND-FAILED on a torn socket) OR a server-closed read
+   (%ms-recv-message :EOF) OR a STALLED server (:TIMEOUT — it never answered within the armed recv timeout,
+   so a malicious/half-open server can never hang us; WP-DURABILITY-MS-DOS, ADR 0050 §4.6) — is returned as
+   :CONN-LOST so %ms-call attempts one bounded reconnect. A non-ok STATUS BYTE is a legit server rejection,
+   NOT a drop, so it is :SERVER-ERROR (never retried). Caller holds the store lock."
   (let ((msg (%ms-frame-message code payload)))
     (multiple-value-bind (sent status) (dds.pal:tcp-send sock msg (length msg))
       (declare (ignore sent))
       (when status
-        (error 'microservice-conn-lost
-               :detail (format nil "send failed (connection dropped): ~a" status))))
+        (bail :conn-lost)))                       ; send failed: connection dropped -> %ms-call reconnects (ADR 0064)
     ;; test-only: simulate a server-APPLIED-but-ack-LOST drop of the targeted op (the send reached the server
     ;; + it applied the op; the client never ADVANCES its state because DECODE-FN doesn't run). Scoped to
     ;; *durability-debug-ms-force-recv-drop-op* so a store-open enumerate / re-sync get-range on the same
@@ -651,20 +652,20 @@
     (when (and (plusp *durability-debug-ms-force-recv-drop*) (= code *durability-debug-ms-force-recv-drop-op*))
       (decf *durability-debug-ms-force-recv-drop*)
       (%ms-recv-message sock)
-      (error 'microservice-conn-lost :detail "forced post-send recv drop (test-only)"))
+      (bail :conn-lost))                           ; forced post-send recv drop (test-only)
     ;; a stalled server that never responds trips the socket's armed recv timeout -> tcp-recv returns
     ;; :TIMEOUT; translate it to conn-lost so %ms-call takes the bounded reconnect path (a malicious/
     ;; half-open server can NEVER hang the client's tcp-recv forever — WP-DURABILITY-MS-DOS, ADR 0050 §4.6).
     (multiple-value-bind (body status) (%ms-recv-message sock)
       (when (eq status :timeout)
-        (error 'microservice-conn-lost :detail "server stalled (client recv timeout)"))
-      (unless body (error 'microservice-conn-lost :detail "server closed the connection"))
+        (bail :conn-lost))                          ; server stalled (client recv timeout)
+      (unless body (bail :conn-lost))               ; server closed the connection
       (let ((r (%make-ms-reader :buf body :pos 0 :end (length body))))
         ;; body is >= 1 byte (recv rejects a zero declared length), so %rd-u8 always yields the status byte;
         ;; the (and sbyte ...) guard keeps it type-safe under the ADR-0064 (values octet status) reader.
         (let ((sbyte (%rd-u8 r)))
           (unless (and sbyte (= sbyte +ms-status-ok+))
-            (error 'microservice-store-error :detail "server returned an error status"))
+            (bail :server-error))                   ; non-ok status byte: a legit server rejection, never retried
           r)))))
 
 (defun* %ms-call (conn lock code build-fn decode-fn)
@@ -675,8 +676,9 @@
    status VALUE in position 2 of BUILD-FN/DECODE-FN, ADR 0064) is re-signalled as a MICROSERVICE-STORE-ERROR
    so the client API presents ONE clean error type for any bad/torn response — never a raw decode TYPE-ERROR.
 
-   RECONNECT (Slice 3c-1, ADR 0050 §4.5): if the connection DROPPED (MICROSERVICE-CONN-LOST from a send
-   failure or a server-closed read), CLOSE+CLEAR the dead socket, RE-DIAL once (%ms-reconnect), and RETRY
+   RECONNECT (Slice 3c-1, ADR 0050 §4.5): if the connection DROPPED (a :CONN-LOST STATUS from %ms-exchange —
+   a send failure or a server-closed read; ADR 0064, no condition, checked in RUN before decode), CLOSE+CLEAR
+   the dead socket, RE-DIAL once (%ms-reconnect), and RETRY
    the op ONCE — a BOUNDED single reconnect. The retry re-invokes BUILD-FN + DECODE-FN, which is SAFE only
    because every op is idempotent AND advances client chain/put-index state ONLY in DECODE-FN after a
    confirmed response: a byte-identical retry re-sends folded frames the DARE-blind server INSERT-OR-IGNOREs
@@ -703,18 +705,19 @@
              ;; BUILD-FN + DECODE-FN are lambdas (stored in the vtable, invoked after make-microservice-store
              ;; returns), so they thread the protocol status MANUALLY as (values result status) — they CANNOT
              ;; use defun*'s TRY/BAIL, which would return-from make-microservice-store's dead extent. A CONN
-             ;; drop still SIGNALS microservice-conn-lost from %ms-exchange (the reconnect stays a condition).
+             ;; drop is a :CONN-LOST STATUS from %ms-exchange (ADR 0064), checked BEFORE decode-fn so a torn
+             ;; response never decodes; the reconnect below acts on it (no condition, no handler-case).
              (multiple-value-bind (payload bstatus) (funcall build-fn)
                (if bstatus
                    (values nil bstatus)
-                   (multiple-value-bind (result dstatus)
-                       (funcall decode-fn (%ms-exchange (ms-conn-sock conn) code payload))
-                     (values result dstatus))))))
-      (multiple-value-bind (result status)
-          (handler-case (run)
-            (microservice-conn-lost ()
-              (%ms-reconnect conn)          ; bounded single re-dial (signals store-error if the server is down)
-              (run)))                       ; retry ONCE; a second conn-lost propagates as a clean store-error
+                   (multiple-value-bind (reader estatus) (%ms-exchange (ms-conn-sock conn) code payload)
+                     (if estatus
+                         (values nil estatus)
+                         (funcall decode-fn reader)))))))
+      (multiple-value-bind (result status) (run)
+        (when (eq status :conn-lost)        ; bounded single re-dial + retry ONCE (ADR 0064)
+          (%ms-reconnect conn)              ; signals store-error if the server is down
+          (multiple-value-setq (result status) (run)))
         (if status (clean-protocol status) result)))))
 
 (defun* %ms-open (conn lock history-kind history-depth)
@@ -727,7 +730,13 @@
   (dds.pal:with-lock (lock)
     (setf (ms-conn-closed-p conn) nil)              ; store-open (re-)opens — clear any prior terminal close
     (%ms-ensure-connected conn)
-    (%ms-exchange (ms-conn-sock conn) +ms-op-open+ (%ms-encode-open history-kind history-depth))
+    (multiple-value-bind (reader status)
+        (%ms-exchange (ms-conn-sock conn) +ms-op-open+ (%ms-encode-open history-kind history-depth))
+      (declare (ignore reader))
+      ;; store-open failure (conn-lost / server-error during open) stays a store-error SIGNAL, caught at the
+      ;; durability start boundary (runner-start) — the store-open-is-boundary-caught model (tamper parity).
+      (when status
+        (error 'microservice-store-error :detail (format nil "microservice open failed: ~a" status))))
     t))
 
 (defun* %ms-close (conn lock)
@@ -842,7 +851,7 @@
                                              (setf (gethash kkey idx) t))
                                            (values t nil))
                                           ((= res +ms-result-rejected+) (values :rejected nil))
-                                          (t (error 'microservice-store-error :detail "bad put result")))))))
+                                          (t (values nil :bad-put-result)))))))
                     ;; the exhausted-retry MAY have applied the put but lost the ack — mark the topic STALE so
                     ;; the next chained mutation re-syncs the chain state from the server (Fix 1), then re-signal.
                     (microservice-store-error (e) (setf (gethash topic stale-topics) t) (error e))))
@@ -855,7 +864,7 @@
                                   (values nil rstatus)
                                   (cond ((= res +ms-result-t+) (values t nil))
                                         ((= res +ms-result-rejected+) (values :rejected nil))
-                                        (t (error 'microservice-store-error :detail "bad put result")))))))))
+                                        (t (values nil :bad-put-result)))))))))
      :get-range (lambda (topic)
                   (if chain-mac-fn
                       (%ms-get-range-verified conn lock topic chain-mac-fn chain-macs chain-seqs put-index)
@@ -985,7 +994,7 @@
                                  (cond (rstatus (values nil rstatus))
                                        ((= res +ms-result-t+) (values t nil))
                                        ((= res +ms-result-rejected+) (values t nil))
-                                       (t (error 'microservice-store-error :detail "bad delete result")))))))))))
+                                       (t (values nil :bad-delete-result)))))))))))
 
 ;;; ---- client response decoders ----
 
@@ -1319,9 +1328,8 @@
                   (multiple-value-bind (res rstatus) (%rd-u8 r)
                     (cond
                       (rstatus (values nil rstatus))
+                      ((/= res +ms-result-t+) (values nil :bad-rewrite-result))   ; ADR 0064: server didn't confirm the replace
                       (t
-                       (unless (= res +ms-result-t+)
-                         (error 'microservice-store-error :detail "bad topic-rewrite result"))
                        ;; the server confirmed the replace: advance the client chain to the dense survivor state
                        (if (plusp count)
                            (progn (setf (gethash topic chain-macs) tail)

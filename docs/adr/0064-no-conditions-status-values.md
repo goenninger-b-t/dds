@@ -418,6 +418,23 @@ sole non-test caller (`make-microservice-store-factory`) always passes `:port`, 
 microservice family's three sub-slices; the `microservice-store-error` class stays for the non-reconnect
 `store-error` signals (2-B) and the `conn-lost` reconnect state machine (2-C, the hardest).
 
+## Slice — microservice reconnect + decode failures go status-based INTERNALLY (173 -> 165)
+
+**Owner ruling (2026-07-19):** the microservice operation-failure family converts by EXPANDING the store vtable
+contract to thread op-failure status (not an exempt class). This is the internal half. `%ms-exchange` signalled
+`microservice-conn-lost` on a drop (send-fail / server-closed / recv-timeout) and `microservice-store-error` on a
+non-ok status byte; the four decode-fns signalled store-error on a bad result byte. All become STATUS values:
+`%ms-exchange` returns `(values (or null ms-reader) (or null keyword))` — `:CONN-LOST` / `:SERVER-ERROR`; the
+decode-fns return `:BAD-PUT-RESULT` / `:BAD-DELETE-RESULT` / `:BAD-REWRITE-RESULT`. **`%ms-call`'s reconnect is
+now a STATUS check** (`(when (eq status :conn-lost) (%ms-reconnect) (run))`), not a `handler-case` — the deliberate
+control-transfer condition is gone; `run` checks `%ms-exchange`'s status BEFORE `decode-fn`, so a torn response
+never decodes. The EXTERNAL contract is deliberately UNCHANGED: `%ms-open` re-signals `store-error` on an open
+failure (store-open stays boundary-caught at `runner-start`, tamper parity), and `%ms-call`'s terminal
+`clean-protocol` re-signals `store-error` for any residual status. So the client vtable still presents
+`microservice-store-error`, the bounded-reconnect behaviour is byte-identical, and **no consumer or test changed**
+(no test caught `conn-lost`/`store-error` directly). Commit B widens `store-put`/`get`/`delete` so the closures
+RETURN the failure instead of re-signalling, and updates the collect-loop + server consumers.
+
 ## Order of the remaining work (shallow → deep)
 
 **the durability store vtable — the tamper refusals are now `SECURITY-FAILCLOSED` (contained at the start
