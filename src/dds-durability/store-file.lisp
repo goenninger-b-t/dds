@@ -246,7 +246,12 @@
          (flags      (logior (%kind->int (durable-record-kind record))
                              (if kh-p +flag-key-hash-bit+ 0))))
     (when (and mac-p (or (null prev-mac) (null chain-mac-fn)))
-      (error "dds.durability: v3 frame serialization requires prev-mac + chain-mac-fn (ADR 0045)"))
+      ;; An internal serialization invariant, NOT an external precondition — prev-mac + chain-mac-fn are supplied
+      ;; by the store's OWN v3 write/verify path (the chained tier installs the oracle before any v3 frame is
+      ;; built), so this cannot fire on valid input; defense-in-depth against a coding error that would emit an
+      ;; unMACd v3 frame. Not converted: 18 caller sites, never fires in correct code — a threaded status would be
+      ;; pure churn with no runtime path reaching it.
+      (error "dds.durability: v3 frame serialization requires prev-mac + chain-mac-fn (ADR 0045)"))   ; NOCOND(GUARD): internal v3-oracle invariant; cannot fire on valid input; contained under store-open/store-put
     (setf (aref frame 0) +magic-0+)
     (setf (aref frame 1) (the (unsigned-byte 8) version))
     (setf (aref frame 2) (the (unsigned-byte 8) flags))

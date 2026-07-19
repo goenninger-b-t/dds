@@ -486,6 +486,22 @@ the primary FACTORY value, so its status is a benign `NIL`; the interop drivers 
 precondition, and it flips to `nth-value 1`. Mirrors the `make-sqlite-store` / `make-microservice-store`
 constructor-precondition pattern.
 
+## Slice — two durability store corruption/invariant guards annotated (158 -> 156)
+
+Neither is a status conversion — both are already-sanctioned exempt classes:
+
+- **`store-sqlite.lisp` `%sqlite-row->record` unassigned-kind (SECURITY-FAILCLOSED).** A DB row whose `kind`
+  byte is outside {0,1,2} cannot arise from our own writes — it is corruption / tamper. The kind byte is
+  authenticated INSIDE the per-row v3 MAC chain (ADR 0045), so in the production DARE-wrapped tier a corrupted
+  kind fails the open-time chain verify (`%sqlite-verify-topic` — the sibling SECURITY-FAILCLOSED refusals at
+  130/134/139) at the runner-start boundary BEFORE any get-range reads it. Same family as its siblings.
+- **`store-file.lisp` `%frame-record-versioned` v3-requires-oracle (GUARD).** An INTERNAL serialization
+  invariant, not an external precondition: `prev-mac` + `chain-mac-fn` are supplied by the store's own v3
+  write/verify path (the chained tier installs the oracle before any v3 frame is built), so it cannot fire on
+  valid input — defense-in-depth against a coding error emitting an unMACd v3 frame. It has 18 caller sites and
+  never fires in correct code, so a threaded status would be pure churn with no runtime path reaching it (this
+  is the GUARD carve-out's purpose — an internal cannot-fire invariant, contained under store-open/store-put).
+
 ## Order of the remaining work (shallow → deep)
 
 **the durability store vtable — the tamper refusals are now `SECURITY-FAILCLOSED` (contained at the start

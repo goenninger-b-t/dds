@@ -45,7 +45,11 @@
   "Build a DURABLE-RECORD from one raw SQLite row, normalizing blobs to simple octet vectors."
   (let ((kind (%int->kind kind-int)))
     (unless kind
-      (error "dds.durability: SQLite record with unassigned kind ~d (topic ~a)" kind-int topic))
+      ;; A row kind outside {0,1,2} cannot arise from our own writes — it is DB corruption / tamper. The kind
+      ;; byte is authenticated INSIDE the per-row v3 MAC chain (ADR 0045), so in the production DARE-wrapped tier
+      ;; a corrupted kind fails the open-time chain verify (%sqlite-verify-topic, the sibling refusals below) at
+      ;; the durability start boundary (runner-start) BEFORE any get-range reads it; file-store frame-contract parity.
+      (error "dds.durability: SQLite record with unassigned kind ~d (topic ~a)" kind-int topic))   ; NOCOND(SECURITY-FAILCLOSED): DB corruption/tamper refusal, fail-closed at store-open, caught at the durability start boundary
     (make-durable-record
      :topic       topic
      :writer-guid (%to-octets-n wg-blob 16)
