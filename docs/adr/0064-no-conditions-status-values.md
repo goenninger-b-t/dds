@@ -647,6 +647,17 @@ AND it is not debug-gated (that is TEST). Annotated: the 3 zeroize guards + the 
 (`(assert (<= (+ session-id-off 4) …))` on an already-length-validated secured payload). Comment-only + one
 gate regex token; canary falsifies the class; gate-nocond 31 -> 26.
 
+## Slice — handshake %parse-token: self-caught signals → local return-from (26 -> 20)
+
+`%parse-token` (`auth/handshake.lisp`) parses a peer handshake token from the wire and already CAUGHT ITS OWN
+six signals with `(handler-case … (error () nil))`, returning NIL on any malformed field (truncated / bad
+magic / class-id-too-long / too-many-props / name-too-long / value-too-long). The exact pattern converted for
+`identity.lisp` `%parse-remote-token-strings` (`1f354af`): delete the `handler-case`, and replace the six
+`(error "…")` self-signals with a local `(macrolet ((bad () '(return-from %parse-token nil))))` — a plain
+non-local exit, no condition. The `(or handshake-token null)` contract and the NIL-on-malformed behavior are
+byte-identical for every caller, so no consumer changed. Completes the DDS-Security payload/handshake cluster
+(crypto 7 + submessage 2 + key-material 3 + handshake 6 = 18). 567/567 SBCL + Clasp; gate-build/types green.
+
 ## Order of the remaining work (shallow → deep)
 
 **the durability store vtable — the tamper refusals are now `SECURITY-FAILCLOSED` (contained at the start
