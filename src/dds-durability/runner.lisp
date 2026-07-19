@@ -39,29 +39,28 @@
       (ignore-errors (store-close probe)))))
 
 (defun* %start-process-service (spec)
-    (function (service-spec) durability-service)
+    (function (service-spec) (values (or null durability-service) (or null keyword)))
   "Start a :PROCESS-mode service by launching a child Lisp invoking DURABILITY-SERVICE-MAIN.
    Returns a DURABILITY-SERVICE proxy whose THREAD slot is a monitor thread that tracks
    UIOP:PROCESS-ALIVE-P; SERVICE-ALIVE-P reflects the subprocess liveness transparently.
    The subprocess is launched via UIOP:LAUNCH-PROGRAM with %SPEC->ARGV-serialized CLI args.
-   On impls where UIOP:ARGV0 is unavailable or empty, falls back to in-thread mode with a note.
+   Non-SBCL impls fall back to in-thread mode with a note. On SBCL, a spec whose store cannot cross the
+   subprocess boundary, or an unavailable UIOP:ARGV0, returns (VALUES NIL STATUS) —
+   :PROCESS-MODE-NON-MEMORY-STORE or :NO-ARGV0 (ADR 0064: fail-fast as a status, the runner sheds the
+   spec) — never an unwind. Success returns (VALUES PROXY NIL).
    Runtime dispatch on PAL-IMPL-NAME — no reader conditionals (operating contract §10)."
   (if (eq (dds.pal:pal-impl-name) :sbcl)
       (let* ((_conveyable
               (unless (%process-mode-store-conveyable-p spec)
                 ;; FAIL-FAST: never launch a subprocess that would silently drop durability
                 ;; (the CLI cannot convey a file/DARE store factory) — use :thread mode for the
-                ;; PERSISTENT tier (ADR 0026 §10.11). Erroring here beats a service that looks
-                ;; durable but is not.
-                (error "dds.durability: :process-mode service ~s is configured with a non-memory ~
-                        (persistent/file) store, which the CLI cannot convey across the subprocess ~
-                        boundary — launching would SILENTLY run the in-memory tier (no durability). ~
-                        Use :thread mode for the PERSISTENT tier (ADR 0026 §10.11)."
-                       (service-spec-name spec))))
+                ;; PERSISTENT tier (ADR 0026 §10.11). Bailing a status here (ADR 0064) beats a
+                ;; service that looks durable but is not; the runner sheds the spec.
+                (bail :process-mode-non-memory-store)))
              (argv (dds.durability::%spec->argv spec))
              (lisp-bin (uiop:argv0))
              (_ (unless (and lisp-bin (plusp (length lisp-bin)))
-                  (error "dds.durability: (uiop:argv0) returned nil/empty — cannot launch subprocess")))
+                  (bail :no-argv0)))   ; ADR 0064: cannot launch subprocess — runner sheds the spec
              (cmd  (list* lisp-bin
                           "--dynamic-space-size" "512"
                           "--eval" "(require :asdf)"
@@ -141,7 +140,12 @@
   (let ((svcs '()) (failed nil))
     (dolist (spec (service-runner-specs runner))
       (if (eq (service-spec-mode spec) :process)
-          (handler-case (push (%start-process-service spec) svcs)
+          (handler-case
+              (multiple-value-bind (proxy st) (%start-process-service spec)
+                (if st
+                    (progn (setf failed t)
+                           (ignore-errors (funcall *durability-error-hook* st :runner-start-failed 1)))
+                    (push proxy svcs)))
             (error (c)
               (setf failed t)
               (ignore-errors (funcall *durability-error-hook* c :runner-start-failed 1))))

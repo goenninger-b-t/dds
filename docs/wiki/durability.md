@@ -168,7 +168,7 @@ of that open. `service-start` calls `store-open` with the service-spec's `histor
 (dds.durability:service-alive-p service)  ; → boolean
 
 ;; Error hook — bind to observe collect-loop errors
-;; signature: (condition context count) → T
+;; signature: (reason context count) → T   ; reason: a caught condition, or a status keyword (ADR 0064)
 ;; context: :collect-loop | :supervisor-shed | :supervisor-restart-failed
 ;;          | :runner-start-failed | :server-start-failed   ; a spec / server store-open failed at start
 (dds.durability:*durability-error-hook*)

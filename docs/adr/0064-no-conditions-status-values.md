@@ -382,6 +382,18 @@ check sits in the store-factory *builder* (a factory-closure cascade). `store-sq
 not a precondition at all — it is a read-path validation of a corrupt stored `kind` byte (a data-integrity
 refusal on replay, closer to `SECURITY-FAILCLOSED`). Each is its own slice.
 
+## Slice — process-mode start preconditions → status (178 -> 176)
+
+`%start-process-service`'s two fail-fast preconditions — a `:process` spec whose store cannot cross the
+subprocess boundary (`:PROCESS-MODE-NON-MEMORY-STORE`) and an unavailable `uiop:argv0` (`:NO-ARGV0`) —
+signalled a bare `error` (caught at the `runner-start` boundary from the `SECURITY-FAILCLOSED` slice). They
+now `(bail …)` a status; `%start-process-service` returns `(values (or null durability-service) (or null
+keyword))`, and `runner-start` sheds the spec on a non-NIL status exactly as it does on a caught signal — the
+`handler-case` stays for genuine signals (a failed `uiop:launch-program`). `*durability-error-hook*`'s first
+parameter widens from `condition` to `(or condition keyword)` so the same per-spec rate-limited log serves a
+caught condition and a converted status alike (the one test that binds the hook ignores that argument). The
+B1 persistent-refuse test flips from asserting a signal to asserting the status (SBCL-only, as before).
+
 ## Order of the remaining work (shallow → deep)
 
 **the durability store vtable — the tamper refusals are now `SECURITY-FAILCLOSED` (contained at the start

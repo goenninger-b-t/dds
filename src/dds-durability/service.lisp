@@ -32,12 +32,13 @@
         when (= x 1) return t
         when (plusp (mod x 10)) return nil))
 
-(defun* %default-durability-error-hook (condition context count)
-    (function (condition t (integer 1)) t)
+(defun* %default-durability-error-hook (reason context count)
+    (function ((or condition keyword) t (integer 1)) t)
   "Default *DURABILITY-ERROR-HOOK*: clockless rate-limited WARN to *ERROR-OUTPUT* when COUNT is
-   a power of ten (1, 10, 100, …). Mirrors the shape of dds.disc::%default-sender-emit-error-hook."
+   a power of ten (1, 10, 100, …). Mirrors the shape of dds.disc::%default-sender-emit-error-hook.
+   REASON is a caught CONDITION or, for a converted start precondition (ADR 0064), a status KEYWORD."
   (when (%durability-error-count-p count)
-    (warn "dds.durability collect loop (~a) error #~d: ~a" context count condition))   ; NOCOND(WARN): rate-limited diagnostic; returns normally, no control transfer
+    (warn "dds.durability collect loop (~a) error #~d: ~a" context count reason))   ; NOCOND(WARN): rate-limited diagnostic; returns normally, no control transfer
   t)
 
 (defparameter *durability-error-hook* #'%default-durability-error-hook

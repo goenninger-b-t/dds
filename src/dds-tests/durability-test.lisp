@@ -6879,8 +6879,9 @@
     (function () t)
   "B1 (ADR 0026 §10.11): a :process-mode PERSISTENT spec FAILS FAST, never silently running the
    in-memory tier. %process-mode-store-conveyable-p is NIL for a persistent/file store, T for the
-   in-memory store; on SBCL %start-process-service SIGNALS for a persistent :process spec (before
-   any subprocess launch). The in-memory :process path stays conveyable (process-smoke covers it)."
+   in-memory store; on SBCL %start-process-service RETURNS a :process-mode-non-memory-store status for a
+   persistent :process spec (before any subprocess launch; ADR 0064). The in-memory :process path stays
+   conveyable (process-smoke covers it)."
   (let* ((mem-spec (dds.durability:make-service-spec
                     :domain 3 :topics '(("PP" . "ShapeType")) :mode :process :name "pp-mem"))
          (tmp (uiop:merge-pathnames*
@@ -6898,13 +6899,12 @@
     (%check :b1-persistent-not-conveyable
             (not (dds.durability::%process-mode-store-conveyable-p persist-spec))
             "persistent :process store must NOT be conveyable (NIL) — the fail-fast target")
-    ;; SBCL: the subprocess path signals BEFORE launch; Clasp falls to in-thread mode (honors the
-    ;; real store), so the refuse assertion is SBCL-only (NFR-PORT).
+    ;; SBCL: the subprocess path returns a reject STATUS before launch; Clasp falls to in-thread mode
+    ;; (honors the real store), so the refuse assertion is SBCL-only (NFR-PORT).
     (when (eq (dds.pal:pal-impl-name) :sbcl)
-      (%check :b1-persistent-process-signals
-              (handler-case (progn (dds.durability::%start-process-service persist-spec) nil)
-                (error () t))
-              "a :process PERSISTENT spec must signal (fail-fast), not launch a degraded subprocess"))
+      (%check :b1-persistent-process-rejects
+              (and (nth-value 1 (dds.durability::%start-process-service persist-spec)) t)
+              "a :process PERSISTENT spec must RETURN a reject status (fail-fast), not launch a degraded subprocess"))
     t))
 
 (defun* run-durability-origins-cap-test ()
