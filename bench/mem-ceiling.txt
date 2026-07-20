@@ -3,7 +3,7 @@
 # SBCL's per-sample allocation differs materially by arch — measured, not assumed:
 #   arm64   2402-2425      (2026-07-20: + a dynamic-extent RX submessage handler; cumulative -1140
 #                            from 3560, ADR 0062/0065/0066/0067/0068)
-#   x86_64  2707 B/sample   (2026-07-20, read off CI: the same eight slices; still ~7% above arm64. The
+#   x86_64  2584 B/sample   (2026-07-20, read off CI: the same nine slices; still ~7% above arm64. The
 #                            same divergence made the FlatData vtable-vs-classic guard flip, and it is
 #                            why a single shared ceiling cannot work: at the x86_64 number the arm64
 #                            ratchet would never bite, and at the arm64 number x86_64 is permanently red.)
@@ -16,4 +16,4 @@
 # hypothetical: CI was red from the 5th TX slice for exactly this reason. AFTER a win, check the CI
 # gate-mem number and lower the OTHER arch's row in the same or an immediate follow-up commit.
 arm64  2470
-x86_64 2770
+x86_64 2650
