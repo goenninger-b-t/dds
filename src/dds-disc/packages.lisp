@@ -81,6 +81,7 @@
            #:*datagram-sink*
            #:*debug-drop-fragment-numbers*
            #:*debug-drop-sample-numbers*
+           #:*tx-fast-path*
            ;; WP-SENDER-ERROR-RESILIENCE (FR-PF-2): the sender-thread emit guard + its observability + test affordance
            #:*sender-emit-error-hook* #:with-sender-emit-guard #:*debug-emit-fault* #:sender-emit-test-fault
            #:node-discovered-participants #:resolved-destination #:node-acks-in

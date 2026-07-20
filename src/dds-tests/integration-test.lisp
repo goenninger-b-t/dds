@@ -6138,6 +6138,34 @@
       (dds.disc:stop-node step-node)))
   t)
 
+(defun* run-tx-fast-path-equivalence-test ()
+    (function () t)
+  "NFR-MEM (ADR 0062, task #29) byte-identity oracle: %SEND-CHANGES-PACKED's single-datagram FAST PATH emits
+   the EXACT wire bytes the %CHANGES-DATAGRAM-PLAN path does for the common case — one small non-ZC change +
+   the trailing HEARTBEAT to one destination. Two equivalently-built nodes (same guid-prefix, matched reliable
+   reader, one small write): the fast-path capture (*tx-fast-path* T, the default) and the forced-plan capture
+   (*tx-fast-path* NIL) datagram sequences must be byte-IDENTICAL — and be ONE datagram carrying 1 DATA +
+   1 HEARTBEAT. The datagram bytes are transport-independent (SHMEM-DEST only routes the send), so a UDP
+   fixture proves the framing for both transports. The fast path is a pure allocation win: ZERO wire bytes."
+  (let ((fast-node (%flow-step-build-node #x73 #x83 7803 (list (octets 1 2 3 4 5 6 7 8))))
+        (plan-node (%flow-step-build-node #x73 #x83 7803 (list (octets 1 2 3 4 5 6 7 8)))))
+    (unwind-protect
+         (progn
+           (%check :tx-fast-path-reachable (null (dds.disc::disc-node-zc-pool fast-node))
+                   "the fixture must have no ZC pool so the single-datagram fast path is reachable")
+           (let ((fast-dgs (let ((dds.disc::*tx-fast-path* t))   (%coalesce-capture fast-node)))
+                 (plan-dgs (let ((dds.disc::*tx-fast-path* nil)) (%coalesce-capture plan-node))))
+             (%check :tx-fast-path-one-datagram (= 1 (length fast-dgs))
+                     "one small change + HEARTBEAT must coalesce into ONE datagram on the fast path")
+             (destructuring-bind (total data hb) (%count-submessages (first fast-dgs))
+               (%check :tx-fast-path-submsgs (and (= 2 total) (= 1 data) (= 1 hb))
+                       "the fast-path datagram must carry 1 DATA + 1 HEARTBEAT (2 submessages)"))
+             (%check :tx-fast-path-identical (%datagrams-identical-p fast-dgs plan-dgs)
+                     "the fast-path datagram sequence must be byte-identical to the forced-plan path")))
+      (dds.disc:stop-node fast-node)
+      (dds.disc:stop-node plan-node)))
+  t)
+
 ;;; WP-ASYNC-FLOW Phase C (FR-PF-2, ADR 0016): the shared flow-controller + its scheduler thread paces the
 ;;; aggregate user-data byte rate of its associated writers via the token bucket, round-robining one datagram
 ;;; per writer per turn (so multiple writers interleave at the shaped rate). Three tests: (1) object lifecycle

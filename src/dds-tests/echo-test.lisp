@@ -3760,6 +3760,7 @@
                  ("async-emit-fault-survives" . run-async-emit-fault-survives-test)
                  ("emit-fault-inert"         . run-emit-fault-inert-test)
                  ("flow-step-equivalence"    . run-flow-step-equivalence-test)
+                 ("tx-fast-path-equivalence" . run-tx-fast-path-equivalence-test)
                  ("flow-token-bucket"        . run-flow-token-bucket-test)
                  ("flow-backpressure"        . run-flow-backpressure-test)
                  ("flow-controller-lifecycle" . run-flow-controller-lifecycle-test)

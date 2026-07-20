@@ -841,6 +841,13 @@
    non-fragmented DATA %SEND-SAMPLE silently SKIPS, proving lost-final-sample recovery via the
    periodic HEARTBEAT (RTPS 2.5 §8.4.2.2). Never set in production.")
 
+(defparameter *tx-fast-path* t
+  "NFR-MEM (ADR 0062, task #29): when T (default), %SEND-CHANGES-PACKED emits the common case — one small
+   non-ZC change (+ optional HB) fitting a single budget-bounded datagram to one destination (UDP or SHMEM) —
+   directly, skipping the %changes-datagram-plan closure allocation. Bind to NIL to FORCE the plan path for
+   the SAME input: the byte-identity oracle (run-tx-fast-path-equivalence-test) captures both and asserts
+   they are byte-for-byte identical. Never bound in production.")
+
 (defparameter *emit-writer* nil
   "WP-N-ENDPOINT-S1 (ADR 0048): the local user ENGINE WRITER (rtps-writer) whose changes / HEARTBEAT / HEARTBEAT_FRAG
    / GAP the send path is CURRENTLY emitting — dynamically bound per-writer by the fan-out (%push-one-writer-changes,
@@ -880,41 +887,54 @@
   (multiple-value-bind (sec nsec) (floor ns 1000000000)
     (values (logand sec #xffffffff) (dds.qos:duration-nanosec->wire-fraction nsec))))
 
+(defun* %change-submessage-size (change)
+    (function (dds.rtps.history:cache-change) (integer 0))
+  "The exact octet length of CHANGE's small (packable) submessage(s): an optional INFO_TS (12, when
+   source_timestamp>0) plus either one DATA (:data — 4 submsg-header + 20 body-prefix + inlineQoS + payload)
+   or one no-payload dispose/unregister DATA (56). The fit bound %pack-plan and the %send-changes-packed
+   single-datagram fast path check before writing so a datagram never overflows the buffer. Extracted from
+   %data-builder so the plan and the fast path agree on the size by construction (DRY)."
+  (let ((ts-size (if (plusp (dds.rtps.history:cache-change-source-timestamp change)) 12 0)))
+    (if (eq (dds.rtps.history:cache-change-kind change) :data)
+        (+ 24 (let ((iq (dds.rtps.history:cache-change-inline-qos change))) (if iq (length iq) 0))
+           (dds.rtps.history:cache-change-payload-len change)   ; TRUE length, not the oversized pooled vec (T5a)
+           ts-size)
+        (+ 56 ts-size))))
+
+(defun* %write-change-submessage (node change wid mc)
+    (function (disc-node dds.rtps.history:cache-change (unsigned-byte 32) dds.core.buffer:cursor) t)
+  "Write CHANGE's small submessage(s) into cursor MC at writerId WID (RTPS 2.5 §9.4.5.4): an optional INFO_TS
+   (source_timestamp>0, §9.4.5.9 / §8.3.7.9) then either one DATA (:data, D-flag, inlineQoS from the change's
+   slot when non-nil — byte-identical when nil) or one no-payload dispose/unregister DATA (flags E+Q, inlineQoS
+   PID_KEY_HASH + PID_STATUS_INFO, §9.6.4.9). WID is PASSED IN (not read from *emit-writer* here) so a deferred
+   flow-controller emit stamps the writerId captured when the change was PACKED, not whenever it is stepped.
+   The byte-exact writer shared by %data-builder's pack closure and %send-changes-packed's fast path (DRY)."
+  (declare (ignore node))
+  (when (plusp (dds.rtps.history:cache-change-source-timestamp change))
+    (multiple-value-bind (sec frac) (%ns->rtps-time (dds.rtps.history:cache-change-source-timestamp change))
+      (dds.rtps.message:write-info-ts mc sec frac)))
+  (if (eq (dds.rtps.history:cache-change-kind change) :data)
+      (dds.rtps.message:write-data
+       mc dds.rtps.message:+entityid-unknown+ wid (dds.rtps.history:cache-change-sn change)
+       (dds.rtps.history:cache-change-serialized-payload change) 0
+       (dds.rtps.history:cache-change-payload-len change)   ; TRUE length (T5a)
+       :inline-qos (dds.rtps.history:cache-change-inline-qos change))
+      (dds.rtps.message:write-data-dispose
+       mc dds.rtps.message:+entityid-unknown+ wid (dds.rtps.history:cache-change-sn change)
+       (dds.rtps.history:cache-change-instance-key-hash change)
+       (dds.rtps.history:cache-change-status-info change)))
+  t)
+
 (defun* %data-builder (node change)
     (function (disc-node dds.rtps.history:cache-change) cons)
-  "A (SIZE . BUILD-FN) packable item for the SMALL CHANGE (for %send-packed), dispatching on KIND (RTPS
-   2.5 §9.4.5.4): a :data change writes one DATA (write-data, D-flag, inline-qos from the change's slot
-   when non-nil — byte-identical to before when nil), SIZE = 4 + 20 + iq-len + payload; a :dispose/:unregister
-   writes one no-payload DATA (write-data-dispose, flags E+Q, inlineQos PID_KEY_HASH + PID_STATUS_INFO,
-   §9.6.4.9), SIZE = 4 + 52. S5.T4: when the change carries a non-zero source_timestamp (a _w_timestamp
-   write/dispose/unregister), an INFO_TS submessage (12 octets) is emitted BEFORE the DATA (RTPS 2.5
-   §9.4.5.9 / §8.3.7.9); a plain write carries source_timestamp 0 -> no INFO_TS -> byte-identical. SIZE is
-   the exact submessage length(s) — the fit bound %send-packed checks before writing so the datagram never
-   overflows the buffer."
-  (let* ((sn (dds.rtps.history:cache-change-sn change))
-         (wid (%emit-wid node))
-         (ts (dds.rtps.history:cache-change-source-timestamp change))
-         (ts-size (if (plusp ts) 12 0)))
-    (flet ((%emit-info-ts (mc)
-             (when (plusp ts)
-               (multiple-value-bind (sec frac) (%ns->rtps-time ts)
-                 (dds.rtps.message:write-info-ts mc sec frac)))))
-      (if (eq (dds.rtps.history:cache-change-kind change) :data)
-          (let* ((pl (dds.rtps.history:cache-change-serialized-payload change))
-                 (len (dds.rtps.history:cache-change-payload-len change))   ; TRUE length, not the oversized pooled vec (T5a)
-                 (iq (dds.rtps.history:cache-change-inline-qos change))
-                 (iq-len (if iq (length iq) 0)))
-            (cons (+ 24 iq-len len ts-size)
-                  (lambda (mc) (%emit-info-ts mc)
-                    (dds.rtps.message:write-data
-                     mc dds.rtps.message:+entityid-unknown+ wid sn pl 0 len
-                     :inline-qos iq))))
-          (let ((kh (dds.rtps.history:cache-change-instance-key-hash change))
-                (si (dds.rtps.history:cache-change-status-info change)))
-            (cons (+ 56 ts-size)
-                  (lambda (mc) (%emit-info-ts mc)
-                    (dds.rtps.message:write-data-dispose
-                     mc dds.rtps.message:+entityid-unknown+ wid sn kh si))))))))
+  "A (SIZE . BUILD-FN) packable item for the SMALL CHANGE (for %send-packed): SIZE from %change-submessage-size,
+   BUILD-FN a closure that writes the submessage(s) via %write-change-submessage. WID is captured HERE, at pack
+   time, into the closure so a deferred flow-controller emit stamps the right per-writer EntityId
+   (WP-N-ENDPOINT-S1; N=1 byte-identical). Both the SIZE and the writer are shared verbatim with the
+   single-datagram fast path in %send-changes-packed (DRY), keeping the two paths byte-identical."
+  (let ((wid (%emit-wid node)))
+    (cons (%change-submessage-size change)
+          (lambda (mc) (%write-change-submessage node change wid mc)))))
 
 (defun* %heartbeat-builder (node first last count)
     (function (disc-node integer integer integer) cons)
@@ -1392,6 +1412,32 @@
    *zerocopy-enabled* is nil) is the existing path verbatim. SHARED (WP-ZC-MULTI-DEST-REFCOUNT, ADR 0047;
    default NIL) is the per-pass cross-group CHANGE -> (slot . gen) table so a change reaching >=2 ZC destinations
    emits ONE shared slot's ref here instead of a fresh per-destination loan (byte-identical ref bytes)."
+  ;; NFR-MEM fast path (ADR 0062, task #29): the common case — exactly ONE small non-ZC change (+ optional
+  ;; trailing HB) to ONE destination (UDP or SHMEM) that fits a single budget-bounded datagram — is emitted
+  ;; DIRECTLY, with none of %changes-datagram-plan's list / %pack-plan group / per-group closure / state-cons
+  ;; allocation. Byte-IDENTICAL to the plan path by construction: same header, the SAME %write-change-submessage
+  ;; + HB closure in the same order, and %pack-plan would put a 4-aligned change followed by the 4-aligned HB
+  ;; (both within budget) in exactly ONE group. SHMEM-DEST is passed through to %send-raw-buf unchanged (the
+  ;; datagram BYTES are transport-independent; only the send target differs). Any precondition failing (>1
+  ;; change, ZC, a pinned :data whose slot will not resolve, a non-4-aligned or over-budget size) falls
+  ;; through to the unchanged plan path.
+  (when (and *tx-fast-path* changes (null (cdr changes)) (zerop zc-readers)
+             (null (disc-node-zc-pool node)))
+    (let ((change (car changes)))
+      (when (and (%small-change-p change)
+                 (not (and *debug-drop-sample-numbers*
+                           (member (dds.rtps.history:cache-change-sn change) *debug-drop-sample-numbers*)))
+                 (or (not (eq (dds.rtps.history:cache-change-kind change) :data))
+                     (%ensure-change-payload node change)))   ; resolve+cache a pinned slot; NIL -> fall through (plan drops it)
+        (let ((size (%change-submessage-size change)))
+          (when (and (zerop (mod size 4))                       ; 4-aligned -> %pack-plan would NOT force a boundary after it
+                     (<= (+ size (if hb (car hb) 0)) (%pack-budget buf)))   ; change (+ HB) fit ONE datagram
+            (let ((mc (dds.core.buffer:cursor buf :endianness :little)))
+              (dds.rtps.message:write-header mc (disc-node-guid-prefix node))
+              (%write-change-submessage node change (%emit-wid node) mc)
+              (when hb (funcall (cdr hb) mc))
+              (%send-raw-buf node buf (dds.core.buffer:cursor-position mc) host port shmem-dest dest-prefix))
+            (return-from %send-changes-packed t))))))
   (let ((state (cons (cons host port)
                      (%changes-datagram-plan node buf changes hb shmem-dest zc-readers shared))))
     (loop while (cdr state)   ; (cdr state) = the remaining datagram plan; NIL when exhausted
