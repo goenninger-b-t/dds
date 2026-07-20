@@ -4007,6 +4007,7 @@
                  ("shmem-transport"          . dds.xport.shmem:run-shmem-transport-test)
                  ("shmem-receiver-thread"    . dds.xport.shmem:run-shmem-receiver-test)
                  ("shmem-stress"             . dds.xport.shmem:run-shmem-stress-test)
+                 ("shmem-dest-cache"         . dds.xport.shmem:run-shmem-dest-cache-test)
                  ("zc-ref-codec"             . run-zc-ref-codec-test)
                  ("zc-sedp-flag"             . run-zc-sedp-flag-test)
                  ("zc-resolve-drop"          . run-zc-resolve-drop-test)

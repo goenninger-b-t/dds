@@ -233,20 +233,50 @@
   (make-shmem-locator :name (shmem-transport-name st) :host-uuid (shmem-transport-host-uuid st)
                       :lane-count (shmem-transport-lane-count st) :capacity (shmem-transport-capacity st)))
 
+(defvar *shmem-dest-cache* t
+  "T (the default): %SHMEM-SEND reads the destination SAP and lane from the resolved SHMEM-DEST cached
+   beside the attach (ADR 0067). NIL: re-derive both on every datagram — SHM-SAP plus a %CLAIM-LANE that
+   takes the segment's pshared mutex, scans every lane descriptor and runs an unwind-protect.
+
+   The RING BYTES are identical either way; only how the sender finds its lane differs. Kept as the A/B
+   lever the NFR-MEM measurement requires (ADR 0062) and as an escape hatch — a WRONG cached lane is
+   SILENT MIS-DELIVERY into another sender's ring, so the flag exists to isolate it instantly.")
+
+(defstruct* (shmem-dest (:constructor %make-shmem-dest))
+  "A RESOLVED SHMEM destination: the attached SEGMENT, its mapped SAP, and the LANE this sender holds in
+   it. Resolved once per destination name and cached in SHMEM-TRANSPORT-ATTACH-CACHE (HOT PATH).
+
+   WP-PERF (NFR-MEM, ADR 0067): %SHMEM-SEND used to re-derive both on EVERY datagram — SHM-SAP (which
+   boxes a pointer) and %CLAIM-LANE, whose own docstring says 'one-time, off the hot path' but which was
+   taking the segment's pshared MUTEX, scanning every lane descriptor and running an UNWIND-PROTECT per
+   send. All three have the SAME LIFETIME as the attach itself, so caching them in one cell adds no new
+   invalidation surface: they go stale together, exactly where the attach already did.
+
+   LANE is NIL until claimed. A claim can legitimately fail (every lane taken), and that must stay
+   RETRYABLE — the segment is still cached (we hold the mapping and must detach it at close, so dropping
+   it would leak), while the NIL lane makes the next send re-attempt the claim."
+  (segment nil :type t)
+  (sap nil :type t)
+  (lane nil :type (or null (integer 0))))
+
 (defun* %attach-for (st locator)
     (function (shmem-transport shmem-locator) (values t (or null keyword)))
-  "Cached shm-segment for LOCATOR's destination (attach once per name; off the hot path). Returns
-   (values segment NIL), or (values NIL status) if the destination segment cannot be attached — a peer
-   that died between advertising its locator and this send. That used to be an shm-attach CONDITION
-   unwinding OUT OF A SEND; it is now a status, and %shmem-send turns it into the ordinary 0-octets-sent
-   result (the caller falls back to UDP), which is what the send path already meant to do.
+  "Cached SHMEM-DEST for LOCATOR's destination (attach + lane-claim once per name; off the hot path).
+   Returns (values shmem-dest NIL), or (values NIL status) if the destination segment cannot be attached
+   — a peer that died between advertising its locator and this send. That used to be an shm-attach
+   CONDITION unwinding OUT OF A SEND; it is now a status, and %shmem-send turns it into the ordinary
+   0-octets-sent result (the caller falls back to UDP), which is what the send path already meant to do.
    A failed attach is NOT cached: the peer may come back."
   (let ((cached (gethash (shmem-locator-name locator) (shmem-transport-attach-cache st))))
     (when cached (return-from %attach-for (values cached nil))))
-  (let ((seg (try (dds.pal:shm-attach
-                   (shmem-locator-name locator)
-                   (%segment-bytes (shmem-locator-lane-count locator) (shmem-locator-capacity locator))))))
-    (values (setf (gethash (shmem-locator-name locator) (shmem-transport-attach-cache st)) seg) nil)))
+  (let* ((seg (try (dds.pal:shm-attach
+                    (shmem-locator-name locator)
+                    (%segment-bytes (shmem-locator-lane-count locator) (shmem-locator-capacity locator)))))
+         (sap (dds.pal:shm-sap seg)))
+    (values (setf (gethash (shmem-locator-name locator) (shmem-transport-attach-cache st))
+                  (%make-shmem-dest :segment seg :sap sap
+                                    :lane (%claim-lane sap (shmem-transport-token st))))
+            nil)))
 
 (defun* %shmem-send (st locator buffer len)
     (function (shmem-transport shmem-locator dds.core.buffer:octet-buffer (integer 0)) (integer 0))
@@ -263,8 +293,12 @@
   (when *debug-shmem-send-fault* (error 'shmem-send-test-fault))   ; test affordance: inert when NIL (byte-identical production)   ; HOTPATH-COND(TEST): fault injection, armed only by *debug-shmem-send-fault*
   (multiple-value-bind (dest attach-status) (%attach-for st locator)
     (when attach-status (return-from %shmem-send 0))   ; peer segment gone: 0 sent = the caller falls back to UDP
-    (let* ((sap (dds.pal:shm-sap dest))
-           (lane (%claim-lane sap (shmem-transport-token st))))
+    ;; Resolved-once SAP + lane (ADR 0067). An unclaimed lane stays retryable: the setf re-stores NIL.
+    (let* ((sap (if *shmem-dest-cache* (shmem-dest-sap dest) (dds.pal:shm-sap (shmem-dest-segment dest))))
+           (lane (if *shmem-dest-cache*
+                     (or (shmem-dest-lane dest)
+                         (setf (shmem-dest-lane dest) (%claim-lane sap (shmem-transport-token st))))
+                     (%claim-lane sap (shmem-transport-token st)))))
       (if (and lane (%lane-enqueue sap lane (shmem-locator-capacity locator)
                                    (dds.core.buffer:octet-buffer-vec buffer) 0 len))
           (progn
@@ -289,7 +323,8 @@
   (stop-shmem-receiver st)
   (let ((sap (dds.pal:shm-sap (shmem-transport-segment st))))
     (dds.pal:pshared-destroy sap +mutex-off+ +cond-off+))
-  (maphash (lambda (k v) (declare (ignore k)) (ignore-errors (dds.pal:shm-detach v))) (shmem-transport-attach-cache st))
+  (maphash (lambda (k v) (declare (ignore k)) (ignore-errors (dds.pal:shm-detach (shmem-dest-segment v))))
+           (shmem-transport-attach-cache st))
   (clrhash (shmem-transport-attach-cache st))
   (dds.pal:shm-detach (shmem-transport-segment st))
   (dds.pal:shm-destroy (shmem-transport-name st))
@@ -340,6 +375,61 @@
            (assert (equal '(4 . #xDE) got) () "SHMEM round-trip mismatch: ~s (want (4 . 222))" got)   ; HOTPATH-COND(TEST): in-file self-test
            t)
       (shmem-transport-close tx)
+      (shmem-transport-close rx))))
+
+(defun* run-shmem-dest-cache-test ()
+    (function () (eql t))
+  "ADR 0067: the resolved-once destination cache must never send a sender into the WRONG LANE.
+
+   A stale or shared lane is SILENT MIS-DELIVERY — two senders writing the same ring lane interleave and
+   corrupt each other's records rather than failing — so this asserts the invariant directly instead of
+   trusting delivery alone. TWO senders drive the SAME receiver, repeatedly:
+
+     1. each sender's cached lane is CLAIMED (non-NIL) and STABLE across many sends (the memo is used,
+        not silently re-claimed every time);
+     2. the two senders hold DISTINCT lanes (no cross-sender clobber);
+     3. the memo AGREES WITH THE AUTHORITY — a fresh %CLAIM-LANE for that token returns the cached lane
+        (this is what would go red if the cache ever drifted from the ring's own ownership table);
+     4. every record from both senders arrives with its own payload intact.
+
+   Pass-skips on the Clasp/macOS-arm64 by-name-attach gap (ADR 0013)."
+  (unless (shm-attach-by-name-reliable-p) (return-from run-shmem-dest-cache-test t))
+  (let ((rx (make-shmem-transport :participant-guid (%test-guid 11) :host-uuid 7))
+        (a (make-shmem-transport :participant-guid (%test-guid 12) :host-uuid 7))
+        (b (make-shmem-transport :participant-guid (%test-guid 13) :host-uuid 7)))
+    (unwind-protect
+         (let ((buf (dds.core.buffer:make-octet-buffer 64))
+               (loc (shmem-transport-locator rx))
+               (seen '()) (lane-a nil) (lane-b nil))
+           (flet ((send1 (st tag)
+                    (let ((c (dds.core.buffer:cursor buf)))
+                      (dotimes (i 4) (dds.core.buffer:put-u8 c tag)))
+                    (dds.xport:send (shmem-transport-transport st) loc buf 0 4))
+                  (lane-of (st)
+                    (shmem-dest-lane (gethash (shmem-locator-name loc)
+                                              (shmem-transport-attach-cache st)))))
+             (send1 a #xA1) (send1 b #xB2)
+             (setf lane-a (lane-of a) lane-b (lane-of b))
+             (assert (and lane-a lane-b) () "both senders must hold a claimed lane")   ; HOTPATH-COND(TEST): in-file self-test
+             (assert (/= lane-a lane-b) () "two senders must hold DISTINCT lanes (~a vs ~a)" lane-a lane-b)   ; HOTPATH-COND(TEST): in-file self-test
+             (dotimes (i 12) (send1 a #xA1) (send1 b #xB2))
+             (assert (and (eql lane-a (lane-of a)) (eql lane-b (lane-of b))) ()   ; HOTPATH-COND(TEST): in-file self-test
+                     "a cached lane must be STABLE across sends")
+             ;; the memo must agree with the ring's own ownership table, not merely be self-consistent
+             (let ((sap (dds.pal:shm-sap (shmem-dest-segment
+                                          (gethash (shmem-locator-name loc)
+                                                   (shmem-transport-attach-cache a))))))
+               (assert (eql lane-a (%claim-lane sap (shmem-transport-token a))) ()   ; HOTPATH-COND(TEST): in-file self-test
+                       "the cached lane must equal a fresh %claim-lane for the same token"))
+             (shmem-receive-drain
+              rx (lambda (s size)
+                   (push (cons size (aref (dds.core.buffer:octet-buffer-vec s) 0)) seen)))
+             (assert (= 26 (length seen)) () "want 26 records, got ~a" (length seen))   ; HOTPATH-COND(TEST): in-file self-test
+             (assert (= 13 (count #xA1 seen :key #'cdr)) () "sender A's records must arrive intact")   ; HOTPATH-COND(TEST): in-file self-test
+             (assert (= 13 (count #xB2 seen :key #'cdr)) () "sender B's records must arrive intact")   ; HOTPATH-COND(TEST): in-file self-test
+             t))
+      (shmem-transport-close a)
+      (shmem-transport-close b)
       (shmem-transport-close rx))))
 
 ;;;; D2 — the receiver thread: block on the segment's pshared cond until a lane has data (or stop),

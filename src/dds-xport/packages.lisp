@@ -49,7 +49,10 @@
            #:*shmem-rx-spin-iterations* #:start-shmem-receiver #:stop-shmem-receiver
            #:shm-attach-by-name-reliable-p
            #:*debug-shmem-send-fault* #:shmem-send-test-fault
-           #:run-shmem-transport-test #:run-shmem-receiver-test #:run-shmem-stress-test))
+           ;; The resolved-once destination cache (NFR-MEM, ADR 0067): the A/B lever + escape hatch
+           #:*shmem-dest-cache*
+           #:run-shmem-transport-test #:run-shmem-receiver-test #:run-shmem-stress-test
+           #:run-shmem-dest-cache-test))
 
 (defpackage #:net.goenninger.dds.xport.zerocopy
   (:nicknames #:dds.xport.zerocopy)

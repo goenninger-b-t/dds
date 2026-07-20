@@ -155,6 +155,29 @@ measured 3648), so no step can silently lose its win.** Highest value next: `%re
 the TX send-plan flattening (349 B) — together ~19 % — but BOTH have a correctness invariant to preserve
 (stale-route mis-delivery; byte-identical wire), so neither is a quick edit.
 
+## LANDED (2026-07-20) — the SHMEM sender resolved its destination per datagram, −87 B (2621 → 2534)
+
+Full decision in **ADR 0067**; measurement in
+`bench/report/2026-07-20-shmem-cost-more-than-udp-and-reclaimed-its-lane-per-datagram.md`.
+
+Once 0065/0066 made UDP send+recv ~0 B/call, a FREE A/B (flip the existing `dds.disc:*shmem-enabled*`, no
+code change) showed **SHMEM 2577.3 vs pure UDP 2446.4** — the intra-host transport that exists for SPEED
+had become 131 B/sample more expensive than the network one. It had not regressed; UDP got cheap and
+nothing re-ranked the transports.
+
+`%shmem-send` re-derived its destination on EVERY datagram: `(shm-sap dest)` boxes a pointer, and
+`%claim-lane` — **whose own docstring says "One-time, off the hot path"** — took the segment's pshared
+MUTEX, scanned every lane descriptor and ran an `unwind-protect`, all to return the lane it had already
+returned for the same token. Now resolved once into a `shmem-dest` (segment+sap+lane) cached in the
+EXISTING attach cache: all three share the attach's lifetime, so they go stale together and there is no
+second thing to invalidate. arm64 ceiling 2710 → 2600; cumulative **3560 → 2534, −29 %**.
+
+⚠️ A wrong cached lane is SILENT MIS-DELIVERY (two senders on one lane interleave rather than fail), so
+`run-shmem-dest-cache-test` asserts lanes are claimed, stable, DISTINCT, and agree with a fresh
+`%claim-lane` — and was FALSIFIED first (force lane 0 for everyone ⇒ red).
+
+**A docstring claiming "off the hot path" is a claim, not a fact. Check it.**
+
 ## LANDED (2026-07-20) — the SECOND receiver-thread slice: raw recvfrom(2), −87 B (2730 → ~2630)
 
 Full decision in **ADR 0066**; measurement in `bench/report/2026-07-20-the-receive-path-built-a-sender-address-nobody-read.md`.
