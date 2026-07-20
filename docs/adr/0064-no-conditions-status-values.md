@@ -679,8 +679,10 @@ The last twenty non-hot-path signalling forms, cleared in one sweep across five 
   as before. `create-participant` `TRY`s it, so a denied config returns `(values nil STATUS)` with no unwind.
 - `dds.disc:parse-peers` — a malformed `host:port` CLI entry SIGNALed; now `(bail :bad-peer-spec)` →
   `(values nil :bad-peer-spec)`. The shapes wrapper `%parse-peers` keeps its `list` return and, on a non-nil
-  status, emits a `NOCOND(WARN)` visible degradation to multicast-only discovery (no control transfer); the
-  `dds-bench` `%perf-participant` validates it with a `NOCOND(BENCH)` harness check. Test `T6b`'s two
+  status, is a HARD STOP at the shapes CLI: it prints the reason to `*error-output*` and exits non-zero via
+  `uiop:quit` — a clean process exit, not a condition (the shapes runners ARE the CLI entrypoints, invoked
+  directly by `sbcl --eval` from the Makefile, and no test reaches this path). The `dds-bench`
+  `%perf-participant` validates it with a `NOCOND(BENCH)` harness check. Test `T6b`'s two
   catch-the-signal assertions flip to `(null (create-datawriter …))` fail-closed checks.
 
 **Annotated (owner-sanctioned exempt classes), each verified unreachable-on-valid-input or already-contained:**
