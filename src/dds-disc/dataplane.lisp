@@ -858,6 +858,13 @@
    non-fragmented DATA %SEND-SAMPLE silently SKIPS, proving lost-final-sample recovery via the
    periodic HEARTBEAT (RTPS 2.5 §8.4.2.2). Never set in production.")
 
+(defparameter *tx-single-group* t
+  "NFR-MEM (ADR 0062, task #29): when T (default), %PUSH-ONE-WRITER-CHANGES emits the common single-destination
+   case (exactly one %reader-push-targets group) DIRECTLY, skipping %capture-push-groups' per-group
+   %zc-push-group struct + the groups/all lists — the ADR 0047 cross-group freeze is trivially satisfied by one
+   group (no change reaches >=2 groups, so the shared-ZC table is +no-shared-zc-refs+). Bind NIL to force the
+   general %capture-push-groups path for the SAME input (the byte-identity/allocation A/B). Never bound in production.")
+
 (defparameter *tx-fast-path* t
   "NFR-MEM (ADR 0062, task #29): when T (default), %SEND-CHANGES-PACKED emits the common case — one small
    non-ZC change (+ optional HB) fitting a single budget-bounded datagram to one destination (UDP or SHMEM) —
@@ -1845,19 +1852,38 @@
    so every DATA/HEARTBEAT it emits carries THIS writer's own EntityId (WP-N-ENDPOINT-S1)."
   (let ((*emit-writer* writer))   ; WP-N-ENDPOINT-S1: stamp + source (HEARTBEAT_FRAG) from this writer's own GUID/HC
     (multiple-value-bind (first last count) (dds.rtps.reliable:writer-heartbeat writer)
-      (multiple-value-bind (groups all-changes) (%capture-push-groups node writer)   ; ADR 0047: freeze every dest's unsent set once
-        (let ((shared (%shared-zc-refs node writer groups)))   ; ADR 0047: one slot per change reaching >=2 ZC dests (exact refcount)
-          (unwind-protect
-               (dolist (g groups)   ; DATA + HEARTBEAT -> each matched-reader destination, in %reader-push-targets order
-                 (%send-changes-packed node buf
-                                       (%zc-push-group-changes g)
-                                       (car (%zc-push-group-dest g)) (cdr (%zc-push-group-dest g))
-                                       first last count   ; raw HB -> written inline on the fast path (no per-send closure); the plan path builds it lazily
-                                       (%zc-push-group-shmem g)
-                                       (%zc-push-group-zc-count g)
-                                       (%zc-push-group-dest-prefix g)   ; T10: wrap user data to a :keyed destination
-                                       shared))
-            (dds.rtps.reliable:writer-release-change-refs writer all-changes))))))   ; release all send-refs after every destination's datagrams are emitted (copied)
+      (let ((targets (and *tx-single-group* (%reader-push-targets node (%writer-topic node writer)))))
+        (if (and targets (null (cdr targets)))
+            ;; NFR-MEM single-destination fast path (ADR 0062): exactly ONE %reader-push-targets group -> capture
+            ;; + emit DIRECTLY, with none of %capture-push-groups' %zc-push-group struct / groups / all-changes
+            ;; allocation. The ADR 0047 cross-group freeze is a no-op with one group (no change reaches >=2
+            ;; groups), so the shared-ZC ref table is +no-shared-zc-refs+ — byte-identical to the general path.
+            (let* ((group (car targets))
+                   (dest (car group))
+                   (changes (dds.rtps.reliable:writer-capture-unsent writer (cdr group))))
+              (unwind-protect
+                   (%send-changes-packed node buf changes
+                                         (car dest) (cdr dest)
+                                         first last count
+                                         (%group-shmem-dest node group)
+                                         (%zc-readers node (cdr group))
+                                         (%group-dest-prefix group)
+                                         +no-shared-zc-refs+)
+                (dds.rtps.reliable:writer-release-change-refs writer changes)))
+            ;; general path: freeze EVERY destination's unsent set up front (ADR 0047 stability) before any emit
+            (multiple-value-bind (groups all-changes) (%capture-push-groups node writer)   ; ADR 0047: freeze every dest's unsent set once
+              (let ((shared (%shared-zc-refs node writer groups)))   ; ADR 0047: one slot per change reaching >=2 ZC dests (exact refcount)
+                (unwind-protect
+                     (dolist (g groups)   ; DATA + HEARTBEAT -> each matched-reader destination, in %reader-push-targets order
+                       (%send-changes-packed node buf
+                                             (%zc-push-group-changes g)
+                                             (car (%zc-push-group-dest g)) (cdr (%zc-push-group-dest g))
+                                             first last count   ; raw HB -> written inline on the fast path (no per-send closure); the plan path builds it lazily
+                                             (%zc-push-group-shmem g)
+                                             (%zc-push-group-zc-count g)
+                                             (%zc-push-group-dest-prefix g)   ; T10: wrap user data to a :keyed destination
+                                             shared))
+                  (dds.rtps.reliable:writer-release-change-refs writer all-changes)))))))) ; release all send-refs after every destination's datagrams are emitted (copied)
   t)
 
 (defun* %push-data (node)

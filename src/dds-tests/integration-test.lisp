@@ -6167,6 +6167,27 @@
       (dds.disc:stop-node plan-node)))
   t)
 
+(defun* run-tx-single-group-equivalence-test ()
+    (function () t)
+  "NFR-MEM (ADR 0062, task #29) byte-identity oracle: %PUSH-ONE-WRITER-CHANGES' single-destination fast path
+   (one %reader-push-targets group -> emit directly, no %zc-push-group struct / groups / all-changes lists,
+   shared-ZC table = +no-shared-zc-refs+) emits the EXACT wire bytes the general %capture-push-groups path does.
+   Two equivalently-built nodes (same guid-prefix, one matched reader = one group, K small writes): the fast-path
+   capture (*tx-single-group* T, default) and the forced-general capture (*tx-single-group* NIL) datagram
+   sequences must be byte-IDENTICAL. The struct is a pure allocation bundle; eliminating it is a ZERO-byte wire change."
+  (let ((fast-node (%flow-step-build-node #x75 #x85 7805 (loop repeat 6 collect (octets 1 2 3 4 5 6 7 8))))
+        (gen-node  (%flow-step-build-node #x75 #x85 7805 (loop repeat 6 collect (octets 1 2 3 4 5 6 7 8)))))
+    (unwind-protect
+         (let ((fast-dgs (let ((dds.disc::*tx-single-group* t))   (%coalesce-capture fast-node)))
+               (gen-dgs  (let ((dds.disc::*tx-single-group* nil)) (%coalesce-capture gen-node))))
+           (%check :tx-single-group-nonempty (plusp (length fast-dgs))
+                   "the single-group fast path must emit at least one datagram")
+           (%check :tx-single-group-identical (%datagrams-identical-p fast-dgs gen-dgs)
+                   "the single-group fast path's datagram sequence must be byte-identical to the general %capture-push-groups path"))
+      (dds.disc:stop-node fast-node)
+      (dds.disc:stop-node gen-node)))
+  t)
+
 (defun* run-match-dest-cache-invalidation-test ()
     (function () t)
   "NFR-MEM (ADR 0062): the %match-destinations-prefixed send-destination memo is populated on resolve and

@@ -92,6 +92,14 @@ after all matches); `run-push-spdp-peer-isolation-test` caught it on both impls.
 `%record-match` (the choke point) + a `%record-match` assertion in the invalidation test. The full-suite run
 is the gate that earned its keep here.
 
+## Slice 5 (same day) — single-destination push fast path: −90 B (~2960 → 2883)
+
+`%push-one-writer-changes` emits the one-`%reader-push-targets`-group common case directly, skipping
+`%capture-push-groups`' per-group `%zc-push-group` struct + the `groups`/`all-changes` lists (the ADR 0047
+cross-group freeze is a no-op with one group). `gate-mem` A/B (`*tx-single-group*`): OFF ~2976 → ON ~2883.
+**Cumulative 3560 → ~2883 = −677 B/sample (~19%).** arm64 ceiling 3030 → 2950. Byte-identical
+(`run-tx-single-group-equivalence-test` + `run-flow-step-equivalence-test` + live n-reader/same-topic).
+
 ## Note
 
 The first cut gated on `(null shmem-dest)` (UDP only) and measured as a no-op — because `mem-per-sample`

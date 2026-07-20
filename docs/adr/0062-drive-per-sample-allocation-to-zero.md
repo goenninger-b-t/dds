@@ -155,7 +155,21 @@ measured 3648), so no step can silently lose its win.** Highest value next: `%re
 the TX send-plan flattening (349 B) — together ~19 % — but BOTH have a correctness invariant to preserve
 (stale-route mis-delivery; byte-identical wire), so neither is a quick edit.
 
-## LANDED (2026-07-20) — TX + send-destination allocation: ~−600 B/sample (3560 → ~2960)
+## LANDED (2026-07-20) — TX allocation: ~−680 B/sample (3560 → ~2883)
+
+### Slice 5 — single-destination push fast path (skip the %zc-push-group struct): −90 B (~2960 → 2883)
+
+`%capture-push-groups` builds a `%zc-push-group` struct (+ the `groups` / `all-changes` lists) per destination
+to freeze every dest's unsent set up front for the ADR 0047 cross-group ZC-refcount stability. For the common
+case — exactly ONE `%reader-push-targets` group — that freeze is a no-op (no change reaches ≥2 groups, so the
+shared-ZC table is `+no-shared-zc-refs+`). `%push-one-writer-changes` now emits that case directly: capture the
+one group's unsent set, send, release — no struct, no lists. `gate-mem` A/B (`*tx-single-group*`): OFF ~2976 →
+ON ~2883, −90 B. Byte-identical — proven three ways: the new `run-tx-single-group-equivalence-test`
+(`*tx-single-group*` T vs NIL via `*datagram-sink*`), the existing `run-flow-step-equivalence-test` (this
+single-group path vs the general `%node-datagram-plan` path), and the live n-reader / same-topic delivery
+tests. arm64 ceiling 3030 → 2950.
+
+### Slice 4 — memoize the TX push grouping (%reader-push-targets): −185 B (3145 → ~2960)
 
 ### Slice 4 — memoize the TX push grouping (%reader-push-targets): −185 B (3145 → ~2960)
 
