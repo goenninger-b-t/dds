@@ -155,7 +155,23 @@ measured 3648), so no step can silently lose its win.** Highest value next: `%re
 the TX send-plan flattening (349 B) — together ~19 % — but BOTH have a correctness invariant to preserve
 (stale-route mis-delivery; byte-identical wire), so neither is a quick edit.
 
-## LANDED (2026-07-20) — TX send-plan flattening: −262 B/sample (3560 → 3298)
+## LANDED (2026-07-20) — TX common-path allocation: −349 B/sample (3560 → 3211)
+
+### Slice 2 — inline HEARTBEAT on the fast path: −87 B (3298 → 3211)
+
+Re-profiling after slice 1 (below) showed `%send-changes-packed` gone from the top-25 allocators and
+`%push-one-writer-changes` risen to #1 (10.6 % self). The cause: it built a fresh HEARTBEAT **pack closure**
+per send (`%heartbeat-builder` → `(cons 32 (lambda (mc) …))`), inside the per-destination `dolist`. The TX
+fast path (slice 1) `funcall`ed that closure but did not eliminate it. Fixed by passing the HB as raw
+`(first last count)` down to `%send-changes-packed` and writing it **inline** via a new `%write-hb-submessage`
+(extracted from `%heartbeat-builder`'s body, shared DRY); the pack closure is now built **lazily only on the
+plan fallback** (`(and hb-first (%heartbeat-builder …))`), never on the common path. `gate-mem` A/B:
+**FAST-OFF 3577.6 → FAST-ON ~3247 B** (official `gate-mem` 3210.8); byte-identical (the same
+`%write-hb-submessage` bytes; `run-tx-fast-path-equivalence-test` still green). arm64 ceiling 3360 → 3290.
+The `%send-changes-packed` signature took the HB `(SIZE . closure)` param → three `hb-first/last/count`
+integers; both callers (`%push-one-writer-changes`, `%on-user-acknack` retransmit) updated.
+
+### Slice 1 — TX send-plan flattening: −262 B/sample (3560 → 3298)
 
 `%send-changes-packed` now emits the common case — exactly one small non-ZC change (+ the optional trailing
 HEARTBEAT) fitting a single budget-bounded datagram to one destination — **directly**, skipping

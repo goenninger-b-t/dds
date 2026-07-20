@@ -936,15 +936,25 @@
     (cons (%change-submessage-size change)
           (lambda (mc) (%write-change-submessage node change wid mc)))))
 
+(defun* %write-hb-submessage (first last count wid mc)
+    (function (integer integer integer (unsigned-byte 32) dds.core.buffer:cursor) t)
+  "Write one NON-FINAL user-writer HEARTBEAT (FIRST,LAST,COUNT) at writerId WID into cursor MC — readerId
+   UNKNOWN, FinalFlag NOT_SET so it solicits an ACKNACK (RTPS 2.5 §8.3.7.5 / §8.4.9.2.7). WID is PASSED IN
+   (captured at pack time by %heartbeat-builder) so a deferred flow-controller emit stamps the writerId from
+   when the HB was packed. The byte-exact HB writer shared by %heartbeat-builder's pack closure and
+   %send-changes-packed's single-datagram fast path (DRY)."
+  (dds.rtps.message:write-heartbeat mc dds.rtps.message:+entityid-unknown+ wid first last count :final nil)
+  t)
+
 (defun* %heartbeat-builder (node first last count)
     (function (disc-node integer integer integer) cons)
   "A (SIZE . BUILD-FN) packable item for one NON-FINAL user-writer HEARTBEAT (FIRST,LAST,COUNT) —
    readerId UNKNOWN, FinalFlag NOT_SET so it solicits an ACKNACK (RTPS 2.5 §8.3.7.5 / §8.4.9.2.7);
-   mirrors %send-user-heartbeat. SIZE = 4 submsg-header + 28 body."
+   mirrors %send-user-heartbeat. SIZE = 4 submsg-header + 28 body. WID captured HERE (pack time) into the
+   closure. Delegates the write to %write-hb-submessage, shared verbatim with the fast path (DRY)."
   (let ((wid (%emit-wid node)))
     (cons 32
-          (lambda (mc) (dds.rtps.message:write-heartbeat
-                        mc dds.rtps.message:+entityid-unknown+ wid first last count :final nil)))))
+          (lambda (mc) (%write-hb-submessage first last count wid mc)))))
 
 (defun* %zc-payload-wire-protected-p (node)
     (function (disc-node) boolean)
@@ -1394,10 +1404,11 @@
           (%send-raw-buf node buf len (car dest) (cdr dest) (cdr entry) dest-prefix)
           (values len (and (cdr plan) t) (cons dest (cdr plan)))))))
 
-(defun* %send-changes-packed (node buf changes host port hb &optional shmem-dest (zc-readers 0) dest-prefix shared)
-    (function (disc-node dds.core.buffer:octet-buffer list string (unsigned-byte 16) (or null cons)
+(defun* %send-changes-packed (node buf changes host port hb-first hb-last hb-count &optional shmem-dest (zc-readers 0) dest-prefix shared)
+    (function (disc-node dds.core.buffer:octet-buffer list string (unsigned-byte 16)
+               (or null integer) (or null integer) (or null integer)
                &optional t (integer 0) (or null (simple-array (unsigned-byte 8) (12))) (or null hash-table)) t)
-  "Send CHANGES (+ optional trailing HEARTBEAT item HB, a (SIZE . BUILD-FN)) to HOST:PORT, coalescing the
+  "Send CHANGES (+ optional trailing HEARTBEAT (HB-FIRST,HB-LAST,HB-COUNT); HB-FIRST NIL = no HB) to HOST:PORT, coalescing the
    small ones into as few datagrams as fit the budget: this is now the per-datagram STEP run to completion —
    build the %changes-datagram-plan once, then %emit-next-datagram in a loop until no datagram remains. The
    plan emits every LARGE change's DATA_FRAG series first (one datagram per fragment group, UDP only in v1),
@@ -1415,12 +1426,13 @@
   ;; NFR-MEM fast path (ADR 0062, task #29): the common case — exactly ONE small non-ZC change (+ optional
   ;; trailing HB) to ONE destination (UDP or SHMEM) that fits a single budget-bounded datagram — is emitted
   ;; DIRECTLY, with none of %changes-datagram-plan's list / %pack-plan group / per-group closure / state-cons
-  ;; allocation. Byte-IDENTICAL to the plan path by construction: same header, the SAME %write-change-submessage
-  ;; + HB closure in the same order, and %pack-plan would put a 4-aligned change followed by the 4-aligned HB
-  ;; (both within budget) in exactly ONE group. SHMEM-DEST is passed through to %send-raw-buf unchanged (the
-  ;; datagram BYTES are transport-independent; only the send target differs). Any precondition failing (>1
-  ;; change, ZC, a pinned :data whose slot will not resolve, a non-4-aligned or over-budget size) falls
-  ;; through to the unchanged plan path.
+  ;; allocation, AND without building the HEARTBEAT pack closure (%heartbeat-builder) — the HB submessage is
+  ;; written inline via %write-hb-submessage. Byte-IDENTICAL to the plan path by construction: same header, the
+  ;; same %write-change-submessage + %write-hb-submessage in the same order, and %pack-plan would put a
+  ;; 4-aligned change followed by the 4-aligned HB (both within budget) in exactly ONE group. SHMEM-DEST is
+  ;; passed through to %send-raw-buf unchanged (datagram BYTES are transport-independent). Any precondition
+  ;; failing (>1 change, ZC, a pinned :data whose slot will not resolve, non-4-aligned or over-budget) falls
+  ;; through to the plan path, which builds the HB closure lazily only there.
   (when (and *tx-fast-path* changes (null (cdr changes)) (zerop zc-readers)
              (null (disc-node-zc-pool node)))
     (let ((change (car changes)))
@@ -1431,15 +1443,18 @@
                      (%ensure-change-payload node change)))   ; resolve+cache a pinned slot; NIL -> fall through (plan drops it)
         (let ((size (%change-submessage-size change)))
           (when (and (zerop (mod size 4))                       ; 4-aligned -> %pack-plan would NOT force a boundary after it
-                     (<= (+ size (if hb (car hb) 0)) (%pack-budget buf)))   ; change (+ HB) fit ONE datagram
-            (let ((mc (dds.core.buffer:cursor buf :endianness :little)))
+                     (<= (+ size (if hb-first 32 0)) (%pack-budget buf)))   ; change (+ 32-octet HB) fit ONE datagram
+            (let ((mc (dds.core.buffer:cursor buf :endianness :little))
+                  (wid (%emit-wid node)))
               (dds.rtps.message:write-header mc (disc-node-guid-prefix node))
-              (%write-change-submessage node change (%emit-wid node) mc)
-              (when hb (funcall (cdr hb) mc))
+              (%write-change-submessage node change wid mc)
+              (when hb-first (%write-hb-submessage hb-first hb-last hb-count wid mc))
               (%send-raw-buf node buf (dds.core.buffer:cursor-position mc) host port shmem-dest dest-prefix))
             (return-from %send-changes-packed t))))))
   (let ((state (cons (cons host port)
-                     (%changes-datagram-plan node buf changes hb shmem-dest zc-readers shared))))
+                     (%changes-datagram-plan node buf changes
+                                             (and hb-first (%heartbeat-builder node hb-first hb-last hb-count))
+                                             shmem-dest zc-readers shared))))
     (loop while (cdr state)   ; (cdr state) = the remaining datagram plan; NIL when exhausted
           do (setf state (nth-value 2 (%emit-next-datagram node buf state dest-prefix))))   ; T10: wrap to a keyed dest
     t))
@@ -1805,7 +1820,7 @@
                  (%send-changes-packed node buf
                                        (%zc-push-group-changes g)
                                        (car (%zc-push-group-dest g)) (cdr (%zc-push-group-dest g))
-                                       (%heartbeat-builder node first last count)
+                                       first last count   ; raw HB -> written inline on the fast path (no per-send closure); the plan path builds it lazily
                                        (%zc-push-group-shmem g)
                                        (%zc-push-group-zc-count g)
                                        (%zc-push-group-dest-prefix g)   ; T10: wrap user data to a :keyed destination
@@ -3419,7 +3434,7 @@
                       (peers (if dest (list (cons src-prefix dest)) (%match-destinations-prefixed node t))))
                  (dolist (pd peers)   ; retransmit present DATA(_FRAG)/dispose, then GAP the missing -> the NACKing reader
                    (let ((peer (cdr pd)))
-                     (%send-changes-packed node (disc-node-rx-tx-msg node) resends (car peer) (cdr peer) nil nil 0 (car pd))
+                     (%send-changes-packed node (disc-node-rx-tx-msg node) resends (car peer) (cdr peer) nil nil nil nil 0 (car pd))
                      (when gaps (%send-user-gap node (disc-node-rx-tx-msg node) rid gaps (car peer) (cdr peer) (car pd))))))
             (dds.rtps.reliable:writer-release-change-refs w resends))   ; release after the retransmit datagrams are emitted (copied)
           ;; the ACKNACK advanced this reader's acked-base -> purge HistoryCache changes ALL matched readers

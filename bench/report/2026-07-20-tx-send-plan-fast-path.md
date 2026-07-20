@@ -34,6 +34,24 @@ measurement noise. arm64 ceiling ratcheted **3600 → 3360** (`bench/mem-ceiling
 - `run-flow-step-equivalence-test`, `run-coalesce-pack-test` unchanged and green.
 - 567/567 SBCL + Clasp; gate-build (clean cache, both impls) + gate-types + gate-nocond (0) green.
 
+## Slice 2 (same day) — inline HEARTBEAT on the fast path: −87 B (3298 → 3211)
+
+Re-profiling (`sb-sprof :mode :alloc`) after slice 1 put `%push-one-writer-changes` at #1 (10.6 % self): it
+built a fresh HEARTBEAT pack closure per send (`%heartbeat-builder`). The fast path now writes the HB inline
+(`%write-hb-submessage`, extracted DRY); the closure is built lazily only on the plan fallback.
+
+| arm (samples=5000, warmup=500) | bytes/sample |
+|---|---:|
+| FAST-OFF (plan) | 3577.6 |
+| FAST-ON (HB inline) — run 1 | 3250.1 |
+| FAST-ON (HB inline) — run 2 | 3242.9 |
+| FAST-ON (HB inline) — run 3 | 3250.1 |
+| **official `gate-mem`** | **3210.8** |
+
+**Cumulative: 3560 → 3211 = −349 B/sample (~10 %)** across the two slices. arm64 ceiling ratcheted 3360 → 3290.
+`%send-changes-packed`'s HB param went `(SIZE . closure)` → three `hb-first/last/count` ints; both callers
+updated; 568/568 both impls, byte-identity + corpus green.
+
 ## Note
 
 The first cut gated on `(null shmem-dest)` (UDP only) and measured as a no-op — because `mem-per-sample`
