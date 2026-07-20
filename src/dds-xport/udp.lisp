@@ -53,9 +53,12 @@
   (dds.pal:udp-local-port socket))
 
 (defun* udp-transport-recv (socket buffer)
-    (function (t dds.core.buffer:octet-buffer) (values (integer 0) t t))
+    (function (t dds.core.buffer:octet-buffer) (values integer t t))
   "Block until a datagram arrives; read it into BUFFER up to its capacity.
-   Returns (values size sender-address sender-port)."
+   Returns (values size sender-address sender-port). SIZE is NEGATIVE when the socket was closed and
+   the sender address is NIL on the raw-recvfrom path — see dds.pal:udp-recv (ADR 0066). The return
+   type is `integer`, NOT `(integer 0)`: declaring it non-negative would let the compiler fold a
+   caller's own (minusp size) shutdown check away at (safety 0)."
   (dds.pal:udp-recv socket
                     (dds.core.buffer:octet-buffer-vec buffer)
                     (dds.core.buffer:octet-buffer-capacity buffer)))
@@ -109,7 +112,11 @@
               (let ((size (handler-case
                               (nth-value 0 (dds.pal:udp-recv socket
                                                              (dds.core.buffer:octet-buffer-vec buf) 65507))
-                            (error () (return)))))   ; socket closed / recv error -> exit thread
+                            (error () (return)))))   ; socket-receive arm: closed socket SIGNALS -> exit
+                ;; raw-recvfrom arm: a closed socket RETURNS negative instead (ADR 0066) -> exit here,
+                ;; or this thread spins and stop-node's join never returns. ZERO is NOT an exit: a
+                ;; zero-length datagram is legal and any peer could send one (NFR-SEC-POSTURE).
+                (when (and (integerp size) (minusp size)) (return))
                 ;; one malformed or unexpected datagram must not kill the receiver
                 (handler-case (funcall on-datagram buf size)
                   (error () nil))))

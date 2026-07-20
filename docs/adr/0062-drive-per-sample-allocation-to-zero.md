@@ -155,6 +155,27 @@ measured 3648), so no step can silently lose its win.** Highest value next: `%re
 the TX send-plan flattening (349 B) — together ~19 % — but BOTH have a correctness invariant to preserve
 (stale-route mis-delivery; byte-identical wire), so neither is a quick edit.
 
+## LANDED (2026-07-20) — the SECOND receiver-thread slice: raw recvfrom(2), −87 B (2730 → ~2630)
+
+Full decision in **ADR 0066**; measurement in `bench/report/2026-07-20-the-receive-path-built-a-sender-address-nobody-read.md`.
+
+`udp-recv` went through `sb-bsd-sockets:socket-receive`, which builds a sockaddr for the SENDER and
+converts it to a Lisp address on every datagram — **304.6 B/call isolated, for a value nothing reads**
+(RTPS identifies a source by GuidPrefix, never by IP; `start-udp-receiver` takes `(nth-value 0 …)` and both
+other callers `(declare (ignore addr senderport))`). Now `recvfrom(2)` with `src_addr = NULL`: 0.0 B/call.
+
+**The syscall swap was the easy half.** The receiver thread exits today *because `socket-receive` signals*
+on a closed socket; `recvfrom` returns −1, so a naive port spins forever and `stop-node`'s join hangs — the
+"stack could not shut down on Linux" defect. Probed, not assumed: a thread parked in raw `recvfrom` is NOT
+woken by `tcp-shutdown` on Darwin (`ENOTCONN` on an unconnected UDP socket — the probe HUNG), and
+`socket-close` resets the fd slot to −1 on BOTH impls, so a fresh-read fd gives `EBADF` with no fd-reuse
+exposure. The loop exits on NEGATIVE, never on zero (a legal zero-length datagram would otherwise let any
+peer kill a receiver thread, NFR-SEC-POSTURE). `udp-transport-recv`'s `(values (integer 0) t t)` was widened
+to `(values integer t t)` — at `(safety 0)` a non-negative declaration folds a caller's `(minusp size)`
+check away.
+
+304.6 B/call → −87 end-to-end: the **fourth** per-site over-report (~3.5×). Rule unchanged.
+
 ## LANDED (2026-07-20) — the FIRST RECEIVER-THREAD slice: raw sendto(2), −175 B (2883 → 2730)
 
 Full decision in **ADR 0065**; measurement in `bench/report/2026-07-20-the-acknack-reparsed-its-destination-ip-per-datagram.md`.

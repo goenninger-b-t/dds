@@ -184,7 +184,8 @@ in-segment `PTHREAD_PROCESS_SHARED` mutex/condvar. All thin CFFI wrappers; no ex
 | `dds.pal:udp-local-port` | function | `(socket)` — the bound local port of `socket`. |
 | `dds.pal:udp-send-to` | function | `(socket buffer length host port)` — send `length` octets of `buffer` from `socket` to `host:port`, via raw `sendto(2)` with **zero allocation per datagram** (ADR 0065). Returns `sendto`'s value: the octet count sent, or **negative** on failure — UDP is best-effort, so the caller drops the datagram and the reliable layer recovers via HEARTBEAT/ACKNACK. **`buffer` MUST be PAL-static (`dds.pal:alloc-static`)**: it is handed to the kernel by raw pointer, and NFR-MEM requires anything addressed by a pointer/SAP to be foreign/static, never a plain heap array (SBCL's and AllegroCL's GCs move objects, so a heap vector's address can be invalidated underneath a blocking syscall). |
 | `dds.pal:*udp-raw-sendto*` | special variable | Default `T`: `udp-send-to` fills a pre-allocated per-thread foreign `struct sockaddr_in` and calls `sendto(2)` directly. `NIL`: the original `sb-bsd-sockets:socket-send` path, which allocates ~360 B per datagram — about 262 B of it re-parsing the dotted-quad destination **string** on every send. **The datagram bytes on the wire are identical either way**; only the syscall wrapper differs. Kept as the A/B lever ADR 0062 requires for sizing an allocation change against `make gate-mem`, and as an escape hatch should a platform's `sockaddr_in` layout differ from the Darwin and Linux ones documented in ADR 0065. `run-udp-loopback-test` asserts byte-exact delivery under **both** arms, which is what makes a wrong layout fail loudly rather than silently drop every datagram. |
-| `dds.pal:udp-recv` | function | `(socket buffer length)` — block until a datagram arrives; return `(values size sender-address sender-port)`. Used from a dedicated receiver thread. |
+| `dds.pal:udp-recv` | function | `(socket buffer length)` — block until a datagram arrives; return `(values size sender-address sender-port)`, with **zero allocation per datagram** (ADR 0066). Used from a dedicated receiver thread. On the raw path the sender address is **not reported** (`NIL`) — nothing in the stack uses it, since RTPS identifies a source by GuidPrefix, never by IP. **A NEGATIVE size means the socket was closed**: `recvfrom(2)` reports that by returning −1 where `socket-receive` signalled, so **a receiver loop must check for it and exit**, or the thread spins and `stop-node`'s join never returns. Zero is *not* an exit condition — a zero-length datagram is legal, and treating it as end-of-stream would let any peer kill a receiver thread. **`buffer` MUST be PAL-static**, as for `udp-send-to`. |
+| `dds.pal:*udp-raw-recvfrom*` | special variable | Default `T`: `udp-recv` calls `recvfrom(2)` directly with `src_addr = NULL`. `NIL`: the original `sb-bsd-sockets:socket-receive` path, which allocates ~305 B per datagram — most of it building a sender sockaddr and converting it to a Lisp address that no caller reads. A/B lever and escape hatch, as `*udp-raw-sendto*` is; `run-udp-loopback-test` asserts byte-exact delivery under both arms. |
 | `dds.pal:udp-close` | function | `(socket)` — close `socket`. |
 | `dds.pal:udp-set-reuse-port` | function | `(socket)` — enable `SO_REUSEPORT` so multiple participants on one host can share the SPDP multicast port. Must be called before bind. Returns `(values t nil)` or `(values nil :setsockopt-failed)`. |
 | `dds.pal:udp-join-multicast` | function | `(socket group)` — join the IPv4 multicast `group` (dotted-quad) on the default interface and enable loopback (RTPS 2.5 §9.6.1.1). The socket must already be bound to the multicast port. Returns `(values t nil)` or `(values nil :setsockopt-failed)` — a node that cannot join the SPDP group discovers nobody, so the caller must surface it rather than proceed deaf. |
@@ -319,25 +320,25 @@ datagram; it exits cleanly when the socket is closed. Adapted from `dds.xport.ud
 The transport record wraps these, but the PAL UDP layer is usable directly — this is what
 `run-udp-loopback-test` (`src/dds-tests/udp-test.lisp`) exercises.
 
-The SEND buffer must be **PAL-static** (`dds.pal:alloc-static`) — `udp-send-to` hands it to the kernel by
-raw pointer (ADR 0065, NFR-MEM). The RECEIVE buffer goes through `socket-receive` and may be an ordinary
-heap array.
+Both buffers must be **PAL-static** (`dds.pal:alloc-static`) — the kernel reads the send buffer and writes
+the receive buffer through raw pointers (ADR 0065/0066, NFR-MEM).
 
 ```lisp
 (let ((rx (dds.pal:udp-open :host "127.0.0.1" :port 0)))
   (unwind-protect
       (let ((tx  (dds.pal:udp-open :host "127.0.0.1" :port 0))
             (out (dds.pal:alloc-static 4))                       ; static: addressed by raw pointer
-            (in  (make-array 16 :element-type '(unsigned-byte 8))))
+            (in  (dds.pal:alloc-static 16)))                     ; static: the kernel writes into it
         (replace out #(#xde #xad #xbe #xef))
         (unwind-protect
             (let ((port (dds.pal:udp-local-port rx)))
               (dds.pal:udp-send-to tx out 4 "127.0.0.1" port)    ; => 4 (negative = dropped)
               (sleep 0.2)
               (multiple-value-bind (n addr sport) (dds.pal:udp-recv rx in 4)
-                (declare (ignore addr sport))
+                (declare (ignore addr sport))   ; sender NIL on the raw path; n < 0 = socket closed
                 (values n in)))   ; => 4, #(#xde #xad #xbe #xef ...)
           (dds.pal:free-static out)
+          (dds.pal:free-static in)
           (dds.pal:udp-close tx)))
     (dds.pal:udp-close rx)))
 ```

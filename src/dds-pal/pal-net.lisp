@@ -285,6 +285,17 @@
    through dlsym on EVERY call on Clasp (~3.8 us measured), and this one sits on the ACKNACK /
    discovery-announce send path.")
 
+(defparameter *recvfrom-fp*
+  (cffi:foreign-symbol-pointer "recvfrom")
+  "The RESOLVED recvfrom(2) function pointer, looked up ONCE at load. Same rule and reason as
+   *SENDTO-FP*: never resolve a foreign symbol by name on a datagram path. Used by UDP-RECV.")
+
+(defparameter *null-sap*
+  (cffi:null-pointer)
+  "The NULL foreign pointer, boxed ONCE at load — recvfrom's src_addr/addrlen when the sender address
+   is not wanted. Address 0 is reload-stable, so unlike *SENDTO-FP* / *RECVFROM-FP* it needs no
+   image-restart re-resolution (the same carve-out dds.dare makes for its *%NULL-PTR*).")
+
 (defconstant +sockaddr-in-bytes+ 16
   "sizeof(struct sockaddr_in) — 16 octets on both supported targets. Layouts, read from the platform
    headers (never reconstructed from memory), differ ONLY in the first two octets:
@@ -395,21 +406,64 @@
    build that dumps a core (a delivered durability-service executable) re-resolves libc on startup.
 
    *CLOCK-GETTIME-FP* predates this hook and carried the identical exposure with no hook at all; it is
-   covered here rather than growing a second one-off. Idempotent — re-resolving a live pointer is a no-op."
+   covered here rather than growing a second one-off. *NULL-SAP* is address 0 and is reload-stable, so
+   it is intentionally left alone. Idempotent — re-resolving a live pointer is a no-op."
   (setf *clock-gettime-fp* (cffi:foreign-symbol-pointer "clock_gettime")
-        *sendto-fp* (cffi:foreign-symbol-pointer "sendto"))
+        *sendto-fp* (cffi:foreign-symbol-pointer "sendto")
+        *recvfrom-fp* (cffi:foreign-symbol-pointer "recvfrom"))
   t)
 
 (eval-when (:load-toplevel :execute)
   (register-image-restart-hook '%pal-reresolve-foreign-pointers))
 
+(defvar *udp-raw-recvfrom* t
+  "T (the default): UDP-RECV calls recvfrom(2) directly with src_addr = NULL — zero allocation per
+   datagram received, and NO sender address is reported. NIL: the original sb-bsd-sockets
+   SOCKET-RECEIVE path, which allocates ~305 B per datagram, most of it building a sender sockaddr
+   and converting it to a Lisp address.
+
+   NOTHING IN THE STACK USES THE SENDER ADDRESS. RTPS identifies a source by the GuidPrefix in the
+   message header, never by IP (RTPS 2.5 §8.3.3); START-UDP-RECEIVER takes only (nth-value 0 ...) and
+   the two remaining callers both (declare (ignore addr senderport)). Reporting it cost a sockaddr,
+   an address conversion and a generic-function dispatch on every datagram we receive.
+
+   A/B lever for the NFR-MEM measurement (ADR 0062) and escape hatch, as *UDP-RAW-SENDTO* is.")
+
 (defun* udp-recv (socket buffer length)
     (function (t (simple-array (unsigned-byte 8) (*)) (integer 0)) t)
-  "Block until a datagram arrives; return (values size sender-address sender-port).
-   Used from a dedicated receiver thread."
-  (multiple-value-bind (buf size addr port) (sb-bsd-sockets:socket-receive socket buffer length)
-    (declare (ignore buf))
-    (values size addr port)))
+  "Block until a datagram arrives; return (values size sender-address sender-port). Used from a
+   dedicated receiver thread. On the raw path SENDER-ADDRESS and SENDER-PORT are NIL — see
+   *UDP-RAW-RECVFROM* for why nothing needs them.
+
+   A NEGATIVE size means the socket was CLOSED (or the receive failed): recvfrom(2) reports that by
+   RETURNING -1, where SOCKET-RECEIVE reported it by SIGNALLING. **A RECEIVER LOOP MUST CHECK FOR IT
+   AND EXIT**, or the thread spins forever and stop-node's join never returns — which is exactly the
+   'THE STACK COULD NOT SHUT DOWN ON LINUX' defect UDP-CLOSE documents. This is safe against fd reuse
+   because SOCKET-CLOSE resets the descriptor slot to -1 on BOTH implementations (verified, not
+   assumed), so the fd read here is never a recycled one belonging to some other socket.
+
+   A ZERO size is NOT an exit condition: a zero-length UDP datagram is legal, so treating it as
+   end-of-stream would let any peer kill a receiver thread by sending one (NFR-SEC-POSTURE). On Linux
+   a shutdown(2)-woken recvfrom also returns 0, which is indistinguishable from that; UDP-CLOSE closes
+   the socket immediately after shutting it down, so the fd goes to -1 and the next call returns
+   negative. That is byte-for-byte the pre-existing behaviour of the SOCKET-RECEIVE path.
+
+   BUFFER MUST be PAL-static (DDS.PAL:ALLOC-STATIC) on the raw path, for the same reason as
+   UDP-SEND-TO's: the kernel writes into it through a raw pointer (NFR-MEM)."
+  (if *udp-raw-recvfrom*
+      (values (cffi:foreign-funcall-pointer
+               *recvfrom-fp* ()
+               :int (sb-bsd-sockets:socket-file-descriptor socket)
+               :pointer (static-pointer buffer)
+               :unsigned-long length
+               :int 0                                       ; flags
+               :pointer *null-sap*                          ; src_addr — sender not wanted
+               :pointer *null-sap*                          ; addrlen
+               :long)
+              nil nil)
+      (multiple-value-bind (buf size addr port) (sb-bsd-sockets:socket-receive socket buffer length)
+        (declare (ignore buf))
+        (values size addr port))))
 
 (defun* udp-join-multicast (socket group)
     (function (t string) (values t (or null keyword)))

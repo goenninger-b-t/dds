@@ -52,8 +52,9 @@
    ;; UDPv4 sockets (native, FR-XPORT-1)
    #:udp-open #:udp-local-port #:udp-send-to #:udp-recv #:udp-close
    #:udp-set-reuse-port #:udp-join-multicast
-   ;; UDP-SEND-TO's zero-allocation raw-sendto(2) path (NFR-MEM, ADR 0065): the A/B lever + escape hatch
-   #:*udp-raw-sendto*
+   ;; The zero-allocation raw sendto(2)/recvfrom(2) datagram paths (NFR-MEM, ADR 0065/0066):
+   ;; the A/B levers + escape hatches
+   #:*udp-raw-sendto* #:*udp-raw-recvfrom*
    ;; TCPv4 stream sockets (native, FR-XPORT-1). Byte-stream full-send / full-frame recv loops
    ;; (a stream is not message-framed): tcp-send loops over short writes, tcp-recv loops until LEN
    ;; bytes or peer-close (status :EOF). tcp-set-recv-timeout arms SO_RCVTIMEO so a stalled tcp-recv
