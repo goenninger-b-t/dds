@@ -1523,8 +1523,18 @@
    DATA (which a foreign peer binds on a different port from its user-data locator). WP-N-ENDPOINT-S1 (ADR 0048):
    when TOPIC is non-NIL, ONLY matched readers on that topic are targeted — the per-writer push filter so a
    participant's DataWriter reaches only its OWN readers, never a sibling writer's (RxO matches on topic-name).
-   NIL TOPIC (the default / discovery-less value path) targets every matched reader, byte-identical to pre-S1."
-  (let ((groups '())   ; alist: (host . port) -> list of matched reader GUID keys at that destination
+   NIL TOPIC (the default / discovery-less value path) targets every matched reader, byte-identical to pre-S1.
+   NFR-MEM (ADR 0062): MEMOIZED per TOPIC on the node (reader-push-cache), dropped WHOLESALE by
+   %invalidate-dest-cache on match/unmatch/prune + an SPDP locator update — a STALE grouping is SILENT
+   MIS-DELIVERY, so invalidation is coarse on purpose. The returned alist is SHARED (callers only READ it:
+   %capture-push-groups reads (car group)=dest + (cdr group)=reader-keys; writer-capture-unsent reads the keys)."
+  (multiple-value-bind (cached gen)
+      (dds.pal:with-lock ((disc-node-lock node))
+        (values (gethash topic (disc-node-reader-push-cache node) :none)
+                (disc-node-match-dest-generation node)))
+   (unless (eq cached :none)
+     (return-from %reader-push-targets cached))
+   (let ((groups '())   ; alist: (host . port) -> list of matched reader GUID keys at that destination
         (parts (%discovered-participants node)))
     (dolist (remote (%matched-endpoints node))
       (let ((guid (dds.rtps.discovery:endpoint-data-guid remote)))
@@ -1543,7 +1553,12 @@
       (dolist (peer (disc-node-peers node))
         (unless (assoc peer groups :test #'equal)   ; dedup duplicate :peers entries
           (push (list peer (disc-node-user-reader-id node)) groups))))
-    groups))
+    ;; STORE ONLY IF NO INVALIDATION RACED THE RESOLVE (the sub-reads take the node lock, so a match/unmatch/SPDP
+    ;; can land between them); caching a now-stale grouping would be permanent silent mis-delivery.
+    (dds.pal:with-lock ((disc-node-lock node))
+      (when (= gen (disc-node-match-dest-generation node))
+        (setf (gethash topic (disc-node-reader-push-cache node)) groups)))
+    groups)))
 
 (defun* %merge-unsent (writer keys)
     (function (dds.rtps.reliable:rtps-writer list) list)

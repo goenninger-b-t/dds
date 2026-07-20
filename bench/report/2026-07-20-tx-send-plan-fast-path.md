@@ -78,6 +78,20 @@ dynamic binding never reaches. Only setting the special **globally** (visible to
 ~100 B. Same family as the slice-1 SHMEM-vs-UDP miss: prove the flag's effect reaches the code before trusting
 a null A/B.
 
+## Slice 4 (same day) — memoize the TX push grouping: −185 B (3145 → ~2960)
+
+`%reader-push-targets` (per-destination reader-key grouping the TX push builds every send) memoized per topic
+on the node, reusing slice 3's `%invalidate-dest-cache` + generation. **gate-mem 3145 → 2948–2970**
+(biggest slice). **Cumulative 3560 → ~2960 = −600 B/sample (~17%).** arm64 ceiling 3220 → 3030.
+
+**This slice caught a real latent silent-mis-delivery bug.** Both dest memos read `disc-node-matches`, but the
+match funnel invalidates (via `%reader-route-add`) ONLY for a matched remote *writer*; a matched remote
+*reader* (our writer's new push target) reached only `%record-match`, which didn't invalidate — so a reader
+matching a writer that had already sent would be silently dropped. Happy-path tests miss it (memo populated
+after all matches); `run-push-spdp-peer-isolation-test` caught it on both impls. Fixed by invalidating in
+`%record-match` (the choke point) + a `%record-match` assertion in the invalidation test. The full-suite run
+is the gate that earned its keep here.
+
 ## Note
 
 The first cut gated on `(null shmem-dest)` (UDP only) and measured as a no-op — because `mem-per-sample`

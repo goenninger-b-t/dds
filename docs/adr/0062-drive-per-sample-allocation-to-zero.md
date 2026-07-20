@@ -155,7 +155,29 @@ measured 3648), so no step can silently lose its win.** Highest value next: `%re
 the TX send-plan flattening (349 B) — together ~19 % — but BOTH have a correctness invariant to preserve
 (stale-route mis-delivery; byte-identical wire), so neither is a quick edit.
 
-## LANDED (2026-07-20) — TX + send-destination allocation: −415 B/sample (3560 → 3145)
+## LANDED (2026-07-20) — TX + send-destination allocation: ~−600 B/sample (3560 → ~2960)
+
+### Slice 4 — memoize the TX push grouping (%reader-push-targets): −185 B (3145 → ~2960)
+
+`%reader-push-targets` (the per-destination `((host . port) . matched-reader-GUID-keys)` grouping the TX push
+builds on every send via `%capture-push-groups`) rebuilt from scratch — `copy-seq` per reader GUID + `subseq`
++ `find`/`assoc` — for a value that changes only on match/unmatch or a participant's locators. Memoized per
+`topic` on the node (`reader-push-cache`), reusing slice 3's `%invalidate-dest-cache` + `match-dest-generation`
+verbatim. `gate-mem` 3145 → ~2960 (biggest single slice — this grouping conses more than the ACKNACK-dest set).
+
+**This slice surfaced — and fixed — a real latent invalidation gap (the suite earned its keep).** The
+`match-dest-cache` (slice 3) and this `reader-push-cache` both read `%matched-endpoints` (= `disc-node-matches`).
+The match funnel `%match-remote-endpoint` invalidates via `%reader-route-add` ONLY for a matched remote WRITER
+(`(when writer-p …)`); a matched remote READER — our writer's NEW push target — reaches only `%record-match`,
+which did NOT invalidate. So a reader matching a writer that had already sent (populating the memo) would be
+**silently dropped**. The happy-path delivery tests miss it (they populate the memo AFTER all matches; the
+durability late-joiner replays via a direct-to-reader path), but `run-push-spdp-peer-isolation-test` (which
+raw-`clrhash`es `disc-node-matches`) failed on BOTH impls. Fix: `%record-match` now calls `%invalidate-dest-cache`
+on a first-time match (the choke point for the remote-reader case), and `run-match-dest-cache-invalidation-test`
+gained a `%record-match` assertion. NB slice 3 shipped with this latent gap — it was correct only because
+`match-dest-cache` happened never to be populated before a first match in practice; it is now genuinely covered.
+
+### Slice 3 — memoize the send-destination union: −66 B (3211 → 3145)
 
 ### Slice 3 — memoize the send-destination union: −66 B (3211 → 3145)
 

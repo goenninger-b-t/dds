@@ -232,6 +232,12 @@
   ;; resolving (which takes the lock internally, so an invalidation can land mid-resolve) and stores only if it
   ;; is unchanged.
   (match-dest-generation 0 :type (integer 0))
+  ;; NFR-MEM (ADR 0062): memo of %reader-push-targets keyed by the writer's TOPIC (a string, or NIL for the
+  ;; discovery-less value path) — the per-destination ((host . port) . matched-reader-GUID-keys) grouping the
+  ;; TX push builds on EVERY send (%capture-push-groups). Same inputs (matched endpoints + discovered locators
+  ;; + peers) and SAME hazard as match-dest-cache: a stale grouping is SILENT MIS-DELIVERY, so it shares
+  ;; %invalidate-dest-cache (cleared with match-dest-cache, guarded by match-dest-generation). Node-lock guarded.
+  (reader-push-cache (make-hash-table :test 'equal) :type hash-table)
   (reader-routes (make-hash-table :test 'equalp) :type hash-table) ; WP-N-ENDPOINT-S2 (ADR 0048): the DELIVERY ROUTE — remote-writer 16-octet GUID (equalp) -> list of local user-reader EntityIds matched to it. Populated at %match-remote-endpoint (idempotent), purged on unmatch/lease-expiry (by prefix) + re-added on re-announce. The %drain source-GUID filter (each reader deserializes ONLY its matched writers) and the receive-hook demux (drive/ACKNACK the engine reader matched to the source writer, not unconditionally the primary) read it. Node-lock guarded.
   (reader-join-watermarks (make-hash-table :test 'eql) :type hash-table) ; WP-N-ENDPOINT-2C3 (ADR 0048/0017; MEMORY-SAFETY): the mid-stream ZC-joiner high-water. local user-reader EntityId (eql) -> hash(remote-writer 16-octet GUID equalp -> highest stored SN AT THE MOMENT this reader was route-added to that writer). Set ATOMICALLY with %reader-route-add (same node-lock section) ONLY for a JOINER (the writer's route was already non-empty) on a ZC-loan-capable node. %drain consults max(dr-drained, this) so a joiner NEVER drains a marker delivered before it joined (a marker whose demux %zc-bump did not count it -> would be a cross-reader use-after-free). Empty for the first reader / non-loan nodes (byte-identical). Node-lock guarded.
   ;; FR-XPORT-2 SHMEM intra-host data plane (same-host user DATA only; discovery/HB/ACKNACK stay UDP)
@@ -1867,8 +1873,9 @@
    needless clrhash costs nothing (discovery events are rare, the send path is not). Static PEERS are set once
    at make-disc-node (before the first send) and never mutated at runtime in production, so they need no
    invalidation site. If you add a mutation of %matched-endpoints, a discovered participant's locators, or (in
-   production) disc-node-peers, call this from it."
+   production) disc-node-peers, call this from it. Clears the TX %reader-push-targets memo too — same inputs."
   (clrhash (disc-node-match-dest-cache node))
+  (clrhash (disc-node-reader-push-cache node))
   (incf (disc-node-match-dest-generation node))
   t)
 
@@ -1989,7 +1996,14 @@
     (let ((key (copy-seq (dds.rtps.discovery:endpoint-data-guid remote))))
       (if (nth-value 1 (gethash key (disc-node-matches node)))
           nil
-          (progn (setf (gethash key (disc-node-matches node)) remote) t)))))
+          (progn (setf (gethash key (disc-node-matches node)) remote)
+                 ;; ADR 0062: a NEW matched endpoint changes the send DESTINATIONS (%matched-endpoints feeds
+                 ;; %match-destinations-prefixed + %reader-push-targets). %reader-route-add invalidates only for
+                 ;; a matched remote WRITER (our reader); a matched remote READER (our writer's new push target)
+                 ;; reaches only here — so this is the choke point that keeps the dest memo from going stale (a
+                 ;; stale destination silently drops a newly-matched reader). Idempotent per remote (first match only).
+                 (%invalidate-dest-cache node)
+                 t)))))
 
 (defun* %record-match-pair (node remote local-entity-id)
     (function (disc-node dds.rtps.discovery:endpoint-data (unsigned-byte 32)) boolean)

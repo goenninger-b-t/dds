@@ -5166,6 +5166,7 @@
                      (notany (lambda (g) (equal (cons "127.0.0.1" 7410) (car g))) groups)
                      "user data must never target the static SPDP/metatraffic peer port (7410)"))
            (clrhash (dds.disc::disc-node-matches node))           ; discovery-less: no matched reader
+           (dds.disc::%invalidate-dest-cache node)                ; white-box: a raw matches mutation must invalidate the dest memo, exactly as %record-match / %fire-unmatch do in production (ADR 0062)
            (let ((groups (dds.disc::%reader-push-targets node)))
              (%check :psi-fallback
                      (and (= 1 (length groups)) (equal (cons "127.0.0.1" 7410) (car (first groups))))
@@ -6182,21 +6183,40 @@
          (progn
            (dds.disc::%match-destinations-prefixed node t)     ; resolve both variants -> two memo entries
            (dds.disc::%match-destinations-prefixed node nil)
-           (%check :mdc-populated (= 2 (hash-table-count (dds.disc::disc-node-match-dest-cache node)))
-                   "both WANT-READERS variants must be memoized after resolve")
+           (dds.disc::%reader-push-targets node)               ; resolve the TX grouping memo too (key NIL)
+           (%check :mdc-populated (and (= 2 (hash-table-count (dds.disc::disc-node-match-dest-cache node)))
+                                       (plusp (hash-table-count (dds.disc::disc-node-reader-push-cache node))))
+                   "both WANT-READERS variants + the reader-push grouping must be memoized after resolve")
            (let ((g0 (dds.disc::disc-node-match-dest-generation node)))
-             (dds.disc::%invalidate-route-cache node)          ; a match/unmatch/prune drops the dest memo too
+             (dds.disc::%invalidate-route-cache node)          ; a match/unmatch/prune drops BOTH memos
              (%check :mdc-route-inval
                      (and (zerop (hash-table-count (dds.disc::disc-node-match-dest-cache node)))
+                          (zerop (hash-table-count (dds.disc::disc-node-reader-push-cache node)))
                           (> (dds.disc::disc-node-match-dest-generation node) g0))
-                     "%invalidate-route-cache must clear the dest memo AND bump its generation"))
-           (dds.disc::%match-destinations-prefixed node t)     ; re-populate
+                     "%invalidate-route-cache must clear BOTH dest memos AND bump the generation"))
+           (dds.disc::%match-destinations-prefixed node t)     ; re-populate both
+           (dds.disc::%reader-push-targets node)
            (let ((g1 (dds.disc::disc-node-match-dest-generation node)))
              (dds.disc::%invalidate-dest-cache node)           ; the SPDP locator-update path
              (%check :mdc-dest-inval
                      (and (zerop (hash-table-count (dds.disc::disc-node-match-dest-cache node)))
+                          (zerop (hash-table-count (dds.disc::disc-node-reader-push-cache node)))
                           (> (dds.disc::disc-node-match-dest-generation node) g1))
-                     "%invalidate-dest-cache must clear the dest memo AND bump its generation")))
+                     "%invalidate-dest-cache must clear BOTH dest memos AND bump the generation"))
+           ;; THE CRUX: %record-match of a NEW matched endpoint (our writer's new push target — a matched
+           ;; remote READER reaches ONLY %record-match, NOT %reader-route-add) must invalidate the dest memo, or
+           ;; a reader matching a writer that has already sent is SILENTLY DROPPED (the bug the PSI-FALLBACK
+           ;; suite failure surfaced). This asserts the choke-point invalidation in %record-match directly.
+           (dds.disc::%reader-push-targets node)               ; re-populate
+           (let ((g2 (dds.disc::disc-node-match-dest-generation node))
+                 (rep (dds.rtps.discovery:make-endpoint-data
+                       :role :reader
+                       :guid (make-array 16 :element-type '(unsigned-byte 8) :initial-element #x99))))
+             (dds.disc::%record-match node rep)                ; a first-time match
+             (%check :mdc-record-match-inval
+                     (and (zerop (hash-table-count (dds.disc::disc-node-reader-push-cache node)))
+                          (> (dds.disc::disc-node-match-dest-generation node) g2))
+                     "%record-match of a NEW matched endpoint must invalidate the dest memo (no silent drop)")))
       (dds.disc:stop-node node)))
   t)
 
