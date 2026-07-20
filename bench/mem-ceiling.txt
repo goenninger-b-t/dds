@@ -2,11 +2,17 @@
 #
 # SBCL's per-sample allocation differs materially by arch — measured, not assumed:
 #   arm64   2730 B/sample   (2026-07-20: + raw sendto(2) UDP path, cumulative -830 from 3560, ADR 0062/0065)
-#   x86_64  4674 B/sample   (~31% more; the same divergence made the FlatData vtable-vs-classic
-#                            guard flip, and it is why a single shared ceiling cannot work: at the
-#                            x86_64 number the arm64 ratchet would never bite, and at the arm64
-#                            number x86_64 is permanently red.)
+#   x86_64  3302 B/sample   (2026-07-20, read off CI: the same six slices; still ~21% above arm64. The
+#                            same divergence made the FlatData vtable-vs-classic guard flip, and it is
+#                            why a single shared ceiling cannot work: at the x86_64 number the arm64
+#                            ratchet would never bite, and at the arm64 number x86_64 is permanently red.)
 #
 # The ratchet only moves DOWN. Lower a row when you bank a win on THAT arch (gate-mem tells you).
+#
+# ⚠️ YOU CAN ONLY LOWER THE ROW FOR THE ARCH YOU MEASURED ON. gate-mem reads the row for `uname -m`, so a
+# win banked on the dev box lowers arm64 and leaves x86_64 stale — and the ratchet then FAILS ON
+# IMPROVEMENT in CI, which is red until someone reads the CI number and lowers that row too. This is not
+# hypothetical: CI was red from the 5th TX slice for exactly this reason. AFTER a win, check the CI
+# gate-mem number and lower the OTHER arch's row in the same or an immediate follow-up commit.
 arm64  2800
-x86_64 4750
+x86_64 3400
