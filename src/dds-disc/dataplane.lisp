@@ -803,8 +803,18 @@
    :keyed participant's user-data sends engage T10 whole-RTPS-message protection (DEST-PREFIX threads to
    %send-raw-buf -> %maybe-wrap-srtps). RxO-incompatible / topic-mismatched peers never match, so they receive
    nothing (FR-QOS-2). The (host . port) SET is identical to the pre-T10 plain helper (only the per-dest prefix
-   is added); %match-destinations is the prefix-stripped projection (DRY)."
-  (let ((dests '())
+   is added); %match-destinations is the prefix-stripped projection (DRY).
+   NFR-MEM (ADR 0062): the union is MEMOIZED per WANT-READERS on the node (match-dest-cache), a ~100 B/sample
+   win across the 6 hot-path callers; dropped WHOLESALE by %invalidate-dest-cache on match/unmatch/prune + an
+   SPDP locator update — a STALE DESTINATION IS SILENT MIS-DELIVERY, so invalidation is coarse on purpose. The
+   returned list is SHARED (callers MUST treat it read-only; they only ever dolist / mapcar it)."
+  (multiple-value-bind (cached gen)
+      (dds.pal:with-lock ((disc-node-lock node))
+        (values (gethash want-readers (disc-node-match-dest-cache node) :none)
+                (disc-node-match-dest-generation node)))
+   (unless (eq cached :none)
+     (return-from %match-destinations-prefixed cached))
+   (let ((dests '())
         (parts (%discovered-participants node)))
     (dolist (remote (%matched-endpoints node))
       (let ((guid (dds.rtps.discovery:endpoint-data-guid remote)))
@@ -818,7 +828,14 @@
     (dolist (peer (disc-node-peers node))   ; static PEERS not already covered by a matched (host . port)
       (unless (member peer dests :key #'cdr :test #'equal)
         (push (cons nil peer) dests)))
-    (nreverse dests)))
+    (let ((result (nreverse dests)))
+      ;; STORE ONLY IF NO INVALIDATION RACED THE RESOLVE. %discovered-participants / %matched-endpoints each
+      ;; take the node lock, so a match/unmatch/SPDP can land between them; caching a now-stale union would be
+      ;; permanent silent mis-delivery. On a race, return the fresh value and re-resolve next call.
+      (dds.pal:with-lock ((disc-node-lock node))
+        (when (= gen (disc-node-match-dest-generation node))
+          (setf (gethash want-readers (disc-node-match-dest-cache node)) result)))
+      result))))
 
 (defun* %match-destinations (node want-readers)
     (function (disc-node t) list)

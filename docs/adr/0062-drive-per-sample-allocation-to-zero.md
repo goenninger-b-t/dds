@@ -155,7 +155,28 @@ measured 3648), so no step can silently lose its win.** Highest value next: `%re
 the TX send-plan flattening (349 B) — together ~19 % — but BOTH have a correctness invariant to preserve
 (stale-route mis-delivery; byte-identical wire), so neither is a quick edit.
 
-## LANDED (2026-07-20) — TX common-path allocation: −349 B/sample (3560 → 3211)
+## LANDED (2026-07-20) — TX + send-destination allocation: −415 B/sample (3560 → 3145)
+
+### Slice 3 — memoize the send-destination union: −66 B (3211 → 3145)
+
+`%match-destinations-prefixed` (the matched-participant-locators ∪ static-peers set, each a
+`(DEST-PREFIX . (HOST . PORT))`) was rebuilt from scratch — `subseq` ×2 per matched endpoint + `find`/`member`
++ fresh conses — on **every** send / HEARTBEAT / ACKNACK / retransmit (6 hot-path callers), for a value that
+changes only on match/unmatch or a discovered participant's advertised locators. Now MEMOIZED per
+`want-readers` on the node (`match-dest-cache`), mirroring the `reader-routes-cache` pattern exactly:
+resolve outside the node lock (the sub-reads take it), a generation race-guard (`match-dest-generation`,
+store only if unchanged), and **coarse wholesale invalidation** — a STALE DESTINATION IS SILENT MIS-DELIVERY.
+
+Invalidation surface (broader than routes, which depend only on matches): `%invalidate-dest-cache` is called
+from `%invalidate-route-cache` (so every match/unmatch/prune site covers it) AND from the SPDP handler on
+every announce (a locator update — right beside the existing `%invalidate-shmem-dest`). Static PEERS are
+immutable after `make-disc-node` in production (set once, before the first send), so they need no site. A/B
+(memo cache-forever) was ~100 B; the shipped invalidating version is −66 B (the ~1 Hz SPDP announces
+re-resolve periodically). Gated by a deterministic invalidation unit test
+(`run-match-dest-cache-invalidation-test`) **plus** the live late-joiner / N-reader integration tests (a
+reader joining after the writer has been sending must still receive — a stale memo silently drops it).
+
+### Slice 2 — inline HEARTBEAT on the fast path: −87 B (3298 → 3211)
 
 ### Slice 2 — inline HEARTBEAT on the fast path: −87 B (3298 → 3211)
 

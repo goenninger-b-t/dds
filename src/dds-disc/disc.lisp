@@ -216,6 +216,22 @@
   ;; Bumped by EVERY %invalidate-route-cache. A resolve that races an invalidation must NOT store its now-stale
   ;; result: %reader-routes-for reads this BEFORE resolving (outside the lock) and stores only if it is unchanged.
   (reader-routes-generation 0 :type (integer 0))
+  ;; NFR-MEM (ADR 0062): memo of %match-destinations-prefixed keyed by WANT-READERS (t = a writer's DATA/HB
+  ;; destinations, nil = a reader's ACKNACK destinations). That union of matched-participant locators + static
+  ;; peers was rebuilt from scratch (subseq x2 per endpoint + find/member + fresh conses) on EVERY send / HB /
+  ;; ACKNACK / retransmit — ~100 B/sample across 6 hot-path callers — for a value that changes only on
+  ;; match/unmatch or a discovered participant's advertised locators. INVALIDATED WHOLESALE by
+  ;; %invalidate-dest-cache (from %invalidate-route-cache on match/unmatch/prune, and from the SPDP handler on a
+  ;; locator update). SAME hazard as reader-routes-cache: a STALE DESTINATION IS SILENT MIS-DELIVERY (a sample
+  ;; sent to a dead peer, or not sent to a live one), so the invalidation is coarse ON PURPOSE. Static PEERS are
+  ;; immutable after make-disc-node in production (set once at construction, before the first send), so no peer
+  ;; mutation can stale this at runtime. Node-lock guarded.
+  (match-dest-cache (make-hash-table :test 'eql) :type hash-table)
+  ;; Bumped by EVERY %invalidate-dest-cache. A resolve that races an invalidation must NOT store its now-stale
+  ;; result: %match-destinations-prefixed reads this atomically with the cache miss (under the lock) BEFORE
+  ;; resolving (which takes the lock internally, so an invalidation can land mid-resolve) and stores only if it
+  ;; is unchanged.
+  (match-dest-generation 0 :type (integer 0))
   (reader-routes (make-hash-table :test 'equalp) :type hash-table) ; WP-N-ENDPOINT-S2 (ADR 0048): the DELIVERY ROUTE — remote-writer 16-octet GUID (equalp) -> list of local user-reader EntityIds matched to it. Populated at %match-remote-endpoint (idempotent), purged on unmatch/lease-expiry (by prefix) + re-added on re-announce. The %drain source-GUID filter (each reader deserializes ONLY its matched writers) and the receive-hook demux (drive/ACKNACK the engine reader matched to the source writer, not unconditionally the primary) read it. Node-lock guarded.
   (reader-join-watermarks (make-hash-table :test 'eql) :type hash-table) ; WP-N-ENDPOINT-2C3 (ADR 0048/0017; MEMORY-SAFETY): the mid-stream ZC-joiner high-water. local user-reader EntityId (eql) -> hash(remote-writer 16-octet GUID equalp -> highest stored SN AT THE MOMENT this reader was route-added to that writer). Set ATOMICALLY with %reader-route-add (same node-lock section) ONLY for a JOINER (the writer's route was already non-empty) on a ZC-loan-capable node. %drain consults max(dr-drained, this) so a joiner NEVER drains a marker delivered before it joined (a marker whose demux %zc-bump did not count it -> would be a cross-reader use-after-free). Empty for the first reader / non-loan nodes (byte-identical). Node-lock guarded.
   ;; FR-XPORT-2 SHMEM intra-host data plane (same-host user DATA only; discovery/HB/ACKNACK stay UDP)
@@ -1721,6 +1737,7 @@
             (setf (gethash key (disc-node-discovered node)) spdp)
             (setf (gethash key (disc-node-participant-last-seen node)) (%lease-now))
             (%invalidate-shmem-dest node prefix)
+            (%invalidate-dest-cache node)   ; ADR 0062: a fresh SPDP may change this peer's advertised locators -> drop the %match-destinations memo (stale = silent mis-delivery)
             ;; Fire ON-PARTICIPANT-DISCOVERED for a SECURITY-enabled peer on EVERY SPDP (first +
             ;; re-announce), not only first discovery: the §8.7 handshake rides the best-effort
             ;; ParticipantStatelessMessage, so the auth manager uses the re-announce cadence to
@@ -1841,14 +1858,30 @@
             (funcall removed-place (list* direction remote nil))))))
   t)
 
+(defun* %invalidate-dest-cache (node)
+    (function (disc-node) t)
+  "Drop the ENTIRE %match-destinations-prefixed memo (ADR 0062). Called on EVERY change to what that union
+   returns: the matched endpoints (via %invalidate-route-cache, from match/unmatch/prune) OR a discovered
+   participant's advertised locators (the SPDP handler, on every announce). Coarse ON PURPOSE: a stale
+   destination is SILENT MIS-DELIVERY — a sample sent to a dead peer, or not sent to a live one — whereas a
+   needless clrhash costs nothing (discovery events are rare, the send path is not). Static PEERS are set once
+   at make-disc-node (before the first send) and never mutated at runtime in production, so they need no
+   invalidation site. If you add a mutation of %matched-endpoints, a discovered participant's locators, or (in
+   production) disc-node-peers, call this from it."
+  (clrhash (disc-node-match-dest-cache node))
+  (incf (disc-node-match-dest-generation node))
+  t)
+
 (defun* %invalidate-route-cache (node)
     (function (disc-node) t)
   "Drop the ENTIRE resolved-route memo (ADR 0062). Called by EVERY mutation of READER-ROUTES or
    USER-READERS. Coarse ON PURPOSE: a stale route is SILENT MIS-DELIVERY — a sample lost, or delivered to a
    dead reader — whereas a needless clrhash costs nothing (discovery events are rare, the receive path is
-   not). If you add a mutation site, call this from it."
+   not). If you add a mutation site, call this from it. A match/unmatch also changes the send DESTINATIONS,
+   so this drops the %match-destinations-prefixed memo too (%invalidate-dest-cache)."
   (clrhash (disc-node-reader-routes-cache node))
   (incf (disc-node-reader-routes-generation node))
+  (%invalidate-dest-cache node)
   t)
 
 (defun* %lease-sweep (node)

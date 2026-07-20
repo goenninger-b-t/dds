@@ -3761,6 +3761,7 @@
                  ("emit-fault-inert"         . run-emit-fault-inert-test)
                  ("flow-step-equivalence"    . run-flow-step-equivalence-test)
                  ("tx-fast-path-equivalence" . run-tx-fast-path-equivalence-test)
+                 ("match-dest-cache-invalidation" . run-match-dest-cache-invalidation-test)
                  ("flow-token-bucket"        . run-flow-token-bucket-test)
                  ("flow-backpressure"        . run-flow-backpressure-test)
                  ("flow-controller-lifecycle" . run-flow-controller-lifecycle-test)

@@ -6166,6 +6166,40 @@
       (dds.disc:stop-node plan-node)))
   t)
 
+(defun* run-match-dest-cache-invalidation-test ()
+    (function () t)
+  "NFR-MEM (ADR 0062): the %match-destinations-prefixed send-destination memo is populated on resolve and
+   dropped WHOLESALE on EVERY destination-changing event — match/unmatch/prune (via %invalidate-route-cache)
+   and a discovered participant's advertised-locator update (%invalidate-dest-cache, from the SPDP handler).
+   A STALE destination memo is SILENT MIS-DELIVERY (a sample sent to a dead peer, or not sent to a live one),
+   so this asserts each invalidation path deterministically CLEARS the memo and BUMPS its generation (the
+   resolve-race guard). The LIVE re-match delivery — a reader joining after the writer has been sending, then
+   receiving — is covered by the late-joiner (%run-dcps-late-joiner) and N-reader integration tests: a stale
+   memo there silently drops the joiner, failing those."
+  (let ((node (dds.disc:make-disc-node :host "127.0.0.1" :port 0
+                                       :peers (list (cons "127.0.0.1" 7777)))))
+    (unwind-protect
+         (progn
+           (dds.disc::%match-destinations-prefixed node t)     ; resolve both variants -> two memo entries
+           (dds.disc::%match-destinations-prefixed node nil)
+           (%check :mdc-populated (= 2 (hash-table-count (dds.disc::disc-node-match-dest-cache node)))
+                   "both WANT-READERS variants must be memoized after resolve")
+           (let ((g0 (dds.disc::disc-node-match-dest-generation node)))
+             (dds.disc::%invalidate-route-cache node)          ; a match/unmatch/prune drops the dest memo too
+             (%check :mdc-route-inval
+                     (and (zerop (hash-table-count (dds.disc::disc-node-match-dest-cache node)))
+                          (> (dds.disc::disc-node-match-dest-generation node) g0))
+                     "%invalidate-route-cache must clear the dest memo AND bump its generation"))
+           (dds.disc::%match-destinations-prefixed node t)     ; re-populate
+           (let ((g1 (dds.disc::disc-node-match-dest-generation node)))
+             (dds.disc::%invalidate-dest-cache node)           ; the SPDP locator-update path
+             (%check :mdc-dest-inval
+                     (and (zerop (hash-table-count (dds.disc::disc-node-match-dest-cache node)))
+                          (> (dds.disc::disc-node-match-dest-generation node) g1))
+                     "%invalidate-dest-cache must clear the dest memo AND bump its generation")))
+      (dds.disc:stop-node node)))
+  t)
+
 ;;; WP-ASYNC-FLOW Phase C (FR-PF-2, ADR 0016): the shared flow-controller + its scheduler thread paces the
 ;;; aggregate user-data byte rate of its associated writers via the token bucket, round-robining one datagram
 ;;; per writer per turn (so multiple writers interleave at the shaped rate). Three tests: (1) object lifecycle

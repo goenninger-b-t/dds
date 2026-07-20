@@ -52,6 +52,32 @@ built a fresh HEARTBEAT pack closure per send (`%heartbeat-builder`). The fast p
 `%send-changes-packed`'s HB param went `(SIZE . closure)` → three `hb-first/last/count` ints; both callers
 updated; 568/568 both impls, byte-identity + corpus green.
 
+## Slice 3 (same day) — memoize the send-destination union: −66 B (3211 → 3145)
+
+`%match-destinations-prefixed` (matched-participant locators ∪ static peers) rebuilt the whole list —
+`subseq` ×2 per endpoint + `find`/`member` + conses — on every send / HB / ACKNACK / retransmit (6 callers),
+for a value that changes only on match/unmatch or a participant's advertised locators. Now memoized per
+`want-readers` on the node, invalidated wholesale (the `reader-routes-cache` pattern) — a stale destination
+is silent mis-delivery, so invalidation is coarse and gated.
+
+| arm (samples=5000, warmup=500) | bytes/sample |
+|---|---:|
+| MEMO-OFF (global, all threads) | ~3225 |
+| MEMO-ON (A/B, cache-forever ceiling) | ~3125 |
+| **official `gate-mem` (shipped, invalidating)** | **3145.2** |
+
+**Cumulative: 3560 → 3145 = −415 B/sample (~11.7%)** across the three slices. arm64 ceiling 3290 → 3220.
+Invalidation gated by `run-match-dest-cache-invalidation-test` (deterministic) + the live late-joiner /
+N-reader integration tests. 568+/568+ both impls; corpus green.
+
+### Measurement lesson (again): the flag must be effective where the code runs
+
+The first destination A/B `let`-bound the memo flag on the main thread and read as a no-op — but
+`%match-destinations-prefixed` runs on the receiver/TX threads (the ACKNACK path), which a thread-local
+dynamic binding never reaches. Only setting the special **globally** (visible to all threads) revealed the
+~100 B. Same family as the slice-1 SHMEM-vs-UDP miss: prove the flag's effect reaches the code before trusting
+a null A/B.
+
 ## Note
 
 The first cut gated on `(null shmem-dest)` (UDP only) and measured as a no-op — because `mem-per-sample`

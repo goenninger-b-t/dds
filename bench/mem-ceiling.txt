@@ -1,12 +1,12 @@
 # NFR-MEM allocation ratchet (ADR 0062). One ceiling PER ARCHITECTURE, in bytes/sample.
 #
 # SBCL's per-sample allocation differs materially by arch — measured, not assumed:
-#   arm64   3211 B/sample   (2026-07-20: TX fast path −262 B + inline HEARTBEAT −87 B = −349 from 3560, ADR 0062)
+#   arm64   3145 B/sample   (2026-07-20: TX fast path −262 + inline HB −87 + dest-memo −66 = −415 from 3560, ADR 0062)
 #   x86_64  4674 B/sample   (~31% more; the same divergence made the FlatData vtable-vs-classic
 #                            guard flip, and it is why a single shared ceiling cannot work: at the
 #                            x86_64 number the arm64 ratchet would never bite, and at the arm64
 #                            number x86_64 is permanently red.)
 #
 # The ratchet only moves DOWN. Lower a row when you bank a win on THAT arch (gate-mem tells you).
-arm64  3290
+arm64  3220
 x86_64 4750
