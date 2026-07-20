@@ -570,29 +570,29 @@
                (or (simple-array (unsigned-byte 8) (*)) null)
                (or (simple-array (unsigned-byte 8) (*)) null)
                (or (simple-array (unsigned-byte 8) (*)) null))
-              (or dds.security:access-handle null))
+              (values (or dds.security:access-handle null) (or null keyword)))
   "DDS-Security 1.1 §8.4: validate a participant's AccessControl configuration, returning the
    ACCESS-HANDLE to install, or NIL when AccessControl is OFF (any of IDENTITY / PERMISSIONS-CA /
    GOVERNANCE / PERMISSIONS absent — AC requires an authenticated identity plus both signed §9.4
    documents). When all are supplied: CMS-verify the signed Governance + Permissions against the
    Permissions CA and bind the LOCAL grant by the identity cert's subject name
    (validate-local-permissions), then gate check_create_participant (§8.4.2.3). Fail-closed: an
-   invalid/denied config SIGNALS a clear error (the participant does not join), freeing the handle on a
-   check_create_participant denial. Validated up-front (before the engine opens) so the error path
-   leaks no node. The *_WITH_ORIGIN_AUTHENTICATION discovery tier (receiver-specific MACs for the builtin
+   invalid/denied config returns (values nil STATUS) — :no-subject-name / :permissions-validation-failed /
+   :participant-denied — so create-participant fails closed (the participant does not join) with no signal
+   (ADR 0064), freeing the handle on a check_create_participant denial. Validated up-front (before the engine
+   opens) so the reject path leaks no node. The *_WITH_ORIGIN_AUTHENTICATION discovery tier (receiver-specific MACs for the builtin
    secure-SEDP endpoints, §9.5.3.3.4.3) is now WIRED (T-ORIGINAUTH), so it is accepted here — its origin-auth
    flag is carried to the disc-node by %install-access-control (no longer refused)."
   (when (and identity permissions-ca governance permissions)
     (let ((subject (dds.dare:x509-subject-name (dds.security:identity-handle-cert identity))))
       (unless subject
-        (error "create-participant: could not extract subject name from the identity certificate"))
+        (bail :no-subject-name))
       (let ((ah (dds.security:validate-local-permissions permissions-ca governance permissions subject)))
         (unless ah
-          (error "create-participant: AccessControl validate-local-permissions failed (bad Permissions CA / Governance / Permissions signature, or subject ~s not granted)"
-                 subject))
+          (bail :permissions-validation-failed))
         (unless (dds.security:check-create-participant ah)
           (dds.security:free-access-handle ah)
-          (error "create-participant: AccessControl check_create_participant denied subject ~s" subject))
+          (bail :participant-denied))
         ;; T-ORIGINAUTH: the *_WITH_ORIGIN_AUTHENTICATION secure-discovery tier (receiver-specific MACs,
         ;; DDS-Security 1.1 §9.5.3.3.4.3) is now WIRED for the builtin secure-SEDP endpoints (origin-auth
         ;; EntityCrypto registration + receiver-key exchange + per-receiver MACs), so it is no longer refused
@@ -736,7 +736,7 @@
    byte-identical."
   ;; DDS-Security §8.4: validate the AccessControl config BEFORE opening the engine so an invalid or
   ;; denied config fails closed with no node leak; the resulting handle is installed once the node exists.
-  (let ((access-handle (%validate-access-config identity permissions-ca governance permissions))
+  (let ((access-handle (try (%validate-access-config identity permissions-ca governance permissions)))
         (installed nil))   ; T once the participant is fully constructed and will be returned
     (unwind-protect
         (let* ((node (try (dds.disc:make-disc-node
@@ -972,7 +972,7 @@
   t)
 
 (defun* create-datawriter (pub topic &key (qos nil qos-supplied-p))
-    (function (publisher topic &key (:qos t)) data-writer)
+    (function (publisher topic &key (:qos t)) (values (or null data-writer) (or null keyword)))
   "Publisher::create_datawriter — register a local writer in the engine on the
    topic's name/type with the QoS reliability (v1: the single user writer); the
    endpoint kind (WITH_KEY/NO_KEY) is selected from the topic type's keyed-ness.
@@ -980,20 +980,21 @@
    (DDS 1.4 §2.2.2.4.1, set_default_datawriter_qos), falling back to the role default.
    DDS-Security §8.4.2.4: when the participant is access-controlled, check_create_datawriter must
    grant publish on the topic (local Permissions + Governance write-AC toggle) or the writer is
-   refused (fail-closed SIGNAL). No access-state (default) = unchecked, byte-identical."
+   refused fail-closed as (values nil :not-allowed-by-security) — no signal (ADR 0064). An exhausted
+   1-octet entity-key space (255 writers/participant) yields (values nil :out-of-resources). No access-state
+   (default) = unchecked, byte-identical."
   (let ((node (dp-node (pub-participant pub)))
         (ah (dp-access-state (pub-participant pub)))
         (qos (if qos-supplied-p qos
                  (%default-qos-for-create (pub-default-datawriter-qos pub) (dds.qos:make-writer-qos)))))
     (when (and ah (not (dds.security:check-create-datawriter ah (topic-name topic))))
-      (error "create-datawriter: AccessControl check_create_datawriter denied publish on topic ~s"
-             (topic-name topic)))
-    (let ((ep (dds.disc:add-local-writer node :topic (topic-name topic) :type (topic-type-name topic)
+      (bail :not-allowed-by-security))
+    (let ((ep (try (dds.disc:add-local-writer node :topic (topic-name topic) :type (topic-type-name topic)
                                          :keyed (%topic-keyed-p topic)
                                          ;; ADR 0060: a created-DISABLED writer registers with the engine but is NOT
                                          ;; SEDP-announced and cannot match until enable() (DDS 1.4 §2.2.2.1.1.7).
                                          :enabled (%child-created-enabled-p pub)
-                                         :qos qos :type-information (%topic-type-information topic))))
+                                         :qos qos :type-information (%topic-type-information topic)))))
     (%set-user-metadata-protection node ah (topic-name topic) :writer)   ; ADR 0046 §9.4.1.2.4: the WRITER's own protection tiers
     (dds.disc:enable-publisher node :history-kind (dds.qos:qos-history-kind qos)
                                     :history-depth (dds.qos:qos-history-depth qos))
@@ -1007,7 +1008,7 @@
       dw))))
 
 (defun* create-datareader (sub topic &key (qos nil qos-supplied-p))
-    (function (subscriber t &key (:qos t)) data-reader)
+    (function (subscriber t &key (:qos t)) (values (or null data-reader) (or null keyword)))
   "Subscriber::create_datareader — register a local reader in the engine on the
    topic's name/type with the QoS reliability (v1: the single user reader). TOPIC may
    be a Topic or a ContentFilteredTopic; in the latter case the reader applies the
@@ -1017,20 +1018,21 @@
    (DDS 1.4 §2.2.2.5.1, set_default_datareader_qos), falling back to the role default.
    DDS-Security §8.4.2.5: when the participant is access-controlled, check_create_datareader must
    grant subscribe on the topic (local Permissions + Governance read-AC toggle) or the reader is
-   refused (fail-closed SIGNAL). No access-state (default) = unchecked, byte-identical."
+   refused fail-closed as (values nil :not-allowed-by-security) — no signal (ADR 0064). An exhausted
+   1-octet entity-key space (255 readers/participant) yields (values nil :out-of-resources). No access-state
+   (default) = unchecked, byte-identical."
   (let ((node (dp-node (sub-participant sub)))
         (ah (dp-access-state (sub-participant sub)))
         (qos (if qos-supplied-p qos
                  (%default-qos-for-create (sub-default-datareader-qos sub) (dds.qos:make-reader-qos)))))
     (when (and ah (not (dds.security:check-create-datareader ah (topic-name topic))))
-      (error "create-datareader: AccessControl check_create_datareader denied subscribe on topic ~s"
-             (topic-name topic)))
-    (let ((ep (dds.disc:add-local-reader node :topic (topic-name topic) :type (topic-type-name topic)
+      (bail :not-allowed-by-security))
+    (let ((ep (try (dds.disc:add-local-reader node :topic (topic-name topic) :type (topic-type-name topic)
                                          :keyed (%topic-keyed-p topic)
                                          ;; ADR 0060: a created-DISABLED reader registers with the engine but is NOT
                                          ;; SEDP-announced and cannot match until enable() (DDS 1.4 §2.2.2.1.1.7).
                                          :enabled (%child-created-enabled-p sub)
-                                         :qos qos :type-information (%topic-type-information topic))))
+                                         :qos qos :type-information (%topic-type-information topic)))))
     (%set-user-metadata-protection node ah (topic-name topic) :reader)   ; ADR 0046 §9.4.1.2.4: the READER's own protection tiers
     (setf (dds.disc:disc-node-durability-gate-active node) t)   ; ADR 0059: DCPS owns the reader-side durability baseline from here on, so a MATCHED-but-UNARMED writer HEARTBEAT is the ADR 0043 window, not the bare-disc norm — arm the fail-safe guard
     (dds.disc:enable-subscriber node)
@@ -1551,7 +1553,7 @@
             (return-from loan-sample ln)))))
     (let ((ctor (dds.types:type-support-flatdata-ctor ts)))   ; graceful degradation: an owned FlatData buffer
       (setf (writer-loan-kind ln) :fallback (writer-loan-size ln) (or size 0)
-            (writer-loan-sample ln) (if ctor (funcall ctor) (error "loan-sample: ~a is not a FlatData type" (dds.types:type-support-type-name ts))))
+            (writer-loan-sample ln) (if ctor (funcall ctor) (error "loan-sample: ~a is not a FlatData type" (dds.types:type-support-type-name ts)))) ; NOCOND(GUARD): loan-sample is the FlatData-only loan-write API; a non-FlatData writer cannot reach the fallback ctor path in correct use
       (push ln (dw-loans dw))
       ln)))
 

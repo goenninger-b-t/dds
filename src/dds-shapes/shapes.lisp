@@ -146,8 +146,13 @@
     (function ((or null string)) list)
   "Parse a \"host:port[,host:port]...\" PEERS string into the ((host . port) ...) list make-disc-node
    expects. Delegates to DDS.DISC:PARSE-PEERS — the layer that owns the peer-list contract — so the shapes
-   CLI, the perf/interop harness and any future caller convert a peers string the ONE way (DRY)."
-  (dds.disc:parse-peers peers))
+   CLI, the perf/interop harness and any future caller convert a peers string the ONE way (DRY).
+   A malformed spec is a visible degradation to multicast-only discovery (ADR 0064: no signal)."
+  (multiple-value-bind (plist pstatus) (dds.disc:parse-peers peers)
+    (when pstatus
+      ;; NOCOND(WARN): malformed --peers at the shapes CLI harness boundary — print + return (no control
+      (warn "shapes: ignoring malformed --peers ~s (~a); discovery falls back to multicast-only" peers pstatus))
+    plist))
 
 (defun* run-publisher (&key (domain 0) (color "BLUE") (shapesize 30) (rate 30) (count 0)
                            (advertise-address "127.0.0.1") (type :tagged) (peers nil)

@@ -13,7 +13,11 @@
 
 #-sbcl
 (eval-when (:compile-toplevel :load-toplevel :execute)
-  (warn "pal-sbcl.lisp loaded on a non-SBCL build; capabilities will stub out."))
+  ;; A diagnostic, not a condition (ADR 0064: nothing in our code signals). WARN would unwind into the
+  ;; loading image's handlers and, under a warnings-as-errors build policy, fail a build that is merely
+  ;; loading the wrong PAL for its implementation (mirrors pal-clasp.lisp's #-clasp notice).
+  (format *error-output*
+          "~&dds.pal: pal-sbcl.lisp loaded on a non-SBCL build — this PAL is not the one for this image.~%"))
 
 
 (defun* pal-impl-name ()

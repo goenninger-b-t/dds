@@ -132,11 +132,11 @@
               (ref (type-identifier-referenced ti))
               (h (or cached (and (minimal-struct-type-p ref) (equivalence-hash ref)))))
          (unless (and h (>= (length h) 14))
-           (error "TypeObject serialize: no EquivalenceHash for an EK_* member TypeIdentifier"))
+           (error "TypeObject serialize: no EquivalenceHash for an EK_* member TypeIdentifier"))   ; NOCOND(GUARD): a successfully-registered EK_* member type always carries its EquivalenceHash; cannot fire on a registered supported type; contained in the TypeObject serializer
          (dds.core.buffer:put-octets cursor h 0 14)))
       ((ti-sequence-p ti)
-       (error "TypeObject serialize: sequence member TypeIdentifiers are pending Connext-oracle confirmation"))
-      (t (error "TypeObject serialize: unsupported TypeIdentifier kind #x~2,'0x" kind))))
+       (error "TypeObject serialize: sequence member TypeIdentifiers are pending Connext-oracle confirmation"))   ; NOCOND(GUARD): sequence-member TypeIdentifier serialization is a not-yet-enabled (Connext-oracle-pending) path; the currently-registered supported types never emit one; defense-in-depth refusing to emit unverified bytes
+      (t (error "TypeObject serialize: unsupported TypeIdentifier kind #x~2,'0x" kind))))   ; NOCOND(GUARD): an unsupported TypeIdentifier kind cannot arise from a successfully-registered supported type; defense-in-depth in the serializer
   t)
 
 ;;; ---- CommonStructMember (FINAL, rule 17) + MinimalMemberDetail (FINAL) ----

@@ -658,6 +658,46 @@ non-local exit, no condition. The `(or handshake-token null)` contract and the N
 byte-identical for every caller, so no consumer changed. Completes the DDS-Security payload/handshake cluster
 (crypto 7 + submessage 2 + key-material 3 + handshake 6 = 18). 567/567 SBCL + Clasp; gate-build/types green.
 
+## Slice — the final tail to ZERO: DCPS create/access-control + disc entity-key + peer parse (20 -> 0)
+
+The last twenty non-hot-path signalling forms, cleared in one sweep across five files. The ratchet reaches
+**0** and the campaign's `src/` production surface is condition-free.
+
+**Converted to status (the DDS/RTPS entry points):**
+- `dds.dcps:create-datawriter` / `create-datareader` — the DDS-Security §8.4.2.4/.5 AccessControl denial was a
+  fail-closed SIGNAL; it now returns `(values nil :not-allowed-by-security)` (a `bail`). Both widen to
+  `(values (or null data-{writer,reader}) (or null keyword))` — matching `create-participant`. The local
+  `check_create_datawriter/datareader` deny path is byte-identical fail-closed, just as a value.
+- `dds.disc:%alloc-user-writer-key` / `%alloc-user-reader-key` — the 1-octet RTPS entity-key ceiling (255
+  endpoints/participant, §9.3.1.2) was a fail-fast SIGNAL; now `(bail :out-of-resources)`. `add-local-writer`
+  / `add-local-reader` wrap the alloc in `TRY`, so they gain an **additive second status value**; their many
+  callers (the low-level disc/dataplane/secure-sedp/shapes/perftest tests) read only the primary endpoint and
+  are byte-unchanged. Only `create-datawriter/datareader` `TRY` the call, surfacing `:out-of-resources`.
+- `%validate-access-config` (create-participant's AC gate) — three fail-closed SIGNALs (no subject name /
+  validate-local-permissions failed / check_create_participant denied) become `(bail :no-subject-name)` /
+  `:permissions-validation-failed` / `:participant-denied`, freeing the handle before the denial `bail` exactly
+  as before. `create-participant` `TRY`s it, so a denied config returns `(values nil STATUS)` with no unwind.
+- `dds.disc:parse-peers` — a malformed `host:port` CLI entry SIGNALed; now `(bail :bad-peer-spec)` →
+  `(values nil :bad-peer-spec)`. The shapes wrapper `%parse-peers` keeps its `list` return and, on a non-nil
+  status, emits a `NOCOND(WARN)` visible degradation to multicast-only discovery (no control transfer); the
+  `dds-bench` `%perf-participant` validates it with a `NOCOND(BENCH)` harness check. Test `T6b`'s two
+  catch-the-signal assertions flip to `(null (create-datawriter …))` fail-closed checks.
+
+**Annotated (owner-sanctioned exempt classes), each verified unreachable-on-valid-input or already-contained:**
+- `store-microservice` 1735 — `NOCOND(SECURITY-FAILCLOSED)`: the server-listener cleanup-reraise re-signals the
+  inner store-open tamper after closing the listener; contained at `%run-microservice-server` (the server-start
+  boundary gate check B already asserts).
+- `types/typeobject-cdr` 135/138/139 — `NOCOND(GUARD)`: TypeObject-serializer invariants (missing
+  EquivalenceHash on an EK_* member / a sequence-member TypeIdentifier / an unsupported kind). The suite is
+  567/567 with these as `(error …)`, proving no successfully-registered supported type reaches them today —
+  sequence-in-TypeObject is a pending (Connext-oracle-unconfirmed) feature, unregisterable at present. When
+  sequences ship, the dedicated TYPE-REGISTRATION slice (they sit under `equivalence-hash`, which the whole
+  registry calls) converts them; until then this is defense-in-depth refusing to emit unverified bytes.
+- `dcps/entities` 1554 (`loan-sample`) — `NOCOND(GUARD)`: the FlatData-only loan-write API; a non-FlatData
+  writer cannot reach the fallback-ctor path in correct use.
+
+567/567 SBCL + Clasp; gate-build (clean cache, both impls) + gate-types green; `bench/nocond-ceiling.txt` → 0.
+
 ## Order of the remaining work (shallow → deep)
 
 **the durability store vtable — the tamper refusals are now `SECURITY-FAILCLOSED` (contained at the start

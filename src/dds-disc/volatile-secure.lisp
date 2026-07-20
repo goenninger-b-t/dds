@@ -595,7 +595,7 @@
         until (and (plusp (disc-node-discovered-count node1))
                    (plusp (disc-node-discovered-count node2)))
         do (sleep 0.02))
-  (assert (and (plusp (disc-node-discovered-count node1))
+  (assert (and (plusp (disc-node-discovered-count node1))   ; NOCOND(TEST): test-assertion helper reached ONLY from run-volatile-secure-*-test; the assert IS the test failure mechanism
                (plusp (disc-node-discovered-count node2)))
           () "PVMS test: SPDP discovery did not complete")
   t)

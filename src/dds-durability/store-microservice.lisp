@@ -1732,7 +1732,7 @@
     ;; server-owned lifecycle: open the inner ONCE (persistent inner replays from disk) BEFORE the serve
     ;; thread accepts, so the inner is ready for the first client; a failed open closes the listener.
     (handler-case (store-open inner history-kind history-depth)
-      (error (e) (ignore-errors (dds.pal:tcp-close listener)) (error e)))
+      (error (e) (ignore-errors (dds.pal:tcp-close listener)) (error e)))   ; NOCOND(SECURITY-FAILCLOSED): cleanup-reraise of the inner store-open tamper refusal (close listener, re-signal); contained at %run-microservice-server (server-start boundary, gate check B)
     (setf (microservice-server-thread srv)
           (dds.pal:spawn (lambda () (%ms-serve-loop listener inner stop-cell reg-cell reg-lock
                                                     max-connections recv-timeout))

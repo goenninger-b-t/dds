@@ -53,7 +53,7 @@
    a power of ten (1, 10, 100, …) so a persistent emit failure logs O(log n) lines, never a per-iteration
    flood (no logging framework exists; this is the minimal observable default). Runs ON the sender thread."
   (when (%power-of-ten-p count)
-    (warn "dds sender thread (~a) emit error #~d: ~a" context count condition))
+    (warn "dds sender thread (~a) emit error #~d: ~a" context count condition))   ; NOCOND(WARN): rate-limited diagnostic hook; prints + returns, no control transfer
   t)
 
 (defparameter *sender-emit-error-hook* #'%default-sender-emit-error-hook
@@ -494,7 +494,7 @@
   (when *debug-emit-fault*
     (when (integerp *debug-emit-fault*)
       (setf *debug-emit-fault* (when (> *debug-emit-fault* 1) (1- *debug-emit-fault*))))   ; N -> N-1, last -> NIL
-    (error 'sender-emit-test-fault))   ; :persistent or a positive integer: inject; inert when NIL
+    (error 'sender-emit-test-fault))   ; :persistent or a positive integer: inject; inert when NIL   ; NOCOND(TEST): inert in production (armed only by *debug-emit-fault* defaulting NIL); the UNWIND is the emit-fault mechanism under test
   (when (and shmem-dest (disc-node-shmem node))
     (when (plusp (handler-case
                      (dds.xport:send (dds.xport.shmem:shmem-transport-transport (disc-node-shmem node))
@@ -2918,7 +2918,7 @@
   (cond ((secured-loan-handle-p loans) (%secured-loan-release node loans))
         ((vectorp loans)
          (when (< count 0)   ; ADR 0038 residual g: a vector's stale tail must never be walked -> premature double-release
-           (error "node-return-loan: a vector of loans MUST be returned with its populated COUNT (its stale tail could double-release a live loan)"))
+           (error "node-return-loan: a vector of loans MUST be returned with its populated COUNT (its stale tail could double-release a live loan)")) ; NOCOND(GUARD): a negative loan COUNT is caller misuse; cannot fire on valid input; contained at the node-return-loan API (defense against double-release)
          (dotimes (i count) (let ((h (aref loans i))) (when (secured-loan-handle-p h) (%secured-loan-release node h)))))
         ((listp loans) (dolist (h loans) (when (secured-loan-handle-p h) (%secured-loan-release node h)))))
   t)

@@ -644,28 +644,30 @@
   writer)
 
 (defun* %alloc-user-writer-key (node)
-    (function (disc-node) (unsigned-byte 8))
+    (function (disc-node) (values (or null (unsigned-byte 8)) (or null keyword)))
   "Allocate + return the next distinct per-participant USER-writer entity KEY (WP-N-ENDPOINT-S1, ADR 0048; RTPS
    2.5 §9.3.1.2). Starts at 1 so the first DataWriter keeps EntityId #x0102/#x0103 (byte-identical to pre-S1);
    each subsequent writer gets a distinct key -> a distinct EntityId + SEDP GUID. Builtin/secure EntityIds are
-   NOT drawn from here. Fail-fasts if the 1-octet key space (255 writers/participant) is exhausted."
+   NOT drawn from here. Returns (values nil :out-of-resources) if the 1-octet key space (255 writers/participant)
+   is exhausted (ADR 0064 — a structural RTPS ceiling surfaced as a status, not a signal)."
   (let ((k (disc-node-user-writer-key-next node)))
     (when (> k #xff)
-      (error "disc-node: user-writer entity-key space exhausted (>255 DataWriters on one participant)"))
+      (bail :out-of-resources))
     (setf (disc-node-user-writer-key-next node) (1+ k))
     k))
 
 (defun* %alloc-user-reader-key (node)
-    (function (disc-node) (unsigned-byte 8))
+    (function (disc-node) (values (or null (unsigned-byte 8)) (or null keyword)))
   "Allocate + return the next distinct per-participant USER-reader entity KEY (WP-N-ENDPOINT-S2, ADR 0048; RTPS
    2.5 §9.3.1.2). Starts at 1 so the first DataReader keeps EntityId #x0107/#x0104 (byte-identical to pre-S2);
    each subsequent reader gets a distinct key -> a distinct EntityId + SEDP GUID. Writer + reader keys are
    SEPARATE counters (the entity KIND — 0x07/0x04 reader vs 0x02/0x03 writer — keeps their EntityIds disjoint even
    at the same key). Builtin/secure EntityIds are NOT drawn from here. Fail-fasts if the 1-octet key space (255
-   readers/participant) is exhausted."
+   readers/participant) is exhausted, returning (values nil :out-of-resources) — a structural RTPS ceiling
+   surfaced as a status, not a signal (ADR 0064)."
   (let ((k (disc-node-user-reader-key-next node)))
     (when (> k #xff)
-      (error "disc-node: user-reader entity-key space exhausted (>255 DataReaders on one participant)"))
+      (bail :out-of-resources))
     (setf (disc-node-user-reader-key-next node) (1+ k))
     k))
 
@@ -948,10 +950,11 @@
   (and (disc-node-zc-pool node) t))
 
 (defun* parse-peers (peers)
-    (function ((or null string)) list)
+    (function ((or null string)) (values list (or null keyword)))
   "Parse a \"host:port[,host:port]...\" PEERS string into the ((host . port) ...) list MAKE-DISC-NODE expects
    (FR-DISC-4 unicast announce targets). NIL or \"\" parses to NIL (multicast-only discovery). A malformed
-   entry (missing colon, empty host, non-numeric or out-of-range port) signals one uniform error.
+   entry (missing colon, empty host, non-numeric or out-of-range port) returns (values nil :bad-peer-spec)
+   — a config-parse status, not a signal (ADR 0064).
 
    Lives here, in the layer that OWNS the peer-list contract, so every caller that accepts a peers STRING
    from a CLI/Makefile/harness converts it the one way (DRY). It was previously private to dds.shapes, which
@@ -963,7 +966,7 @@
           for colon = (position #\: entry :from-end t)
           for port = (and colon (ignore-errors (parse-integer entry :start (1+ colon))))
           unless (and colon (plusp colon) (typep port '(unsigned-byte 16)))
-            do (error "peer ~s is not host:port (port 0..65535)" entry)
+            do (bail :bad-peer-spec)
           collect (cons (subseq entry 0 colon) port))))
 
 (defun* make-disc-node (&key (guid-prefix (make-array 12 :element-type '(unsigned-byte 8)
@@ -1336,7 +1339,7 @@
 (defun* add-local-writer (node &key (topic "") (type "")
                                    (reliability dds.rtps.discovery:+reliability-reliable+)
                                    (key nil) qos type-information (keyed t) (enabled t))
-    (function (disc-node &key (:topic string) (:type string) (:reliability integer) (:key (or null (unsigned-byte 8))) (:qos t) (:type-information t) (:keyed t) (:enabled t)) dds.rtps.discovery:endpoint-data)
+    (function (disc-node &key (:topic string) (:type string) (:reliability integer) (:key (or null (unsigned-byte 8))) (:qos t) (:type-information t) (:keyed t) (:enabled t)) (values (or null dds.rtps.discovery:endpoint-data) (or null keyword)))
   "Register a local publication (writer endpoint) on NODE with QOS (or a QoS derived from
    the legacy :reliability constant). TYPE-INFORMATION is the opaque serialized XTypes
    TypeInformation for PID_TYPE_INFORMATION. announce-endpoints sends it via SEDP. KEYED
@@ -1354,7 +1357,7 @@
    (%writer-durability-init/%prearm with ITS writer-id). Distinct EntityIds/GUIDs on the wire are correct
    (RTPS 2.5 §9.3.1.2). Byte-identical at N=1 / distinct topics."
   (let ((wqos (or qos (%qos-from-reliability reliability))))
-    (let* ((key (or key (%alloc-user-writer-key node)))
+    (let* ((key (or key (try (%alloc-user-writer-key node))))
            (kind (if keyed #x02 #x03))
            (ep (dds.rtps.discovery:make-endpoint-data
                 :role :writer
@@ -1372,7 +1375,7 @@
 (defun* add-local-reader (node &key (topic "") (type "")
                                    (reliability dds.rtps.discovery:+reliability-best-effort+)
                                    (key nil) qos type-information (keyed t) (enabled t))
-    (function (disc-node &key (:topic string) (:type string) (:reliability integer) (:key (or null (unsigned-byte 8))) (:qos t) (:type-information t) (:keyed t) (:enabled t)) dds.rtps.discovery:endpoint-data)
+    (function (disc-node &key (:topic string) (:type string) (:reliability integer) (:key (or null (unsigned-byte 8))) (:qos t) (:type-information t) (:keyed t) (:enabled t)) (values (or null dds.rtps.discovery:endpoint-data) (or null keyword)))
   "Register a local subscription (reader endpoint) on NODE with QOS (or a QoS derived from
    the legacy :reliability constant). TYPE-INFORMATION is the opaque serialized XTypes
    TypeInformation for PID_TYPE_INFORMATION. announce-endpoints sends it via SEDP. KEYED
@@ -1394,7 +1397,7 @@
    co-located holders before any drain/release), the mid-stream-joiner ZC high-water freeze (create-datareader), and
    the secured store-purge-defer (%secured-loan-release, purge only after all K readers return). This whole
    participant-with-N-same-topic-loan-capable-readers case is now correct in full generality."
-  (let* ((key (or key (%alloc-user-reader-key node)))
+  (let* ((key (or key (try (%alloc-user-reader-key node))))
          (kind (if keyed #x07 #x04))
          (ep (dds.rtps.discovery:make-endpoint-data
               :role :reader

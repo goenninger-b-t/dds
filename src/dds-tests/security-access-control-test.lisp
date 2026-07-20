@@ -748,13 +748,11 @@
                          (ci-topic (dds.dcps:create-topic p-ld "Circle" "ShapeType" nil))
                          (wqos     (dds.qos:make-writer-qos :reliability :best-effort))
                          (rqos     (dds.qos:make-reader-qos :reliability :best-effort)))
-                    ;; (a) Circle publish: local check_create_datawriter MUST signal an error
+                    ;; (a) Circle publish: local check_create_datawriter MUST refuse -> (values nil :not-allowed-by-security)
                     (let ((circle-writer-denied-p
-                           (handler-case
-                               (progn (dds.dcps:create-datawriter pub ci-topic :qos wqos) nil)
-                             (error () t))))
+                           (null (dds.dcps:create-datawriter pub ci-topic :qos wqos))))
                       (%check :acld-circle-writer-denied circle-writer-denied-p
-                              "create-datawriter('Circle') must signal an error (EC grant denies Circle publish)"))
+                              "create-datawriter('Circle') must return NIL fail-closed (EC grant denies Circle publish)"))
                     ;; (b) Square publish: MUST succeed (EC grant allows Square publish)
                     (let ((sq-dw
                            (handler-case
@@ -764,13 +762,11 @@
                                       :detail (format nil "create-datawriter('Square') must not signal; got: ~a" e))))))
                       (%check :acld-square-writer-allowed (not (null sq-dw))
                               "create-datawriter('Square') must return a non-nil DataWriter (EC grant allows Square publish)"))
-                    ;; (c) Circle subscribe: local check_create_datareader MUST signal an error
+                    ;; (c) Circle subscribe: local check_create_datareader MUST refuse -> (values nil :not-allowed-by-security)
                     (let ((circle-reader-denied-p
-                           (handler-case
-                               (progn (dds.dcps:create-datareader sub ci-topic :qos rqos) nil)
-                             (error () t))))
+                           (null (dds.dcps:create-datareader sub ci-topic :qos rqos))))
                       (%check :acld-circle-reader-denied circle-reader-denied-p
-                              "create-datareader('Circle') must signal an error (EC grant denies Circle subscribe)"))
+                              "create-datareader('Circle') must return NIL fail-closed (EC grant denies Circle subscribe)"))
                     ;; (d) Square subscribe: MUST succeed (EC grant allows Square subscribe)
                     (let ((sq-dr
                            (handler-case

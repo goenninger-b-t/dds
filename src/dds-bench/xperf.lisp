@@ -80,13 +80,14 @@
    app-driven discovery work. ADVERTISE/PEERS carry the documented cross-vendor reachability gotchas
    (Connext is pinned to the LAN interface; the Fast DDS profile is loopback-only, so it needs a unicast
    SPDP peer at 127.0.0.1:7410) — see interop/autodiscovery/README.md."
-  (dds.dcps:create-participant :domain domain :autonomous t
-                               :advertise-address advertise
-                               ;; CREATE-PARTICIPANT's :PEERS is a LIST of (host . port); this passed the raw
-                               ;; STRING, so any run with PEERS set died with a TYPE-ERROR before discovery.
-                               ;; The cross-vendor peer path of this harness had therefore NEVER run — which
-                               ;; means the ours<->Connext interop the parity table claimed was never executed.
-                               :peers (dds.disc:parse-peers peers)))
+  ;; CREATE-PARTICIPANT's :PEERS is a LIST of (host . port); parse the harness STRING first (a raw string
+  ;; would die with a TYPE-ERROR before discovery — the cross-vendor peer path had NEVER run otherwise).
+  (multiple-value-bind (peer-list peer-status) (dds.disc:parse-peers peers)
+    (when peer-status
+      (error "xperf: malformed --peers ~s: ~a" peers peer-status))   ; NOCOND(BENCH): harness CLI-arg validation
+    (dds.dcps:create-participant :domain domain :autonomous t
+                                 :advertise-address advertise
+                                 :peers peer-list)))
 
 (defun* run-echo-responder (&key (domain 0) (seconds 60) (advertise-address "127.0.0.1") (peers nil)
                                  (data-representation :xcdr2) (history-kind :keep-all))

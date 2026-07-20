@@ -443,7 +443,7 @@
                                                     0 0 0 0 0 0 0 0 0 0 0 0
                                                     127 0 0 1))))
       (dotimes (i 24)
-        (assert (= (aref vec i) (aref expected i)) ()
+        (assert (= (aref vec i) (aref expected i)) ()   ; NOCOND(TEST): test-assertion helper reached ONLY from a run-*-test; the assert IS the test failure mechanism
                 "Locator byte ~d: got ~d want ~d" i (aref vec i) (aref expected i))))
     t))
 

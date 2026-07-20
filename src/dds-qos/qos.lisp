@@ -248,7 +248,7 @@
 (defun* %assert-rxo (label expect-bad got-bad)
     (function (t t t) t)
   "Assert the RxO incompatible-list GOT-BAD equals the EXPECT-BAD set (order-free)."
-  (assert (and (= (length expect-bad) (length got-bad))
+  (assert (and (= (length expect-bad) (length got-bad))   ; NOCOND(TEST): test-assertion helper reached ONLY from run-qos-rxo-test; the assert IS the test failure mechanism
                (every (lambda (p) (member p got-bad)) expect-bad))
           () "RxO[~a]: expected incompatible ~a, got ~a" label expect-bad got-bad)
   t)
