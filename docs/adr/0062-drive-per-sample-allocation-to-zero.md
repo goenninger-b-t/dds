@@ -155,6 +155,29 @@ measured 3648), so no step can silently lose its win.** Highest value next: `%re
 the TX send-plan flattening (349 B) — together ~19 % — but BOTH have a correctness invariant to preserve
 (stale-route mis-delivery; byte-identical wire), so neither is a quick edit.
 
+## ⚠️ ATTEMPTED + REJECTED (2026-07-20) — TX send-plan flattening is `gate-mem`-NEUTRAL
+
+The `%send-changes-packed` "349 B" line above was implemented and **reverted**: a single-datagram fast path
+for the common case (one small non-ZC change + optional HEARTBEAT to one UDP destination) that skips
+`%changes-datagram-plan`'s `items`/`%pack-plan`/per-group-closure/`state`-cons allocation and writes the
+datagram directly. It was **byte-identical** (a new `run-tx-fast-path-equivalence-test` captured the fast
+path vs the forced-plan path via `*datagram-sink*` and asserted equality) and provably **reached** in the
+`mem-per-sample` harness (single reliable writer→reader, ZC off). The `gate-mem` A/B: **FAST-ON 3582 B,
+FAST-OFF 3538 B** — the fast path is *higher*, i.e. the entire delta is measurement noise (the total
+oscillates ±~22 B). **It saves ZERO allocation.**
+
+Why: SBCL **stack-allocates** the plan's short-lived closures and cons cells (dynamic-extent), so they were
+never heap garbage. The 349 B was the callee-wrapping harness over-reporting yet again (fourth instrument to
+mislead on this task, after `sb-sprof` ×2 and the `%reader-routes-for` harness). **Do not retry this site.**
+
+**Process correction, now mandatory:** size every candidate with a **`*flag*` A/B against `gate-mem`** (bind
+a toggle, run the end-to-end harness both ways) BEFORE writing the real change — not a per-callee
+`bytes-consed` wrap, which counts stack-allocated conses the GC never sees. The per-site table *ranks* sites;
+only a `gate-mem` A/B *sizes* them. The remaining ranked TX items (`%capture-push-groups` 197, `writer-write`
+196, `%write-key-hash` 175) and the RX items (`%on-user-heartbeat` 393, `%deliver-user-sample` 349,
+`%deserialize-sample` 218) must each pass this A/B gate before any implementation — several are likely
+dynamic-extent too.
+
 ## Consequences
 
 - The remaining path to NFR-MEM is **TX-first**, and it starts by asking why `write-sample` costs 1312 B
