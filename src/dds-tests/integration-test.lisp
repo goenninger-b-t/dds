@@ -42,8 +42,8 @@
                                     (dds.xport.udp:make-udp-locator :host "127.0.0.1" :port rx-port)
                                     msg-buf 0 (dds.core.buffer:cursor-position mc)))))
               (sleep 0.2)
-              (multiple-value-bind (size a p) (dds.xport.udp:udp-transport-recv rx-sock in-buf)
-                (declare (ignore a p))
+              (multiple-value-bind (size status) (dds.xport.udp:udp-transport-recv rx-sock in-buf)
+                (declare (ignore status))
                 (%check :e2e-received (> size 0) "no datagram received over UDP"))
               (let ((rc (dds.core.buffer:cursor in-buf :endianness :little)))
                 (dds.rtps.message:dispatch-message

@@ -431,39 +431,48 @@
 
 (defun* udp-recv (socket buffer length)
     (function (t (simple-array (unsigned-byte 8) (*)) (integer 0)) t)
-  "Block until a datagram arrives; return (values size sender-address sender-port). Used from a
-   dedicated receiver thread. On the raw path SENDER-ADDRESS and SENDER-PORT are NIL — see
-   *UDP-RAW-RECVFROM* for why nothing needs them.
+  "Block until a datagram arrives; return (values SIZE STATUS). Used from a dedicated receiver thread.
+   The SENDER ADDRESS IS NOT REPORTED — see *UDP-RAW-RECVFROM* for why nothing needs it.
 
-   A NEGATIVE size means the socket was CLOSED (or the receive failed): recvfrom(2) reports that by
-   RETURNING -1, where SOCKET-RECEIVE reported it by SIGNALLING. **A RECEIVER LOOP MUST CHECK FOR IT
-   AND EXIT**, or the thread spins forever and stop-node's join never returns — which is exactly the
-   'THE STACK COULD NOT SHUT DOWN ON LINUX' defect UDP-CLOSE documents. This is safe against fd reuse
-   because SOCKET-CLOSE resets the descriptor slot to -1 on BOTH implementations (verified, not
-   assumed), so the fd read here is never a recycled one belonging to some other socket.
+   STATUS is :CLOSED when the socket has been closed and the receiver loop must EXIT; NIL otherwise.
+   A NEGATIVE size with a NIL status is a TRANSIENT failure and the loop must simply receive again.
 
-   A ZERO size is NOT an exit condition: a zero-length UDP datagram is legal, so treating it as
-   end-of-stream would let any peer kill a receiver thread by sending one (NFR-SEC-POSTURE). On Linux
-   a shutdown(2)-woken recvfrom also returns 0, which is indistinguishable from that; UDP-CLOSE closes
-   the socket immediately after shutting it down, so the fd goes to -1 and the next call returns
-   negative. That is byte-for-byte the pre-existing behaviour of the SOCKET-RECEIVE path.
+   THE DISTINCTION IS LOAD-BEARING AND CI FOUND IT THE HARD WAY. recvfrom(2) reports a closed socket by
+   RETURNING -1, where SOCKET-RECEIVE reported it by SIGNALLING — but -1 ALSO means EINTR, and on Linux
+   SBCL stops threads for GC with a signal, so a blocked recvfrom is interrupted routinely. Treating
+   every -1 as 'closed' therefore KILLED RECEIVER THREADS MID-RUN under GC pressure: green on macOS,
+   red on Linux. SOCKET-RECEIVE hid this by retrying EINTR internally.
+   The precise test is the SOCKET, not the return value: SOCKET-CLOSE resets the descriptor slot to -1
+   on BOTH implementations (verified, not assumed), so fd < 0 means closed and nothing else. That is
+   also what makes this safe against fd reuse — the socket object never hands back a recycled
+   descriptor belonging to some other socket.
+
+   A ZERO size is NOT an exit condition either: a zero-length UDP datagram is legal, so treating it as
+   end-of-stream would let any peer kill a receiver thread by sending one (NFR-SEC-POSTURE). On Linux a
+   shutdown(2)-woken recvfrom also returns 0, indistinguishable from that; UDP-CLOSE closes the socket
+   immediately after shutting it down, so the fd goes to -1 and the next call reports :CLOSED.
+
+   On the *UDP-RAW-RECVFROM* NIL path a closed socket still SIGNALS (SOCKET-RECEIVE's behaviour), so
+   STATUS is always NIL there and the caller's handler is what ends the loop.
 
    BUFFER MUST be PAL-static (DDS.PAL:ALLOC-STATIC) on the raw path, for the same reason as
    UDP-SEND-TO's: the kernel writes into it through a raw pointer (NFR-MEM)."
   (if *udp-raw-recvfrom*
-      (values (cffi:foreign-funcall-pointer
-               *recvfrom-fp* ()
-               :int (sb-bsd-sockets:socket-file-descriptor socket)
-               :pointer (static-pointer buffer)
-               :unsigned-long length
-               :int 0                                       ; flags
-               :pointer *null-sap*                          ; src_addr — sender not wanted
-               :pointer *null-sap*                          ; addrlen
-               :long)
-              nil nil)
-      (multiple-value-bind (buf size addr port) (sb-bsd-sockets:socket-receive socket buffer length)
+      (let ((n (cffi:foreign-funcall-pointer
+                *recvfrom-fp* ()
+                :int (sb-bsd-sockets:socket-file-descriptor socket)
+                :pointer (static-pointer buffer)
+                :unsigned-long length
+                :int 0                                      ; flags
+                :pointer *null-sap*                         ; src_addr — sender not wanted
+                :pointer *null-sap*                         ; addrlen
+                :long)))
+        (if (and (minusp n) (minusp (sb-bsd-sockets:socket-file-descriptor socket)))
+            (values n :closed)                              ; fd reset to -1 => really closed
+            (values n nil)))                                ; EINTR and friends => receive again
+      (multiple-value-bind (buf size) (sb-bsd-sockets:socket-receive socket buffer length)
         (declare (ignore buf))
-        (values size addr port))))
+        (values size nil))))
 
 (defun* udp-join-multicast (socket group)
     (function (t string) (values t (or null keyword)))

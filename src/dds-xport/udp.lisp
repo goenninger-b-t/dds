@@ -53,12 +53,13 @@
   (dds.pal:udp-local-port socket))
 
 (defun* udp-transport-recv (socket buffer)
-    (function (t dds.core.buffer:octet-buffer) (values integer t t))
+    (function (t dds.core.buffer:octet-buffer) (values integer t))
   "Block until a datagram arrives; read it into BUFFER up to its capacity.
-   Returns (values size sender-address sender-port). SIZE is NEGATIVE when the socket was closed and
-   the sender address is NIL on the raw-recvfrom path — see dds.pal:udp-recv (ADR 0066). The return
-   type is `integer`, NOT `(integer 0)`: declaring it non-negative would let the compiler fold a
-   caller's own (minusp size) shutdown check away at (safety 0)."
+   Returns (values size status) — status :CLOSED means the socket was closed and the caller must stop
+   receiving; a negative SIZE with a NIL status is transient (EINTR). The sender address is not
+   reported: nothing in the stack uses it (dds.pal:udp-recv, ADR 0066). The SIZE type is `integer`,
+   NOT `(integer 0)`: declaring it non-negative would let the compiler fold a caller's own
+   (minusp size) check away at (safety 0)."
   (dds.pal:udp-recv socket
                     (dds.core.buffer:octet-buffer-vec buffer)
                     (dds.core.buffer:octet-buffer-capacity buffer)))
@@ -84,8 +85,8 @@
                              (make-udp-locator :host "127.0.0.1" :port rx-port)
                              out-buffer 0 4)
              (sleep 0.2)
-             (multiple-value-bind (size addr senderport) (udp-transport-recv rx-socket in-buffer)
-               (declare (ignore addr senderport))
+             (multiple-value-bind (size status) (udp-transport-recv rx-socket in-buffer)
+               (declare (ignore status))
                (assert (= 4 size))
                (let ((v (dds.core.buffer:octet-buffer-vec in-buffer)))
                  (assert (= #xDE (aref v 0)))
@@ -109,17 +110,18 @@
      (let ((buf (dds.core.buffer:make-octet-buffer 65507)))
        (unwind-protect
             (loop
-              (let ((size (handler-case
-                              (nth-value 0 (dds.pal:udp-recv socket
-                                                             (dds.core.buffer:octet-buffer-vec buf) 65507))
-                            (error () (return)))))   ; socket-receive arm: closed socket SIGNALS -> exit
-                ;; raw-recvfrom arm: a closed socket RETURNS negative instead (ADR 0066) -> exit here,
-                ;; or this thread spins and stop-node's join never returns. ZERO is NOT an exit: a
-                ;; zero-length datagram is legal and any peer could send one (NFR-SEC-POSTURE).
-                (when (and (integerp size) (minusp size)) (return))
-                ;; one malformed or unexpected datagram must not kill the receiver
-                (handler-case (funcall on-datagram buf size)
-                  (error () nil))))
+              (multiple-value-bind (size status)
+                  (handler-case (dds.pal:udp-recv socket
+                                                  (dds.core.buffer:octet-buffer-vec buf) 65507)
+                    (error () (return)))   ; socket-receive arm: a closed socket SIGNALS -> exit
+                ;; raw-recvfrom arm: a closed socket is reported as :CLOSED (ADR 0066). A bare negative
+                ;; size is TRANSIENT — EINTR, which SBCL's GC raises routinely on Linux — and must NOT
+                ;; end the thread; just receive again. ZERO is a legal zero-length datagram, never EOF.
+                (when (eq status :closed) (return))
+                (when (and (integerp size) (not (minusp size)))
+                  ;; one malformed or unexpected datagram must not kill the receiver
+                  (handler-case (funcall on-datagram buf size)
+                    (error () nil)))))
          (dds.pal:free-static (dds.core.buffer:octet-buffer-vec buf)))))
    :name "dds-udp-rx"))
 
