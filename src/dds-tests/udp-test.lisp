@@ -6,22 +6,40 @@
 
 (defun* run-udp-loopback-test ()
     (function () t)
-  "Test: the UDPv4 PAL sends and receives a datagram over loopback."
+  "Test: the UDPv4 PAL sends and receives a datagram over loopback — under BOTH send mechanisms.
+
+   THIS TEST IS THE FALSIFIER FOR THE struct sockaddr_in LAYOUT (ADR 0065). *UDP-RAW-SENDTO* T builds
+   the destination address in our own foreign block and calls sendto(2) directly; NIL takes the
+   sb-bsd-sockets SOCKET-SEND path. The two layouts differ between Darwin and Linux in their first two
+   octets, and getting them wrong is not a crash — the kernel rejects the address family and the
+   datagram silently goes nowhere. Asserting DELIVERY under the raw arm is what turns that into a loud,
+   platform-specific failure; CI/Linux is the oracle for the non-Darwin branch, which macOS cannot see.
+
+   Runs on the test runner's own thread, which the PAL did not spawn, so *THREAD-SOCKADDR* is NIL and
+   this exercises UDP-SEND-TO's WITH-FOREIGN-OBJECT fallback; the per-thread fast path is exercised by
+   every integration test (a receiver thread answers each HEARTBEAT with an ACKNACK)."
   (let ((rx (dds.pal:udp-open :host "127.0.0.1" :port 0)))
     (unwind-protect
         (let ((tx (dds.pal:udp-open :host "127.0.0.1" :port 0))
-              (out (make-array 4 :element-type '(unsigned-byte 8)
-                                 :initial-contents '(#xde #xad #xbe #xef)))
+              ;; PAL-static: UDP-SEND-TO hands the buffer to the kernel by raw pointer (NFR-MEM).
+              (out (dds.pal:alloc-static 4))
               (in (make-array 16 :element-type '(unsigned-byte 8))))
+          (replace out #(#xde #xad #xbe #xef))
           (unwind-protect
               (let ((port (dds.pal:udp-local-port rx)))
-                (dds.pal:udp-send-to tx out 4 "127.0.0.1" port)
-                (sleep 0.2)
-                (multiple-value-bind (n addr sport) (dds.pal:udp-recv rx in 4)
-                  (declare (ignore addr sport))
-                  (%check :udp-loopback
-                          (and (= n 4) (= (aref in 0) #xde) (= (aref in 3) #xef))
-                          "UDP loopback datagram round-trip")))
+                (dolist (raw '(t nil))
+                  (let ((dds.pal:*udp-raw-sendto* raw))
+                    (fill in 0)
+                    (dds.pal:udp-send-to tx out 4 "127.0.0.1" port)
+                    (sleep 0.2)
+                    (multiple-value-bind (n addr sport) (dds.pal:udp-recv rx in 4)
+                      (declare (ignore addr sport))
+                      (%check (if raw :udp-loopback-raw-sendto :udp-loopback)
+                              (and (= n 4) (= (aref in 0) #xde) (= (aref in 1) #xad)
+                                   (= (aref in 2) #xbe) (= (aref in 3) #xef))
+                              (format nil "UDP loopback datagram round-trip (*udp-raw-sendto* ~a)"
+                                      raw))))))
+            (dds.pal:free-static out)
             (dds.pal:udp-close tx)))
       (dds.pal:udp-close rx))
     t))

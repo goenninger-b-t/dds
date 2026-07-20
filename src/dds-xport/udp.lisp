@@ -32,14 +32,14 @@
               ;; unreachable/stale/placeholder locator, e.g. a foreign participant
               ;; advertising 0.0.0.0 or a down interface) must NOT be fatal — drop
               ;; the datagram; the reliable layer recovers via HEARTBEAT/ACKNACK.
+              ;; raw sendto RETURNS negative on refusal, socket-send SIGNALS: both -> 0 sent (ADR 0065)
               (handler-case
-                  (progn
-                    (dds.pal:udp-send-to socket
-                                         (dds.core.buffer:octet-buffer-vec buffer)
-                                         len
-                                         (udp-locator-host locator)
-                                         (udp-locator-port locator))
-                    len)
+                  (let ((r (dds.pal:udp-send-to socket
+                                                (dds.core.buffer:octet-buffer-vec buffer)
+                                                len
+                                                (udp-locator-host locator)
+                                                (udp-locator-port locator))))
+                    (if (and (integerp r) (minusp r)) 0 len))
                 (error () 0)))
       :receive-loop (lambda () (values))
       :open-receive-resource (lambda (&rest args) (declare (ignore args)) (values))

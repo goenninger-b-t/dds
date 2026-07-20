@@ -97,17 +97,35 @@
    race-free: two threads CASing concurrently must not share one EXPECTED cell or they tear each other's
    operand. Carved out of the SAME allocation as *THREAD-TIMESPEC* (one foreign-alloc per thread).")
 
+(defvar *thread-sockaddr* nil
+  "A per-thread, pre-allocated 16-octet foreign `struct sockaddr_in` destination scratch for
+   UDP-SEND-TO's raw-sendto(2) path, bound by SPAWN for every PAL-created thread; NIL in a thread the
+   PAL did not create, which then falls back to a per-call WITH-FOREIGN-OBJECT.
+
+   WP-PERF (NFR-MEM): the sb-bsd-sockets SOCKET-SEND path allocated 360 B on EVERY datagram — ~262 B of
+   it the four PARSE-INTEGER calls inside %PARSE-IPV4 re-parsing the dotted-quad destination STRING per
+   send, the rest SOCKET-SEND's own keyword/generic-dispatch/alien-sockaddr overhead. One ACKNACK rides
+   this path per received sample, so it was ~12 % of the whole measured per-sample allocation budget
+   (ADR 0062). Filling a pre-allocated 16-octet block costs nothing and allocates nothing.
+
+   Per-THREAD, not global, for the same reason as *THREAD-TIMESPEC*: several threads send on one socket
+   concurrently (each receiver thread answers HEARTBEATs while the user thread announces), and a torn
+   destination address is SILENT MIS-DELIVERY — a datagram to the wrong peer, not a crash. Carved out of
+   the SAME allocation as *THREAD-TIMESPEC* / *THREAD-ATOMIC-CELL* (one foreign-alloc per thread).")
+
 (defun* call-with-thread-clock (fn)
     (function (function) t)
   "Run FN with this thread's per-thread foreign scratch allocated and bound, freeing it on exit: the
-   MONOTONIC-NS timespec (*THREAD-TIMESPEC*, 16 octets) and the CAS expected-operand cell
-   (*THREAD-ATOMIC-CELL*, 8 octets) are carved from ONE 24-octet allocation. SPAWN wraps every PAL thread in
-   this; a non-PAL thread (the user's own) may wrap itself to get the fast clock + CAS paths — the
-   bench/profiling harness does exactly that. The timespec occupies [0,16) and the CAS cell [16,24), which
-   is 8-aligned because foreign-alloc returns at least 16-byte-aligned memory."
-  (let ((tp (cffi:foreign-alloc :uint8 :count 24)))
+   MONOTONIC-NS timespec (*THREAD-TIMESPEC*, 16 octets), the CAS expected-operand cell
+   (*THREAD-ATOMIC-CELL*, 8 octets) and the UDP-SEND-TO destination sockaddr (*THREAD-SOCKADDR*,
+   16 octets) are carved from ONE 40-octet allocation. SPAWN wraps every PAL thread in this; a non-PAL
+   thread (the user's own) may wrap itself to get the fast clock + CAS + send paths — the bench/profiling
+   harness does exactly that. The timespec occupies [0,16), the CAS cell [16,24) and the sockaddr [24,40);
+   every one is at least 4-aligned because foreign-alloc returns at least 16-byte-aligned memory."
+  (let ((tp (cffi:foreign-alloc :uint8 :count 40)))
     (unwind-protect (let ((*thread-timespec* tp)
-                          (*thread-atomic-cell* (cffi:inc-pointer tp 16)))
+                          (*thread-atomic-cell* (cffi:inc-pointer tp 16))
+                          (*thread-sockaddr* (cffi:inc-pointer tp 24)))
                       (funcall fn))
       (cffi:foreign-free tp))))
 
@@ -258,10 +276,132 @@
   "The bound local port of SOCKET."
   (nth-value 1 (sb-bsd-sockets:socket-name socket)))
 
+;;; ---- raw sendto(2) datagram fast path (NFR-MEM: zero allocation per datagram) ----
+
+(defparameter *sendto-fp*
+  (cffi:foreign-symbol-pointer "sendto")
+  "The RESOLVED sendto(2) function pointer, looked up ONCE at load — never by name per call.
+   Same rule, and same reason, as *CLOCK-GETTIME-FP*: a by-name foreign call re-resolves the symbol
+   through dlsym on EVERY call on Clasp (~3.8 us measured), and this one sits on the ACKNACK /
+   discovery-announce send path.")
+
+(defconstant +sockaddr-in-bytes+ 16
+  "sizeof(struct sockaddr_in) — 16 octets on both supported targets. Layouts, read from the platform
+   headers (never reconstructed from memory), differ ONLY in the first two octets:
+
+     Darwin (MacOSX.sdk/usr/include/netinet/in.h, sys/socket.h AF_INET = 2):
+       sin_len(u8)@0=16  sin_family(u8)@1=AF_INET  sin_port(u16 net)@2  sin_addr(u32 net)@4  sin_zero[8]@8
+     Linux/glibc (POSIX 1003.1 <netinet/in.h>) — no sin_len, sin_family is a 2-octet host-order field:
+       sin_family(u16 host)@0=AF_INET             sin_port(u16 net)@2  sin_addr(u32 net)@4  sin_zero[8]@8
+
+   Everything from sin_port on is identical, and both fields from sin_port on are NETWORK byte order.
+   A WRONG prefix does not corrupt memory: the kernel rejects the family and sendto(2) returns -1, so
+   the datagram is dropped LOUDLY (the loopback delivery assertion in the PAL udp test fails). CI/Linux
+   is the oracle for the non-Darwin branch — macOS cannot see it.")
+
+(defparameter *sockaddr-in-prefix-0*
+  (if (member :darwin *features*) +sockaddr-in-bytes+ 2)
+  "Octet 0 of a struct sockaddr_in: BSD's sin_len (= 16), or the low octet of Linux's little-endian
+   2-octet sin_family (AF_INET = 2). Computed from *FEATURES* rather than a reader conditional so this
+   shared PAL file stays conditional-free (the *CLOCK-MONOTONIC-ID* pattern). 64-bit little-endian only
+   (REQUIREMENTS §8).")
+
+(defparameter *sockaddr-in-prefix-1*
+  (if (member :darwin *features*) 2 0)
+  "Octet 1 of a struct sockaddr_in: BSD's sin_family (AF_INET = 2), or the high octet of Linux's
+   little-endian 2-octet sin_family (0). See *SOCKADDR-IN-PREFIX-0*.")
+
+(defvar *udp-raw-sendto* t
+  "T (the default): UDP-SEND-TO builds its destination in a pre-allocated foreign sockaddr and calls
+   sendto(2) directly — zero allocation per datagram. NIL: the original sb-bsd-sockets SOCKET-SEND
+   path, which allocates ~360 B per datagram.
+
+   The datagram BYTES ON THE WIRE are identical either way; only the syscall wrapper differs. Kept as
+   the A/B lever for the NFR-MEM measurement (ADR 0062 requires every allocation change to be sized by
+   a flag A/B against `make gate-mem`) and as an escape hatch should a platform's struct sockaddr_in
+   layout differ from the two documented at +SOCKADDR-IN-BYTES+.")
+
+(defun* %fill-sockaddr-in (sa host port)
+    (function (t string (integer 0 65535)) t)
+  "Fill the 16-octet foreign struct sockaddr_in at SA with dotted-quad HOST and PORT, ALLOCATING
+   NOTHING. Replaces (list (%parse-ipv4 host) port), whose four PARSE-INTEGER calls cons ~262 B per
+   send; the digits are accumulated in a fixnum instead.
+
+   TOTAL AND BOUNDED (NFR-SEC-POSTURE): HOST derives from a peer's advertised locator, i.e. from wire
+   data, so the walk NEVER writes outside sin_addr's four octets [4,8) — the octet index is capped at 4
+   and each accumulated value is masked to 8 bits. A malformed HOST therefore yields some well-formed
+   address whose datagram simply goes nowhere (UDP is best-effort and the reliable layer recovers), and
+   can never corrupt the block or the memory after it."
+  (setf (cffi:mem-ref sa :uint8 0) *sockaddr-in-prefix-0*
+        (cffi:mem-ref sa :uint8 1) *sockaddr-in-prefix-1*
+        (cffi:mem-ref sa :uint8 2) (ldb (byte 8 8) port)      ; sin_port, network byte order
+        (cffi:mem-ref sa :uint8 3) (ldb (byte 8 0) port))
+  (let ((acc 0) (octet 0) (n (length host)))
+    (declare (type fixnum acc n) (type (integer 0 4) octet))
+    (dotimes (i n)
+      (let ((ch (char host i)))
+        (cond ((char= ch #\.)
+               (when (< octet 4)
+                 (setf (cffi:mem-ref sa :uint8 (+ 4 octet)) (logand acc #xff))
+                 (incf octet))
+               (setf acc 0))
+              (t (setf acc (+ (* acc 10) (logand (- (char-code ch) 48) #xff)))))))
+    (when (< octet 4)
+      (setf (cffi:mem-ref sa :uint8 (+ 4 octet)) (logand acc #xff))
+      (incf octet))
+    (loop while (< octet 4)                                   ; a short HOST leaves the rest zero
+          do (setf (cffi:mem-ref sa :uint8 (+ 4 octet)) 0) (incf octet)))
+  (dotimes (i 8) (setf (cffi:mem-ref sa :uint8 (+ 8 i)) 0))   ; sin_zero
+  t)
+
 (defun* udp-send-to (socket buffer length host port)
     (function (t (simple-array (unsigned-byte 8) (*)) (integer 0) string (integer 0 65535)) t)
-  "Send LENGTH octets of BUFFER from SOCKET to HOST:PORT."
-  (sb-bsd-sockets:socket-send socket buffer length :address (list (%parse-ipv4 host) port)))
+  "Send LENGTH octets of BUFFER from SOCKET to HOST:PORT. Returns sendto(2)'s value — the octet count
+   sent, or NEGATIVE on failure. UDP is best-effort: a failed send (an unreachable / stale / 0.0.0.0
+   placeholder locator, a down interface) is DROPPED by the caller, never fatal, and the reliable layer
+   recovers via HEARTBEAT/ACKNACK.
+
+   BUFFER MUST be PAL-static (DDS.PAL:ALLOC-STATIC). It is handed to the kernel by raw pointer, and
+   NFR-MEM is explicit that any buffer addressed by a pointer/SAP is foreign/static and never a plain
+   heap array — SBCL's and AllegroCL's GCs MOVE objects, so a heap vector's address can be invalidated
+   underneath a blocking syscall. The one production caller (DDS.XPORT.UDP:MAKE-UDP-TRANSPORT) passes an
+   octet-buffer vec, which is PAL-backed by construction.
+
+   Set *UDP-RAW-SENDTO* to NIL to fall back to sb-bsd-sockets SOCKET-SEND; the wire bytes are identical."
+  (if *udp-raw-sendto*
+      (flet ((send (sa)
+               (%fill-sockaddr-in sa host port)
+               (cffi:foreign-funcall-pointer
+                *sendto-fp* ()
+                :int (sb-bsd-sockets:socket-file-descriptor socket)
+                :pointer (static-pointer buffer)
+                :unsigned-long length
+                :int 0                                        ; flags
+                :pointer sa
+                :unsigned-int +sockaddr-in-bytes+
+                :long)))
+        (let ((sa *thread-sockaddr*))
+          (if sa
+              (send sa)
+              (cffi:with-foreign-object (sa2 :uint8 +sockaddr-in-bytes+) (send sa2)))))
+      (sb-bsd-sockets:socket-send socket buffer length :address (list (%parse-ipv4 host) port))))
+
+(defun* %pal-reresolve-foreign-pointers ()
+    (function () (eql t))
+  "Re-resolve every libc foreign-symbol pointer this file caches at load time, after an image restart.
+   A dumped core CANNOT carry a live foreign address across save-lisp-and-die — the symbol is re-linked
+   at startup, so a pointer captured before the dump dangles, and the first call through it is undefined
+   behaviour rather than a clean failure. Mirrors dds.dare's %DARE-RERESOLVE-FOREIGN-POINTERS, so any
+   build that dumps a core (a delivered durability-service executable) re-resolves libc on startup.
+
+   *CLOCK-GETTIME-FP* predates this hook and carried the identical exposure with no hook at all; it is
+   covered here rather than growing a second one-off. Idempotent — re-resolving a live pointer is a no-op."
+  (setf *clock-gettime-fp* (cffi:foreign-symbol-pointer "clock_gettime")
+        *sendto-fp* (cffi:foreign-symbol-pointer "sendto"))
+  t)
+
+(eval-when (:load-toplevel :execute)
+  (register-image-restart-hook '%pal-reresolve-foreign-pointers))
 
 (defun* udp-recv (socket buffer length)
     (function (t (simple-array (unsigned-byte 8) (*)) (integer 0)) t)

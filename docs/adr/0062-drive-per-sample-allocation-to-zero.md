@@ -155,6 +155,32 @@ measured 3648), so no step can silently lose its win.** Highest value next: `%re
 the TX send-plan flattening (349 B) — together ~19 % — but BOTH have a correctness invariant to preserve
 (stale-route mis-delivery; byte-identical wire), so neither is a quick edit.
 
+## LANDED (2026-07-20) — the FIRST RECEIVER-THREAD slice: raw sendto(2), −175 B (2883 → 2730)
+
+Full decision in **ADR 0065**; measurement in `bench/report/2026-07-20-the-acknack-reparsed-its-destination-ip-per-datagram.md`.
+
+Re-splitting the budget by probing each phase of the measurement cycle put **44 % on the RECEIVER
+THREADS** (1267 B), 30 % on TX (873 B), 20 % on the take that returns the sample (590 B) and 5 % on an
+empty take (153 B). `(sleep 0.0002)` allocates 0 B on the calling thread, which makes the sleep window a
+clean receiver-thread probe; a writer-idle control arm costs exactly the two empty takes, so 93 % of
+`gate-mem` is genuinely marginal per-sample cost.
+
+**This corrects the scoping note that preceded it**, which attributed ~1883 B (65 %) to the user
+drain/take path and named it the target — it had counted the whole poll region as user-thread work. The
+take path is 590 B. The distinction decides what to do next: loan-safe RX pooling carries five hazards
+(read/take aliasing, the WaitSet cross-thread drain, `instance-rec-key-sample` retention, the N≥2-reader
+shared-store leak, the KEEP_LAST loan UAF guard) and the receiver thread carries none of them.
+
+With exactly 1 DATA + 1 ACKNACK per sample (counter deltas), the whole per-datagram send cost is paid
+once per sample. `udp-send-to` was `(socket-send … :address (list (%parse-ipv4 host) port))` — **the
+dotted-quad destination STRING re-parsed on every datagram**, ~262 B of `parse-integer` consing, plus
+~98 B of `socket-send` keyword/generic/alien overhead. It now fills a per-thread foreign `sockaddr_in`
+and calls `sendto(2)` through a pre-resolved pointer: 0 B/call isolated, **−175 B end-to-end**, wire
+bytes unchanged. arm64 ceiling 2950 → 2800.
+
+The isolated 360 B/call over-predicted the 175 B end-to-end delta by ~2× — the **third** per-site
+over-report. §"CORRECTION" below stands: per-site numbers RANK, `gate-mem` SIZES.
+
 ## LANDED (2026-07-20) — TX allocation: ~−680 B/sample (3560 → ~2883)
 
 ### Slice 5 — single-destination push fast path (skip the %zc-push-group struct): −90 B (~2960 → 2883)
