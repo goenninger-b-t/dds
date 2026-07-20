@@ -2559,9 +2559,8 @@
                       (%handle-datagram node buf (+ 20 (length stream)) t)))))))
         (return-from %handle-datagram t)))   ; SRTPS datagram: decoded+re-dispatched, or dropped (fail-closed)
     (let ((*rx-source-timestamp* nil))   ; S5.T4: per-datagram INFO_TS source_timestamp (ns), set by the INFO_TS clause + read at the store (%deliver-user-sample); reset each datagram
-     (dds.rtps.message:dispatch-message
-     cursor
-     (lambda (id flags c body-len)
+     ;; flet + dynamic-extent: dispatch-message is a downward funarg, so this closure stack-allocates (ADR 0068)
+     (flet ((%rx-dispatch-submsg (id flags c body-len)
        (cond
          ((= id dds.rtps.message:+submsg-data+)
           (multiple-value-bind (rdr wtr sn has-payload poff plen keyp kind key-hash status-flags
@@ -2742,8 +2741,9 @@
          ((and (= id dds.rtps.message:+submsg-heartbeat-frag+) (disc-node-on-heartbeat-frag node) (not enforce-rtps))
           (funcall (disc-node-on-heartbeat-frag node) c flags src-prefix))
          ((and (= id dds.rtps.message:+submsg-nack-frag+) (disc-node-on-nack-frag node) (not enforce-rtps))
-          (funcall (disc-node-on-nack-frag node) c flags))))
-     size))
+          (funcall (disc-node-on-nack-frag node) c flags)))))
+       (declare (dynamic-extent #'%rx-dispatch-submsg))
+       (dds.rtps.message:dispatch-message cursor #'%rx-dispatch-submsg size)))
     t))
 
 (defun* start-node (node)

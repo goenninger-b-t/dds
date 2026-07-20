@@ -155,6 +155,24 @@ measured 3648), so no step can silently lose its win.** Highest value next: `%re
 the TX send-plan flattening (349 B) — together ~19 % — but BOTH have a correctness invariant to preserve
 (stale-route mis-delivery; byte-identical wire), so neither is a quick edit.
 
+## LANDED (2026-07-20) — the RX submessage handler was heap-allocated per datagram, −120 B (2534 → ~2413)
+
+Full decision in **ADR 0068**; measurement in
+`bench/report/2026-07-20-rx-submessage-handler-was-heap-allocated-per-datagram.md`.
+
+`%handle-datagram` built a FRESH LAMBDA per datagram (closing over node/enforce-rtps/src-prefix/buf) and
+handed it to `dispatch-message`. SBCL can't prove non-escape across the non-inlined call, so it
+heap-allocated the closure on EVERY received datagram (~2/round-trip). `dispatch-message` is a DOWNWARD
+FUNARG (funcalls the handler, never stores it — verified by reading it), so naming it with `flet` +
+`(declare (dynamic-extent …))` stack-allocates it. −110..130 B; ceiling 2600 → 2470; cumulative
+**3560 → ~2413, −32 %**. Fires on EVERY received datagram of every kind, not just the bench topology.
+
+⚠️ This is the MOST-FUZZED, most security-critical function in the stack at `(safety 0)`; a `dynamic-extent`
+closure that ESCAPED would be a use-after-return. So it was not trusted on inspection: `make fuzz` drives
+adversarial submessages through this closure (prod + safety-0) and is clean, and BOTH impls pass 571/571
+(`dynamic-extent` is a permission — Clasp staying correct if it ignores it). Paren balance checked with the
+string/comment-aware checker (net 0) before building — the recurring deep-closure-edit hazard.
+
 ## LANDED (2026-07-20) — the SHMEM sender resolved its destination per datagram, −87 B (2621 → 2534)
 
 Full decision in **ADR 0067**; measurement in
