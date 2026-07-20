@@ -9212,9 +9212,22 @@
              (%loan 2 ka #x000000a2) (%loan 3 kb #x000000b2)
              (%loan 4 ka #x000000a3) (%loan 5 kb #x000000b3))
            ;; the keyed reader retains the last 2 of EACH instance: 4 cached, 2 per handle, NOT 6 and NOT a global 2
-           (%check :kfdkl-total (= 4 (length (dds.dcps::dr-cache dr)))
-                   (format nil "keyed KEEP_LAST-2 loan reader over 2 instances must hold 4 cached, got ~d"
-                           (length (dds.dcps::dr-cache dr))))
+           ;; On failure, dump each cached sample's (SN, instance kind vs the kh-a/kh-b oracles, valid-data) so a
+           ;; rare full-suite flake (github#1) self-diagnoses: same-key samples showing DIFFERENT kinds ⇒ a ZC-view
+           ;; handle-resolution race; an unexpected "?" kind ⇒ a foreign/mis-keyed sample; :INVALID ⇒ a valid-data
+           ;; anomaly. No production impact (evaluated only when the assertion fails).
+           (flet ((%kind (h) (cond ((equalp h kh-a) "A") ((equalp h kh-b) "B")
+                                   (t (format nil "?~{~2,'0x~}" (coerce (subseq h 0 4) 'list))))))
+             (%check :kfdkl-total (= 4 (length (dds.dcps::dr-cache dr)))
+                     (format nil "keyed KEEP_LAST-2 loan reader over 2 instances must hold 4 cached, got ~d [~{~a~^ ~}]"
+                             (length (dds.dcps::dr-cache dr))
+                             (mapcar (lambda (cs)
+                                       (let ((info (dds.dcps::cached-sample-info cs)))
+                                         (format nil "sn~a:~a~:[:INVALID~;~]"
+                                                 (dds.dcps::sample-info-sequence-number info)
+                                                 (%kind (dds.dcps::sample-info-instance-handle info))
+                                                 (dds.dcps::sample-info-valid-data info))))
+                                     (dds.dcps::dr-cache dr)))))
            (%check :kfdkl-a-2 (= 2 (%handle-cache-count dr kh-a))
                    (format nil "instance A must keep exactly its last 2 loaned samples, got ~d"
                            (%handle-cache-count dr kh-a)))
