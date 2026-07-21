@@ -224,7 +224,7 @@
                                  :advertise-address advertise-address :peers peers :label label
                                  :data-representation data-representation)))
 
-(defun* mem-per-sample (&key (domain 7) (samples 3000) (warmup 500) (payload-bytes 0))
+(defun* mem-per-sample (&key (domain 7) (samples 60000) (warmup 500) (payload-bytes 0))
     (function (&key (:domain (integer 0)) (:samples (integer 1)) (:warmup (integer 0))
                     (:payload-bytes (integer 0)))
               double-float)
@@ -246,7 +246,24 @@
    payload the path still allocates thousands of bytes, so the payload copy is not the problem.
 
    SBCL only in practice — `dds.pal:bytes-consed` returns 0 on Clasp, so a Clasp run measures nothing.
-   Callers must gate on that (scripts/gate-mem.sh does). Reproducible to about 1 %."
+   Callers must gate on that (scripts/gate-mem.sh does).
+
+   SAMPLES DEFAULTS TO 60000, AND THE SIZE OF IT IS THE POINT. The measured window contains a FIXED per-run
+   allocation of about 65 KB that occurs a small, VARYING number of times (0-3), so it lands on the result as
+   a quantum of 65700/SAMPLES bytes per sample. At the original 3000 that quantum was ~22 B and ONE UNCHANGED
+   ARM measured 1791 / 1813 / 1835 / 1857 across runs — a ~65 B spread, WIDER than a typical optimisation
+   slice's win (~35 B), so no single run could resolve one and even a min-of-N was not a stable floor. The
+   quantum is per RUN, not per sample, so it shrinks as 1/SAMPLES; measured reproducibility of one arm:
+
+     SAMPLES    3000        30000       60000
+     spread     ~65 B       ~3 B        ~0.4 B     (within one back-to-back batch)
+
+   Across a whole session, where the box's own state drifts, 60000 holds to about 3 B (observed 1847.9 /
+   1850.0 / 1850.9 on identical code) — so size a CEILING from the session-scale number, not the batch one.
+   60000 costs about 18 s and makes the instrument sharp enough to size any win this project still has left.
+   Lowering it re-blunts the gate; raising it further changes the absolute number slightly (the workload is
+   not perfectly scale-free: 3000 -> 30000 -> 60000 reads 1857 -> 1854 -> 1849 on identical code), so a
+   change to SAMPLES is a RE-BASELINE of bench/mem-ceiling.txt for BOTH architectures, not a free knob."
   (let* ((ts (dds.types:find-type-support "perf-data"))
          (pw (dds.dcps:create-participant :domain domain :autonomous t :advertise-address "127.0.0.1"))
          (pr (dds.dcps:create-participant :domain domain :autonomous t :advertise-address "127.0.0.1")))

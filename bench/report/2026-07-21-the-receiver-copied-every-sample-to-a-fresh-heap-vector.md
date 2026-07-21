@@ -55,9 +55,20 @@ they already pool their decode output); should a live handshake install a transf
 `gate-mem`'s default 3000-sample workload carries a fixed ~65 KB of per-run allocation, which amortises to a
 **~22 B/sample quantum that appears or does not**: one unchanged arm measures 1791 / 1813 / 1835 / 1857 across
 runs. Its run-to-run spread (~65 B) now **exceeds a typical slice's win** (~35 B), so no single gate run can
-resolve one — which is why the number above comes from a 30 000-sample A/B and not from the gate. Recorded in
-`bench/mem-ceiling.txt`. Raising the gate's own sample count is the fix; it re-baselines both architecture
-rows, so it needs its own commit and a CI round-trip for x86_64.
+resolve one — which is why the number above comes from a 30 000-sample A/B and not from the gate.
+
+**Fixed immediately after, in the following commit.** `mem-per-sample`'s default went 3000 → **60 000**, since
+the ~65 KB is per RUN and therefore shrinks as 1/samples. Measured spread of one unchanged arm:
+
+| samples | 3000 | 30 000 | 60 000 |
+|---|---|---|---|
+| spread | ~65 B | ~3 B | ~0.4 B back-to-back, ~3 B across a session |
+
+The workload is not perfectly scale-free (identical code reads 1857 / 1854 / 1849 at those three counts), so
+this **re-baselined both architecture rows** — which is why arm64 now reads ~1851 against the 1813 of the last
+3000-sample row: the allocation did not regress, the instrument changed. The gate costs ~18 s and was
+falsified in **both** directions (ceiling below the measurement → regression FAIL; ceiling far above →
+"LOWER THE CEILING" FAIL).
 
 ## Validation
 

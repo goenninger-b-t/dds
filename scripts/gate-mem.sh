@@ -24,6 +24,14 @@
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
+# THE WORKLOAD SIZE IS PART OF THE GATE. mem-per-sample defaults to 60000 samples, and this gate deliberately
+# takes that default rather than pinning its own: the measured window carries a FIXED ~65 KB per-run allocation
+# occurring a varying 0-3 times, so it lands as a quantum of 65700/samples B/sample. At the original 3000 that
+# was ~22 B and one UNCHANGED arm measured 1791/1813/1835/1857 — a ~65 B spread, WIDER than a typical slice's
+# ~35 B win, so this gate could not resolve the very changes it exists to guard. At 60000 the spread is ~0.4 B.
+# Changing `samples` RE-BASELINES both rows of the ceiling file (the workload is not perfectly scale-free) —
+# see mem-per-sample's docstring and the header of bench/mem-ceiling.txt before touching it.
+#
 # PER-ARCHITECTURE ceiling. SBCL's per-sample allocation differs materially by arch (measured: arm64 3560,
 # x86_64 4674 — ~31% more), so a single shared number cannot work: at the x86_64 value the arm64 ratchet
 # would never bite, and at the arm64 value x86_64 is permanently red. Same divergence flipped the FlatData
