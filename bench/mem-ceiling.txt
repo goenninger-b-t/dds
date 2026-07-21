@@ -1,51 +1,33 @@
 # NFR-MEM allocation ratchet (ADR 0062). One ceiling PER ARCHITECTURE, in bytes/sample.
 #
-# ⚠️ RE-BASELINED 2026-07-21 — THE NUMBERS BELOW ARE NOT COMPARABLE TO ANY EARLIER ROW.
-# mem-per-sample's workload went from 3000 to 60000 samples because the gate had become BLUNTER THAN THE
-# WINS IT GUARDS: the measured window carries a FIXED ~65 KB per-run allocation occurring 0-3 times, which
-# at 3000 samples lands as a ~22 B/sample quantum — ONE UNCHANGED ARM read 1791 / 1813 / 1835 / 1857, a
-# ~65 B spread against a typical slice's ~35 B win. The quantum is per RUN, so it shrinks as 1/samples:
+# ⚠️ RE-BASELINED 2026-07-21 (workload) AND RAISED 2026-07-21 (ADR 0078 REVERTED). Neither number below is
+# comparable to a row from before that date. Two separate things moved them:
 #
-#     samples    3000        30000       60000
-#     spread     ~65 B       ~3 B        ~0.4 B      (measured, same code, same box, back-to-back)
+# 1. THE WORKLOAD. mem-per-sample went from 3000 to 60000 samples because the gate had become BLUNTER THAN
+#    THE WINS IT GUARDS: the measured window carries a FIXED ~65 KB per-run allocation occurring 0-3 times,
+#    which at 3000 samples landed as a ~22 B/sample quantum — ONE UNCHANGED ARM read 1791 / 1813 / 1835 /
+#    1857, a ~65 B spread against a typical slice's ~35 B win. The quantum is per RUN, so it shrinks as
+#    1/samples: spread ~65 B at 3000, ~3 B at 30000, ~0.4 B back-to-back at 60000 (~3 B across a session).
+#    Changing `samples` is therefore a re-baseline of BOTH rows, never a free knob.
 #
-# Across a whole SESSION the 60000 spread is about 3 B (observed 1847.9 / 1850.0 / 1850.9 on identical code),
-# and that — not the back-to-back number — is what a ceiling's headroom must cover. arm64's 1880 sits ~29 B
-# above the measured 1851, roughly 10x that spread.
+# 2. ADR 0078 WAS REVERTED, so its ~-33 B/sample went with it and the ceilings went back UP. The RX
+#    store-copy pool caused HEAP CORRUPTION on Linux — proven by isolation on a real Linux box, see the ADR.
+#    This is the documented exception to "the ratchet only moves DOWN": a reverted win is not a regression,
+#    and pretending otherwise would leave a ceiling no code can meet.
 #
-The absolute ceilings MOVED with the workload, so arm64 reads ~1849 here where the last
-# 3000-sample row said 1813: the allocation did not regress, the instrument changed. Any future change to
-# `samples` is likewise a re-baseline of BOTH rows, never a free knob (see mem-per-sample's docstring).
+# BOTH ROWS ARE MEASURED, at 60000 samples, and x86_64 is for the first time measured DIRECTLY rather than
+# predicted from a CI reading or derived from the other arch (a prediction that had been 58 B off):
+#   arm64   1878.4-1880.6   (dev box, Apple silicon, SBCL)
+#   x86_64  1916.8-1918.9   (Ubuntu 24.04 x86_64, SBCL 2.2.9 — the same OS family and arch as CI)
+# Ceilings are set ~30 B above the measured maximum, about 10x the session-scale spread.
 #
-# HOW MUCH OF THAT MOVE IS REAL SCALE-DEPENDENCE IS NOT ESTABLISHED, and an earlier version of this file
-# overstated it. The old 3000-sample readings each carried 0-3 UNKNOWN quanta of ~22 B, so they cannot be
-# compared to a 60000 reading at better than +-65 B. Comparing 0-quantum floors suggests arm64 rose ~57 B
-# (1791 -> ~1848) while x86_64 fell ~9 B (1896.9 -> 1887.9) — i.e. the direction is not even consistent
-# across arches, which is itself a reason to treat every pre-60000 number as non-comparable rather than to
-# model the difference. Do not derive one arch's ceiling from the other's.
-#
-# Per-architecture, because SBCL's per-sample allocation differs materially by arch — measured, not assumed:
-#   arm64   1847.9-1850.9   (2026-07-21 @60000 samples; ~0.4 B back-to-back, ~3 B across a session. Latest win: the RX STORE-COPY POOL —
-#                            the receiver's per-sample copy out of the receive buffer is drawn from an arena
-#                            pool and carries its extent in the buffer's capacity, ADR 0078, -33 B and LINEAR
-#                            IN PAYLOAD SIZE; prior ADR 0062/0065-0068/0072/0073/0075/0076/0077.
-#                            Cumulative from the ADR 0062 baseline of 3560 (measured at 3000): ~-48%.)
-#   x86_64  1887.9          (2026-07-21, MEASURED IN CI at 60000 samples — run 29851563794, PASS. Ceiling
-#                            tightened 2040 -> 1940: ~52 B headroom, wider than arm64's 29 B because only ONE
-#                            x86_64 reading exists so its session-scale spread is unmeasured.
-#                            ⚠️ THE ESTIMATE THIS REPLACES WAS 58 B HIGH (~1945 +-25 — wrong by more than its
-#                            own stated band), which is precisely why the provisional row had been left at a
-#                            wide 2040 rather than tightened to the estimate. Predict WIDE, measure, THEN
-#                            tighten. The same arch divergence made the FlatData vtable-vs-classic guard
-#                            flip, and is why one shared ceiling cannot work.)
-#
-# The ratchet only moves DOWN (a re-baseline of the workload, as above, is the one documented exception —
-# and it must say so in this file). Lower a row when you bank a win on THAT arch (gate-mem tells you).
+# The ratchet only moves DOWN, except for the two documented re-baselines above (a workload change or a
+# reverted win — and either must say so here). Lower a row when you bank a win on THAT arch.
 #
 # ⚠️ YOU CAN ONLY LOWER THE ROW FOR THE ARCH YOU MEASURED ON. gate-mem reads the row for `uname -m`, so a
 # win banked on the dev box lowers arm64 and leaves x86_64 stale — and the ratchet then FAILS ON
 # IMPROVEMENT in CI, which is red until someone reads the CI number and lowers that row too. This is not
 # hypothetical: CI was red from the 5th TX slice for exactly this reason. AFTER a win, check the CI
 # gate-mem number and lower the OTHER arch's row in the same or an immediate follow-up commit.
-arm64  1880
-x86_64 1940
+arm64  1910
+x86_64 1950

@@ -102,13 +102,13 @@ carved from it (NFR-MEM).
 | `dds.core.arena:teardown-arena` | Free every pool's static buffers and mark the arena uninitialized. |
 | `dds.core.arena:arena-initialized-p` | True while the arena is live (between `init-arena` and `teardown-arena`). |
 | `dds.core.arena:arena-report` | Plist of byte budget, bytes used, and per-pool reserved sizes / high-water, for startup logging (NFR-OBS). |
-| `dds.core.arena:make-buffer-pool` | `(arena element-bytes capacity)` — carve a fixed-capacity pool of `capacity` octet-buffers of `element-bytes` each, pre-allocated once. Returns `(values pool NIL)`, or `(values NIL :arena-exhausted)` when the carve does not fit the remaining budget — exhaustion is an ordinary expected **status**, not a condition (ADR 0064). Every caller must test it: the arena is stored only after the carve succeeds, so an unchecked `NIL` orphans it. |
+| `dds.core.arena:make-buffer-pool` | `(arena element-bytes capacity)` — carve a fixed-capacity pool of `capacity` octet-buffers of `element-bytes` each, pre-allocated once. Signals `arena-exhausted` if the request exceeds the remaining budget. |
 | `dds.core.arena:pool-acquire` | Pop a buffer from the pool. **Returns `NIL` on exhaustion** — the caller applies RESOURCE_LIMITS, never a GC-heap fallback. |
 | `dds.core.arena:pool-release` | Return a buffer to the pool. |
 | `dds.core.arena:pool-capacity` | Fixed number of buffers the pool was provisioned with. |
 | `dds.core.arena:pool-in-use` | Number of buffers currently checked out. |
 | `dds.core.arena:pool-high-water` | Peak in-use count seen for the pool (budget tracking). |
-| `dds.core.arena:pool-release` (RX store copy) | The receive path draws each sample's store copy from a per-node pool (`dds.disc:*rx-store-pool-capacity*`, ADR 0078) whose element is an `octet-buffer` with `capacity` set to the exact payload extent — so the pooled buffer **is** its own bounds check and a recycled buffer can never be over-read into. See [Discovery](discovery.md). |
+| `dds.core.arena:arena-exhausted` | Condition raised at provisioning time when a pool would exceed the budget. |
 
 ### Buffers & cursors (`dds.core.buffer`)
 

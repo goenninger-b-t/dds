@@ -1,6 +1,6 @@
 # ADR 0078 — the receiver's store-copy is drawn from an arena pool and carries its own extent
 
-- **Status:** Accepted
+- **Status:** REVERTED 2026-07-21 (heap corruption on Linux — see "Why this was reverted")
 - **Date:** 2026-07-21
 - **Requirements:** NFR-MEM (0 bytes/sample), NFR-PERF-3 (the peer GC-tail), NFR-PERF-8, NFR-SEC-POSTURE (the payload extent is the bounds check)
 - **Relates to:** ADR 0062 (the allocation budget); WP-DDS-SECURITY-ZEROALLOC-AEAD T5a/T5b (the payload + decode pools this mirrors); ADR 0073 (the drain already decodes in place); ADR 0077 (the TX-side struct pool)
@@ -130,6 +130,49 @@ uses the new verbatim accessor `node-sample-raw` and dispatches on the type, as 
 - Single-owner release discipline is inherited from the store itself: an entry is dropped exactly once, by
   exactly one owner, under the node lock. `%rx-store-release` additionally refuses to push into a full pool,
   so a hypothetical double release degrades to a leaked slot rather than corrupting the pool.
+
+## Why this was reverted
+
+**This design causes heap corruption on Linux.** It was reverted from `main` the day it landed. The
+mechanism is not fully pinned down; the isolation is, and that was enough to stop shipping it.
+
+CI went red intermittently on `async-emit-fault-survives`, which I initially could not distinguish from a
+flake — it did not reproduce on macOS (0/12), and the CI evidence (0 failures in ~9 runs before, 3 in 9
+after) was not statistically significant. On a real Linux box (Ubuntu 24.04, x86_64, the same OS family and
+arch as CI) it reproduced, and isolation settled it. Same tree, same fixes, **the pool as the only variable**:
+
+| arm | full-suite runs |
+|---|---|
+| pre-ADR-0078 | **3/3 pass**, 574 tests, 0 corruption |
+| pool **enabled** | **1/3 pass** — one `RELAY-COLLECT` failure, one GC heap corruption |
+| pool **disabled**, same tree | **3/3 pass**, 575 tests, 0 corruption |
+
+The corruption presents as `CORRUPTION WARNING ... Memory fault` inside `garbage_collect_generation ->
+scav_vector_t`, and as `fatal error ... no transport function for object ... (widetag 0)` — in both cases
+the GC walking a reference that is no longer a valid object, on a receiver thread.
+
+**One cause was found and fixed and was NOT sufficient.** `teardown-arena` frees a pool by walking its
+SLOTS, and `pool-acquire` NILs the slot it hands out — so a buffer still checked out is never freed. The
+first cut of this ADR asserted the opposite. Returning the buffers at teardown without also DROPPING the
+store entry then made it worse, not better: the entry became a reference to freed static memory, and a
+static vector is a Lisp-visible object, so the next GC to scavenge the still-reachable table faults.
+Detaching the entry before returning the buffer removed the `CORRUPTION WARNING`s, but a second corruption
+signature survived — so at least one more retention or aliasing path exists that this design has not
+accounted for.
+
+**What a re-landing would have to establish**, not assume: every site that can retain a pooled buffer past
+its release; an audit of `pool-release`, which at `(safety 0)` writes `(svref slots top)` with **no bounds
+check**, so a double release is an out-of-bounds heap write rather than a detectable error; and the
+`RELAY-COLLECT` failure, which suggests the durability relay's view of the store is affected too. The
+underlying idea — a pooled buffer carrying its own extent in `capacity`, so the buffer is its own bounds
+check and a pooled entry is a distinct type — is sound and worth keeping. The lifetime discipline around it
+was not, and the copy path's exposure is far wider than the secured path's, which is why the same pattern
+has been safe there for months.
+
+**The lesson worth carrying:** macOS could not see any of this — 12 standalone runs and a full green suite
+locally, three times over. CI/Linux caught it, and only a real Linux box could isolate it. That is now the
+third class of defect in this repo that only Linux could see, after uninitialised memory on the wire and a
+stack that could not shut down.
 
 ## Alternatives rejected
 

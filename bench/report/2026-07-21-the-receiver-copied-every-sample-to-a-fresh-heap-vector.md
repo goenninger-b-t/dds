@@ -1,4 +1,11 @@
-# The receiver copied every sample into a fresh heap vector — it now draws that copy from an arena pool
+# The receiver copied every sample into a fresh heap vector — a pooled copy was tried and REVERTED
+
+> **REVERTED 2026-07-21, the day it landed: the pool causes HEAP CORRUPTION on Linux.** Isolated on a real
+> Linux box with the pool as the only variable — pre-ADR 3/3 clean, pool enabled 1/3, pool disabled (same
+> tree) 3/3 clean. The measurements below are real and reproducible; the change they measure is not safe.
+> See ADR 0078 "Why this was reverted". What survives from this work: the `gate-mem` sharpening (3000 ->
+> 60000 samples) and the finding that made it necessary, both recorded below and still in effect.
+
 
 **Date:** 2026-07-21 · **Requirement:** NFR-MEM (0 B/sample), NFR-PERF-3, NFR-PERF-8, NFR-SEC-POSTURE · **ADR:** 0078, 0062
 **Machine:** arm64 Darwin, SBCL · **Harnesses:** `dds.bench:mem-per-sample` A/B in one session + `make gate-mem`
