@@ -4,7 +4,8 @@
 #   arm64   1988-2031      (2026-07-21: + RX-pooling: the %deserialize-sample copy scratch (ADR 0073) and
 #                            the drain's %instance-handle key-serialization scratch (ADR 0075, -80 B/call);
 #                            floor 2118 -> 1988, cumulative ~-1572 from 3560, ADR 0062/0065-0068/0072/0073/0075)
-#   x86_64  2388 B/sample   (2026-07-21, read off CI: + the %drain closures; still ~9% above arm64. The
+#   x86_64  2083 B/sample   (2026-07-21, read off CI: + RX-pooling deser-scratch (ADR 0073) + %instance-handle
+#                            key-serialization scratch (ADR 0075); floor 2388 -> 2083, still ~5% above arm64. The
 #                            same divergence made the FlatData vtable-vs-classic guard flip, and it is
 #                            why a single shared ceiling cannot work: at the x86_64 number the arm64
 #                            ratchet would never bite, and at the arm64 number x86_64 is permanently red.)
@@ -17,4 +18,4 @@
 # hypothetical: CI was red from the 5th TX slice for exactly this reason. AFTER a win, check the CI
 # gate-mem number and lower the OTHER arch's row in the same or an immediate follow-up commit.
 arm64  2080
-x86_64 2470
+x86_64 2180
