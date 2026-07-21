@@ -3411,7 +3411,10 @@
             (when routes
               (let ((reader (cdr (first routes))))
                 (dds.rtps.reliable:reader-on-heartbeat reader wguid first last)
-                (multiple-value-bind (base numbits bitmap) (dds.rtps.reliable:reader-acknack reader wguid)
+                ;; REUSE-BITMAP t: the returned bitmap is the proxy's reused scratch, serialized synchronously
+                ;; in the dolist below on this receiver thread (no lock release, no same-proxy recall) — zero
+                ;; per-ACKNACK alloc under the single-receiver-thread-per-proxy discipline (RX zero-alloc, NFR-MEM).
+                (multiple-value-bind (base numbits bitmap) (dds.rtps.reliable:reader-acknack reader wguid t)
                   (dolist (rr routes)
                     (let ((cnt (incf (disc-node-ack-count node))))
                       (dolist (pd (%match-destinations-prefixed node nil))   ; ACKNACK -> matched writers; T10 wraps a :keyed dest

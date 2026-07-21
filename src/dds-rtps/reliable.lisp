@@ -584,7 +584,10 @@
   (last-sn 0 :type integer)                ; available range from HEARTBEAT
   (skip-history nil :type boolean)         ; durability gate: VOLATILE skips pre-match history (DDS §2.2.3.4)
   (durability-applied-p nil :type boolean) ; latch: the skip is applied once, on the first HEARTBEAT
-  (reassembly (make-hash-table :test 'eql) :type hash-table)) ; SN -> frag-reassembly
+  (reassembly (make-hash-table :test 'eql) :type hash-table)   ; SN -> frag-reassembly
+  (acknack-bitmap (make-array (ceiling dds.rtps.message:+seqnum-set-max-bits+ 32)
+                              :element-type '(unsigned-byte 32) :initial-element 0)
+                  :type (simple-array (unsigned-byte 32) (*)))) ; reusable ACKNACK NACK-bitmap scratch (256-bit cap = 8 words, RTPS 2.5 §9.4.2.6), opt-in via reader-acknack REUSE-BITMAP on the lock-free user path — single-mutator, same receiver-thread discipline as RECEIVED (NFR-MEM)
 
 (defstruct* (dedup-origin (:constructor %make-dedup-origin))
   "Per-original-GUID dedup state: contiguous low-watermark LO + bounded out-of-order set ABOVE.
@@ -713,11 +716,20 @@
     (setf (writer-proxy-durability-applied-p proxy) nil)   ; re-arm on (re)match
     proxy))
 
-(defun* reader-acknack (reader writer-id)
-    (function (rtps-reader t) (values integer (unsigned-byte 32) (simple-array (unsigned-byte 32) (*))))
+(defun* reader-acknack (reader writer-id &optional reuse-bitmap)
+    (function (rtps-reader t &optional t) (values integer (unsigned-byte 32) (simple-array (unsigned-byte 32) (*))))
   "Compute an ACKNACK (RTPS 2.5 §8.3.7.1): (values base numBits bitmap). BASE is
    the lowest unreceived SN in [first, last] (or last+1 if none); the bitmap NACKs
-   the unreceived SNs in [base, last] (capped at 256)."
+   the unreceived SNs in [base, last] (capped at 256). REUSE-BITMAP (default NIL):
+   NIL allocates a fresh bitmap — the ONLY safe choice when the returned bitmap is
+   serialized after any lock is released or a second same-proxy reader-acknack may
+   interleave (the builtin/secure/test callers). NON-NIL returns the proxy's REUSED
+   acknack-bitmap scratch (zero per-ACKNACK alloc, NFR-MEM) — sound ONLY when the
+   caller serializes it synchronously before any concurrent same-proxy recall; the
+   lock-free user HEARTBEAT path (%on-user-heartbeat) does exactly that under the
+   single-receiver-thread-per-proxy discipline (the same that lets RECEIVED be a
+   lock-free hash). write-sequence-number-set reads exactly ceil(numBits/32) words,
+   so the reused scratch's tail is never serialized."
   (let* ((proxy (get-writer-proxy reader writer-id))
          (first (writer-proxy-first-sn proxy))
          (last (writer-proxy-last-sn proxy))
@@ -726,8 +738,12 @@
                      unless (gethash sn received) return sn
                      finally (return (1+ last))))
          (numbits (max 0 (min 256 (- (1+ last) base))))
-         (bitmap (make-array (max 1 (ceiling numbits 32))
-                             :element-type '(unsigned-byte 32) :initial-element 0)))
+         (bitmap (if reuse-bitmap
+                     (let ((s (writer-proxy-acknack-bitmap proxy)))
+                       (fill s 0 :end (ceiling numbits 32))   ; zero only the M words this ACKNACK sets/serializes
+                       s)
+                     (make-array (max 1 (ceiling numbits 32))
+                                 :element-type '(unsigned-byte 32) :initial-element 0))))
     (loop for sn from base below (+ base numbits)
           unless (gethash sn received)
             do (dds.rtps.message:seqnum-set-bit bitmap (- sn base)))
