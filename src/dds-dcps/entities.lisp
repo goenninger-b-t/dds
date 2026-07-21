@@ -157,6 +157,7 @@
    (view-freelist :initform '() :accessor dr-view-freelist) ; WP-FLATDATA-ZC-LOAN: recycled flatdata-view structs (no per-sample GC-heap alloc; NFR-MEM)
    (secured-loans :initform '() :accessor dr-secured-loans) ; WP-DCPS-SECURED-TAKE-LOAN (ADR 0038 (i)): outstanding secured decode-loan handles — SEPARATE registry from dr-loans (the type-clean two-registry discipline); return-loan / reader-close node-return-loan them
    (secured-scratch :initform nil :accessor dr-secured-scratch) ; WP-DCPS-SECURED-TAKE-LOAN: reusable octet-buffer wrapper (repointed per drain) for the in-place [0,len) secured-plaintext deserialize — created once, zero per-sample cons (NFR-MEM)
+   (deser-scratch :initform nil :accessor dr-deser-scratch) ; RX-POOLING Phase A (ADR 0073): reusable octet-buffer wrapper repointed at the stored bytes per COPY-path drain, so %deserialize-sample decodes IN PLACE with no per-sample make-octet-buffer / replace / free-static (NFR-MEM)
    (status-lock :initform (dds.pal:make-lock "dr-status") :accessor dr-status-lock))
   (:documentation "DDS DataReader: receives typed samples on a Topic into a read/take
    cache with per-instance SampleInfo, carrying its SUBSCRIPTION_MATCHED,
@@ -523,18 +524,24 @@
         ;; its status reads as NIL. Both shapes pass straight through.
         (funcall (dds.types:type-support-deserialize ts) rc mode)))))
 
-(defun* %deserialize-sample (ts bytes)
-    (function (t (simple-array (unsigned-byte 8) (*))) (values t (or null keyword)))
-  "Deserialize a SerializedPayload (encap header + body) into a sample via TS. Copies BYTES into a fresh scratch
-   octet-buffer (sized exactly), decodes it in place via %deserialize-payload, then frees the scratch — the
-   allocating deserialize path (the copy-backed and non-secured samples). See %deserialize-payload for the
-   representation-selection contract."
-  (let ((ob (dds.core.buffer:make-octet-buffer (length bytes))))
-    (replace (dds.core.buffer:octet-buffer-vec ob) bytes)
-    ;; MULTIPLE-value-prog1: PROG1 would drop the status and hand the caller a bare NIL sample with no
-    ;; indication the payload was rejected — precisely the silent-swallow this whole rework exists to stop.
-    (multiple-value-prog1 (%deserialize-payload ts ob)
-      (dds.pal:free-static (dds.core.buffer:octet-buffer-vec ob)))))
+(defun* %deserialize-sample (ts bytes &optional scratch)
+    (function (t (simple-array (unsigned-byte 8) (*)) &optional (or null dds.core.buffer:octet-buffer))
+              (values t (or null keyword)))
+  "Deserialize a SerializedPayload (encap header + body) into a sample via TS. RX-POOLING Phase A (ADR 0073,
+   NFR-MEM): decode DIRECTLY from the caller-owned BYTES — %deserialize-payload only READS the buffer (a cursor
+   + aref, never a SAP) and returns an INDEPENDENT struct, so no copy is ever needed. When SCRATCH (a reusable
+   octet-buffer wrapper) is supplied — the hot drain path passes the per-reader dr-deser-scratch — it is repointed
+   at BYTES in place, so a steady-state take allocates ZERO here: no make-octet-buffer, no replace, no free-static.
+   With no SCRATCH (the standalone/test path) a fresh octet-buffer-over wrapper is allocated but still shares BYTES
+   — no static allocation, no copy. Byte-identical to the old copy-then-decode either way. BYTES must outlive this
+   call (it does: %drain runs on the user thread, the receiver never mutates a stored sample, and
+   node-consume-sample frees it only after the drain). Mirrors the secured path's dr-secured-scratch. See
+   %deserialize-payload for the representation-selection contract."
+  (let ((ob (cond (scratch (setf (dds.core.buffer:octet-buffer-vec scratch) bytes
+                                 (dds.core.buffer:octet-buffer-capacity scratch) (length bytes))
+                           scratch)
+                  (t (dds.core.buffer:octet-buffer-over bytes)))))
+    (%deserialize-payload ts ob)))
 
 ;;; ---- DomainParticipantFactory + participant lifecycle ----
 
@@ -2578,7 +2585,8 @@
    (WP-DCPS-SECURED-TAKE-LOAN, ADR 0038 (i): a secured loan-capable reader) is dispatched to %drain-one-secured —
    the plaintext is deserialized IN PLACE from the pooled decode buffer (no per-sample decrypt-output alloc) and the
    handle is registered in dr-secured-loans; a bare-vector store slot (the non-secured / carve-fail path) falls
-   through to the allocating %deserialize-sample below, byte-identical."
+   through to %deserialize-sample below, which now also decodes IN PLACE through the reused per-reader
+   dr-deser-scratch wrapper (RX-POOLING Phase A, ADR 0073 — zero alloc/sample), byte-identical."
   (let ((sguid (dds.disc:node-sample-writer-guid node key))
         (sn (dds.disc:node-sample-key-sn key))
         (advance t))                       ; advance the per-writer watermark unless arbitration keeps it pending
@@ -2590,7 +2598,10 @@
       (%drain-one-secured dr node ts key bytes sn sguid)
       (return-from %drain-one-sample t))
     (when bytes
-      (multiple-value-bind (data decode-status) (%deserialize-sample ts bytes)
+      (multiple-value-bind (data decode-status)
+          (%deserialize-sample ts bytes                 ; RX-POOLING Phase A (ADR 0073): decode in place through the reused per-reader scratch wrapper -> zero alloc/sample
+                               (or (dr-deser-scratch dr)
+                                   (setf (dr-deser-scratch dr) (dds.core.buffer:octet-buffer-over bytes))))
         ;; A REJECTED payload (FlatData: short body / non-transcodable representation id) is a STATUS now,
         ;; not a signalled condition (ADR 0064). Drop the sample: never hand a NIL DATA to the filter or to
         ;; %instance-handle. It must still fall through to the watermark advance at the tail — an early
