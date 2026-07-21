@@ -3799,9 +3799,18 @@
                    (and (plusp (dds.dcps:matched-count p2)) (plusp (dds.dcps:discovered-count p2)))
                    "P2 discovers + matches P1 with no app-driven spin")
            (dds.dcps:delete-participant p1)   ; the KILL: P1 stops announcing (no dispose on the wire)
-           ;; P2's announcer (100 ms cadence) must prune P1 once its 1 s announced lease elapses.
+           ;; P2's announcer (100 ms cadence) must prune P1 once its 1 s announced lease elapses. Wait on ALL
+           ;; THREE observables, because they are updated in a defined order and are NOT mutually atomic
+           ;; (github#3, ADR 0070): %lease-sweep removes the node-level discovered/matched entries UNDER the node
+           ;; lock, then fires the on-unmatch hook that decrements the per-reader SUBSCRIPTION_MATCHED OUTSIDE the
+           ;; lock (ADR 0063 — the hook runs user listener code, which must never hold the node lock). So the node
+           ;; counts reach 0 STRICTLY BEFORE the reader status; polling a participant aggregate as a proxy for a
+           ;; per-reader status is the wrong barrier. The AUTHORITATIVE observable for "is this reader unmatched"
+           ;; is the reader's own SUBSCRIPTION_MATCHED (the DDS per-entity status) — wait on it directly.
            (loop repeat 400
-                 until (and (zerop (dds.dcps:matched-count p2)) (zerop (dds.dcps:discovered-count p2)))
+                 until (and (zerop (dds.dcps:matched-count p2)) (zerop (dds.dcps:discovered-count p2))
+                            (zerop (dds.dcps:subscription-matched-status-current-count
+                                    (dds.dcps:get-subscription-matched-status dr))))
                  do (sleep 0.025))
            (%check :lease-aged-out
                    (and (zerop (dds.dcps:discovered-count p2)) (zerop (dds.dcps:matched-count p2)))
