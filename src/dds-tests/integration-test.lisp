@@ -4119,7 +4119,8 @@
    :rxp-truncation-bounded, which is what proves that assertion is not vacuous."
   (let* ((ts (dds.types:find-type-support "shape-type"))
          (p1 (dds.dcps:create-participant :domain (test-domain)))
-         (p2 (dds.dcps:create-participant :domain (test-domain))))
+         (p2 (dds.dcps:create-participant :domain (test-domain)))
+         (pool-at-teardown nil))   ; captured BEFORE teardown so the post-teardown assertion can still read it
     (unwind-protect
          (let* ((tw (dds.dcps:create-topic p1 "RxPool" "shape-type" ts))
                 (tr (dds.dcps:create-topic p2 "RxPool" "shape-type" ts))
@@ -4194,9 +4195,25 @@
                                    (or (null d) (and s t)))
                                (dds.core.buffer:buffer-overflow () t))
                              "a payload presented SHORTER than its buffer must be refused at the extent, never completed by reading the recycled bytes beyond it")
-                     (dds.disc::%rx-store-release node ob2)))))))
+                     (dds.disc::%rx-store-release node ob2)))
+                 ;; Leave ONE pooled buffer checked out and resident in the store across teardown, and hold on
+                 ;; to the pool so it can be inspected afterwards.
+                 (let ((live (dds.disc::%rx-store-acquire node (length payload))))
+                   (when live
+                     (setf (gethash 99 (dds.disc::%inner-table (dds.disc::disc-node-samples node) guid)) live))
+                   (setf pool-at-teardown pool))))))
       (progn (dds.dcps:delete-participant p1)
-             (dds.dcps:delete-participant p2))))
+             (dds.dcps:delete-participant p2)))
+    ;; AFTER teardown. teardown-arena frees a pool by walking its SLOTS, and pool-acquire NILs the slot it
+    ;; hands out — so a buffer still checked out at teardown is NOT freed and its foreign memory leaks.
+    ;; stop-node must therefore return every pooled store-copy buffer FIRST
+    ;; (node-return-all-rx-store-buffers, the twin of node-return-all-loans). Reading the CAPTURED pool works
+    ;; because teardown-arena does not touch the in-use counter and the node's own slot is cleared.
+    ;; FALSIFIED: drop that call from stop-node and this reads 1, not 0.
+    (when pool-at-teardown
+      (%check :rxp-teardown-returns (zerop (dds.core.arena:pool-in-use pool-at-teardown))
+              (format nil "stop-node must return every pooled store-copy buffer to its slot before teardown-arena, or its static memory leaks (~d still checked out)"
+                      (dds.core.arena:pool-in-use pool-at-teardown)))))
   t)
 
 ;;; Builtin-topic readers (M3 #5, FR-DCPS-6): DCPSParticipant / DCPSPublication /

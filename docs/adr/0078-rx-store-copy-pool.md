@@ -95,11 +95,18 @@ Concretely:
   is dropped (`node-consume-sample` for the copy path, `%secured-loan-release` for the loan path). Riding
   the existing choke means every present *and future* drop path returns the buffer. A sample that is
   dedup-rejected (never stored) is released on that arm of `%deliver-user-sample`, mirroring the loan path.
-- **Teardown** — `stop-node` tears the arena down after the receiver threads are joined. Because the pool
-  *owns* its buffers, an entry still resident in the store at teardown is freed with the arena; there is no
-  per-entry free obligation and no foreign leak. (This is exactly why a raw freelist of `alloc-static`
-  vectors was rejected: the store is heterogeneous — vectors, loan handles, ZC markers — so no teardown
-  sweep could tell which entries it owned.)
+- **Teardown** — `stop-node` returns every pooled buffer still held by a store entry
+  (`node-return-all-rx-store-buffers`) and *then* tears the arena down, after the receiver threads are
+  joined. The return is **not optional**: `teardown-arena` frees a pool by walking its SLOTS, and
+  `pool-acquire` NILs the slot it hands out, so a checked-out buffer is not in them and its foreign memory
+  would leak — proportional to samples left undrained times participant churn. The secured decode pool has
+  always had the identical hazard and has always handled it the identical way (`node-return-all-loans`,
+  whose docstring states the rule). **This was got wrong in the first cut of this ADR**, which asserted the
+  opposite ("the pool owns its buffers, so an entry resident at teardown is freed with the arena"); CI's red
+  run prompted re-reading `teardown-arena`, which says otherwise in three lines of code.
+  A raw freelist of `alloc-static` vectors is still the worse option, but for the surviving reason: the
+  store is heterogeneous — vectors, loan handles, ZC markers — so a sweep could not tell which entries it
+  owned, whereas a pooled buffer is identifiable by its type.
 
 **`node-sample` keeps its contract.** It is documented as "the received payload for composite sample KEY",
 and ~20 tests plus the durability relay depend on that being an exact-length vector. It now copies a pooled

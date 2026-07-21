@@ -3863,7 +3863,12 @@
                           (disc-node-rx-store-arena node) arena   ; only after the carve succeeds (teardown reachability)
                           (disc-node-rx-store-pool node) pool)
                     pool)
-                ((or error storage-condition) () nil)))))))   ; arena-exhausted / static-alloc failure: leave NIL -> allocating copy
+                ;; arena-exhausted / static-alloc failure: leave the pool NIL -> allocating copy, and LATCH it.
+                ;; Without the latch a NIL pool reads as "not carved yet" and every later sample retries the
+                ;; carve (64 static allocations each), hammering a node that is already short of memory.
+                ((or error storage-condition) ()
+                  (setf (disc-node-rx-store-carve-failed node) t)
+                  nil)))))))
 
 (defun* %rx-store-acquire (node plen)
     (function (disc-node (integer 0)) (or null dds.core.buffer:octet-buffer))
@@ -3876,7 +3881,9 @@
    NIL when there is no pool (not yet carved / arena exhausted), when the pool is exhausted, or when PLEN
    exceeds the carved element size; the caller then allocates as before. Runs on the receiver thread with
    NO node lock held; the pool lock is a leaf taken only here and in %rx-store-release."
-  (let ((pool (or (disc-node-rx-store-pool node) (%ensure-rx-store-pool node))))
+  (let ((pool (or (disc-node-rx-store-pool node)
+                  (and (not (disc-node-rx-store-carve-failed node))   ; latched: never retry a failed carve per sample
+                       (%ensure-rx-store-pool node)))))
     (when (and pool (<= plen (disc-node-rx-store-element-bytes node)))
       (let ((ob (dds.pal:with-lock ((disc-node-rx-store-pool-lock node))
                   (dds.core.arena:pool-acquire pool))))
@@ -3901,6 +3908,32 @@
         (when (plusp (dds.core.arena:pool-in-use pool))
           (dds.core.arena:pool-release pool ob)))))
   (values))
+
+(defun* node-return-all-rx-store-buffers (node)
+    (function (disc-node) t)
+  "ADR 0078 teardown safety, the exact twin of node-return-all-loans: return EVERY pooled store-copy buffer
+   still held by a sample-store entry, so stop-node leaves no ACQUIRED buffer outside the pool's slots.
+
+   WHY THIS IS NOT OPTIONAL. teardown-arena frees a pool by walking its SLOTS — and pool-acquire NILs the
+   slot it hands out, so a checked-out buffer is not in them and its static (foreign) memory would simply
+   LEAK. That is a real leak, not a GC-reclaimed one, and it is proportional to the samples left undrained
+   at teardown times the number of participants a process creates and destroys. The secured decode pool has
+   always had this same hazard and has always handled it here (node-return-all-loans, whose docstring states
+   the rule); this mirrors it for the copy path.
+
+   Called by stop-node AFTER the receiver threads are joined (no concurrent acquire) and BEFORE
+   teardown-arena. The store entries themselves are left alone — the node is being destroyed and its hash
+   tables go with it; only the buffers need to re-enter their slots."
+  (when (disc-node-rx-store-pool node)
+    (dds.pal:with-lock ((disc-node-lock node))
+      (maphash (lambda (guid inner)
+                 (declare (ignore guid))
+                 (maphash (lambda (sn v)
+                            (declare (ignore sn))
+                            (when (typep v 'dds.core.buffer:octet-buffer) (%rx-store-release node v)))
+                          inner))
+               (disc-node-samples node))))
+  t)
 
 (defun* set-secured-loan-capable (node capable)
     (function (disc-node t) t)

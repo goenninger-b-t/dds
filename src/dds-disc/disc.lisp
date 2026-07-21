@@ -329,12 +329,19 @@
   ;; threads and the draining user thread; it nests INSIDE disc-node-lock (lock order: disc-node-lock outer),
   ;; exactly as decode-pool-lock does. RX-STORE-ELEMENT-BYTES records the carved element size so the acquire
   ;; can reject an oversize payload without reaching into the pool. All NIL/0 default = no pool yet -> the
-  ;; allocating copy, byte-identical. Carved lazily by %ensure-rx-store-pool; stop-node tears the arena down
-  ;; (the pool OWNS its buffers, so an entry still resident in the store at teardown is freed with it).
+  ;; allocating copy, byte-identical. Carved lazily by %ensure-rx-store-pool; stop-node returns every buffer
+  ;; still held by a store entry (node-return-all-rx-store-buffers) and THEN tears the arena down — a
+  ;; checked-out buffer is not in the pool's slots, so teardown-arena would not free it and it would leak.
   (rx-store-arena nil :type t)
   (rx-store-pool nil :type t)
   (rx-store-pool-lock (dds.pal:make-lock "rx-store-pool") :type t)
   (rx-store-element-bytes 0 :type fixnum)
+  ;; RX-STORE-CARVE-FAILED LATCHES a failed carve. Without it the NIL pool is indistinguishable from
+  ;; "not carved yet", so EVERY subsequent received sample would re-attempt the carve — 64 static
+  ;; allocations per sample — and a node that cannot carve (the exact case: memory pressure) would be driven
+  ;; into a retry storm precisely when it can least afford one. Read unlocked on the receive path; only ever
+  ;; set, never cleared, so the race is benign (a concurrent carve either wins or is skipped once).
+  (rx-store-carve-failed nil :type boolean)
   (sample-key-hashes (make-hash-table :test 'equalp) :type hash-table) ; src GUID -> SN -> 16-octet wire key-hash of the :data sample (RTPS 2.5 §9.6.4.8), absent when not captured
   (sample-timestamps (make-hash-table :test 'equalp) :type hash-table) ; S5.T4: src GUID -> SN -> source_timestamp (nanoseconds) from the preceding INFO_TS (RTPS 2.5 §9.4.5.9), absent when the DATA carried none
   (lifecycle-changes (make-hash-table :test 'equalp) :type hash-table) ; 2-level: 16-octet src GUID (equalp) -> SN (eql) -> (kind key-hash status writer-id source-guid) (§8.3.5.4: SN is per-writer; no per-change composite-key alloc)
@@ -2935,7 +2942,8 @@
     (node-return-all-loans node)
     (dds.core.arena:teardown-arena (disc-node-decode-arena node))
     (setf (disc-node-decode-arena node) nil (disc-node-decode-pool node) nil))
-  (when (disc-node-rx-store-arena node)   ; ADR 0078: free the RX store-copy pool's static buffers AFTER every receiver thread is joined (no live acquire). The pool OWNS its buffers, so an entry still resident in the sample store needs no per-entry release — no foreign leak, no sweep
+  (when (disc-node-rx-store-arena node)   ; ADR 0078: return every pooled store-copy buffer still held by a store entry (teardown-arena frees the pool's SLOTS, and pool-acquire NILs the slot it hands out — a checked-out buffer is not in them and its static memory would LEAK), then free the pool. AFTER every receiver thread is joined (no live acquire). Exactly the decode pool's node-return-all-loans discipline one line above.
+    (node-return-all-rx-store-buffers node)
     (dds.core.arena:teardown-arena (disc-node-rx-store-arena node))
     (setf (disc-node-rx-store-arena node) nil (disc-node-rx-store-pool node) nil))
   ;; ADR-0034 secret hygiene: zeroize + free the PVMS bootstrap KeyMaterials (KxKey/KxSalt-derived secrets) AFTER the receiver thread is joined (no live PVMS resolver), then clear the table (a post-teardown resolve returns NIL, fail-closed)
