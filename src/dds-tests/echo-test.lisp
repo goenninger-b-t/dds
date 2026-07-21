@@ -3800,6 +3800,7 @@
                  ("flatdata-zc-loan-e2e"     . run-flatdata-zc-loan-e2e-test)
                  ("keyed-flatdata-loan-handle" . run-keyed-flatdata-loan-handle-test)
                  ("keyed-flatdata-loan-keeplast" . run-keyed-flatdata-loan-keeplast-test)
+                 ("keyed-flatdata-loan-mixed-copy-drop" . run-keyed-flatdata-loan-mixed-copy-drop-test)
                  ("keyed-flatdata-copy-behavior" . run-keyed-flatdata-copy-behavior-test)
                  ("keyed-flatdata-dispose"    . run-keyed-flatdata-dispose-test)
                  ("flatdata-zc-loan-stress"  . run-flatdata-zc-loan-stress-test)

@@ -2049,10 +2049,21 @@
    read-loaned-but-not-returned view). If every over-depth sample is app-held (no :NOT-READ candidate), nothing is
    released and the new sample appends — a transient over-depth the app resolves by return-loan, the only
    memory-safe choice under the ZC loan contract (the slot is pinned until the app returns it). The depth cap counts
-   ALL valid-data (matching the copy path); only the drop is guarded. O(N) scan via %reader-instance-oldest (DRY)."
+   ALL valid-data (matching the copy path); only the drop is guarded. O(N) scan via %reader-instance-oldest (DRY).
+
+   MIXED-DELIVERY (github#1): an instance can hold BOTH ZC-loan samples (data = flatdata-view) AND copy-path
+   samples (data = a deserialized struct) — early samples delivered before this reader's ZC-loan capability
+   armed fall back to the copy path (a legitimate degrade, ADR 0017). The drop target OLDEST may therefore be a
+   copy. return-loan ONLY tears down a view (or a secured handle); handed a copy struct it silently no-ops and
+   the sample is NEVER evicted -> dr-cache overflows KEEP_LAST depth. So DISPATCH on the datum, mirroring
+   %reader-keeplast-drop-oldest-secured: a view -> return-loan (release slot + drop dr-loans + recycle); a copy
+   -> a plain dr-cache delete (a copy's data is private heap, nothing to release)."
   (multiple-value-bind (count oldest) (%reader-instance-oldest dr handle t)
     (when (and (>= count depth) oldest)
-      (return-loan dr (list (cached-sample-data oldest)))))            ; full teardown (release slot + drop dr-loans + recycle); UAF-safe: oldest is :not-read
+      (let ((data (cached-sample-data oldest)))
+        (if (dds.types:flatdata-view-p data)
+            (return-loan dr (list data))                                ; ZC loan: full teardown; UAF-safe (oldest is :not-read)
+            (setf (dr-cache dr) (delete oldest (dr-cache dr) :test #'eq))))))   ; copy-path fallback sample: plain drop
   t)
 
 (defun* %reader-keeplast-drop-oldest-secured (dr handle depth)

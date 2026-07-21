@@ -1291,6 +1291,31 @@
   "How many cached-samples (valid OR invalid) DR holds for instance HANDLE (test accessor)."
   (count-if (lambda (cs) (equalp handle (%cs-ih cs))) (dds.dcps::dr-cache dr)))
 
+(defun* %kfdkl-cache-dump (dr kh-a kh-b node)
+    (function (dds.dcps:data-reader (simple-array (unsigned-byte 8) (16))
+              (simple-array (unsigned-byte 8) (16)) t) string)
+  "Per-cached-sample diagnostic for the github#1 keyed-flatdata-loan-keeplast flake, shared by the
+   :kfdkl-total and :kfdkl-loans-4 assertions so WHICHEVER trips first prints the same detail (the
+   original dump was on :kfdkl-total only, so a :kfdkl-loans-4 recurrence — total passing, a loan
+   miscounted — showed nothing). Per sample: sn, instance kind vs the kh-a/kh-b oracles (?hex = a
+   foreign/mis-keyed handle), :INVALID = a valid-data anomaly, and L/- = whether this sample's FlatData
+   view is still live in dr-loans (a live cached sample with - is a released-under-a-live-sample slot;
+   an evicted-but-still-L view is the leak the assertion names). Trailing totals: dr-loans and the
+   writer pool free-count. Evaluated ONLY on assertion failure — zero happy-path impact."
+  (flet ((%kind (h) (cond ((equalp h kh-a) "A") ((equalp h kh-b) "B")
+                          (t (format nil "?~{~2,'0x~}" (coerce (subseq h 0 4) 'list))))))
+    (format nil "~{~a~^ ~} | loans=~d free=~d"
+            (mapcar (lambda (cs)
+                      (let ((info (dds.dcps::cached-sample-info cs)))
+                        (format nil "sn~a:~a~:[:INVALID~;~]:~:[-~;L~]"
+                                (dds.dcps::sample-info-sequence-number info)
+                                (%kind (dds.dcps::sample-info-instance-handle info))
+                                (dds.dcps::sample-info-valid-data info)
+                                (member (dds.dcps::cached-sample-data cs) (dds.dcps::dr-loans dr)))))
+                    (dds.dcps::dr-cache dr))
+            (length (dds.dcps::dr-loans dr))
+            (dds.xport.zerocopy::%zc-free-count (dds.disc::disc-node-zc-pool-sap node)))))
+
 (defun* %backdate-not-alive (dr handle seconds-ago)
     (function (dds.dcps:data-reader (simple-array (unsigned-byte 8) (16)) (integer 0)) t)
   "Backdate instance HANDLE's not-alive-since by SECONDS-AGO of internal-time (clamped at 0 so a
@@ -9291,18 +9316,10 @@
            ;; rare full-suite flake (github#1) self-diagnoses: same-key samples showing DIFFERENT kinds ⇒ a ZC-view
            ;; handle-resolution race; an unexpected "?" kind ⇒ a foreign/mis-keyed sample; :INVALID ⇒ a valid-data
            ;; anomaly. No production impact (evaluated only when the assertion fails).
-           (flet ((%kind (h) (cond ((equalp h kh-a) "A") ((equalp h kh-b) "B")
-                                   (t (format nil "?~{~2,'0x~}" (coerce (subseq h 0 4) 'list))))))
-             (%check :kfdkl-total (= 4 (length (dds.dcps::dr-cache dr)))
-                     (format nil "keyed KEEP_LAST-2 loan reader over 2 instances must hold 4 cached, got ~d [~{~a~^ ~}]"
-                             (length (dds.dcps::dr-cache dr))
-                             (mapcar (lambda (cs)
-                                       (let ((info (dds.dcps::cached-sample-info cs)))
-                                         (format nil "sn~a:~a~:[:INVALID~;~]"
-                                                 (dds.dcps::sample-info-sequence-number info)
-                                                 (%kind (dds.dcps::sample-info-instance-handle info))
-                                                 (dds.dcps::sample-info-valid-data info))))
-                                     (dds.dcps::dr-cache dr)))))
+           (%check :kfdkl-total (= 4 (length (dds.dcps::dr-cache dr)))
+                   (format nil "keyed KEEP_LAST-2 loan reader over 2 instances must hold 4 cached, got ~d [~a]"
+                           (length (dds.dcps::dr-cache dr))
+                           (%kfdkl-cache-dump dr kh-a kh-b node1)))
            (%check :kfdkl-a-2 (= 2 (%handle-cache-count dr kh-a))
                    (format nil "instance A must keep exactly its last 2 loaned samples, got ~d"
                            (%handle-cache-count dr kh-a)))
@@ -9322,8 +9339,9 @@
            ;; dr-cache shape (above) CANNOT see the leak — the unfixed bug is precisely a slot surviving in dr-loans /
            ;; the pool while gone from dr-cache. Unfixed: dr-loans=6, writer pool free=26 (2 dropped slots LEAK held).
            (%check :kfdkl-loans-4 (= 4 (length (dds.dcps::dr-loans dr)))
-                   (format nil "the 2 KEEP_LAST-evicted loaned views must be released (dr-loans=4), got ~d (=6 ⇒ slot LEAK)"
-                           (length (dds.dcps::dr-loans dr))))
+                   (format nil "the 2 KEEP_LAST-evicted loaned views must be released (dr-loans=4), got ~d (=6 ⇒ slot LEAK) [~a]"
+                           (length (dds.dcps::dr-loans dr))
+                           (%kfdkl-cache-dump dr kh-a kh-b node1)))
            ;; the 2 dropped slots returned to the writer's ZC pool (28 of 32 reclaimable: 4 still held by live loans)
            (let ((wsap (dds.disc::disc-node-zc-pool-sap node1)))
              (%check :kfdkl-pool-2-reclaimed
@@ -9451,6 +9469,43 @@
            (dds.pal:free-static (dds.core.buffer:octet-buffer-vec fd)))
       (dds.dcps:delete-participant p1)
       (when p2 (dds.dcps:delete-participant p2))))
+  t)
+
+(defun* run-keyed-flatdata-loan-mixed-copy-drop-test ()
+    (function () t)
+  "github#1 ROOT-CAUSE regression (ADR 0069): the KEEP_LAST per-instance drop on the ZC-loan path must evict a
+   COPY-path sample, not only a loan view. Under a discovery/arming race an instance legitimately holds a MIX —
+   early samples delivered before this reader's ZC-loan capability armed fall back to the copy path (data = a
+   deserialized struct), later ones are ZC loans (data = a flatdata-view). When a loan arrival triggers the drop
+   and the oldest is the copy, %reader-keeplast-drop-oldest-loan handed it to return-loan, which tears down ONLY
+   a view / secured handle and SILENTLY NO-OPS on a copy struct -> the copy was never evicted -> dr-cache grew
+   past KEEP_LAST depth (the 'got 6 want 4' full-suite flake, reproduced deterministically here with no threads:
+   a mixed depth-2 instance holding a copy SN1 + a loan-view SN3, dropping the oldest). DETERMINISTIC + fast: no
+   network, no load — directly exercises the drop on a hand-built mixed cache, so it fails 100% before the fix and
+   needs no ZC/SHMEM (runs on every impl)."
+  (let* ((dr (make-instance 'dds.dcps::data-reader))
+         (kh (make-array 16 :element-type '(unsigned-byte 8) :initial-element 7))
+         (copy-cs (dds.dcps::make-cached-sample                 ; a COPY-path sample: data is a plain (non-view) struct
+                   :data (list :copy-oldest)
+                   :info (dds.dcps::make-sample-info
+                          :instance-handle kh :sequence-number 1 :valid-data t :sample-state :not-read)))
+         (view (dds.types:make-flatdata-view))
+         (loan-cs (dds.dcps::make-cached-sample                 ; a ZC-LOAN sample: data is a flatdata-view in dr-loans
+                   :data view
+                   :info (dds.dcps::make-sample-info
+                          :instance-handle kh :sequence-number 3 :valid-data t :sample-state :not-read))))
+    (setf (dds.dcps::dr-cache dr) (list copy-cs loan-cs)
+          (dds.dcps::dr-loans dr) (list view))
+    (dds.dcps::%reader-keeplast-drop-oldest-loan dr kh 2)       ; a 3rd same-instance arrival triggers the oldest-drop
+    (%check :kfdmc-copy-evicted (not (member copy-cs (dds.dcps::dr-cache dr)))
+            "the KEEP_LAST loan drop must evict the OLDEST even when it is a copy-path sample (github#1)")
+    (%check :kfdmc-loan-kept (member loan-cs (dds.dcps::dr-cache dr))
+            "the newer loan sample must survive the drop")
+    (%check :kfdmc-cache-1 (= 1 (length (dds.dcps::dr-cache dr)))
+            (format nil "the mixed depth-2 instance must hold exactly 1 after the drop, got ~d"
+                    (length (dds.dcps::dr-cache dr))))
+    (%check :kfdmc-loan-intact (equal (list view) (dds.dcps::dr-loans dr))
+            "the surviving loan's registry entry must be untouched (only the copy was dropped)"))
   t)
 
 (defun* run-keyed-flatdata-copy-behavior-test ()
