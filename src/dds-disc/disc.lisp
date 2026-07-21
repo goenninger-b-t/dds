@@ -2031,6 +2031,14 @@
   (dds.pal:with-lock ((disc-node-lock node))
     (nth-value 1 (gethash guid (disc-node-matches node)))))
 
+(defvar *post-record-match-hook* nil
+  "TEST SEAM (github#2/ADR 0071), default NIL = inert in production. When set, %MATCH-REMOTE-ENDPOINT
+   funcalls it as (NODE REMOTE-GUID DIRECTION) immediately after %RECORD-MATCH — i.e. at the exact instant
+   the HEARTBEAT match-gate (%guid-matched-p) begins to admit HEARTBEATs for this remote. It exists so a
+   test can assert the invariant the fix establishes: by the time the match is observable, the reader-side
+   durability baseline is ALREADY armed (skip-history set on the WriterProxy). Same affordance pattern as
+   *DEBUG-SHMEM-SEND-FAULT*; one NIL check per match (discovery plane, not the hot path).")
+
 (defun* %prearm-writer-future-base (node reader-guid &optional writer-id)
     (function (disc-node (simple-array (unsigned-byte 8) (16)) &optional (or null (unsigned-byte 32))) (eql t))
   "WP-ACKNACK-MATCH-GATE (DDS 1.4 §2.2.3.4; RTPS 2.5 §8.4.2.2 / §8.4.10.1): FUTURE-only-base the reliable
@@ -2241,8 +2249,25 @@
                              ;; local readers (the route holds a LIST; idempotent), so a 2nd same-topic reader is added too.
                              (when writer-p
                                (%reader-route-add node remote-guid local-eid))
+                             ;; WP-ACKNACK-MATCH-GATE (DDS 1.4 §2.2.3.4; github#2/ADR 0071): arm the READER-side
+                             ;; durability baseline (skip-history for a VOLATILE reader vs a retaining writer) BEFORE
+                             ;; the match is RECORDED — SYMMETRIC with the writer prearm above. Rationale is identical:
+                             ;; %record-match opens the HEARTBEAT match-gate (%guid-matched-p) and it writes
+                             ;; disc-node-matches UNDER the node lock, which the gate also reads under the node lock —
+                             ;; so arming here, before the lock release, means any HEARTBEAT thread that later observes
+                             ;; the match sees the FULLY-armed WriterProxy (skip-history set) via that happens-before.
+                             ;; Pre-fix the arm fired only in %fire-match (below, AFTER %record-match, and after the node
+                             ;; lock was released with no happens-before), so a HEARTBEAT racing the arm on a second
+                             ;; thread could NACK the writer's pre-join history [1..lastSN] and pull it via ACKNACK-repair
+                             ;; (which replays independently of the writer's future-base) — the github#2 LJ-VOL-PRE flake.
+                             (when (and first-pair writer-p)
+                               (%reader-durability-init
+                                node remote-guid
+                                (dds.qos:qos-durability (dds.rtps.discovery:endpoint-data-qos remote))))
                              ;; per-REMOTE presence (matched-count / HB-gate / lease-sweep) — idempotent; unconditional.
                              (%record-match node remote)
+                             (when *post-record-match-hook*   ; TEST SEAM (github#2): inert in production
+                               (funcall *post-record-match-hook* node remote-guid direction))
                              ;; per-(local,remote) PAIR status/crypto/durability fire — once per pair, threading LOCAL-EID
                              ;; so it lands on the RIGHT same-topic endpoint. DO NOT return; continue the dolist (all locals).
                              (when first-pair (%fire-match node direction remote local-eid))))))))))

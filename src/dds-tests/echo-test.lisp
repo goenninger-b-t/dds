@@ -3911,6 +3911,7 @@
                  ("dcps-instance-read-take"  . run-dcps-instance-test)
                  ("dcps-dispose-unregister"  . run-dcps-dispose-test)
                  ("dcps-durability-latejoiner" . run-dcps-durability-latejoiner-test)
+                 ("dcps-latejoiner-reader-armed-before-match" . run-dcps-latejoiner-reader-armed-before-match-test)
                  ("dcps-durability-multiwriter" . run-dcps-durability-multiwriter-test)
                  ("dcps-same-topic-durability-multiwriter" . run-dcps-same-topic-durability-multiwriter-test)
                  ("dcps-durability-keeplast" . run-dcps-durability-keeplast-test)

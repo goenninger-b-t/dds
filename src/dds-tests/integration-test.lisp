@@ -573,6 +573,67 @@
             "the VOLATILE late reader must still receive the 4th sample (published after it joined)"))
   t)
 
+(defvar *lj-armed-at-match* :not-fired
+  "github#2 regression capture: the VOLATILE reader's WriterProxy arm-state at the instant the match is
+   recorded (:armed / :unarmed / :no-proxy), captured on the SEDP thread via dds.disc::*post-record-match-hook*.")
+
+(defun* run-dcps-latejoiner-reader-armed-before-match-test ()
+    (function () t)
+  "github#2 ROOT-CAUSE regression (ADR 0071): a VOLATILE reader's durability skip-history baseline must be
+   ARMED BEFORE its match becomes observable — symmetric with the writer-side future-base prearm. The HEARTBEAT
+   match-gate (%guid-matched-p) opens when %record-match writes disc-node-matches under the node lock; a
+   HEARTBEAT thread reads that under the node lock, so anything armed BEFORE %record-match is visible to it via
+   happens-before. Pre-fix the reader-side arm fired only in %fire-match — AFTER %record-match and after the node
+   lock was released with no happens-before — so at the instant the match was observable the WriterProxy did not
+   yet exist; a HEARTBEAT racing the later arm on a second thread (the load-only trigger) NACKed the writer's
+   pre-join history [1..lastSN] and pulled it via ACKNACK-repair (which replays independently of the writer's
+   future-base) = the LJ-VOL-PRE flake. This test drives a real VOLATILE-reader / TL-writer match and, via the
+   dds.disc::*post-record-match-hook* seam, asserts the reader is ALREADY armed (skip-history set) at
+   %record-match. Deterministic (no injected timing): RED before the fix (:no-proxy), GREEN after (:armed)."
+  (let* ((ts (dds.types:find-type-support "shape-type"))
+         (p1 (dds.dcps:create-participant :domain (test-domain))))
+    (unwind-protect
+         (let* ((tw (dds.dcps:create-topic p1 "Square" "shape-type" ts))
+                (pub (dds.dcps:create-publisher p1))
+                (dw (dds.dcps:create-datawriter
+                     pub tw :qos (dds.qos:make-writer-qos :durability :transient-local :history-kind :keep-all))))
+           (dds.dcps:write-sample dw (make-shape-type :color "RED"   :x 1 :y 1 :shapesize 10))
+           (dds.dcps:write-sample dw (make-shape-type :color "GREEN" :x 2 :y 2 :shapesize 20))
+           (dds.dcps:write-sample dw (make-shape-type :color "BLUE"  :x 3 :y 3 :shapesize 30))
+           (loop repeat 10 do (dds.dcps:spin p1) (sleep 0.01))
+           (let ((p2 (dds.dcps:create-participant :domain (test-domain))))
+             (unwind-protect
+                  (let* ((tr (dds.dcps:create-topic p2 "Square" "shape-type" ts))
+                         (sub (dds.dcps:create-subscriber p2))
+                         (dr (dds.dcps:create-datareader
+                              sub tr :qos (dds.qos:make-reader-qos :reliability :reliable
+                                                                   :durability :volatile
+                                                                   :history-kind :keep-all)))
+                         (node2 (dds.dcps::dp-node p2)))
+                    (declare (ignore dr))
+                    (setf *lj-armed-at-match* :not-fired)
+                    (setf dds.disc::*post-record-match-hook*
+                          (lambda (node rguid direction)
+                            (when (and (eq direction :remote-writer) (eq node node2)
+                                       (eq *lj-armed-at-match* :not-fired))
+                              (let* ((reader (dds.disc::disc-node-user-reader node))
+                                     (proxy (and reader (gethash rguid (dds.rtps.reliable::rtps-reader-proxies reader)))))
+                                (setf *lj-armed-at-match*
+                                      (cond ((null proxy) :no-proxy)
+                                            ((dds.rtps.reliable:writer-proxy-skip-history proxy) :armed)
+                                            (t :unarmed)))))))
+                    (loop repeat 200
+                          until (and (plusp (dds.dcps:matched-count p1)) (plusp (dds.dcps:matched-count p2)))
+                          do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+                    (%check :ljarm-matched (plusp (dds.dcps:matched-count p2)) "the late reader did not match")
+                    (%check :ljarm-armed-before-match (eq :armed *lj-armed-at-match*)
+                            (format nil "the VOLATILE reader's skip-history must be ARMED at %record-match, was ~a (github#2)"
+                                    *lj-armed-at-match*)))
+               (setf dds.disc::*post-record-match-hook* nil)
+               (dds.dcps:delete-participant p2))))
+      (dds.dcps:delete-participant p1))
+    t))
+
 (defun* run-dcps-durability-keeplast-test ()
     (function () t)
   "DCPS per-instance KEEP_LAST retention for a late-joiner (DDS 1.4 §2.2.3.4, spec test 3). A reliable
