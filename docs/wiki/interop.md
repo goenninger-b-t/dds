@@ -7,6 +7,43 @@ under [`interop/connext/`](../../interop/connext/), the **Fast DDS peer harness*
 (`dds-shapes`, the `make square-*` targets). Wire correctness is judged with the Wireshark/
 tshark RTPS dissector — the same dissector `make wire` uses — not by eye.
 
+## The interop gate (`make interop`)
+
+`make interop` runs `make wire` (our emitted RTPS validated against the tshark RTPS dissector) and then
+**four live legs, both vendors, both directions**:
+
+| leg | direction | notes |
+|---|---|---|
+| Connext -> us | inbound | the STRICT oracle |
+| Fast DDS -> us | inbound | LENIENT peer — proves strictly less (it accepted the ADR 0061 malformed payload Connext rejected) |
+| us -> Connext | **outbound** | the direction that hid ADR 0057 |
+| us -> Fast DDS | **outbound** | |
+
+Two properties of this gate are load-bearing and easy to lose:
+
+- **A gate that cannot run must FAIL, not print green.** If a vendor is missing the gate fails and names it.
+  Opt out deliberately and visibly with `INTEROP_ALLOW_MISSING=connext|fastdds|both`.
+- **`MIN_SAMPLES` (default 5) is a floor, not a formality.** ">0 samples" is nearly vacuous — one sample can
+  come from a stale peer or a single lucky datagram. A leg that moves fewer than the floor fails.
+
+**The outbound legs need `REP=xcdr1`, and that is a protocol fact rather than a tuning knob.** A stock
+foreign Shapes `DataReader` advertises **XCDR1 only**, and `DATA_REPRESENTATION` is an **RxO** policy, so an
+XCDR2-default writer **silently does not match** — no error, just `matched=0`. Verified by falsifying the
+gate: publishing the identical stream as XCDR2 gets **0** samples accepted by Connext where XCDR1 gets 253.
+That silent-non-match is exactly the ADR 0057 failure mode, in which our `DataWriter` matched no foreign
+`DataReader` for six slices because every live leg had exercised our *reader*.
+
+**Every peer runs in its own process group and the gate kills the group.** Killing only the direct child
+leaks the real binary whenever the child is a wrapper (`with-fastdds.sh` -> `bash` -> `shapes_pub`); the
+grandchild is reparented to init and **keeps publishing on the domain forever**. That is not hypothetical —
+a leaked `shapes_pub RED` once fed 358 phantom samples into a later leg and made an outbound test look like
+it was receiving its own traffic, and it depressed a Fast DDS inbound leg to a single sample.
+
+Not covered: this gate exercises the **Shapes topic only**. Per-feature legs (keyed/nokey, TypeLookup,
+large-data fragmentation, keyed FlatData, liveliness, deadline, durability, security) have drivers under
+`scripts/` and `interop/` but are not gated yet — the gate says so on every run rather than letting a green
+line read as "interop is covered".
+
 ## The Shapes harness (this stack)
 
 `dds-shapes` is a self-contained Square/ShapeType publisher + subscriber on multicast
