@@ -122,18 +122,22 @@
    serialize the KEYS from INPUT (accessed via ACC-FN, PLAIN_CDR2/XCDR2 big-endian, origin-0) and copy them into
    OUT (<=16 direct/zero-padded when KEY-DIRECT-P, else the MD5). Shared by the struct (KEY-HASH-<name>) and the
    FlatData (KEY-HASH-<name>-FD) emitters (DRY) — they differ only in IN-TYPE, INPUT, and ACC-FN. RX-POOLING
-   (ADR 0075, NFR-MEM): the trailing &optional SER-SCRATCH — a reusable :big cursor over a >=256-octet buffer —
-   lets the caller serialize the key IN PLACE with zero per-call make-octet-buffer/cursor/free-static; NIL (every
-   TX / register / test caller) allocates and frees a fresh scratch, byte-identical. OUT is always freshly
-   allocated (the handle is retained in SampleInfo / the instance table)."
-  `((declaim (ftype (function (,in-type &optional t) (simple-array (unsigned-byte 8) (16))) ,fn))
-    (defun ,fn (,input &optional ser-scratch)
+   (ADR 0075/0076, NFR-MEM): two trailing &optionals, both defaulting NIL (every TX / register / test caller
+   allocates fresh, byte-identical). SER-SCRATCH — a reusable :big cursor over a >=256-octet buffer — serializes
+   the key IN PLACE (no per-call make-octet-buffer/cursor/free-static). OUT-SCRATCH — a reusable 16-octet array —
+   is the RESULT buffer, zero-filled then written in place (no per-call make-array); the caller (the drain) uses
+   it ONLY transiently for the instance-rec lookup, then reads the STABLE handle off the rec (ADR 0076), so it is
+   NOT retained. With OUT-SCRATCH the steady-state keyed take/write allocates ZERO here."
+  `((declaim (ftype (function (,in-type &optional t t) (simple-array (unsigned-byte 8) (16))) ,fn))
+    (defun ,fn (,input &optional ser-scratch out-scratch)
       ,doc
-      (let* ((out (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0))
+      (let* ((out (the (simple-array (unsigned-byte 8) (16))
+                       (or out-scratch (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0))))
              (fresh (unless ser-scratch (dds.core.buffer:make-octet-buffer 256)))
              (wc (if ser-scratch
                      (progn (dds.core.buffer:cursor-reset ser-scratch) ser-scratch)
                      (dds.core.buffer:cursor fresh :endianness :big))))
+        (when out-scratch (fill out 0))   ; reused result: clear stale bytes so the <=16-direct zero-pad is correct
         ,@(loop for m in keys
                 collect `(,(getf m :put) wc (,(funcall acc-fn m) ,input) :xcdr2))
         (let ((len (dds.core.buffer:cursor-position wc))

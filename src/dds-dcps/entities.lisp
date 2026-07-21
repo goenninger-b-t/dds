@@ -159,6 +159,7 @@
    (secured-scratch :initform nil :accessor dr-secured-scratch) ; WP-DCPS-SECURED-TAKE-LOAN: reusable octet-buffer wrapper (repointed per drain) for the in-place [0,len) secured-plaintext deserialize — created once, zero per-sample cons (NFR-MEM)
    (deser-scratch :initform nil :accessor dr-deser-scratch) ; RX-POOLING Phase A (ADR 0073): reusable octet-buffer wrapper repointed at the stored bytes per COPY-path drain, so %deserialize-sample decodes IN PLACE with no per-sample make-octet-buffer / replace / free-static (NFR-MEM)
    (keyhash-scratch :initform nil :accessor dr-keyhash-scratch) ; RX-POOLING (ADR 0075): reusable :big cursor over a 256-octet buffer for the per-sample instance-handle key serialization — created once, zero per-sample make-octet-buffer/cursor/free-static; single-threaded per reader (the drain runs on the user thread, take is single-threaded-per-reader) (NFR-MEM)
+   (keyhash-out :initform nil :accessor dr-keyhash-out) ; RX-POOLING (ADR 0076): reusable 16-octet RESULT array for the drain's TRANSIENT instance-handle — the handle is used only for the instance-rec lookup, then the STABLE handle is read off the rec; created once, zero per-sample make-array on a known instance (NFR-MEM)
    (status-lock :initform (dds.pal:make-lock "dr-status") :accessor dr-status-lock))
   (:documentation "DDS DataReader: receives typed samples on a Topic into a read/take
    cache with per-instance SampleInfo, carrying its SUBSCRIPTION_MATCHED,
@@ -402,6 +403,7 @@
   (owner-guid nil :type (or null (simple-array (unsigned-byte 8) (16))))
   (owner-strength 0 :type integer)
   (not-alive-since nil :type (or null (integer 0)))
+  (handle nil :type (or null (simple-array (unsigned-byte 8) (16))))   ; RX-POOLING (ADR 0076): this instance's STABLE 16-octet handle (= its dr-instance-recs hash key), copied ONCE at creation from the drain's reused key-hash scratch; SampleInfo + retention sites read it so the drain's per-sample handle need not be freshly allocated (NFR-MEM)
   (key-sample nil :type t))   ; S5.T1: a representative delivered sample carrying this instance's key fields (get_key_value); the handle is a one-way hash so the key is retained here
 
 ;;; ---- type-support serialization helpers (PLAIN_CDR(2)_LE SerializedPayload) ----
@@ -1664,15 +1666,18 @@
   (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)
   "HANDLE_NIL — the instance handle for an unkeyed type (single instance).")
 
-(defun* %instance-handle (ts sample &optional kh-scratch)
-    (function (t t &optional t) (simple-array (unsigned-byte 8) (16)))
+(defun* %instance-handle (ts sample &optional kh-scratch out-scratch)
+    (function (t t &optional t t) (simple-array (unsigned-byte 8) (16)))
   "16-octet instance handle for SAMPLE via the type-support key-hash, or HANDLE_NIL
    for an unkeyed type. KH-SCRATCH (default NIL): a reusable :big key-serialization cursor the generated
    key-hash serializes the key in place through (zero per-sample make-octet-buffer/cursor/free-static,
-   RX-POOLING ADR 0075) — sound only on a single-threaded-per-entity caller (the drain). NIL allocates a
-   fresh scratch, byte-identical (every TX / register / unkeyed caller)."
+   RX-POOLING ADR 0075). OUT-SCRATCH (default NIL): a reusable 16-octet RESULT array the handle is written into
+   in place (no per-sample make-array, ADR 0076) — the caller MUST treat the returned handle as TRANSIENT (use
+   it only for the instance-rec lookup, then read the STABLE handle off the rec). Both are sound only on a
+   single-threaded-per-entity caller (the drain); NIL allocates fresh, byte-identical (every TX / register /
+   unkeyed caller)."
   (let ((kh (dds.types:type-support-key-hash ts)))
-    (if kh (funcall kh sample kh-scratch) +instance-handle-nil+)))
+    (if kh (funcall kh sample kh-scratch out-scratch) +instance-handle-nil+)))
 
 (defun* %reader-keyhash-scratch (dr)
     (function (data-reader) t)
@@ -1683,6 +1688,15 @@
   (or (dr-keyhash-scratch dr)
       (setf (dr-keyhash-scratch dr)
             (dds.core.buffer:cursor (dds.core.buffer:make-octet-buffer 256) :endianness :big))))
+
+(defun* %reader-keyhash-out (dr)
+    (function (data-reader) (simple-array (unsigned-byte 8) (16)))
+  "DR's reusable 16-octet key-hash RESULT array, created on first use — the drain writes the per-sample
+   instance handle into it TRANSIENTLY (for the instance-rec lookup only; the STABLE handle is then read off
+   the rec), so a known-instance take allocates no handle (RX-POOLING, ADR 0076, NFR-MEM). Single-threaded per
+   reader, the same drain discipline as dr-keyhash-scratch."
+  (or (dr-keyhash-out dr)
+      (setf (dr-keyhash-out dr) (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0))))
 
 (defun* %handle-p (x)
     (function (t) t)
@@ -1843,10 +1857,14 @@
    is seen. Also seeds the view-state dr-instances entry (nil = not yet accessed) so a synthetic
    lifecycle notification surfaces with view-state NEW just like a first data sample."
   (or (gethash handle (dr-instance-recs dr))
-      (progn
-        (unless (nth-value 1 (gethash handle (dr-instances dr)))
-          (setf (gethash handle (dr-instances dr)) nil))
-        (setf (gethash handle (dr-instance-recs dr)) (make-instance-rec)))))
+      ;; RX-POOLING (ADR 0076): first sighting of this instance -> COPY the (possibly reused-scratch) HANDLE to a
+      ;; STABLE array used as BOTH hash keys AND the rec's own handle slot, so the drain can pass a reused scratch
+      ;; for the lookup and read this stable handle back for SampleInfo / retention. copy-seq runs once per NEW
+      ;; instance (rare); a known instance is a pure lock-free gethash (zero alloc).
+      (let ((stable (copy-seq handle)))
+        (unless (nth-value 1 (gethash stable (dr-instances dr)))
+          (setf (gethash stable (dr-instances dr)) nil))
+        (setf (gethash stable (dr-instance-recs dr)) (make-instance-rec :handle stable)))))
 
 (defun* %enqueue-instance-notification (dr handle rec)
     (function (data-reader (simple-array (unsigned-byte 8) (16)) instance-rec) t)
@@ -2626,26 +2644,28 @@
         (when (and (null decode-status)
                    ;; ContentFilteredTopic: drop reader-side a sample failing the filter.
                    (or (null (dr-filter dr)) (funcall (dr-filter dr) data)))
-          (let* ((handle (%instance-handle ts data (%reader-keyhash-scratch dr)))   ; RX-POOLING (ADR 0075): serialize the key in place through the reused per-reader cursor -> zero scratch alloc/sample
-                 (reason (%resource-reject-reason dr handle))
+          (let* ((scratch (%instance-handle ts data (%reader-keyhash-scratch dr) (%reader-keyhash-out dr)))   ; RX-POOLING (ADR 0075/0076): key serialized + result written IN PLACE through reused per-reader scratches -> zero alloc/sample. TRANSIENT: use only for the instance-rec lookup; read the STABLE handle off the rec for anything RETAINED.
+                 (reason (%resource-reject-reason dr scratch))
                  (verdict (if (and (null reason) (%reader-exclusive-p dr))
-                              (%arbitrate-owner dr node key handle)
+                              (%arbitrate-owner dr node key scratch)
                               :deliver)))
             (cond
               (reason
-               ;; RESOURCE_LIMITS would be exceeded -> reject (SAMPLE_REJECTED).
-               (%reader-sample-rejected dr reason handle))
+               ;; RESOURCE_LIMITS would be exceeded -> reject (SAMPLE_REJECTED). The handle is RETAINED in the
+               ;; SAMPLE_REJECTED status (read via get_status) -> a STABLE copy, never the reused scratch (rare path).
+               (%reader-sample-rejected dr reason (copy-seq scratch)))
               ((eq verdict :drop-unmatched)
                ;; Source writer identified but not yet SEDP-matched -> keep pending, do NOT advance.
                (setf advance nil))
               ((eq verdict :drop-loser)
                ;; Lost EXCLUSIVE arbitration (owner resolved) -> DROP the data, but still register the writer.
-               (let ((wid (dds.disc:node-sample-writer node key)) (rec (%reader-instance-rec dr handle)))
+               (let ((wid (dds.disc:node-sample-writer node key)) (rec (%reader-instance-rec dr scratch)))   ; %reader-instance-rec copies scratch->stable on a new instance
                  (when (and wid (not (member wid (instance-rec-writers rec))))
                    (push wid (instance-rec-writers rec)))))
               (t
-                (let ((rec (%reader-revive-instance dr handle (dds.disc:node-sample-writer node key)))
-                      (depth (%reader-keeplast-depth dr)))
+                (let* ((rec (%reader-revive-instance dr scratch (dds.disc:node-sample-writer node key)))
+                       (handle (the (simple-array (unsigned-byte 8) (16)) (instance-rec-handle rec)))   ; the STABLE handle (copied once at creation) — the ONLY handle retained past this drain
+                       (depth (%reader-keeplast-depth dr)))
                   (unless (instance-rec-key-sample rec) (setf (instance-rec-key-sample rec) data))   ; S5.T1: retain the key holder for get_key_value
                   (%deadline-touch dr handle)   ; WP-DCPS-API-COMPLETION S4: (re)arm this instance's requested DEADLINE on delivery (no-op + 0-alloc when INFINITE)
                   (when depth (%reader-keeplast-drop-oldest dr handle depth))   ; KEEP_LAST per-instance drop (DDS 1.4 §2.2.3.18) before append
