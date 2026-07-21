@@ -1,17 +1,27 @@
 # NFR-MEM allocation ratchet (ADR 0062). One ceiling PER ARCHITECTURE, in bytes/sample.
 #
 # SBCL's per-sample allocation differs materially by arch — measured, not assumed:
-#   arm64   1813-1857      (2026-07-21: + TASK-3 the cache-change STRUCT pool — an evicted, send-ref-free,
-#                            non-ZC/pooled/pinned change is recycled to the HistoryCache change-freelist and
-#                            reused by the next write (ADR 0077, ~-109 B); prior RX-pooling ADR 0073/0075/0076;
-#                            floor 2118 -> 1813, cumulative ~-1747 from 3560,
-#                            ADR 0062/0065-0068/0072/0073/0075/0076/0077)
-#   x86_64  ~1951 (est)     (2026-07-21: was 2083 read off CI at ADR 0076; the TASK-3 struct pool (ADR 0077)
-#                            drops it ~109 like arm64 -> est ~1951. NOT measured here (dev box is arm64); the
-#                            2090 ceiling is set ROBUSTLY-SAFE for a floor anywhere in [1910,2010] (above
-#                            max-floor+strays, below min-floor/0.9) so CI neither ratchet-demands nor regresses.
-#                            Tighten to CI's actual number on the next slice. The same divergence made the
-#                            FlatData vtable-vs-classic guard flip, and is why a single shared ceiling cannot work.)
+#   arm64   1791-1857      (2026-07-21: + the RX STORE-COPY POOL — the receiver's per-sample copy out of the
+#                            receive buffer is drawn from an arena pool and carries its extent in the buffer's
+#                            capacity (ADR 0078, -35 B and LINEAR IN PAYLOAD SIZE thereafter); prior TASK-3
+#                            cache-change struct pool ADR 0077 and RX-pooling ADR 0073/0075/0076;
+#                            floor 2118 -> 1791, cumulative ~-1769 from 3560,
+#                            ADR 0062/0065-0068/0072/0073/0075/0076/0077/0078)
+#   x86_64  ~1917 (est)     (2026-07-21: 1951.5 read off CI at ADR 0077; ADR 0078 removes the same fixed-size
+#                            heap array on both arches, so the drop is ~35 there too -> est ~1917. NOT measured
+#                            here (dev box is arm64); the 2040 ceiling is set ROBUSTLY-SAFE for a floor anywhere
+#                            in [1840,1990] (above max-floor+strays, below min-floor/0.9) so CI neither
+#                            ratchet-demands nor regresses. Confirm against CI's actual number on the next
+#                            slice. The same divergence made the FlatData vtable-vs-classic guard flip, and is
+#                            why a single shared ceiling cannot work.)
+#
+# ⚠️ THIS GATE IS NOW BLUNTER THAN THE WINS IT GUARDS. mem-per-sample defaults to 3000 samples, and a fixed
+# ~65 KB of per-RUN allocation amortises to a ~22 B/sample QUANTUM that appears or does not: a single arm
+# measures 1791 / 1813 / 1835 / 1857 across runs. So run-to-run spread (~65 B) now EXCEEDS a typical slice's
+# win (~35 B), and no single gate run can resolve one. Size a win with an A/B at a much larger sample count
+# in ONE session instead — at :samples 30000 the same arm is reproducible to +-0.07 B, which is how ADR 0078's
+# -35 B was established (1887.2 -> 1852.3). FOLLOW-ON: raise the gate's own sample count so it measures what
+# the ADRs claim; it re-baselines BOTH rows, so it needs its own commit and a CI round-trip for x86_64.
 #
 # The ratchet only moves DOWN. Lower a row when you bank a win on THAT arch (gate-mem tells you).
 #
@@ -20,5 +30,5 @@
 # IMPROVEMENT in CI, which is red until someone reads the CI number and lowers that row too. This is not
 # hypothetical: CI was red from the 5th TX slice for exactly this reason. AFTER a win, check the CI
 # gate-mem number and lower the OTHER arch's row in the same or an immediate follow-up commit.
-arm64  1900
-x86_64 2090
+arm64  1890
+x86_64 2040

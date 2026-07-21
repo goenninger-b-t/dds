@@ -72,7 +72,7 @@
            #:node-consume-sample #:node-sole-consumer-p
            #:node-collect-pending-samples #:node-collect-pending-lifecycle
            #:node-reader-matches-writer-p-unlocked #:node-reader-join-watermark-unlocked
-           #:node-sample-count #:node-sample #:node-sample-sns
+           #:node-sample-count #:node-sample #:node-sample-raw #:node-sample-sns #:*rx-store-pool-capacity*
            #:node-sample-writer #:node-sample-writer-guid #:node-sample-origin-guid #:node-sample-origin-sn #:node-sample-key-hash #:node-sample-timestamp #:node-sample-key-sn #:node-sample-by-sn #:matched-writer-ownership
            #:node-reader-join-watermark
            #:node-user-reader-count #:node-reader-matches-writer-p

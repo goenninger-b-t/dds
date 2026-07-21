@@ -2920,6 +2920,12 @@
               (secured-loan-handle-reg-index handle) -1))))
   (values))
 
+;; ADR 0078: the RX store-copy pool helpers are defined after the pool-sizing specials (loaded later);
+;; forward-declared so the purge choke below and %on-user-data reach them without an undefined-function
+;; warning (the build fails on any promoted warning).
+(declaim (ftype (function (disc-node (integer 0)) (or null dds.core.buffer:octet-buffer)) %rx-store-acquire))
+(declaim (ftype (function (disc-node dds.core.buffer:octet-buffer) (values)) %rx-store-release))
+
 (defun* %purge-secured-sample (node guid sn)
     (function (disc-node (simple-array (unsigned-byte 8) (16)) integer) t)
   "WP-SECURED-STORE-GROWTH: the SINGLE purge choke for a released / evicted / drained secured sample — remove
@@ -2931,6 +2937,14 @@
    the drain/release path without perturbing the secured zero-alloc receive arms (operating contract §4 NFR-MEM).
    Caller holds the node lock. The inner per-GUID SN maps are left in place (bounded by the matched-writer count,
    not by sample count — §8.3.5.4), only their (GUID,SN) entry is dropped."
+  ;; ADR 0078: this is the SINGLE choke every (GUID,SN) store entry is dropped through, so returning a pooled
+  ;; store-copy buffer HERE covers every present and future drop path (node-consume-sample on the copy path,
+  ;; %secured-loan-release on the loan path) with one site. A loan handle / ZC marker is a different type and
+  ;; is skipped. Zero-cons: one gethash + a structure typep.
+  (let ((inner (gethash guid (disc-node-samples node))))
+    (when inner
+      (let ((v (gethash sn inner)))
+        (when (typep v 'dds.core.buffer:octet-buffer) (%rx-store-release node v)))))
   (macrolet ((drop (accessor)
                `(let ((inner (gethash guid (,accessor node)))) (when inner (remhash sn inner)))))   ; no auto-create; zero-cons
     (drop disc-node-samples)
@@ -3074,6 +3088,9 @@
    if the decode pool could not be carved (arena exhausted at the first secured sample) the reader stays
    loan-capable but the store holds BARE plaintext vectors (byte-correct); they ride in VEC with NO loan, so a
    caller MUST test secured-loan-handle-p before secured-loan-bytes (the same test the mixed non-loan case needs).
+   INVARIANT THIS RELIES ON (ADR 0078): a plaintext value here is a BARE VECTOR, never a pooled RX store-copy
+   octet-buffer — %on-user-data refuses to pool for a SECURED-LOAN-CAPABLE node precisely so that this
+   two-way dispatch stays exhaustive. Relaxing that gate means teaching every caller here a third type.
    The buffer is held by the loan until node-return-loan releases it, so the app's in-place read can never race a
    pool recycle. Leaves the samples in the store until node-return-loan invalidates them (mirrors take-loaned)."
   (dds.pal:with-lock ((disc-node-lock node))
@@ -3187,11 +3204,12 @@
   t)
 
 (defun* %deliver-user-sample (node writer-id sn vec src-prefix effective-guid effective-sn
-                             &optional key-hash overlay-secured)
+                             &optional key-hash overlay-secured pooled)
     (function (disc-node (unsigned-byte 32) integer (simple-array (unsigned-byte 8) (*))
               (simple-array (unsigned-byte 8) (12))
               (simple-array (unsigned-byte 8) (16)) integer
-              &optional (or null (simple-array (unsigned-byte 8) (*))) t) t)
+              &optional (or null (simple-array (unsigned-byte 8) (*))) t
+              (or null dds.core.buffer:octet-buffer)) t)
   "Feed a complete user sample VEC (SN from WRITER-ID at SRC-PREFIX) to the reliable reader, record it
    under the 2-level (source-GUID -> SN) store (payload + writer EntityId for the S2 writers-set + full
    source GUID for S1 EXCLUSIVE ownership arbitration), then fire ON-SAMPLE outside the node lock
@@ -3216,13 +3234,20 @@
    %zc-try-resolve's reserved-field 2nd value). It ORs into the decode gate so the SecuredPayload is decoded to
    plaintext EVEN when the reader's OWN data_protection governance is NONE (an ENCRYPT-tier writer regains
    Zero-Copy with no cleartext in SHMEM); the KM resolves + fail-closes via the SAME block as a normal
-   data_protection decode (no parallel path). NIL (default) is byte-identical to every pre-overlay caller."
+   data_protection decode (no parallel path). NIL (default) is byte-identical to every pre-overlay caller.
+   POOLED (ADR 0078, NFR-MEM): when the receiver thread copied this sample into a buffer drawn from the node's
+   RX store-copy pool, that octet-buffer — VEC is then its backing vector and the buffer's CAPACITY is the exact
+   payload extent. It becomes the STORED value (a pooled entry is a DISTINCT TYPE, so no extent-unaware consumer
+   can misread it) and is returned to the pool at the store-drop choke, or here on the dedup-reject arm. It is
+   drawn only for a node with NO crypto-transform; should a live handshake have installed one since, the decode
+   below needs the EXACT ciphertext extent, so the buffer is returned and the exact-length vector materialised
+   (the pre-pool path, byte-identical). NIL (the default, and always on the secured path) changes nothing."
   (let* ((guid (%source-guid src-prefix writer-id))   ; ONE source GUID: km-resolve + reliable proxy + the three inner tables + the loan handle
          (routes (%reader-routes-for node guid))       ; WP-N-ENDPOINT-S2/S4: the reader(s) matched to this writer — resolved ONCE (tier + delivery, DRY)
          (canon (and routes (cdr (first routes))))     ; the CANONICAL engine reader (single reliability truth for this writer)
          (rid (if routes (car (first routes)) (disc-node-user-reader-id node)))   ; WP-N-ENDPOINT-S4: the target reader's EntityId (route id; N=1/pre-match -> primary id)
          (rkind (%user-endpoint-kinds node rid))       ; WP-N-ENDPOINT-S4 (ADR 0046/0048): THIS reader's OWN data_protection tier (per-endpoint map; N=1 -> node-single, byte-identical)
-         (stored vec)                                  ; the value stored in disc-node-samples (a plaintext vec, or a T5b secured-loan-handle)
+         (stored (or pooled vec))                      ; the value stored in disc-node-samples (a plaintext vec, an ADR 0078 pooled octet-buffer, or a T5b secured-loan-handle)
          (loan nil))                                   ; non-NIL = the pooled-buffer loan handle to register / release-on-reject (T5b)
     ;; §9.4.1.2.4: apply the SecuredPayload (data_protection) DECODE UNLESS governance set data_protection=NONE (data=NONE:
     ;; the payload rides PLAIN; decoding a plain payload as a SecuredPayload fails-closed and would DROP every sample).
@@ -3236,6 +3261,16 @@
     ;; the reader's own data_protection governance is NONE — OVERLAY-SECURED forces the decode (the KM resolves as
     ;; the remote-writer EntityCrypto key exactly as the normal data_protection decode; fail-closed reuse below).
     (let ((ct (and (or overlay-secured (not (eq rkind :none))) (disc-node-crypto-transform node))))
+      ;; ADR 0078: the RX store pool is drawn only for a node with NO crypto-transform, but the transform can be
+      ;; installed by a live DDS-Security handshake between that test (on the receiver thread, before this call)
+      ;; and here. The decode below reads VEC as the CIPHERTEXT and needs its exact extent, which a fixed-size
+      ;; pooled buffer does not carry in its length — so return the buffer and materialise the exact-length
+      ;; vector, taking the pre-pool path unchanged. Never in steady state (one test, both arms constant-time);
+      ;; it also guarantees POOLED is NIL inside the CT block, so none of its early returns can leak a slot.
+      (when (and ct pooled)
+        (setf vec (subseq vec 0 (dds.core.buffer:octet-buffer-capacity pooled)))
+        (%rx-store-release node pooled)
+        (setf pooled nil stored vec))
       (when ct
         (let ((km (if (typep ct 'dds.security:crypto-keys)
                       (funcall (dds.security:crypto-keys-decode-key-fn ct) guid)
@@ -3293,7 +3328,9 @@
     ;; separate delivery per reader.
     (when canon
       (dds.rtps.reliable:reader-on-data canon guid sn
-                                        (if loan (load-time-value (make-array 0 :element-type '(unsigned-byte 8))) stored)))
+                                        (if loan
+                                            (load-time-value (make-array 0 :element-type '(unsigned-byte 8)))
+                                            (if pooled vec stored))))   ; ADR 0078: STORED is the octet-buffer when pooled — hand the engine the backing VECTOR (it ignores the payload, but the declared type is a vector)
     (cond
       ;; app delivery gated: only if this (logical-origin GUID, SN) pair is new (§8.3.5.4)
       ((and canon (dds.rtps.reliable:reader-dedup-accept-p canon effective-guid effective-sn))
@@ -3314,7 +3351,10 @@
            (%secured-loan-register node loan)))   ; T5b/T5d: register the loan in the fixed registry vector (receiver registers; app return-loan releases)
        (when (disc-node-on-sample node) (funcall (disc-node-on-sample node))))
       ;; T5b: a deduped DUPLICATE on the loan path -> release the unused pooled buffer (no store, no leak)
-      (loan (%secured-loan-release node loan))))
+      (loan (%secured-loan-release node loan))
+      ;; ADR 0078: the same for the copy path — a deduped duplicate (or no canonical reader) was never stored,
+      ;; so nothing will ever reach the store-drop choke to return its buffer. Release it here.
+      (pooled (%rx-store-release node pooled))))
   t)
 
 (defun* %on-user-data (node writer-id sn buf poff plen src-prefix
@@ -3357,9 +3397,27 @@
       (cond
         ((null zc))                                                 ; armed + ref present but defer/resolve FAILED -> drop (best-effort)
         ((eq zc :not-a-ref)                                         ; normal payload (or ZC off)
-         (let ((vec (make-array plen :element-type '(unsigned-byte 8))))
-           (replace vec (dds.core.buffer:octet-buffer-vec buf) :start2 poff :end2 (+ poff plen))
-           (%deliver-user-sample node writer-id sn vec src-prefix eff-guid eff-sn key-hash)))
+         ;; ADR 0078 (NFR-MEM): the copy out of the reusable receive buffer is drawn from the node's RX
+         ;; store-copy pool — the last receive-path allocation that scaled with payload size. No pool /
+         ;; exhausted / oversize -> OB is NIL and the copy allocates exactly as before, byte-identical;
+         ;; exhaustion here is never data loss, because the drain copies the sample out again into an
+         ;; independent struct. TWO GATES, both about a SECURED node, and both structural rather than
+         ;; incidental: (a) NO CRYPTO-TRANSFORM — the secured arm of %deliver-user-sample reads VEC as
+         ;; ciphertext and needs its exact extent (it has its own T5b decode pool); (b) NOT SECURED-LOAN-CAPABLE
+         ;; — node-take-loaned hands the store's VALUES to the app, whose contract is "a secured-loan-handle or
+         ;; a bare plaintext vector", and its callers dispatch on secured-loan-handle-p alone; a pooled buffer
+         ;; reaching there would be read as a bare vector. That is reachable in the window where a node is
+         ;; marked loan-capable but the live handshake has not yet installed its transform, so gate (a) does not
+         ;; subsume gate (b). Such a node's steady state is the loan path, which is already pooled — excluding
+         ;; it costs nothing.
+         (let* ((ob  (and (null (disc-node-crypto-transform node))
+                          (not (disc-node-secured-loan-capable node))
+                          (%rx-store-acquire node plen)))
+                (vec (if ob
+                         (dds.core.buffer:octet-buffer-vec ob)
+                         (make-array plen :element-type '(unsigned-byte 8)))))
+           (replace vec (dds.core.buffer:octet-buffer-vec buf) :end1 plen :start2 poff :end2 (+ poff plen))
+           (%deliver-user-sample node writer-id sn vec src-prefix eff-guid eff-sn key-hash nil ob)))
         ((zc-loan-marker-p zc)
          (%deliver-user-marker node writer-id sn zc src-prefix eff-guid eff-sn)) ; loan-capable: the unresolved marker
         ;; resolved ZC payload (non-loan-capable): OVERLAY is numeric here (only the %zc-try-resolve arm reaches this);
@@ -3766,6 +3824,84 @@
                 ;; bounded allocating-decode fallback, never propagate (operating contract §4 NFR-MEM).
                 ((or error storage-condition) () nil)))))))   ; arena-exhausted / static-alloc failure: leave NIL -> allocating-decode fallback
 
+(defparameter *rx-store-pool-capacity* 64
+  "ADR 0078 (NFR-MEM): the number of buffers in a disc-node's RX store-copy pool — the working set of
+   received copy-path samples resident in the node sample store between the receiver thread storing one and
+   the draining user thread consuming it. Read once per node, at the lazy carve on the first copy-path
+   receive; rebinding it later has no effect on an already-carved node. Exhaustion is NOT data loss and NOT
+   a RESOURCE_LIMITS reject here (unlike the secured decode pool, whose loan accounting depends on its
+   bound): the store copy is copied out again at the drain, so a receive that finds the pool empty simply
+   allocates its vector as before — bounded degradation, byte-identical delivery.")
+
+(defun* %ensure-rx-store-pool (node)
+    (function (disc-node) t)
+  "ADR 0078: provision NODE's RX store-copy pool if absent and return it (or NIL on arena-allocation
+   failure — the caller then allocates the copy exactly as before, byte-identical). Carved LAZILY on the
+   first copy-path receive and double-checked under RX-STORE-POOL-LOCK, so the carve happens exactly once
+   and off the steady state (the steady receive then stores 0 B/sample).
+
+   element-bytes is (+ 4 *plain-payload-max-bytes* 8) — deliberately the SAME bound publish-sample-into's
+   allocating fallback uses, so ONE knob governs the pooled payload extent in both directions; a received
+   SerializedPayload larger than that keeps allocating (the documented, bounded degradation). capacity is
+   *rx-store-pool-capacity*.
+
+   On arena exhaustion this leaves the pool NIL — never an error, and never a GC-silent claim of a zero it
+   did not achieve (operating contract §4 / NFR-MEM). storage-condition is caught alongside error because a
+   static/off-heap allocation failure signals storage-condition, not error, on SBCL and Clasp."
+  (or (disc-node-rx-store-pool node)                      ; fast unlocked check (steady state: no lock)
+      (dds.pal:with-lock ((disc-node-rx-store-pool-lock node))
+        (or (disc-node-rx-store-pool node)                ; re-check under the lock (double-checked carve)
+            (let ((element-bytes (+ 4 *plain-payload-max-bytes* 8))
+                  (capacity *rx-store-pool-capacity*))
+              (handler-case
+                  (let* ((arena (dds.core.arena:init-arena :bytes (* element-bytes (1+ capacity))))   ; +1 slot slack
+                         (pool (dds.core.arena:make-buffer-pool arena element-bytes capacity)))
+                    ;; ADR 0064: :arena-exhausted is a STATUS — test it before installing anything, or the
+                    ;; arena is pushed onto the node and orphaned ("store the arena only after the carve succeeds").
+                    (when (null pool) (dds.core.arena:teardown-arena arena) (return-from %ensure-rx-store-pool nil))
+                    (setf (disc-node-rx-store-element-bytes node) element-bytes
+                          (disc-node-rx-store-arena node) arena   ; only after the carve succeeds (teardown reachability)
+                          (disc-node-rx-store-pool node) pool)
+                    pool)
+                ((or error storage-condition) () nil)))))))   ; arena-exhausted / static-alloc failure: leave NIL -> allocating copy
+
+(defun* %rx-store-acquire (node plen)
+    (function (disc-node (integer 0)) (or null dds.core.buffer:octet-buffer))
+  "ADR 0078: draw a buffer for the receiver thread's PLEN-octet store copy, with its CAPACITY set to
+   exactly PLEN. That capacity is the payload's extent everywhere downstream — %deserialize-payload
+   bounds-checks against it (buffer.lisp) — so a pooled sample is decoded under byte-identical bounds to
+   the exact-length vector it replaces, and a truncated or hostile payload can never over-read into the
+   previous sample's bytes (NFR-SEC-POSTURE).
+
+   NIL when there is no pool (not yet carved / arena exhausted), when the pool is exhausted, or when PLEN
+   exceeds the carved element size; the caller then allocates as before. Runs on the receiver thread with
+   NO node lock held; the pool lock is a leaf taken only here and in %rx-store-release."
+  (let ((pool (or (disc-node-rx-store-pool node) (%ensure-rx-store-pool node))))
+    (when (and pool (<= plen (disc-node-rx-store-element-bytes node)))
+      (let ((ob (dds.pal:with-lock ((disc-node-rx-store-pool-lock node))
+                  (dds.core.arena:pool-acquire pool))))
+        (when ob
+          (setf (dds.core.buffer:octet-buffer-capacity ob) plen)
+          ob)))))
+
+(defun* %rx-store-release (node ob)
+    (function (disc-node dds.core.buffer:octet-buffer) (values))
+  "ADR 0078: return a pooled store-copy buffer OB to NODE's RX store pool. Called from the SINGLE store-drop
+   choke (%purge-secured-sample) and from the dedup-reject arm of %deliver-user-sample (a sample that was
+   never stored). Zero-alloc.
+
+   Ownership is the store's single-owner discipline: an entry is dropped exactly once, by exactly one owner,
+   under the node lock. The in-use guard is belt-and-braces for that invariant — a release when the pool has
+   nothing checked out could only be a double release, and degrading it to a LEAKED SLOT (bounded; the pool
+   then falls back to allocating) is strictly better than corrupting the pool's free list.
+   Lock order: the pool lock nests INSIDE disc-node-lock (the purge choke calls this holding it)."
+  (let ((pool (disc-node-rx-store-pool node)))
+    (when pool
+      (dds.pal:with-lock ((disc-node-rx-store-pool-lock node))
+        (when (plusp (dds.core.arena:pool-in-use pool))
+          (dds.core.arena:pool-release pool ob)))))
+  (values))
+
 (defun* set-secured-loan-capable (node capable)
     (function (disc-node t) t)
   "WP-DDS-SECURITY-ZEROALLOC-AEAD T5b: mark NODE's secured (data_protection) RECEIVE path LOAN-CAPABLE (CAPABLE
@@ -3878,9 +4014,40 @@
   "Recover the raw RTPS SequenceNumber from a (GUID . SN) composite sample KEY (§8.3.5.4)."
   (cdr key))
 
+(defun* %normalize-stored-sample (stored)
+    (function (t) t)
+  "ADR 0078: present a store entry as the EXACT-LENGTH payload vector node-sample has always returned. A
+   pooled store-copy buffer (an octet-buffer whose CAPACITY is the payload extent, drawn from the RX store
+   pool) is copied out to a fresh exact-length vector; every other entry — a plain vector, a
+   secured-loan-handle, a zc-loan-marker, NIL — passes through untouched.
+
+   WHY A COPY IS THE RIGHT ANSWER HERE. Consumers of this value keep it beyond the entry's lifetime: the
+   durability relay PERSISTS it and re-publishes it. Handing them the pooled buffer would hand them a
+   fixed-size buffer (wrong length written to the store) that the next receive may reuse underneath them.
+   The one HOT consumer, the DCPS drain, does not come through here at all — it takes node-sample-raw and
+   decodes in place — so this copy is off every hot path."
+  (if (typep stored 'dds.core.buffer:octet-buffer)
+      (subseq (dds.core.buffer:octet-buffer-vec stored) 0 (dds.core.buffer:octet-buffer-capacity stored))
+      stored))
+
 (defun* node-sample (node key)
     (function (disc-node cons) t)
-  "The received payload for composite sample KEY (a (GUID . SN) cons, see node-sample-sns), or NIL."
+  "The received payload for composite sample KEY (a (GUID . SN) cons, see node-sample-sns), or NIL.
+   The payload is an EXACT-LENGTH octet vector: a sample copied into an ADR 0078 pooled buffer is copied out
+   here, so this accessor's contract is unchanged by pooling. For the verbatim store entry (the hot DCPS
+   drain, which type-dispatches and decodes in place) use node-sample-raw."
+  (%normalize-stored-sample
+   (dds.pal:with-lock ((disc-node-lock node))
+     (let ((inner (gethash (car key) (disc-node-samples node))))
+       (and inner (gethash (cdr key) inner))))))
+
+(defun* node-sample-raw (node key)
+    (function (disc-node cons) t)
+  "ADR 0078: the VERBATIM store entry for composite sample KEY, or NIL — a plain octet vector, a pooled
+   store-copy octet-buffer (whose CAPACITY is the exact payload extent), a secured-loan-handle, or a
+   zc-loan-marker. For the ONE hot consumer, the DCPS drain, which already type-dispatches the store entry
+   and decodes it in place; it must not pay node-sample's normalising copy. Every other caller wants
+   node-sample."
   (dds.pal:with-lock ((disc-node-lock node))
     (let ((inner (gethash (car key) (disc-node-samples node))))
       (and inner (gethash (cdr key) inner)))))
@@ -3888,10 +4055,12 @@
 (defun* node-sample-by-sn (node sn)
     (function (disc-node integer) t)
   "The payload of ANY received user sample whose RTPS SN equals SN, or NIL. A single-writer convenience
-   (the sample store is keyed by GUID then SN, §8.3.5.4) — for tests/diagnostics that know only the SN."
-  (dds.pal:with-lock ((disc-node-lock node))
-    (loop for inner being the hash-values of (disc-node-samples node)
-          thereis (gethash sn inner))))
+   (the sample store is keyed by GUID then SN, §8.3.5.4) — for tests/diagnostics that know only the SN.
+   Exact-length, on the same terms as node-sample (an ADR 0078 pooled entry is copied out)."
+  (%normalize-stored-sample
+   (dds.pal:with-lock ((disc-node-lock node))
+     (loop for inner being the hash-values of (disc-node-samples node)
+           thereis (gethash sn inner)))))
 
 (defun* node-collect-pending-samples (node pending-p out)
     (function (disc-node function (array t (*))) (array t (*)))

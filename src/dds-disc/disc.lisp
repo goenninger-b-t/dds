@@ -320,6 +320,21 @@
   (secured-loan-count 0 :type fixnum)
   (secured-take-vec nil :type (or null simple-vector))
   (decode-pool-rejects 0 :type (integer 0))
+  ;; ADR 0078 (RX store-copy pool, NFR-MEM): the arena pool the receiver thread draws the per-sample
+  ;; store COPY from — the copy out of the reusable receive datagram buffer into the sample store, the last
+  ;; receive-path allocation that scaled with payload size. Its element is an octet-buffer whose CAPACITY is
+  ;; set to the exact payload extent at acquire, so the stored buffer IS its own bounds check
+  ;; (%deserialize-payload validates against capacity) and a pooled entry is a DISTINCT TYPE that no
+  ;; extent-unaware consumer can misread. RX-STORE-POOL-LOCK serializes acquire/release across the receiver
+  ;; threads and the draining user thread; it nests INSIDE disc-node-lock (lock order: disc-node-lock outer),
+  ;; exactly as decode-pool-lock does. RX-STORE-ELEMENT-BYTES records the carved element size so the acquire
+  ;; can reject an oversize payload without reaching into the pool. All NIL/0 default = no pool yet -> the
+  ;; allocating copy, byte-identical. Carved lazily by %ensure-rx-store-pool; stop-node tears the arena down
+  ;; (the pool OWNS its buffers, so an entry still resident in the store at teardown is freed with it).
+  (rx-store-arena nil :type t)
+  (rx-store-pool nil :type t)
+  (rx-store-pool-lock (dds.pal:make-lock "rx-store-pool") :type t)
+  (rx-store-element-bytes 0 :type fixnum)
   (sample-key-hashes (make-hash-table :test 'equalp) :type hash-table) ; src GUID -> SN -> 16-octet wire key-hash of the :data sample (RTPS 2.5 §9.6.4.8), absent when not captured
   (sample-timestamps (make-hash-table :test 'equalp) :type hash-table) ; S5.T4: src GUID -> SN -> source_timestamp (nanoseconds) from the preceding INFO_TS (RTPS 2.5 §9.4.5.9), absent when the DATA carried none
   (lifecycle-changes (make-hash-table :test 'equalp) :type hash-table) ; 2-level: 16-octet src GUID (equalp) -> SN (eql) -> (kind key-hash status writer-id source-guid) (§8.3.5.4: SN is per-writer; no per-change composite-key alloc)
@@ -2920,6 +2935,9 @@
     (node-return-all-loans node)
     (dds.core.arena:teardown-arena (disc-node-decode-arena node))
     (setf (disc-node-decode-arena node) nil (disc-node-decode-pool node) nil))
+  (when (disc-node-rx-store-arena node)   ; ADR 0078: free the RX store-copy pool's static buffers AFTER every receiver thread is joined (no live acquire). The pool OWNS its buffers, so an entry still resident in the sample store needs no per-entry release — no foreign leak, no sweep
+    (dds.core.arena:teardown-arena (disc-node-rx-store-arena node))
+    (setf (disc-node-rx-store-arena node) nil (disc-node-rx-store-pool node) nil))
   ;; ADR-0034 secret hygiene: zeroize + free the PVMS bootstrap KeyMaterials (KxKey/KxSalt-derived secrets) AFTER the receiver thread is joined (no live PVMS resolver), then clear the table (a post-teardown resolve returns NIL, fail-closed)
   (maphash (lambda (prefix km) (declare (ignore prefix)) (dds.security:zeroize-key-material km))
            (disc-node-pvms-bootstrap-kms node))
