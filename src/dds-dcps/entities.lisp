@@ -158,6 +158,7 @@
    (secured-loans :initform '() :accessor dr-secured-loans) ; WP-DCPS-SECURED-TAKE-LOAN (ADR 0038 (i)): outstanding secured decode-loan handles — SEPARATE registry from dr-loans (the type-clean two-registry discipline); return-loan / reader-close node-return-loan them
    (secured-scratch :initform nil :accessor dr-secured-scratch) ; WP-DCPS-SECURED-TAKE-LOAN: reusable octet-buffer wrapper (repointed per drain) for the in-place [0,len) secured-plaintext deserialize — created once, zero per-sample cons (NFR-MEM)
    (deser-scratch :initform nil :accessor dr-deser-scratch) ; RX-POOLING Phase A (ADR 0073): reusable octet-buffer wrapper repointed at the stored bytes per COPY-path drain, so %deserialize-sample decodes IN PLACE with no per-sample make-octet-buffer / replace / free-static (NFR-MEM)
+   (keyhash-scratch :initform nil :accessor dr-keyhash-scratch) ; RX-POOLING (ADR 0075): reusable :big cursor over a 256-octet buffer for the per-sample instance-handle key serialization — created once, zero per-sample make-octet-buffer/cursor/free-static; single-threaded per reader (the drain runs on the user thread, take is single-threaded-per-reader) (NFR-MEM)
    (status-lock :initform (dds.pal:make-lock "dr-status") :accessor dr-status-lock))
   (:documentation "DDS DataReader: receives typed samples on a Topic into a read/take
    cache with per-instance SampleInfo, carrying its SUBSCRIPTION_MATCHED,
@@ -1663,12 +1664,25 @@
   (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)
   "HANDLE_NIL — the instance handle for an unkeyed type (single instance).")
 
-(defun* %instance-handle (ts sample)
-    (function (t t) (simple-array (unsigned-byte 8) (16)))
+(defun* %instance-handle (ts sample &optional kh-scratch)
+    (function (t t &optional t) (simple-array (unsigned-byte 8) (16)))
   "16-octet instance handle for SAMPLE via the type-support key-hash, or HANDLE_NIL
-   for an unkeyed type."
+   for an unkeyed type. KH-SCRATCH (default NIL): a reusable :big key-serialization cursor the generated
+   key-hash serializes the key in place through (zero per-sample make-octet-buffer/cursor/free-static,
+   RX-POOLING ADR 0075) — sound only on a single-threaded-per-entity caller (the drain). NIL allocates a
+   fresh scratch, byte-identical (every TX / register / unkeyed caller)."
   (let ((kh (dds.types:type-support-key-hash ts)))
-    (if kh (funcall kh sample) +instance-handle-nil+)))
+    (if kh (funcall kh sample kh-scratch) +instance-handle-nil+)))
+
+(defun* %reader-keyhash-scratch (dr)
+    (function (data-reader) t)
+  "DR's reusable :big key-serialization cursor (over a 256-octet buffer), created on first use — the drain's
+   per-sample %instance-handle serializes the key in place through it, so a keyed take allocates no scratch
+   (RX-POOLING, ADR 0075, NFR-MEM). Single-threaded per reader (the drain runs on the user thread; take is
+   single-threaded-per-reader, the same discipline that lets the drain mutate the reader cache unlocked)."
+  (or (dr-keyhash-scratch dr)
+      (setf (dr-keyhash-scratch dr)
+            (dds.core.buffer:cursor (dds.core.buffer:make-octet-buffer 256) :endianness :big))))
 
 (defun* %handle-p (x)
     (function (t) t)
@@ -2612,7 +2626,7 @@
         (when (and (null decode-status)
                    ;; ContentFilteredTopic: drop reader-side a sample failing the filter.
                    (or (null (dr-filter dr)) (funcall (dr-filter dr) data)))
-          (let* ((handle (%instance-handle ts data))
+          (let* ((handle (%instance-handle ts data (%reader-keyhash-scratch dr)))   ; RX-POOLING (ADR 0075): serialize the key in place through the reused per-reader cursor -> zero scratch alloc/sample
                  (reason (%resource-reject-reason dr handle))
                  (verdict (if (and (null reason) (%reader-exclusive-p dr))
                               (%arbitrate-owner dr node key handle)

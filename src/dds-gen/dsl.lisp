@@ -116,6 +116,34 @@
         (setf pos (* (ceiling pos a) a))
         (incf pos (getf m :size))))))
 
+(defun* %key-hash-defun (fn in-type input acc-fn doc keys key-direct-p)
+    (function (symbol t symbol function string list t) list)
+  "Emit (declaim + defun) for a generated 16-octet key-hash / instance-handle function FN (RTPS 2.5 §9.6.4.8):
+   serialize the KEYS from INPUT (accessed via ACC-FN, PLAIN_CDR2/XCDR2 big-endian, origin-0) and copy them into
+   OUT (<=16 direct/zero-padded when KEY-DIRECT-P, else the MD5). Shared by the struct (KEY-HASH-<name>) and the
+   FlatData (KEY-HASH-<name>-FD) emitters (DRY) — they differ only in IN-TYPE, INPUT, and ACC-FN. RX-POOLING
+   (ADR 0075, NFR-MEM): the trailing &optional SER-SCRATCH — a reusable :big cursor over a >=256-octet buffer —
+   lets the caller serialize the key IN PLACE with zero per-call make-octet-buffer/cursor/free-static; NIL (every
+   TX / register / test caller) allocates and frees a fresh scratch, byte-identical. OUT is always freshly
+   allocated (the handle is retained in SampleInfo / the instance table)."
+  `((declaim (ftype (function (,in-type &optional t) (simple-array (unsigned-byte 8) (16))) ,fn))
+    (defun ,fn (,input &optional ser-scratch)
+      ,doc
+      (let* ((out (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0))
+             (fresh (unless ser-scratch (dds.core.buffer:make-octet-buffer 256)))
+             (wc (if ser-scratch
+                     (progn (dds.core.buffer:cursor-reset ser-scratch) ser-scratch)
+                     (dds.core.buffer:cursor fresh :endianness :big))))
+        ,@(loop for m in keys
+                collect `(,(getf m :put) wc (,(funcall acc-fn m) ,input) :xcdr2))
+        (let ((len (dds.core.buffer:cursor-position wc))
+              (vec (dds.core.buffer:octet-buffer-vec (dds.core.buffer:cursor-buffer wc))))
+          ,(if key-direct-p
+               `(replace out vec :end2 len)
+               `(replace out (dds.core.md5:md5 (subseq vec 0 len)))))
+        (when fresh (dds.pal:free-static (dds.core.buffer:octet-buffer-vec fresh)))
+        out))))
+
 ;;;; NOT cleared for ship — pending counsel (R6); see ADR 0015.
 (defun* %flatdata-offsets (parsed)
     (function (list) (values list (integer 0)))
@@ -306,26 +334,15 @@
          (defun ,ssz (sample &optional (mode :xcdr2))
            (,sszi sample 0 mode))
          ,@(when keys
-             `((declaim (ftype (function (,name) (simple-array (unsigned-byte 8) (16))) ,khf))
-               (defun ,khf (sample)
-                 ,(format nil "16-octet DDS keyhash / instance handle (RTPS 2.5 §9.6.4.8, ~
-                   FR-TYPE-5): the @key members in member order, PLAIN_CDR2 (XCDR2) ~
-                   big-endian, no encapsulation/type/member headers, origin-0 (4-aligned). ~
-                   Key holder max serialized size = ~a -> ~a path."
-                          (if (integerp keymax) keymax :unbounded)
-                          (if key-direct-p "<=16 direct/zero-padded" "MD5"))
-                 (let ((buf (dds.core.buffer:make-octet-buffer 256))
-                       (out (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)))
-                   (let ((wc (dds.core.buffer:cursor buf :endianness :big)))
-                     ,@(loop for m in keys
-                             collect `(,(getf m :put) wc (,(acc m) sample) :xcdr2))
-                     (let ((len (dds.core.buffer:cursor-position wc))
-                           (vec (dds.core.buffer:octet-buffer-vec buf)))
-                       ,(if key-direct-p
-                            `(replace out vec :end2 len)
-                            `(replace out (dds.core.md5:md5 (subseq vec 0 len))))))
-                   (dds.pal:free-static (dds.core.buffer:octet-buffer-vec buf))
-                   out))))
+             (%key-hash-defun
+              khf name 'sample #'acc
+              (format nil "16-octet DDS keyhash / instance handle (RTPS 2.5 §9.6.4.8, ~
+                FR-TYPE-5): the @key members in member order, PLAIN_CDR2 (XCDR2) ~
+                big-endian, no encapsulation/type/member headers, origin-0 (4-aligned). ~
+                Key holder max serialized size = ~a -> ~a path."
+                      (if (integerp keymax) keymax :unbounded)
+                      (if key-direct-p "<=16 direct/zero-padded" "MD5"))
+              keys key-direct-p))
          ;;;; NOT cleared for ship — pending counsel (R6); see ADR 0015.
          ,@(when flatp
              (let* ((fd-pad (mod (- 4 (mod fd-body 4)) 4))
@@ -389,32 +406,19 @@
                                        ,(%flatdata-setter-form 'vec base nbytes bool-p 'v))))))))
                  ;;;; NOT cleared for ship — pending counsel (R6); see ADR 0015/0017.
                  ,@(when keys
-                     `((declaim (ftype (function ((or dds.core.buffer:octet-buffer dds.types:flatdata-view))
-                                                 (simple-array (unsigned-byte 8) (16)))
-                                       ,khf-fd))
-                       (defun ,khf-fd (x)
-                         ,(format nil "WP-KEYED-FLATDATA 16-octet DDS keyhash / instance handle (RTPS 2.5 §9.6.4.8, ~
-                           FR-TYPE-5) for a KEYED FlatData type — read directly from the FlatData SAMPLE X (an owned ~
-                           octet-buffer OR a flatdata-view, via the dual-dispatching <name>-<field>-fd accessors), not ~
-                           a struct. The @key members in member order, PLAIN_CDR2 (XCDR2) big-endian, no ~
-                           encapsulation/type/member headers, origin-0 (4-aligned); key holder max serialized size = ~
-                           ~a -> ~a path. Byte-identical to the struct key-hash-<name> for the same key values (the ~
-                           conformance crux: a keyed FlatData instance's identity equals what a non-FlatData peer ~
-                           computes). NOT cleared for ship — pending counsel (R6); see ADR 0015/0017."
-                                  (if (integerp keymax) keymax :unbounded)
-                                  (if key-direct-p "<=16 direct/zero-padded" "MD5"))
-                         (let ((buf (dds.core.buffer:make-octet-buffer 256))
-                               (out (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)))
-                           (let ((wc (dds.core.buffer:cursor buf :endianness :big)))
-                             ,@(loop for m in keys
-                                     collect `(,(getf m :put) wc (,(fd-acc m) x) :xcdr2))
-                             (let ((len (dds.core.buffer:cursor-position wc))
-                                   (vec (dds.core.buffer:octet-buffer-vec buf)))
-                               ,(if key-direct-p
-                                    `(replace out vec :end2 len)
-                                    `(replace out (dds.core.md5:md5 (subseq vec 0 len))))))
-                           (dds.pal:free-static (dds.core.buffer:octet-buffer-vec buf))
-                           out))))
+                     (%key-hash-defun
+                      khf-fd '(or dds.core.buffer:octet-buffer dds.types:flatdata-view) 'x #'fd-acc
+                      (format nil "WP-KEYED-FLATDATA 16-octet DDS keyhash / instance handle (RTPS 2.5 §9.6.4.8, ~
+                        FR-TYPE-5) for a KEYED FlatData type — read directly from the FlatData SAMPLE X (an owned ~
+                        octet-buffer OR a flatdata-view, via the dual-dispatching <name>-<field>-fd accessors), not ~
+                        a struct. The @key members in member order, PLAIN_CDR2 (XCDR2) big-endian, no ~
+                        encapsulation/type/member headers, origin-0 (4-aligned); key holder max serialized size = ~
+                        ~a -> ~a path. Byte-identical to the struct key-hash-<name> for the same key values (the ~
+                        conformance crux: a keyed FlatData instance's identity equals what a non-FlatData peer ~
+                        computes). NOT cleared for ship — pending counsel (R6); see ADR 0015/0017."
+                              (if (integerp keymax) keymax :unbounded)
+                              (if key-direct-p "<=16 direct/zero-padded" "MD5"))
+                      keys key-direct-p))
                  (declaim (ftype (function () dds.core.buffer:octet-buffer) ,fd-ctor))
                  (defun ,fd-ctor ()
                    ,(format nil "WP-FLATDATA constructor: allocate a ~a-octet foreign octet-buffer (the sample IS ~
