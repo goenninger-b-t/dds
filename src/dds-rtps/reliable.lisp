@@ -222,13 +222,9 @@
    pin hold is released (once) by hc-try-release-pinned at the change-removal choke (ADR 0044 §4)."
   (let ((change nil))
     (values (%writer-add-bounded
-             writer (lambda (sn) (setf change (dds.rtps.history:make-cache-change
-                                               :sn sn :serialized-payload payload :instance-key-hash key-hash
-                                               :inline-qos inline-qos
-                                               :pooled-buffer pooled-buffer :pooled-len pooled-len
-                                               :zc-slot (or zc-slot -1) :zc-generation zc-gen
-                                               :zc-state (and zc-slot :armed)
-                                               :zc-pinned (and zc-pinned t) :zc-len zc-len))))
+             writer (lambda (sn) (setf change (dds.rtps.history:hc-data-change   ; TASK-3 (ADR 0077): draw+fill from the writer's change-freelist (zero per-sample struct alloc once warm), else fresh
+                                               (rtps-writer-hc writer) sn payload key-hash inline-qos
+                                               pooled-buffer pooled-len zc-slot zc-gen zc-pinned zc-len))))
             change)))
 
 (defun* writer-zc-claim (writer change)
@@ -271,10 +267,9 @@
    like any DATA. For a writer with no finite max_samples this never blocks and never returns
    :timeout (byte-identical to before)."
   (%writer-add-bounded
-   writer (lambda (sn) (dds.rtps.history:make-cache-change
-                        :sn sn :kind (dds.rtps.message:status-info->kind status-flags)
-                        :instance-key-hash key-hash :status-info status-flags
-                        :inline-qos inline-qos :source-timestamp source-timestamp))))   ; S5.T4: INFO_TS on dispose/unregister_w_timestamp
+   writer (lambda (sn) (dds.rtps.history:hc-lifecycle-change   ; TASK-3 (ADR 0077): draw+fill from the writer's change-freelist, else fresh
+                        (rtps-writer-hc writer) sn (dds.rtps.message:status-info->kind status-flags)
+                        key-hash status-flags inline-qos source-timestamp))))   ; S5.T4: INFO_TS on dispose/unregister_w_timestamp
 
 (defun* writer-heartbeat (writer)
     (function (rtps-writer) (values integer integer integer))
@@ -389,6 +384,7 @@
       (setf (dds.rtps.history:cache-change-send-refcount change) (if (plusp rc) (1- rc) 0))
       (dds.rtps.history:hc-try-release-pooled (rtps-writer-hc writer) change)   ; deferred pool-release on the last ref drop of an evicted pooled change (T5a)
       (dds.rtps.history:hc-try-release-pinned (rtps-writer-hc writer) change)   ; deferred pin-release on the last ref drop of an evicted pinned change (ADR 0044 I1)
+      (dds.rtps.history:hc-try-recycle-change (rtps-writer-hc writer) change)   ; TASK-3 (ADR 0077): deferred struct-recycle on the last ref drop of an evicted change
       (dds.rtps.history:cache-change-send-refcount change))))
 
 (defun* writer-release-change-refs (writer changes)
@@ -405,7 +401,8 @@
         (let ((rc (dds.rtps.history:cache-change-send-refcount ch)))
           (setf (dds.rtps.history:cache-change-send-refcount ch) (if (plusp rc) (1- rc) 0)))
         (dds.rtps.history:hc-try-release-pooled hc ch)   ; deferred pool-release on the last ref drop of an evicted pooled change (T5a)
-        (dds.rtps.history:hc-try-release-pinned hc ch)))))   ; deferred pin-release on the last ref drop of an evicted pinned change (ADR 0044 I1)
+        (dds.rtps.history:hc-try-release-pinned hc ch)   ; deferred pin-release on the last ref drop of an evicted pinned change (ADR 0044 I1)
+        (dds.rtps.history:hc-try-recycle-change hc ch)))))   ; TASK-3 (ADR 0077): deferred struct-recycle on the last ref drop of an evicted change
 
 (defun* writer-acquire-payload-buffer (writer)
     (function (rtps-writer) t)

@@ -1,16 +1,17 @@
 # NFR-MEM allocation ratchet (ADR 0062). One ceiling PER ARCHITECTURE, in bytes/sample.
 #
 # SBCL's per-sample allocation differs materially by arch — measured, not assumed:
-#   arm64   1922-2009      (2026-07-21: + RX-pooling: %deserialize-sample copy scratch (ADR 0073), the drain's
-#                            %instance-handle key-serialization scratch (ADR 0075) AND its 16-octet result via a
-#                            reused out-scratch + the instance-rec's STABLE handle (ADR 0076, known-instance take
-#                            key-hash = 0 alloc); floor 2118 -> 1922, cumulative ~-1638 from 3560,
-#                            ADR 0062/0065-0068/0072/0073/0075/0076)
-#   x86_64  2083 B/sample   (2026-07-21, read off CI: + RX-pooling deser-scratch (ADR 0073) + %instance-handle
-#                            key-serialization scratch (ADR 0075); floor 2388 -> 2083, still ~5% above arm64. The
-#                            same divergence made the FlatData vtable-vs-classic guard flip, and it is
-#                            why a single shared ceiling cannot work: at the x86_64 number the arm64
-#                            ratchet would never bite, and at the arm64 number x86_64 is permanently red.)
+#   arm64   1813-1857      (2026-07-21: + TASK-3 the cache-change STRUCT pool — an evicted, send-ref-free,
+#                            non-ZC/pooled/pinned change is recycled to the HistoryCache change-freelist and
+#                            reused by the next write (ADR 0077, ~-109 B); prior RX-pooling ADR 0073/0075/0076;
+#                            floor 2118 -> 1813, cumulative ~-1747 from 3560,
+#                            ADR 0062/0065-0068/0072/0073/0075/0076/0077)
+#   x86_64  ~1951 (est)     (2026-07-21: was 2083 read off CI at ADR 0076; the TASK-3 struct pool (ADR 0077)
+#                            drops it ~109 like arm64 -> est ~1951. NOT measured here (dev box is arm64); the
+#                            2090 ceiling is set ROBUSTLY-SAFE for a floor anywhere in [1910,2010] (above
+#                            max-floor+strays, below min-floor/0.9) so CI neither ratchet-demands nor regresses.
+#                            Tighten to CI's actual number on the next slice. The same divergence made the
+#                            FlatData vtable-vs-classic guard flip, and is why a single shared ceiling cannot work.)
 #
 # The ratchet only moves DOWN. Lower a row when you bank a win on THAT arch (gate-mem tells you).
 #
@@ -19,5 +20,5 @@
 # IMPROVEMENT in CI, which is red until someone reads the CI number and lowers that row too. This is not
 # hypothetical: CI was red from the 5th TX slice for exactly this reason. AFTER a win, check the CI
 # gate-mem number and lower the OTHER arch's row in the same or an immediate follow-up commit.
-arm64  2060
-x86_64 2180
+arm64  1900
+x86_64 2090

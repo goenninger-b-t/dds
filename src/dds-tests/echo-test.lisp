@@ -3853,6 +3853,7 @@
                  ("hc-remove-change-consistency" . run-hc-remove-change-consistency-test)
                  ("rtps-reliable-delivery"   . run-reliability-test)
                  ("cache-change-send-refcount" . run-cache-change-send-refcount-test)
+                 ("cache-change-recycle" . run-cache-change-recycle-test)
                  ("secured-encode-pool-balance" . run-secured-encode-pool-balance-test)
                  ("rtps-writer-pushonce"     . run-writer-pushonce-test)
                  ("rtps-history-purge"       . run-history-purge-test)

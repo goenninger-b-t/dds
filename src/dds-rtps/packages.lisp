@@ -24,6 +24,7 @@
            #:history-cache #:make-history-cache #:hc-change-count #:hc-kind #:hc-max-samples #:hc-depth
            #:history-cache-payload-pool #:hc-try-release-pooled
            #:history-cache-zc-release-fn #:hc-try-release-pinned
+           #:hc-data-change #:hc-lifecycle-change #:hc-try-recycle-change
            #:hc-add-change #:hc-remove-change #:hc-purge-below #:hc-get-change
            #:hc-min-seq #:hc-max-seq #:hc-changes-for-reader #:hc-changes-from
            #:history-not-implemented))

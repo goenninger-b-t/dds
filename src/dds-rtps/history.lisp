@@ -122,7 +122,8 @@
   (min-seq 0 :type fixnum)          ; 0 = empty (a valid SN is >= 1, RTPS 2.5 §8.3.5.4)
   (max-seq 0 :type fixnum)
   (payload-pool nil :type (or null dds.core.arena:buffer-pool))                   ; T5a: data_protection secured-payload pool (NIL = no pooling, byte-identical); buffers acquired+released ONLY under the owning writer's lock
-  (zc-release-fn nil :type (or null function)))                                   ; WP-ACKED-SLOT-PINNING (ADR 0044): opaque (lambda (slot generation)) the disc layer installs to %zc-release a pinned change's TX slot at the change-removal choke; NIL = no pinning (layering: history must not depend on dds.xport.zerocopy, so the release is a funcall'd closure, mirroring payload-pool)
+  (zc-release-fn nil :type (or null function))                                    ; WP-ACKED-SLOT-PINNING (ADR 0044): opaque (lambda (slot generation)) the disc layer installs to %zc-release a pinned change's TX slot at the change-removal choke; NIL = no pinning (layering: history must not depend on dds.xport.zerocopy, so the release is a funcall'd closure, mirroring payload-pool)
+  (change-freelist '() :type list))                                               ; TASK-3 (ADR 0077): recycled cache-change STRUCTS (non-ZC / non-pooled / non-pinned only), drawn by hc-data-change/-lifecycle-change and returned by hc-try-recycle-change at the release gate (evicted + send-refcount 0) — zero per-sample struct alloc on the common write path once warm; mutated ONLY under the owning writer's lock (NFR-MEM)
 
 (defun* %resolve-max-samples (resource-limits)
     (function (t) t)
@@ -259,6 +260,109 @@
              (cache-change-zc-slot change) (cache-change-zc-generation change)))
   t)
 
+(defun* %reset-cache-change (c)
+    (function (cache-change) cache-change)
+  "Reset EVERY slot of C to its make-cache-change default, so a recycled struct (hc-take-change) is
+   indistinguishable from a fresh one before the fill-helper sets the sample's slots (TASK-3, ADR 0077). This
+   MUST list all 17 slots — a missed slot would carry stale state (e.g. a stale EVICTED, ZC-SLOT, or
+   SEND-REFCOUNT) into the next change and corrupt it. Kept adjacent to the defstruct so the two stay in sync."
+  (setf (cache-change-kind c) :data
+        (cache-change-writer-guid c) nil
+        (cache-change-sn c) 0
+        (cache-change-instance-key-hash c) nil
+        (cache-change-serialized-payload c) nil
+        (cache-change-status-info c) 0
+        (cache-change-source-timestamp c) 0
+        (cache-change-inline-qos c) nil
+        (cache-change-send-refcount c) 0
+        (cache-change-pooled-buffer c) nil
+        (cache-change-pooled-len c) nil
+        (cache-change-evicted c) nil
+        (cache-change-zc-slot c) -1
+        (cache-change-zc-generation c) 0
+        (cache-change-zc-state c) nil
+        (cache-change-zc-pinned c) nil
+        (cache-change-zc-len c) nil)
+  c)
+
+(defun* hc-take-change (hc)
+    (function (history-cache) cache-change)
+  "A cache-change to fill for a new sample: pop one from HC's change-freelist and reset it to defaults if any,
+   else allocate fresh (TASK-3, ADR 0077 — zero per-sample struct alloc once the freelist warms). The
+   fill-helper (hc-data-change / hc-lifecycle-change) then sets the sample's slots. MUST run under the owning
+   writer's lock (the freelist is writer-owned)."
+  (let ((c (pop (history-cache-change-freelist hc))))
+    (if c (%reset-cache-change c) (make-cache-change))))
+
+(defparameter *hc-change-freelist-cap* 64
+  "Upper bound on a HistoryCache's recycled cache-change freelist (TASK-3, ADR 0077): a change due for recycle
+   past the cap is left to the GC rather than pooled, so a burst (a deep KEEP_ALL backlog draining at once)
+   cannot grow the freelist without bound. 64 comfortably covers KEEP_LAST + a typical KEEP_ALL working set;
+   pinned to no spec constant (a local pooling policy).")
+
+(defun* hc-try-recycle-change (hc change)
+    (function (history-cache cache-change) t)
+  "Return CHANGE to HC's change-freelist for reuse iff the recycle is DUE — the struct-pool sibling of
+   hc-try-release-pooled/-pinned (TASK-3, ADR 0077, NFR-MEM), called from the SAME two triggers (the eviction
+   choke %hc-remove-change and the last send-ref drop writer-release-change-ref/-refs). Recycled ONLY when ALL
+   hold: CHANGE is EVICTED, has NO outstanding send-ref (releasable-p, SEND-REFCOUNT 0), is NOT ZC-armed /
+   pooled / pinned (a ZC-armed change is ALSO held by the disc leak-sweep, a pooled change by its payload-pool,
+   a pinned change by its slot — references BEYOND send-refcount, so those keep allocating), and the freelist is
+   below its cap. Clears EVICTED on push so a second call from the other trigger is a validated no-op (the
+   struct is now freelist-owned; hc-take-change resets it fully before reuse). MUST run under the owning
+   writer's lock (the same lock EVICTED + SEND-REFCOUNT + the freelist are mutated under). No allocation."
+  (when (and (cache-change-evicted change)
+             (cache-change-releasable-p change)
+             (< (cache-change-zc-slot change) 0)          ; not ZC-armed (no disc leak-sweep retention)
+             (null (cache-change-pooled-buffer change))   ; not payload-pooled
+             (not (cache-change-zc-pinned change))        ; not slot-pinned
+             (< (length (history-cache-change-freelist hc)) *hc-change-freelist-cap*))
+    (setf (cache-change-evicted change) nil)              ; idempotency: freelist-owned now -> the gate cannot re-fire
+    (push change (history-cache-change-freelist hc)))
+  t)
+
+(defun* hc-data-change (hc sn payload key-hash inline-qos pooled-buffer pooled-len zc-slot zc-gen zc-pinned zc-len)
+    (function (history-cache (integer 0) (or null (array (unsigned-byte 8) (*)))
+              (or null (array (unsigned-byte 8) (*))) (or null (simple-array (unsigned-byte 8) (*)))
+              (or null dds.core.buffer:octet-buffer) (or null (integer 0)) (or null (integer 0))
+              (unsigned-byte 32) t (or null (integer 0)))
+              cache-change)
+  "A filled :data cache-change (SN + PAYLOAD + key/qos/pool/ZC slots), drawn from HC's change-freelist when one
+   is available (TASK-3, ADR 0077 — zero per-sample struct alloc on the common write path), else fresh. Because
+   hc-take-change fully resets a recycled struct, the result is byte-for-byte identical to the make-cache-change
+   this replaced (KIND :data, writer-guid/status-info/source-timestamp at their defaults). MUST run under the
+   owning writer's lock."
+  (let ((c (hc-take-change hc)))
+    (setf (cache-change-sn c) sn
+          (cache-change-serialized-payload c) payload
+          (cache-change-instance-key-hash c) key-hash
+          (cache-change-inline-qos c) inline-qos
+          (cache-change-pooled-buffer c) pooled-buffer
+          (cache-change-pooled-len c) pooled-len
+          (cache-change-zc-slot c) (or zc-slot -1)
+          (cache-change-zc-generation c) zc-gen
+          (cache-change-zc-state c) (and zc-slot :armed)
+          (cache-change-zc-pinned c) (and zc-pinned t)
+          (cache-change-zc-len c) zc-len)
+    c))
+
+(defun* hc-lifecycle-change (hc sn kind key-hash status-info inline-qos source-timestamp)
+    (function (history-cache (integer 0) (member :data :dispose :unregister)
+              (simple-array (unsigned-byte 8) (*)) (unsigned-byte 8)
+              (or null (simple-array (unsigned-byte 8) (*))) integer)
+              cache-change)
+  "A filled dispose/unregister cache-change (no serializedPayload — the instance is identified by KEY-HASH),
+   drawn from HC's change-freelist when available (TASK-3, ADR 0077), else fresh. Byte-for-byte identical to the
+   make-cache-change it replaced. MUST run under the owning writer's lock."
+  (let ((c (hc-take-change hc)))
+    (setf (cache-change-sn c) sn
+          (cache-change-kind c) kind
+          (cache-change-instance-key-hash c) key-hash
+          (cache-change-status-info c) status-info
+          (cache-change-inline-qos c) inline-qos
+          (cache-change-source-timestamp c) source-timestamp)
+    c))
+
 (declaim (ftype (function (history-cache fixnum) t) %hc-extent-dropped))   ; defined below; the removal choke maintains the O(1) SN extent
 
 (defun* %hc-remove-change (hc seqnum)
@@ -279,6 +383,7 @@
       (setf (cache-change-evicted change) t)   ; gate the (possibly deferred) pooled-buffer release
       (hc-try-release-pooled hc change)         ; release NOW if releasable, else defer to the last send-ref drop (T5a)
       (hc-try-release-pinned hc change)         ; WP-ACKED-SLOT-PINNING: release the TX pin hold on a pinned change (one-shot, ADR 0044)
+      (hc-try-recycle-change hc change)         ; TASK-3 (ADR 0077): recycle the struct NOW if releasable, else defer to the last send-ref drop
       t)))
 
 (defun* hc-remove-change (hc seqnum)

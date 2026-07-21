@@ -702,6 +702,48 @@
                 "once the in-flight retransmit drops its ref, the evicted change is releasable (pool-release fires)"))))
   t)
 
+(defun* run-cache-change-recycle-test ()
+    (function () t)
+  "Test (TASK-3, ADR 0077): the cache-change STRUCT recycle rides the SAME send-refcount+evicted gate as the
+   pooled-buffer release. An evicted, send-ref-FREE, non-ZC/pooled/pinned change is returned to the
+   HistoryCache change-freelist and REUSED (eq) — fully reset — by the next write; but a change EVICTED while
+   still send-referenced is NOT recycled until the last ref drops (else a retransmit would read a reused struct)."
+  (let* ((writer (dds.rtps.reliable:make-rtps-writer
+                  :hc (dds.rtps.history:make-history-cache :keep-all 8 nil nil)))
+         (hc (dds.rtps.reliable:rtps-writer-hc writer))
+         (rid 3))
+    ;; -- reuse: an evicted, unreferenced change recycles and the next write reuses it (eq), fully reset --
+    (dds.rtps.reliable:writer-lifecycle-change writer (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xab) 2)   ; a :dispose change (status-info 2) so a stale-slot leak would show
+    (let ((ch1 (dds.rtps.history:hc-get-change hc 1)))
+      (dds.rtps.history:hc-remove-change hc 1)   ; evict, send-refcount 0 -> recycle NOW
+      (%check :recy-freelisted
+              (and (member ch1 (dds.rtps.history::history-cache-change-freelist hc)) t)
+              "an evicted, send-ref-free change is on the change-freelist")
+      (dds.rtps.reliable:writer-write writer (octets 2 2 2 2))   ; :data write should draw ch1 from the freelist
+      (let ((ch2 (dds.rtps.history:hc-get-change hc 2)))
+        (%check :recy-reused-eq (eq ch1 ch2) "the next write REUSES the recycled struct (eq), no fresh alloc")
+        (%check :recy-reset
+                (and (= 2 (dds.rtps.history:cache-change-sn ch2))
+                     (eq :data (dds.rtps.history:cache-change-kind ch2))   ; was :dispose in its prior life
+                     (zerop (dds.rtps.history:cache-change-status-info ch2))   ; was 2 in its prior life
+                     (null (dds.rtps.history:cache-change-evicted ch2))
+                     (zerop (dds.rtps.history:cache-change-send-refcount ch2)))
+                "the reused struct is FULLY reset (SN 2, kind :data, status 0, evicted NIL, refcount 0)")
+        ;; -- safety: a change EVICTED while send-referenced is NOT recycled until the ref drops --
+        (let ((captured (dds.rtps.reliable:writer-capture-unsent writer (list rid))))
+          (%check :recy-captured-held
+                  (not (dds.rtps.history:cache-change-releasable-p ch2))
+                  "capture holds a send-ref on the change (refcount 1)")
+          (dds.rtps.history:hc-remove-change hc 2)   ; evict WHILE send-referenced
+          (%check :recy-deferred-not-freelisted
+                  (not (member ch2 (dds.rtps.history::history-cache-change-freelist hc)))
+                  "a change evicted while send-referenced is NOT recycled (deferred, so a retransmit is safe)")
+          (dds.rtps.reliable:writer-release-change-refs writer captured)   ; last ref drops -> recycle now
+          (%check :recy-deferred-then-freelisted
+                  (and (member ch2 (dds.rtps.history::history-cache-change-freelist hc)) t)
+                  "on the last send-ref drop, the evicted change is finally recycled")))))
+  t)
+
 (defun* run-secured-encode-pool-balance-test ()
     (function () t)
   "Test (WP-DDS-SECURITY-ZEROALLOC-AEAD T5a): the encode payload pool + the refcount-gated DEFERRED pool-release.
