@@ -2672,48 +2672,45 @@
          ;; the sole reader drains every stored sample, exactly as before). A NULL source GUID (never produced for a
          ;; real stored data sample — %deliver-user-sample always records it) is NOT attributable at N>=2, so it is
          ;; filtered out (fail-closed against a cross-topic leak); at N<=1 it passes (unchanged).
-         (multi (> (dds.disc:node-user-reader-count node) 1))
-         ;; WP-PERF: walk the store ONCE deciding pendingness from (GUID, SN) directly — no key is consed for a
-         ;; sample this reader will not take. Previously every stored sample got a fresh key cons (plus a
-         ;; remove-if-not list, a mapcar of 3-cons triples, and for lifecycle a SET-DIFFERENCE with an EQUALP
-         ;; test over BOTH lists) on EVERY take-samples: O(STORED) allocation to deliver O(PENDING) samples,
-         ;; normally one. The scratch vectors are reader-owned and reused, so the steady-state drain conses
-         ;; only the keys it actually delivers.
-         ;; NB the -UNLOCKED accessors: these predicates run INSIDE the node lock (node-collect-pending-*), and it
-         ;; is a non-recursive mutex — the public lock-taking accessors would self-deadlock the drain.
-         (data-keys (dds.disc:node-collect-pending-samples
-                     node
-                     (lambda (g sn)
-                       (and (or (not multi) (dds.disc:node-reader-matches-writer-p-unlocked node rid g))
-                            ;; WP-N-ENDPOINT-2C3 (ADR 0048/0017; MEMORY-SAFETY): gate on max(per-writer dr-drained,
-                            ;; the ZC-joiner match-time high-water) so a mid-stream ZC joiner NEVER drains a marker
-                            ;; delivered before it joined (its %zc-release would underflow the refcount = a
-                            ;; cross-reader UAF). The watermark is 0 for the first reader / non-loan nodes.
-                            (> sn (max (gethash g (dr-drained dr) 0)
-                                       (dds.disc:node-reader-join-watermark-unlocked node rid g)))))
-                     (dr-drain-data-keys dr)))
-         (life-keys (dds.disc:node-collect-pending-lifecycle
-                     node
-                     (lambda (g sn)
-                       (and (or (not multi) (dds.disc:node-reader-matches-writer-p-unlocked node rid g))
-                            ;; Was a SET-DIFFERENCE of two freshly-consed lists under EQUALP; comparing the
-                            ;; (GUID, SN) pair against the drained list in place conses nothing per candidate.
-                            (not (loop for k in (dr-lifecycle-drained dr)
-                                       thereis (and (eql (cdr k) sn) (equalp (car k) g))))))
-                     (dr-drain-life-keys dr)))
-         ;; Order by raw RTPS SN (§8.3.5.4: SN is per-writer) so a dispose/revive from one writer still lands in
-         ;; §2.2.2.5 SN order. Merged into the reader's REUSED plan vector and sorted in place — no nconc, no
-         ;; mapcar, no fresh triples.
-         (plan (let ((v (dr-drain-plan dr)))
-                 (setf (fill-pointer v) 0)
-                 (loop for k across data-keys do (vector-push-extend (cons :data k) v))
-                 (loop for k across life-keys do (vector-push-extend (cons :lifecycle k) v))
-                 (sort v #'< :key (lambda (e) (dds.disc:node-sample-key-sn (cdr e)))))))
-    (loop for entry across plan
-          do (ecase (car entry)
-               (:data (%drain-one-sample dr node ts (cdr entry)))
-               (:lifecycle (%drain-one-lifecycle dr node (cdr entry)))))
-    t))
+         (multi (> (dds.disc:node-user-reader-count node) 1)))
+    ;; WP-PERF (NFR-MEM, ADR 0072): the two pending-p predicates are a NAMED flet + dynamic-extent, NOT fresh
+    ;; per-call lambdas. They are DOWNWARD FUNARGS — node-collect-pending-* funcalls them per candidate UNDER the
+    ;; node lock and never stores them — so SBCL stack-allocates each instead of consing a capturing closure
+    ;; (over multi/node/rid/dr) every drain. %drain runs on EVERY take/read/samples-available (empty polls
+    ;; included), so this is a per-CALL win, not per-delivered-sample; it also removes the dominant run-to-run
+    ;; variance in the mem-per-sample poll loop (the empty-poll count varied and each drain consed these two).
+    ;; NB the -UNLOCKED accessors: the predicates run INSIDE the node lock (node-collect-pending-*), and it is a
+    ;; non-recursive mutex — the public lock-taking accessors would self-deadlock the drain.
+    (flet ((%data-pending-p (g sn)
+             (and (or (not multi) (dds.disc:node-reader-matches-writer-p-unlocked node rid g))
+                  ;; WP-N-ENDPOINT-2C3 (ADR 0048/0017; MEMORY-SAFETY): gate on max(per-writer dr-drained, the
+                  ;; ZC-joiner match-time high-water) so a mid-stream ZC joiner NEVER drains a marker delivered
+                  ;; before it joined (its %zc-release would underflow the refcount = a cross-reader UAF).
+                  (> sn (max (gethash g (dr-drained dr) 0)
+                             (dds.disc:node-reader-join-watermark-unlocked node rid g)))))
+           (%life-pending-p (g sn)
+             (and (or (not multi) (dds.disc:node-reader-matches-writer-p-unlocked node rid g))
+                  ;; comparing the (GUID, SN) pair against the drained list in place conses nothing per candidate.
+                  (not (loop for k in (dr-lifecycle-drained dr)
+                             thereis (and (eql (cdr k) sn) (equalp (car k) g)))))))
+      (declare (dynamic-extent #'%data-pending-p #'%life-pending-p))
+      ;; WP-PERF: walk the store ONCE deciding pendingness from (GUID, SN) directly — no key is consed for a
+      ;; sample this reader will not take. The scratch vectors are reader-owned + reused, so the steady-state
+      ;; drain conses only the keys it actually delivers.
+      (let* ((data-keys (dds.disc:node-collect-pending-samples node #'%data-pending-p (dr-drain-data-keys dr)))
+             (life-keys (dds.disc:node-collect-pending-lifecycle node #'%life-pending-p (dr-drain-life-keys dr)))
+             ;; Order by raw RTPS SN (§8.3.5.4: SN is per-writer) so a dispose/revive from one writer still lands
+             ;; in §2.2.2.5 SN order. Merged into the reader's REUSED plan vector and sorted in place.
+             (plan (let ((v (dr-drain-plan dr)))
+                     (setf (fill-pointer v) 0)
+                     (loop for k across data-keys do (vector-push-extend (cons :data k) v))
+                     (loop for k across life-keys do (vector-push-extend (cons :lifecycle k) v))
+                     (sort v #'< :key (lambda (e) (dds.disc:node-sample-key-sn (cdr e)))))))
+        (loop for entry across plan
+              do (ecase (car entry)
+                   (:data (%drain-one-sample dr node ts (cdr entry)))
+                   (:lifecycle (%drain-one-lifecycle dr node (cdr entry)))))
+        t))))
 
 (defun* %where-any (sample)
     (function (t) (eql t))
