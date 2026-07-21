@@ -261,9 +261,11 @@
    Across a whole session, where the box's own state drifts, 60000 holds to about 3 B (observed 1847.9 /
    1850.0 / 1850.9 on identical code) — so size a CEILING from the session-scale number, not the batch one.
    60000 costs about 18 s and makes the instrument sharp enough to size any win this project still has left.
-   Lowering it re-blunts the gate; raising it further changes the absolute number slightly (the workload is
-   not perfectly scale-free: 3000 -> 30000 -> 60000 reads 1857 -> 1854 -> 1849 on identical code), so a
-   change to SAMPLES is a RE-BASELINE of bench/mem-ceiling.txt for BOTH architectures, not a free knob."
+   Lowering it re-blunts the gate. Changing SAMPLES at all is a RE-BASELINE of bench/mem-ceiling.txt for BOTH
+   architectures, not a free knob: the absolute number moves with the workload, and how much of that move is
+   real scale-dependence rather than the old readings' unknown quanta is NOT established — measured 0-quantum
+   floors move ~+57 B on arm64 and ~-9 B on x86_64 across 3000 -> 60000, not even in the same direction. Treat
+   any pre-60000 number as non-comparable, and never derive one arch's ceiling from the other's."
   (let* ((ts (dds.types:find-type-support "perf-data"))
          (pw (dds.dcps:create-participant :domain domain :autonomous t :advertise-address "127.0.0.1"))
          (pr (dds.dcps:create-participant :domain domain :autonomous t :advertise-address "127.0.0.1")))
