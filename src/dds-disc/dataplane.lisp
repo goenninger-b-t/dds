@@ -3415,13 +3415,15 @@
                   (dolist (rr routes)
                     (let ((cnt (incf (disc-node-ack-count node))))
                       (dolist (pd (%match-destinations-prefixed node nil))   ; ACKNACK -> matched writers; T10 wraps a :keyed dest
-                        (%send-msg-buf node (disc-node-rx-tx-msg node)
-                                       (lambda (mc)
-                                         ;; writerEntityId = the REMOTE writer's id (WID), so the peer
-                                         ;; routes the ACKNACK to its writer (not our local convention).
-                                         (dds.rtps.message:write-acknack
-                                          mc (car rr) wid base numbits bitmap cnt :final t))
-                                       (cadr pd) (cddr pd) (car pd)))))))))))))
+                        ;; flet + dynamic-extent (ADR 0072): %send-msg-buf funcalls the builder and never stores it
+                        ;; (a downward funarg), so this stack-allocates instead of consing a closure per ACKNACK send.
+                        (flet ((%build-acknack (mc)
+                                 ;; writerEntityId = the REMOTE writer's id (WID), so the peer routes the
+                                 ;; ACKNACK to its writer (not our local convention).
+                                 (dds.rtps.message:write-acknack mc (car rr) wid base numbits bitmap cnt :final t)))
+                          (declare (dynamic-extent #'%build-acknack))
+                          (%send-msg-buf node (disc-node-rx-tx-msg node) #'%build-acknack
+                                         (cadr pd) (cddr pd) (car pd))))))))))))))
   t)
 
 (defun* %on-user-gap (node c flags src-prefix)

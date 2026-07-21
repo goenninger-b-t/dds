@@ -60,8 +60,19 @@ the `-UNLOCKED`-accessor deadlock discipline, and the drain semantics are unchan
   `mem` / `fuzz` all green. The paren restructure (a `let*` split into `let*` + `flet` + `let*`) was checked
   with the string/comment-aware paren checker before building.
 
+## Follow-up (same commit series) — the periodic-HEARTBEAT residual, closed
+
+`%on-user-heartbeat`'s ACKNACK builder was a fresh capturing closure (`lambda`) per send, passed to
+`%send-msg-buf` (a downward funarg). Same fix: `flet` + `dynamic-extent` inside the send loop (it captures
+the per-iteration `rr`/`cnt` and the invariant `wid`/`base`/`numbits`/`bitmap`, all in scope). This fires
+~once per sample (the per-sample HEARTBEAT's ACKNACK) **and** on each periodic HEARTBEAT, so it was the
+bimodal residual: **`gate-mem` variance 110 B → ~22 B** (measured 2118–2140), and a ~50 B mean drop
+(~2180 → ~2130). arm64 ceiling 2280 → **2160**. The harness is now ~5× tighter — enough to confirm the
+larger RX-pooling / cache-change wins ahead. 573/573 both impls; all gates + fuzz green.
+
 ## Not addressed
 
-The ~65 B periodic-HEARTBEAT residual (`%on-user-heartbeat`'s ACKNACK builder closure + `reader-acknack`'s
-fresh bitmap) — the next harness-hardening step, same `dynamic-extent` pattern but with per-iteration
-loop-variable capture. And the x86_64 ceiling is lowered from its CI number in the usual follow-up.
+A ~22 B bimodal residual remains (an extra HEARTBEAT still costs `reader-acknack`'s fresh bitmap +
+`%send-msg-buf`'s cursor — the cursor does not stack-allocate via caller `dynamic-extent`, and the bitmap
+needs a per-reader scratch). Small enough for the wins ahead; revisit only if a future slice lands below
+it. The x86_64 ceiling is lowered from its CI number in the usual follow-up.
