@@ -155,6 +155,31 @@ invited the conclusion that A produced and B consumed. It does not: both blocks 
 tracks B at a constant +64 in every position and +1 in every counter at all times. That constant offset
 between the two blocks is observed and **remains unexplained**.
 
+**Shrinking the ring through QoS (`interop/connext/shmem-layout/ring-wrap.sh`) added three results and one
+useful failure.**
+
+- **`0x50 = 176 + 8 * received_message_count_max` — predicted, then confirmed.** With
+  `received_message_count_max` = 8 the value 240 was predicted before the run and 240 was observed (it was
+  688 at the default 64). A relationship that predicts correctly is worth more than one fitted to two points.
+- **The counter at *B*+`0x1c` WRAPS — it is an index, not a running total.** At `count_max` = 8 it cycled
+  0,1,…,8,0,1,… At the default 64 it had only reached ~21 during observation and merely looked monotonic.
+  This corroborates the 8-byte-per-entry descriptor table of `received_message_count_max` entries at 176,
+  and **corrects the "producer message count" wording in the table above**: it advances by one per message
+  and wraps at `count_max`.
+- **Segment size fits `receive_buffer_size + message_size_max + align8(240 + 15 * count)`** across all three
+  measured configurations: (1048576, 65536, 64) → 1115312 exactly; (2048, 2048, 8) → 4456 exactly;
+  (777216, 20480, 37) → 795 rounds to 800, giving 798496. A three-point fit with one rounding, so recorded
+  as consistent-with rather than proven.
+- **Wraparound was NOT observed, and the run was simply too short.** The producer position climbed
+  monotonically 516 → 3076 over 40 seconds, passing `receive_buffer_size` (2048) without wrapping — so the
+  ring extent is **not** simply `receive_buffer_size`. With a segment of 4456 a wrap would be expected near
+  t≈61. Recorded as an open question, not as a result.
+
+⚠️ **`message_size_max` has a floor set by discovery.** At 1024 the participant's own SPDP announcement
+(1020 octets) no longer fit and discovery failed outright — Connext logs
+`MIGGenerator_addData:... message size max ... too small for propagating the participant discovery
+information`. Anything we advertise for our own segment must clear that, or nothing will discover us.
+
 **Still NOT established, and not to be guessed at:** what distinguishes the two blocks (and whether the
 56/112/168 stride implies a third); the meaning of the two position families four bytes apart; whether 688
 is the ring base — it is the value at `0x50`, equals `176 + 8 * received_message_count_max`, and one baseline
