@@ -101,14 +101,16 @@ Little-endian, `arm64Darwin20clang12.0`, Connext 7.3.1, shmem protocol `majorVer
 | **`0x24`** | 16 B | **`shmemUUID`** — 12 significant octets then 4 zero, same shape as the locator address | **proven** — byte-identical to the SPDP-advertised locator of the same participant |
 | `0x40` | u32 | an offset near the end; varies with the property block | not identified |
 | `0x44`,`0x48`,`0x4c` | u32 | 56, 112, 168 (stride 56) | observed, invariant |
-| `0x50` | u32 | consistent with `176 + 8 * received_message_count_max` | two data points (688 @64, 472 @37); needs a third |
+| `0x50` | u32 | **`176 + 8 * received_message_count_max`** — the ring-base candidate | **predicted then confirmed** — 240 predicted for count 8, 240 observed (688 @64) |
 | `0x54` | u32 | 4 | observed, invariant |
 | **`0x58`** | u32 | **`receive_buffer_size`** | **proven by variation** — set 777216, read 777216 |
 | **`0x5c`** | u32 | **`message_size_max`** | **proven by variation** — set 20480, read 20480 |
 | **`0x60`** | u32 | **`received_message_count_max`** | **proven by variation** — set 37, read 37 |
 
-Segment size is a function of the property block: 1115312 for the (1048576, 65536, 64) default and 798496
-for (777216, 20480, 37). Two points do not determine the formula; not yet derived.
+Segment size is a function of the property block and fits
+`receive_buffer_size + message_size_max + align8(240 + 15 * count)` across all three measured
+configurations: (1048576, 65536, 64) → 1115312 exactly, (2048, 2048, 8) → 4456 exactly, and
+(777216, 20480, 37) → 798496 with one 8-byte rounding. Three points and a rounding is a fit, not a proof.
 
 ### 5.0 The ring — partially measured (slice 5 in progress, NOT implemented)
 
@@ -127,9 +129,10 @@ known needle again, rather than guesswork.
   at `0x330`. Consecutive small records sat at a 64-byte stride.
 - **Two control blocks 56 bytes apart**, at `0x78` and `0xb0`, matching the 56/112/168 stride already logged
   at `0x44`/`0x48`/`0x4c`. Each holds several byte positions followed by several equal counters.
-- **Those positions are absolute byte offsets pointing 20 octets INTO a record** — i.e. just past the
-  20-octet RTPS header. Verified at two independent positions: 5316 and 5380 both landed on an `INFO_TS`
-  submessage, and `RTPS` sat exactly 20 octets earlier at `0x14b0` and `0x14f0`.
+- **Those positions sat 20 octets into a record** — i.e. just past the 20-octet RTPS header — at two
+  independent positions: 5316 and 5380 both landed on an `INFO_TS` submessage, with `RTPS` exactly 20 octets
+  earlier at `0x14b0` and `0x14f0`. ⚠️ **They are NOT absolute offsets**, as the running total below shows;
+  they coincided with offsets only because that 1 MiB ring had not yet wrapped.
 - At the moment of observation the two blocks' positions differed by **exactly one record stride** (5380 vs
   5316 = 64) and their counters by **exactly one** (19 vs 18) — the shape of a producer/consumer pair with a
   single unconsumed record.
@@ -170,10 +173,13 @@ useful failure.**
   measured configurations: (1048576, 65536, 64) → 1115312 exactly; (2048, 2048, 8) → 4456 exactly;
   (777216, 20480, 37) → 795 rounds to 800, giving 798496. A three-point fit with one rounding, so recorded
   as consistent-with rather than proven.
-- **Wraparound was NOT observed, and the run was simply too short.** The producer position climbed
-  monotonically 516 → 3076 over 40 seconds, passing `receive_buffer_size` (2048) without wrapping — so the
-  ring extent is **not** simply `receive_buffer_size`. With a segment of 4456 a wrap would be expected near
-  t≈61. Recorded as an open question, not as a result.
+- **The cursor is a CUMULATIVE BYTE COUNT, not an offset into the segment — and this falsifies the claim
+  above that "those positions are absolute byte offsets".** Run long enough (90 samples), the producer
+  position climbed monotonically to **6084 in a segment of 4456**. A number larger than the segment cannot
+  be an offset into it, so no further experiment is needed for the negative. The earlier reading held only
+  by coincidence: in the 1 MiB default ring the running total had not yet exceeded the segment size, so
+  cursor−20 happened to land on the `RTPS` magic. **The ring offset must therefore be derived from the
+  cursor** — by a modulus not yet determined — and `RTPS` at cursor−20 is true only before the first wrap.
 
 ⚠️ **`message_size_max` has a floor set by discovery.** At 1024 the participant's own SPDP announcement
 (1020 octets) no longer fit and discovery failed outright — Connext logs
