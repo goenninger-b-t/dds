@@ -3163,9 +3163,14 @@ public GitHub master for understanding only; no code copied into `src/`.
 - **Public sources only.** The locator kind value is RTI's **published** constant
   `NDDS_TRANSPORT_CLASSID_SHMEM` (`include/ndds/transport/transport_common_user.h`), also exposed in their
   public API as `rti::core::Locator::Kind::SHMEM`. Addressing facts (segment named from the port number,
-  segment key `0x800000 + port`, mutex/semaphore keys `0xb00000 + port`, port a function of `domain_id` and
-  `participant_id`) come from RTI's **shipped public API documentation**
-  (`doc/api/connext_dds/api_c/group__NDDS__Transport__Shmem__Plugin.html`).
+  the port→key mappings, port a function of `domain_id` and `participant_id`) come from RTI's **shipped
+  public API documentation** (`doc/api/connext_dds/api_c/group__NDDS__Transport__Shmem__Plugin.html`) and
+  from the **shipped public header** `include/ndds/transport/transport_shmem.h`.
+  > **CORRECTION (2026-07-22, ADR 0081 §4).** This entry originally recorded "segment key `0x800000 + port`,
+  > mutex/semaphore keys `0xb00000 + port`". That is **wrong**. `transport_shmem.h:50-66` declares the fields
+  > in the order `segmentKey`, `semaphoreKey`, `mutexKey` and the default initializer at `:194-199` supplies
+  > `0x400000, 0x800000, 0xB00000` respectively. The correct mapping is **segment `0x400000 + port`**,
+  > semaphore `0x800000 + port`, mutex `0xB00000 + port`, confirmed against live `ipcs` output.
 - **Cross-checked against the ordinary RTPS wire.** A live Connext 7.3.1 participant with
   `transport_builtin` mask `UDPv4 | SHMEM` was observed via **standard SPDP discovery**, which this stack
   already parses. It advertised kind `#x01000000` alongside its UDPv4 locators, with `port` equal to the
@@ -3176,3 +3181,38 @@ public GitHub master for understanding only; no code copied into `src/`.
   segment contents. Nothing beyond published headers, published API documentation, and public RTPS
   discovery traffic. **The on-segment format is NOT documented in either source and is NOT implemented
   here** — this ADR covers locator RECOGNITION only.
+
+## ADR 0081 slice 2 (2026-07-22) — RTI Connext shared-memory segment layout, established by observation
+
+- **Owner decision, on the record.** Three routes were identified and put to the owner explicitly *before*
+  any was built: (A) drive RTI's own SHMEM transport through their published `NDDS_Transport_Plugin` C API;
+  (B) ship a transport plugin loaded into Connext through the documented `dds.transport.load_plugins`
+  mechanism; (C) reconstruct the segment layout by observation. Each was presented with its cost. **The
+  owner — who is the licensee — chose route C.** Routes A and B are recorded in ADR 0081 §3 so the decision
+  can be revisited without re-deriving the analysis.
+- **Sources used, exhaustively:**
+  1. **Shipped public headers** — `include/ndds/transport/transport_shmem.h`, `transport_interface.h`,
+     `transport_interface_user.h`, `transport_common_user.h`. These are the headers a customer compiles
+     against.
+  2. **Shipped public documentation** — the Connext 7.3.1 User's Manual and Properties Reference under
+     `doc/manuals/`, for `dds.transport.shmem.builtin.*` property semantics, defaults and ranges.
+  3. **The exported-symbol table of the shipped libraries** (`nm -gU libnddscore.dylib`), read to establish
+     which documented entry points are externally linkable. This is the dynamic export table any linker
+     reads; no code was disassembled or decompiled.
+  4. **Ordinary RTPS SPDP discovery traffic**, parsed by this stack's existing discovery path.
+  5. **Live shared-memory segments** created by RTI's own shipped tools (`rtiddsping`, and the harness's
+     `shapes_pub`) running on the owner's licensed installation, **attached read-only** (`SHM_RDONLY`)
+     through the operating system's System V IPC API.
+- **Method — controlled variation, not inference from a dump.** Documented properties
+  (`received_message_count_max`, `receive_buffer_size`, `parent.message_size_max`, `host_id`) were set to
+  distinctive values through Connext's own QoS XML, and the resulting segments were compared. A field is
+  recorded as identified **only** where a chosen value appeared at a predicted location; every entry in
+  ADR 0081 §5 is labelled with how it was established, and fields that merely varied are recorded as *not
+  identified* rather than guessed.
+- **NOT done:** no RTI source code read or copied; no disassembly; no decompilation; no static analysis of
+  their binaries beyond the exported-symbol table above; no modification of any RTI library or tool; no
+  writes to any RTI-created shared-memory segment. Segments created by the probe runs were removed
+  afterwards; segments belonging to other processes were left untouched.
+- **Scope limit.** The layout is valid for shmem protocol `majorVersion` 2, Connext 7.3.1,
+  `arm64Darwin20clang12.0`. ADR 0081 §7 requires an implementation to refuse a segment whose `majorVersion`
+  it has not been validated against, rather than misparse it.
