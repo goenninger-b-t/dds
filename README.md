@@ -153,7 +153,7 @@ L0  PAL (per-impl)     raw memory/SAP, threads, sockets, GC control — the ONLY
 | `dds-rtps`  | L4 | `dds.rtps.*` | submessage codec, reliable engine, HistoryCache, discovery wire |
 | `dds-disc`  | L5 | `dds.disc` | SPDP/SEDP discovery + reliable data plane over UDP |
 | `dds-dcps`  | L6 | `dds.dcps` | the DDS entity model, conditions, statuses, content filters, builtin topics |
-| `dds-xport` | L7 | `dds.xport`, `dds.xport.udp`, `dds.xport.shmem` | the transport record + UDPv4 + shared-memory intra-host transport |
+| `dds-xport` | L7 | `dds.xport`, `dds.xport.udp`, `dds.xport.shmem`, `dds.xport.rti-shmem` | the transport record + UDPv4 + shared-memory intra-host transport + RTI Connext shared-memory recognition (co-location detection against Connext's System V segments, ADR 0081) |
 | `dds-shapes`| L9 | `dds.shapes` | standalone Square/ShapeType interop harness |
 | `dds-tests` | —  | `dds.tests` | the cross-cutting unit/integration suite |
 | `dds`       | —  | umbrella | loads the landed stack |

@@ -787,6 +787,73 @@
 
 (defun* shm-destroy (name) (function (string) t) "shm_unlink NAME." (cffi:foreign-funcall "shm_unlink" :string name :int))
 
+;; System V shared-memory primitives (FR-XPORT-2, ADR 0081). A SECOND, distinct mechanism from the
+;; POSIX shm_open/mmap objects above, needed because RTI Connext's shared-memory transport uses SysV
+;; shmget/shmat and names a segment by an INTEGER KEY derived from the RTPS port (segment 0x400000+port),
+;; not by a filesystem-like name. Values verified from sys/shm.h + sys/ipc.h on BOTH Darwin and Linux and
+;; found IDENTICAL on both, so unlike the open(2) flags above these need no OS reader conditional.
+(defconstant +shm-rdonly+ #o010000 "SHM_RDONLY — shmat(2) attaches read-only. sys/shm.h, Darwin + Linux.")
+(defconstant +ipc-creat+  #o001000 "IPC_CREAT — shmget(2) creates the segment if KEY does not exist. sys/ipc.h, Darwin + Linux.")
+(defconstant +ipc-excl+   #o002000 "IPC_EXCL — with IPC_CREAT, shmget(2) fails if KEY already exists. sys/ipc.h, Darwin + Linux.")
+(defconstant +ipc-rmid+   0        "IPC_RMID — shmctl(2) marks the segment destroyed. sys/ipc.h, Darwin + Linux.")
+
+(defstruct* sysv-shm-segment
+  "An attached System V shared-memory segment: integer KEY, kernel ID, foreign SAP, attached byte SIZE."
+  (key 0 :type (unsigned-byte 31)) (id -1 :type fixnum) (sap nil :type t) (size 0 :type (integer 0)))
+
+(defun* sysv-shm-attach-readonly (key least-bytes)
+    (function ((unsigned-byte 31) (integer 1)) (values (or null sysv-shm-segment) (or null keyword)))
+  "Attach READ-ONLY to the EXISTING System V segment named KEY, which must be at least LEAST-BYTES long.
+   Returns (values segment NIL), or (values NIL status) with status :NO-SUCH-SEGMENT (no segment for KEY,
+   or it is SHORTER than LEAST-BYTES) or :SHMAT-FAILED. Never signals.
+
+   ⚠️ LEAST-BYTES IS THE BOUNDS CHECK, AND THE KERNEL ENFORCES IT. shmget(2) returns EINVAL when a segment
+   exists for KEY but is smaller than the requested size, so passing the number of bytes we intend to read
+   makes a too-short segment fail to attach at all. That is deliberate, and it is why this does NOT call
+   shmctl(IPC_STAT): `struct shmid_ds` has a DIFFERENT layout on Darwin and Linux, so marshalling it would
+   be an OS-specific struct definition AND a second source of truth for the extent. A segment written by
+   another process is untrusted input exactly like a datagram (NFR-SEC-POSTURE); this makes the extent a
+   precondition of attaching rather than something a caller can forget to verify.
+
+   Read-only means a malformed or hostile segment cannot be corrupted BY US, and the mapping faults on any
+   accidental write. The caller must still bounds-check every offset it reads against SIZE."
+  (let ((id (cffi:foreign-funcall "shmget" :int key :unsigned-long least-bytes :int 0 :int)))
+    (when (minusp id) (bail :no-such-segment))
+    (let ((p (cffi:foreign-funcall "shmat" :int id :pointer (cffi:null-pointer) :int +shm-rdonly+ :pointer)))
+      (when (= (cffi:pointer-address p) +map-failed-addr+) (bail :shmat-failed))
+      (values (make-sysv-shm-segment :key key :id id :sap p :size least-bytes) nil))))
+
+(defun* sysv-shm-create (key size)
+    (function ((unsigned-byte 31) (integer 1)) (values (or null sysv-shm-segment) (or null keyword)))
+  "Create an EXCLUSIVE System V segment named KEY of SIZE bytes (shmget IPC_CREAT|IPC_EXCL, mode 0600) and
+   attach it read-write. Returns (values segment NIL), or (values NIL status) with status :SHMGET-FAILED
+   (KEY already exists, or a resource limit) or :SHMAT-FAILED. Never signals.
+
+   Mode is 0600 — owner only. A System V segment OUTLIVES the process that created it, so a caller is
+   responsible for SYSV-SHM-DESTROY; a leaked segment holds its key and makes the next create fail EEXIST."
+  (let ((id (cffi:foreign-funcall "shmget" :int key :unsigned-long size
+                                  :int (logior +ipc-creat+ +ipc-excl+ #o600) :int)))
+    (when (minusp id) (bail :shmget-failed))
+    (let ((p (cffi:foreign-funcall "shmat" :int id :pointer (cffi:null-pointer) :int 0 :pointer)))
+      (when (= (cffi:pointer-address p) +map-failed-addr+) (bail :shmat-failed))
+      (values (make-sysv-shm-segment :key key :id id :sap p :size size) nil))))
+
+(defun* sysv-shm-sap (segment) (function (sysv-shm-segment) t) "Foreign SAP base of SEGMENT."
+  (sysv-shm-segment-sap segment))
+
+(defun* sysv-shm-detach (segment)
+    (function (sysv-shm-segment) t)
+  "shmdt SEGMENT. Does NOT destroy it — the segment survives until SYSV-SHM-DESTROY, by design: we attach
+   to segments owned by other processes and must never remove them."
+  (cffi:foreign-funcall "shmdt" :pointer (sysv-shm-segment-sap segment) :int))
+
+(defun* sysv-shm-destroy (segment)
+    (function (sysv-shm-segment) t)
+  "shmctl(IPC_RMID) SEGMENT — mark it destroyed so it goes away once the last process detaches. Call this
+   only for a segment WE created; removing another process's segment would break it."
+  (cffi:foreign-funcall "shmctl" :int (sysv-shm-segment-id segment) :int +ipc-rmid+
+                        :pointer (cffi:null-pointer) :int))
+
 ;; Cross-process PTHREAD_PROCESS_SHARED mutex+condvar primitives (FR-XPORT-2), living in a
 ;; shared segment for in-band notification. Replaces named POSIX semaphores: sem_open is
 ;; undrivable from the Lisp runtime on macOS arm64 (variadic mode/value mispassed), whereas

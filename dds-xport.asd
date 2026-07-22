@@ -8,5 +8,6 @@
                (:file "transport")
                (:file "udp")
                (:file "shmem")
+               (:file "rti-shmem")
                (:file "zerocopy-pool"))
   :in-order-to ((test-op (test-op "dds-tests"))))

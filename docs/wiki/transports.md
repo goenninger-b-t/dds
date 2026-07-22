@@ -89,6 +89,57 @@ The transport selection is a discovery-layer policy, controlled by one special v
 |---|---|---|
 | `dds.disc:*shmem-enabled*` | special var | Master switch (read once per node at `make-disc-node`) for routing same-host user DATA over SHMEM instead of UDP (FR-XPORT-2). Default `T` on SBCL everywhere and Clasp/Linux (where the SHMEM package is present and by-name attach works); `NIL` on Clasp/macOS (the `shm_open` variadic-mode ABI gap, ADR 0013). Rebind to `NIL` before `make-disc-node` to force the all-UDP path. Not a wire constant — a local transport-selection policy. |
 
+### RTI Connext shared-memory recognition — `dds.xport.rti-shmem`
+
+Separate from our own shared-memory transport above. Connext's shared memory is a *different mechanism*:
+System V segments keyed by integer rather than POSIX objects keyed by name, with the segment key derived
+from the RTPS port. This package answers one question — **is that RTI peer on this machine?**
+
+| symbol | contract |
+|---|---|
+| `rti-shmem-segment-key` *port* → *key* | The System V key serving RTPS `port`: `+rti-shmem-segment-key-base+ + port`. |
+| `rti-shmem-same-host-p` *host-id* *port* → `(values same-host status)` | Attaches read-only to that key and compares the segment's `shmemUUID` against the 12-octet `host-id` from the peer's advertised `Locator_t`. |
+| `+rti-shmem-segment-key-base+` `#x400000` | Segment key offset. Semaphore `#x800000` and mutex `#xB00000` bases are exported alongside it. |
+| `+rti-shmem-protocol-major-validated+` `2` | The one shared-memory protocol version the layout was measured against. |
+
+Get the `host-id` from a discovered locator with `dds.rtps.discovery:rti-shmem-locator-host-id`.
+
+`rti-shmem-same-host-p` distinguishes four outcomes, and the distinction is the point — a plain boolean
+would merge "that peer is elsewhere" with "I could not tell":
+
+| result | meaning |
+|---|---|
+| `(values T NIL)` | Same host. Shared memory is in principle usable to reach it. |
+| `(values NIL NIL)` | The segment exists and is well-formed but names a **different host**. Ordinary, not an error. |
+| `(values NIL :no-such-segment)` | Nothing holds that key here — the routine answer for a peer on another machine. |
+| `(values NIL :not-an-rti-shmem-segment)` | The key is held by something that is not an RTI segment. |
+| `(values NIL :unvalidated-shmem-protocol-version)` | An RTI segment announcing a protocol revision this layout was **not** measured against. |
+
+That last one is a deliberate refusal rather than a best effort. RTI names five internal protocol revisions
+and specifies none of them, so parsing an unmeasured revision with these offsets would produce a confident
+wrong answer — which is exactly what the test proves by removing the check and watching a bad segment read
+as "same host".
+
+```lisp
+;; Is the Connext peer we just discovered reachable over shared memory?
+(let ((host-id (dds.rtps.discovery:rti-shmem-locator-host-id locator)))
+  (when host-id
+    (multiple-value-bind (same-host status)
+        (dds.xport.rti-shmem:rti-shmem-same-host-p host-id (dds.rtps.discovery:locator-port locator))
+      (cond (same-host                       :co-located)
+            ((null status)                   :different-host)
+            ((eq status :no-such-segment)    :different-host)
+            (t                               status)))))   ; refused — report it, never guess
+```
+
+The attachment is read-only: nothing here writes to a segment owned by Connext. The segment is another
+process's memory and is treated as untrusted input — the minimum extent is enforced by the kernel at attach
+time (see `sysv-shm-attach-readonly` below), so a truncated or hostile segment fails to attach rather than
+being read past its end.
+
+The layout is **measured, not published**. See [ADR 0081](../adr/0081-rti-connext-shared-memory-interoperability.md)
+for what was established and how, and `interop/connext/shmem-layout/` to reproduce it.
+
 ### The PAL contract — `dds.pal`
 
 The single frozen L0 surface (IMPLEMENTATION-PLAN §7.6). Everything above L0 depends only on these symbols;
@@ -158,6 +209,19 @@ in-segment `PTHREAD_PROCESS_SHARED` mutex/condvar. All thin CFFI wrappers; no ex
 | `dds.pal:shm-detach` | function | `(handle)` — `munmap` + `close`. |
 | `dds.pal:shm-destroy` | function | `(name)` — `shm_unlink`. |
 | `dds.pal:shm-sap` | function | `(handle)` — the `mmap` base SAP, for the typed `sap-ref-*`/`cffi:mem-ref` reads/writes the ring uses. |
+| `dds.pal:sysv-shm-attach-readonly` | function | `(key least-bytes)` — `shmget` + `shmat(SHM_RDONLY)`. A **System V** segment, keyed by integer, for reaching RTI Connext's shared memory (ADR 0081). Returns `(values segment nil)`, or `(values nil status)` — `:no-such-segment` (nothing at `key`, **or it is shorter than `least-bytes`**) / `:shmat-failed`. |
+| `dds.pal:sysv-shm-create` | function | `(key size)` — `shmget(IPC_CREAT\|IPC_EXCL,0600)` + `shmat` read-write. Returns `(values segment nil)`, or `(values nil status)` — `:shmget-failed` (key taken, or a resource limit) / `:shmat-failed`. |
+| `dds.pal:sysv-shm-detach` | function | `(segment)` — `shmdt`. Deliberately does **not** destroy: we attach to other processes' segments and must never remove them. |
+| `dds.pal:sysv-shm-destroy` | function | `(segment)` — `shmctl(IPC_RMID)`. For segments **we** created only. A System V segment outlives its creating process, so a leaked one holds its key and makes the next create fail. |
+| `dds.pal:sysv-shm-sap` | function | `(segment)` — the `shmat` base SAP. |
+
+`least-bytes` on `sysv-shm-attach-readonly` **is the bounds check, and the kernel enforces it**: `shmget`
+returns `EINVAL` when a segment exists for `key` but is smaller than the requested size, so asking for the
+number of bytes you intend to read makes a too-short segment fail to attach at all. That is why there is no
+`shmctl(IPC_STAT)` wrapper — `struct shmid_ds` has a different layout on Darwin and Linux, so marshalling it
+would add an OS-specific struct *and* a second source of truth for the extent. `SHM_RDONLY`, `IPC_CREAT`,
+`IPC_EXCL` and `IPC_RMID` were read from `sys/shm.h`/`sys/ipc.h` on both platforms and are identical, so
+unlike the `open(2)` flags these need no reader conditional.
 | `dds.pal:shm-segment-size` | function | `(handle)` — the segment's byte length. |
 | `dds.pal:pshared-mutex-init` / `pshared-cond-init` | functions | `(sap offset)` — creator-only init of a `PTHREAD_PROCESS_SHARED` mutex / condvar living **in** the segment. Return `(values t nil)` or `(values nil :mutex-init-failed / :cond-init-failed)`. |
 | `dds.pal:pshared-lock` / `pshared-unlock` | functions | `(sap offset)` — lock / unlock the in-segment mutex. |

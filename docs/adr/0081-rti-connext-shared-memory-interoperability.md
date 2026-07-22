@@ -145,14 +145,30 @@ we must still match.
 1. **Locator recognition** — landed, `75804c6`. `+locator-kind-rti-shmem+`, `rti-shmem-locator-p`,
    `rti-shmem-locator-host-id`, `locator-kind-name`; wired into ADR 0080's `UNADDRESSABLE_PEER` so a refusal
    names the transport instead of printing a number.
-2. **Same-host detection** — this ADR's measurements make it implementable: from a discovered RTI SHMEM
-   locator, compute `0x400000 + port`, attach read-only, verify magic and `majorVersion`, and compare the
-   12 octets at `0x24` against the locator. That is RTI's own documented test, and it needs a System V shared
-   memory surface in `dds-pal/` (`shmget`/`shmat`/`shmdt`/`shmctl`) for SBCL and Clasp.
-3. Property block — parse and check compatibility before trusting a segment.
-4. Ring and framing — derive by publishing known payloads and diffing.
-5. Receive a real RTPS datagram from Connext over shared memory.
-6. Transmit.
+2. **Segment layout** — measured; §4 and §5 above. Harness `interop/connext/shmem-layout/`.
+3. **Same-host detection** — landed. `dds.xport.rti-shmem:rti-shmem-same-host-p` computes `0x400000 + port`,
+   attaches read-only via a new System V surface in `dds-pal/` (`sysv-shm-attach-readonly` / `-create` /
+   `-detach` / `-destroy` / `-sap`, one CFFI implementation serving SBCL and Clasp), verifies magic and
+   `majorVersion`, and compares the 12 octets at `0x24` against the locator's address.
+
+   It reports **four** outcomes rather than a boolean, because a boolean would merge "that peer is
+   elsewhere" with "I could not tell": `(T NIL)` same host · `(NIL NIL)` well-formed but another host, which
+   is ordinary and not an error · `(NIL :no-such-segment)` · `(NIL :not-an-rti-shmem-segment)` ·
+   `(NIL :unvalidated-shmem-protocol-version)`.
+
+   `run-rti-shmem-recognition-test` drives all five against a synthetic segment it builds itself, so no
+   Connext is needed and the failure modes are reachable at all. **Both falsifications were run and went
+   red:** deleting the `majorVersion` refusal makes an unmeasured revision report `T` — a confident wrong
+   answer, which is precisely what §7 requires be impossible — and short-circuiting the UUID comparison
+   makes a foreign host report `T`.
+
+   **Live-validated** against a running Connext 7.3.1 `shapes_pub` (domain 0): its advertised UUID answers
+   `T` at both its metatraffic port 7412 and its user port 7413; a wrong UUID at the same live port answers
+   `(NIL NIL)`; and the real UUID at a port with no segment answers `(NIL :no-such-segment)`.
+4. Property block — parse and check compatibility before trusting a segment.
+5. Ring and framing — derive by publishing known payloads and diffing.
+6. Receive a real RTPS datagram from Connext over shared memory.
+7. Transmit.
 
 ## 7. Consequences and risks
 

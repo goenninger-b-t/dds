@@ -54,6 +54,22 @@
            #:run-shmem-transport-test #:run-shmem-receiver-test #:run-shmem-stress-test
            #:run-shmem-dest-cache-test))
 
+(defpackage #:net.goenninger.dds.xport.rti-shmem
+  (:nicknames #:dds.xport.rti-shmem)
+  (:use #:common-lisp #:net.goenninger.dds.lang)
+  (:documentation
+   "RTI Connext shared-memory segment recognition (ADR 0081). Distinct from DDS.XPORT.SHMEM, which is
+    OUR OWN POSIX-shm transport: Connext uses System V segments keyed by integer (segment key =
+    0x400000 + RTPS port) and identifies a host by a `shmemUUID` carried BOTH in its advertised
+    Locator_t and in the segment header. This package answers co-location — whether an RTI peer is on
+    this machine — which per RTI's published header requires reading the segment, not just the locator.
+    Read-only throughout; nothing here writes to a segment owned by Connext. The layout is measured, not
+    published: see docs/adr/0081-*.md and the reproduction harness interop/connext/shmem-layout/.")
+  (:export #:rti-shmem-same-host-p #:rti-shmem-segment-key
+           #:+rti-shmem-segment-key-base+ #:+rti-shmem-semaphore-key-base+ #:+rti-shmem-mutex-key-base+
+           #:+rti-shmem-protocol-major-validated+ #:+rti-shmem-uuid-bytes+
+           #:run-rti-shmem-recognition-test))
+
 (defpackage #:net.goenninger.dds.xport.zerocopy
   (:nicknames #:dds.xport.zerocopy)
   (:use #:common-lisp #:net.goenninger.dds.lang)

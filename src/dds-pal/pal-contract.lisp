@@ -33,6 +33,11 @@
    #:store-sap-u8
    ;; shared memory segments + in-segment PTHREAD_PROCESS_SHARED mutex/condvar (FR-XPORT-2, ADR 0013)
    #:shm-create #:shm-attach #:shm-detach #:shm-destroy #:shm-sap #:shm-segment-size
+  ;; System V shared memory (shmget/shmat) — a SECOND mechanism, distinct from the POSIX objects
+  ;; above, needed to reach RTI Connext's shared-memory segments, which are keyed by integer
+  ;; (segment = 0x400000 + RTPS port) rather than named (ADR 0081)
+  #:sysv-shm-attach-readonly #:sysv-shm-create #:sysv-shm-detach #:sysv-shm-destroy
+  #:sysv-shm-sap #:sysv-shm-segment-size #:sysv-shm-segment-key #:sysv-shm-segment-p
    #:pshared-mutex-init #:pshared-cond-init #:pshared-lock #:pshared-unlock
    #:pshared-cond-wait #:pshared-cond-signal #:pshared-cond-broadcast #:pshared-destroy
    ;; threads (condvar-wait: (cv lock &optional timeout-seconds) -> woke-p; nil timeout
