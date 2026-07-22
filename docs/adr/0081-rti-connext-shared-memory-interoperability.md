@@ -136,10 +136,32 @@ known needle again, rather than guesswork.
 - `0x50` held 688 = `176 + 8 * received_message_count_max`, consistent with an 8-byte-per-entry table at 176
   and the ring beginning at 688.
 
-**NOT established, and not to be guessed at:** which block is the producer and which the consumer; whether
-688 is in fact the ring base; wraparound behaviour at the end of the buffer; whether an explicit per-record
-length exists at all (an RTPS message is self-delimiting via `octetsToNextHeader`, so one may not be needed);
-and the synchronisation protocol — the semaphore and mutex keys are known (§4) but their use is unexamined.
+**The producer/consumer split is WITHIN each block, not between the two.** Established by stopping the
+reader rather than reasoning about it: `SIGSTOP` the subscriber so it cannot consume, let the publisher keep
+sending, and see which fields still move (`interop/connext/shmem-layout/ring-roles.sh`). Reading the first
+eight u32s of a block at offset *B*:
+
+| field | while the consumer is stopped | role |
+|---|---|---|
+| *B*+`0x00` | advances by 64 — one record stride — per message | **producer** position |
+| *B*+`0x04`, `0x08`, `0x0c` | frozen | **consumer** positions |
+| *B*+`0x10` | advances, always *B*+`0x00` plus 4 | **producer** |
+| *B*+`0x14`, `0x18` | frozen | **consumer** counters |
+| *B*+`0x1c` | advances by exactly 1 per message | **producer** message count |
+
+On `SIGCONT` every field converges as the consumer drains the backlog. **This corrects the reading of the
+static snapshot in the paragraph above** — a single sample showed block A one record ahead of block B and
+invited the conclusion that A produced and B consumed. It does not: both blocks carry both roles, and A
+tracks B at a constant +64 in every position and +1 in every counter at all times. That constant offset
+between the two blocks is observed and **remains unexplained**.
+
+**Still NOT established, and not to be guessed at:** what distinguishes the two blocks (and whether the
+56/112/168 stride implies a third); the meaning of the two position families four bytes apart; whether 688
+is the ring base — it is the value at `0x50`, equals `176 + 8 * received_message_count_max`, and one baseline
+producer position of 708 sits exactly 20 octets above it, but that is suggestive, not proof; wraparound
+behaviour; whether an explicit per-record length exists at all (an RTPS message is self-delimiting via
+`octetsToNextHeader`, so one may not be needed); and the synchronisation protocol — the semaphore and mutex
+keys are known (§4) but their use is unexamined. Only 8 of the 14 u32s in each 56-byte block have been read.
 
 ### 5.1 The address is per-HOST, and that is what makes it usable
 

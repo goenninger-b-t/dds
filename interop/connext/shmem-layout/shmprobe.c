@@ -3,6 +3,7 @@
  *   shmprobe <keyhex> dump [offset] [len]     hexdump a window
  *   shmprobe <keyhex> find <hexbytes>         report every offset of a needle
  *   shmprobe <keyhex> stat                    size / attach count only
+ *   shmprobe <keyhex> u32 <offset> <count>    read COUNT native u32s as decimal, for watching cursors
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -64,6 +65,15 @@ int main(int argc, char **argv) {
         if (off + len > size) len = size - off;
         printf("# key=0x%08x size=%zu window=[%zu,%zu)\n", (unsigned)key, size, off, off + len);
         hexdump(b, off, len);
+    } else if (!strcmp(argv[2], "u32")) {
+        size_t off = (argc > 3) ? strtoul(argv[3], NULL, 0) : 0;
+        size_t n   = (argc > 4) ? strtoul(argv[4], NULL, 0) : 1;
+        for (size_t i = 0; i < n && off + 4 * (i + 1) <= size; i++) {
+            unsigned int v;
+            memcpy(&v, b + off + 4 * i, 4);
+            printf("%s%u", i ? " " : "", v);
+        }
+        printf("\n");
     } else if (!strcmp(argv[2], "find")) {
         if (argc < 4) { fprintf(stderr, "find needs hex bytes\n"); return 2; }
         unsigned char needle[64];
