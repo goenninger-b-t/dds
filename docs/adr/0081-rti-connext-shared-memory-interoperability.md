@@ -181,12 +181,31 @@ useful failure.**
 
       offset = 304 + ((cursor - 68) mod 4096)
 
-  **The modulus is `receive_buffer_size + message_size_max`, and `2 * receive_buffer_size` is ruled out.**
-  Those two were indistinguishable in the run above (both 2048), so four further configurations were
-  measured with them unequal: in every one `2 * receive_buffer_size` **exceeds the whole segment**, which
-  the ring cannot. Ring start was 304 in the measured configuration; whether that is `176 + 16 * count` or
-  `size - ring_length - 56` needs one more wrap at a different `count` to separate — both fit the single
-  point, so neither is claimed.
+  `2 * receive_buffer_size` is **ruled out** — four configurations with `receive_buffer_size` and
+  `message_size_max` unequal all have `2 * receive_buffer_size` **exceeding the whole segment**, which the
+  ring cannot.
+
+  🔴 **BUT THE MODULUS IS *NOT* `receive_buffer_size + message_size_max`, and an earlier revision of this
+  ADR wrongly said it was.** A second wrap at `received_message_count_max` = 16, with `receive_buffer_size`
+  and `message_size_max` unchanged at 2048 each, gave a **different modulus**:
+
+  | `count` | ring start | modulus | `rbs + msm` |
+  |---|---|---|---|
+  | 8 | 304 | 4096 | 4096 |
+  | 16 | **368** | **4160** | 4096 |
+
+  Same `rbs + msm`, different modulus, so the modulus depends on `count` as well. The 4096 of the first run
+  was a coincidence of that configuration. **Ring start is `240 + 8 * count`** — equivalently the value at
+  `0x50` plus 64 — confirmed at both points, and it also refutes *both* candidates the previous revision
+  offered (`176 + 16 * count` predicts 432, `size - ring_length - 56` predicts 424; the measurement is 368).
+
+  The general form, exact at both points, is
+
+      offset = ring_start + ((cursor - 68) mod M),  ring_start = 240 + 8 * count
+
+  with the additive constant 68 invariant across both. **`M` fits `4032 + 8 * count` on two points at
+  `rbs = msm = 2048`, and its dependence on `receive_buffer_size` and `message_size_max` is UNTESTED** —
+  recorded as an open question rather than generalised, which is exactly the mistake being corrected here.
 - **The segment-size formula is confirmed, not fitted.** `receive_buffer_size + message_size_max +
   align8(240 + 15 * received_message_count_max)` was used to PREDICT four new configurations before
   measuring them, and all four landed exactly: (4096, 2048, 8) → 6504, (8192, 2048, 8) → 10600,
