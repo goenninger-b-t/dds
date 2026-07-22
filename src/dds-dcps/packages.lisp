@@ -111,7 +111,9 @@
            #:+qos-policy-id-resource-limits+ #:+qos-policy-id-type-consistency+
            ;; WP-DCPS-API-COMPLETION S1.T1/T2: QoS immutability table + consistency validator
            #:qos-policy-immutable-p
-           #:get-subscription-matched-status #:get-publication-matched-status
+           #:get-subscription-matched-status #:get-unaddressable-peer-status
+           #:unaddressable-peer-status #:unaddressable-peer-status-total-count #:unaddressable-peer-status-last-guid
+           #:unaddressable-peer-status-last-locator-kinds #:+status-unaddressable-peer+ #:get-publication-matched-status
            #:get-requested-incompatible-qos-status #:get-offered-incompatible-qos-status
            #:inconsistent-topic-status #:inconsistent-topic-status-total-count
            #:inconsistent-topic-status-total-count-change

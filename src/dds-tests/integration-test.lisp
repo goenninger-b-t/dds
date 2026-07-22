@@ -5179,6 +5179,98 @@
 ;;; src-prefix; the test seeds two matched reader participants and asserts the fan-out set is 2
 ;;; while the targeted resolution picks exactly the originating one.
 
+(defun* run-unaddressable-match-refused-test ()
+    (function () t)
+  "OWNER DIRECTIVE 2026-07-22: anything that MATCHES must be ADDRESSABLE. A remote endpoint that is
+   topic/type/QoS compatible but whose participant advertises NO user-data locator we can send to must be
+   REFUSED the match and ANNOUNCED — never counted as matched and then silently never sent to.
+
+   THE FAILURE THIS PREVENTS. A peer configured with a shared-memory-only transport (RTI Connext supports
+   transport_builtin mask=SHMEM, and its shared-memory locator carries a vendor kind no other implementation
+   can address) is still discovered over UDP metatraffic and still RxO-matches. Before this gate it was
+   reported matched, and every sample to it went nowhere, silently — the same shape as ADR 0057 (matched,
+   never delivered) and ADR 0079 (sent, silently dropped). RTPS 2.5 §7.5 makes UDP/IP the one PSM every
+   implementation must support and defines no other, so such a peer has opted out of the interoperability
+   guarantee; the honest answer is a loud refusal.
+
+   The peer here advertises ONLY a vendor SHMEM locator — the exact shape of a SHMEM-only configuration.
+
+   FALSIFIED: remove the addressability gate from %match-remote-endpoint and the remote is recorded as
+   matched (:unaddr-not-matched fails) with nothing announced (:unaddr-announced fails)."
+  (let ((node (dds.disc:make-disc-node
+               :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element 3)
+               :host "127.0.0.1" :port 0)))
+    (unwind-protect
+         (let* ((prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element #x7A))
+                (guid (make-array 16 :element-type '(unsigned-byte 8) :initial-element #x7A))
+                (hook-hits '())
+                ;; ONLY a vendor SHMEM locator: no UDPv4 anywhere, so nothing we can address.
+                (shm (dds.rtps.discovery:make-locator
+                      :kind dds.rtps.discovery:+locator-kind-shmem+ :port 65536
+                      :address (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0))))
+           (setf (aref guid 12) #x00 (aref guid 13) #x00 (aref guid 14) #x01 (aref guid 15) #x07)
+           (dds.disc:add-local-writer node :topic "Square" :type "shape-type"
+                                      :reliability dds.rtps.discovery:+reliability-reliable+)
+           (setf (dds.disc:disc-node-on-unaddressable node)
+                 (lambda (g kinds) (push (cons (copy-seq g) kinds) hook-hits)))
+           (dds.disc::%record-participant
+            node (dds.rtps.discovery:make-spdp-data
+                  :guid-prefix prefix :version-major 2 :version-minor 5
+                  :metatraffic-unicast-locators (list shm) :default-unicast-locators (list shm)))
+           (dds.disc::%match-remote-endpoint
+            node (dds.rtps.discovery:make-endpoint-data
+                  :guid guid :topic-name "Square" :type-name "shape-type"
+                  :qos (dds.qos:make-reader-qos))
+            :remote-reader)
+           (%check :unaddr-not-matched (zerop (dds.disc:disc-node-matched-count node))
+                   (format nil "an UNADDRESSABLE remote must NOT be counted as matched (matched-count ~d)"
+                           (dds.disc:disc-node-matched-count node)))
+           (%check :unaddr-counted (= 1 (dds.disc:disc-node-unaddressable-count node))
+                   (format nil "the refusal must be counted exactly once (got ~d)"
+                           (dds.disc:disc-node-unaddressable-count node)))
+           (%check :unaddr-announced (= 1 (length hook-hits))
+                   "the ON-UNADDRESSABLE hook must fire exactly once for the refused remote")
+           (%check :unaddr-reports-kinds
+                   (and hook-hits (member dds.rtps.discovery:+locator-kind-shmem+ (cdr (first hook-hits))))
+                   "the announcement must name the locator kinds the peer actually offered, so an operator can act")
+           ;; a SECOND identical SEDP announcement must NOT re-announce (SEDP re-announces forever;
+           ;; an un-deduped warning becomes a flood, which operators filter — i.e. silence again)
+           (dds.disc::%match-remote-endpoint
+            node (dds.rtps.discovery:make-endpoint-data
+                  :guid guid :topic-name "Square" :type-name "shape-type"
+                  :qos (dds.qos:make-reader-qos))
+            :remote-reader)
+           (%check :unaddr-announced-once (= 1 (length hook-hits))
+                   "a re-announced unaddressable remote must NOT re-fire the announcement"))
+      (dds.disc:stop-node node)))
+  ;; THE REPORTING PATH. The disc layer only RAISES the event; an application must be able to SEE it, so
+  ;; DCPS turns it into a real communication status — bitmask bit + StatusCondition + listener + a
+  ;; get_*_status snapshot — through the same %notify-status chokepoint every other status uses. A printed
+  ;; line would satisfy none of these assertions, which is the point.
+  (let ((p (dds.dcps:create-participant :domain (test-domain))))
+    (unwind-protect
+         (let ((guid (make-array 16 :element-type '(unsigned-byte 8) :initial-element #x5C)))
+           (dds.dcps::%on-disc-unaddressable p guid (list dds.rtps.discovery:+locator-kind-shmem+))
+           (%check :unaddr-status-bit
+                   (logtest (dds.dcps::%entity-status-changes p) dds.dcps:+status-unaddressable-peer+)
+                   "the UNADDRESSABLE_PEER status bit must be set on the participant")
+           (let ((st (dds.dcps:get-unaddressable-peer-status p)))
+             (%check :unaddr-status-count
+                     (= 1 (dds.dcps:unaddressable-peer-status-total-count st))
+                     "get-unaddressable-peer-status must report the refusal")
+             (%check :unaddr-status-guid
+                     (equalp guid (dds.dcps:unaddressable-peer-status-last-guid st))
+                     "the status must carry the refused remote's GUID — an application has to know WHICH peer")
+             (%check :unaddr-status-kinds
+                     (member dds.rtps.discovery:+locator-kind-shmem+
+                             (dds.dcps:unaddressable-peer-status-last-locator-kinds st))
+                     "the status must carry the locator kinds offered — that is what tells an operator what to fix"))
+           (%check :unaddr-status-bit-cleared
+                   (not (logtest (dds.dcps::%entity-status-changes p) dds.dcps:+status-unaddressable-peer+))
+                   "reading the status must clear its bit (DDS 1.4 §2.2.2.1.9 read-communication-status)"))
+      (dds.dcps:delete-participant p)))
+  t)
+
 (defun* %seed-reader-participant (node prefix-byte port)
     (function (dds.disc:disc-node (unsigned-byte 8) (unsigned-byte 16))
               (values (simple-array (unsigned-byte 8) (12)) cons))

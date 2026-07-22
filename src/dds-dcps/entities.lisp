@@ -54,6 +54,8 @@
    (listener :initform nil :accessor dp-listener)            ; WP-DCPS-API-COMPLETION S3.T1: DomainParticipantListener (DDS 1.4 §2.2.4.1)
    (listener-mask :initform '() :accessor dp-listener-mask)
    (listener-lock :initform (dds.pal:make-lock "dp-listener") :accessor dp-listener-lock)
+   (unaddressable-status :initform (make-unaddressable-peer-status) :accessor dp-unaddressable-status)  ; VENDOR EXTENSION: a matched-but-unaddressable remote (owner directive 2026-07-22)
+   (status-lock :initform (dds.pal:make-lock "dp-status") :accessor dp-status-lock)  ; DDS 1.4 attaches communication statuses to Topic/Reader/Writer only; the participant gains one because UNADDRESSABLE_PEER (a vendor extension) is participant-scoped — the refusal is a property of the REMOTE PARTICIPANT, not of any one local endpoint
    (deadline-monitor :initform nil :accessor dp-deadline-monitor)  ; WP-DCPS-API-COMPLETION S4: the lazily-started per-participant deadline monitor thread (deadline.lisp), NIL until the first finite DEADLINE arms a timer
    (deadline-lock :initform (dds.pal:make-lock "dp-deadline") :accessor dp-deadline-lock)  ; WP-DCPS-API-COMPLETION S4: guards lazy deadline-monitor creation
    (autonomous-p :initform nil :accessor dp-autonomous-p)   ; WP-DCPS-API-COMPLETION S7: autonomous-discovery mode (config-gated); T -> a background announcer drives SPDP/SEDP + aging, spin is a no-op
@@ -227,6 +229,9 @@
     (data-reader (dr-status-lock entity))
     (data-writer (dw-status-lock entity))
     (topic (topic-status-lock entity))
+    ;; The participant carries exactly one status, the vendor-extension UNADDRESSABLE_PEER, because that
+    ;; condition is a property of a REMOTE PARTICIPANT rather than of any single local endpoint.
+    (domain-participant (dp-status-lock entity))
     (t nil)))
 
 (defun* %set-status-changed (entity bit)
@@ -780,6 +785,8 @@
                 (lambda () (%on-participant-sample p)))
           (setf (dds.disc:disc-node-on-inconsistent-topic node)
                 (lambda (topic-name) (%on-disc-inconsistent-topic p topic-name)))
+          (setf (dds.disc:disc-node-on-unaddressable node)   ; owner directive 2026-07-22: matched => addressable, else ERROR reported
+                (lambda (guid kinds) (%on-disc-unaddressable p guid kinds)))
           (setf (dds.disc:disc-node-on-sample-lost node)   ; WP-DCPS-API-COMPLETION S4: reliable-GAP SAMPLE_LOST (DDS 1.4 §2.2.4.1) -> the matched DataReader
                 (lambda (rid n)
                   (let ((dr (%participant-reader-by-entity-id p rid)))
@@ -3611,6 +3618,41 @@
     (function (domain-participant string) (or null topic))
   "The participant's local Topic registered under NAME (a plain Topic, not a CFT), or NIL."
   (find-if (lambda (c) (and (typep c 'topic) (string= (topic-name c) name))) (dp-children p)))
+
+(defun* %on-disc-unaddressable (p guid kinds)
+    (function (domain-participant t list) t)
+  "ON-UNADDRESSABLE hook (disc receiver thread), owner directive 2026-07-22: a remote endpoint matched on
+   topic/type/QoS but its participant advertises NO user-data locator this implementation can send to, so
+   the disc layer REFUSED the match. Report it as a real communication status on the participant through the
+   %notify-status chokepoint — status bitmask bit + StatusCondition (so a WaitSet wakes) + the most-specific
+   enabled listener + a get-unaddressable-peer-status snapshot.
+
+   WHY A STATUS AND NOT A LOG. This is an ERROR an application must be able to see and act on: it means a
+   peer it believes it is talking to will never receive anything. A printed line is unconsumable by an
+   application, untestable by a caller, and invisible in a service. UNADDRESSABLE_PEER is a VENDOR
+   EXTENSION (DDS 1.4 defines no such status) carried on a bit far outside the OMG range."
+  (%notify-status p +status-unaddressable-peer+ :unaddressable-peer
+   (lambda ()
+     (let ((s (dp-unaddressable-status p)))
+       (incf (unaddressable-peer-status-total-count s))
+       (incf (unaddressable-peer-status-total-count-change s))
+       (setf (unaddressable-peer-status-last-guid s) guid
+             (unaddressable-peer-status-last-locator-kinds s) kinds)
+       (values t (copy-unaddressable-peer-status s)
+               (lambda () (setf (unaddressable-peer-status-total-count-change s) 0))))))
+  t)
+
+(defun* get-unaddressable-peer-status (p)
+    (function (domain-participant) unaddressable-peer-status)
+  "DomainParticipant::get_unaddressable_peer_status (VENDOR EXTENSION) — a snapshot of the
+   UNADDRESSABLE_PEER status: how many remote endpoints were refused a match because nothing could be sent
+   to them, the last such GUID, and the Locator_t kinds it did offer. Mirrors the read-communication-status
+   reset (DDS 1.4 §2.2.2.1.9): resets total_count_change and clears the status bit."
+  (dds.pal:with-lock ((%entity-status-lock p))
+    (let ((s (dp-unaddressable-status p)))
+      (prog1 (copy-unaddressable-peer-status s)
+        (setf (unaddressable-peer-status-total-count-change s) 0)
+        (%clear-status-changed p +status-unaddressable-peer+)))))
 
 (defun* %on-disc-inconsistent-topic (p name)
     (function (domain-participant string) t)

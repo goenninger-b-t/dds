@@ -22,6 +22,8 @@
            #:disc-node-on-liveliness-changed #:%liveliness-sweep
            #:disc-node-on-lifecycle-event
            #:disc-node-on-incompatible-qos #:disc-node-on-sample #:disc-node-on-sample-lost
+           ;; ADDRESSABILITY (owner directive 2026-07-22): a matched remote MUST be addressable; a refusal is announced
+           #:disc-node-on-unaddressable #:disc-node-unaddressable-count
            #:disc-node-on-inconsistent-topic
            #:disc-node-type-gate #:resume-parked-matches #:disc-node-parked-count
            #:add-local-writer #:add-local-reader #:enable-local-endpoint

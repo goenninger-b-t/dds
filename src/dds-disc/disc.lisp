@@ -180,6 +180,15 @@
   (incompat-pairs (make-hash-table :test 'equalp) :type hash-table) ; WP-DDS-INCOMPAT-QOS-PERPAIR (ADR 0048 §16.3): per-(LOCAL,REMOTE) INCOMPATIBLE_QOS fire set — remote 16-octet GUID (equalp) -> list of already-fired incompatible LOCAL EntityIds. Mirrors match-pairs EXACTLY: the per-endpoint {OFFERED,REQUESTED}_INCOMPATIBLE_QOS idempotency key (once per (local,remote) pair, NOT per SEDP re-announce), so BOTH same-topic incompatible locals fire + a LATE local (created after the remote was recorded) fires. disc-node-incompat stays per-remote presence. Both purged by prefix on lease-expiry/participant-lost (%lease-sweep) so a re-discovery re-fires + the tables stay bounded. Node-lock guarded.
   (inconsistent (make-hash-table :test 'equalp) :type hash-table)
   (parked-matches '() :type list) ; (direction . remote endpoint-data), TYPE-GATE :pending; stale snapshots are pre-empted by SEDP re-announce
+  ;; ADDRESSABILITY (owner directive 2026-07-22): a remote endpoint that MATCHES must be ADDRESSABLE.
+  ;; A peer we cannot send to is refused the match and ANNOUNCED, never silently counted as matched — the
+  ;; failure class this repo keeps rediscovering (ADR 0057 matched-but-never-delivered; ADR 0079 sent-and-
+  ;; dropped). ON-UNADDRESSABLE is called (guid reason kinds) OUTSIDE the node lock, once per remote GUID
+  ;; (UNADDRESSABLE-REPORTED dedups: this sits on the SEDP path, which re-announces indefinitely).
+  ;; UNADDRESSABLE-COUNT counts distinct refused remotes for diagnostics.
+  (on-unaddressable nil :type t)
+  (unaddressable-count 0 :type (integer 0))
+  (unaddressable-reported (make-hash-table :test 'equalp) :type hash-table)
 
   (discovered-writers (make-hash-table :test 'equalp) :type hash-table) ; all remote publications
   (discovered-readers (make-hash-table :test 'equalp) :type hash-table) ; all remote subscriptions
@@ -2171,6 +2180,78 @@
   (let ((gate (disc-node-permissions-gate node)))
     (if gate (funcall gate node remote local) :compatible)))
 
+(declaim (ftype (function (dds.rtps.discovery:spdp-data) t) %usable-destination))   ; defined in dataplane.lisp (loaded after this file)
+
+(defun* %unaddressable-locator-kinds (spdp)
+    (function (dds.rtps.discovery:spdp-data) list)
+  "The DISTINCT Locator_t kinds participant SPDP advertised for user data, for diagnostics — so the refusal
+   below can say WHAT the peer offered instead of merely that nothing worked. Reported numerically and
+   vendor-neutrally: RTPS 2.5 reserves only INVALID/RESERVED/UDPv4/UDPv6 (§8.3.x), every shared-memory kind
+   is vendor-defined (ours is +locator-kind-shmem+), and no OMG PSM other than UDP/IP exists (§7.5, §9), so a
+   kind we cannot address is simply a foreign vendor transport rather than a defect to be decoded here."
+  (remove-duplicates (mapcar #'dds.rtps.discovery:locator-kind
+                             (dds.rtps.discovery:spdp-data-default-unicast-locators spdp))))
+
+(defun* %consult-addressable-gate (node remote)
+    (function (disc-node dds.rtps.discovery:endpoint-data) t)
+  "ADDRESSABILITY gate (owner directive 2026-07-22) — a peer we cannot SEND to must never be reported as
+   MATCHED. Returns :compatible when this node could resolve a user-data destination for REMOTE's participant
+   OR that participant is not discovered yet, and :unaddressable when it IS discovered and offers nothing we
+   can send to. Unknown is deliberately NOT a refusal — see the cond.
+
+   The predicate is deliberately THE SAME ONE THE SEND PATH USES (%usable-destination). That is what makes
+   this safe to add: addressable here is by construction identical to would-have-formed-a-send-group there,
+   so no peer that works today changes behaviour — only peers we could never have delivered to at all.
+
+   WHY THIS MATTERS. Without it a SHMEM-only peer (RTI can be configured transport_builtin mask=SHMEM, and
+   its shared-memory locator carries a vendor kind no other implementation can address) is discovered over
+   UDP metatraffic, RxO-matched, reported matched=1 — and then silently never sent to. Same shape as the two
+   defects this project has already paid for: ADR 0057 (matched, never delivered) and ADR 0079 (sent,
+   silently dropped). Interoperability rests on RTPS 2.5 §7.5: every implementation must implement the
+   UDP/IP PSM, and that is the ONLY transport PSM the standard defines — so a peer offering no UDPv4 locator
+   has opted out of the guarantee, and the honest response is a loud refusal, not a phantom match."
+  (let* ((guid (dds.rtps.discovery:endpoint-data-guid remote))
+         (prefix (subseq guid 0 12))
+         (spdp (dds.pal:with-lock ((disc-node-lock node))
+                 (gethash prefix (disc-node-discovered node)))))
+    (cond ;; UNKNOWN IS NOT UNADDRESSABLE. If the participant's SPDP has not been recorded yet (SEDP can
+          ;; arrive first), we do not yet KNOW the peer is unreachable — and blocking here would make
+          ;; matching depend on discovery ORDER, which is fragile and is not what the directive is about.
+          ;; Refuse only on POSITIVE knowledge. The case this actually guards is a peer whose SPDP we DO
+          ;; have (that is how we know it exists at all) offering only user-data locators we cannot address.
+          ((null spdp) :compatible)
+          ((%usable-destination spdp) :compatible)
+          (t :unaddressable))))
+
+(defun* %announce-unaddressable (node remote)
+    (function (disc-node dds.rtps.discovery:endpoint-data) t)
+  "Announce that REMOTE matched on topic/type/QoS but CANNOT BE ADDRESSED, exactly once per remote GUID.
+   Bumps UNADDRESSABLE-COUNT, calls the ON-UNADDRESSABLE hook (guid kinds) outside the node lock (hook =
+   user code, the %fire-match discipline), and prints one warning naming the locator kinds the peer offered.
+
+   ONCE PER REMOTE, because SEDP re-announces forever: an un-deduped announcement would become a log flood
+   that operators filter out, which is the same as being silent. NOCOND(WARN): a diagnostic that prints and
+   RETURNS — no control transfer, so it stays inside the no-conditions rule (ADR 0064)."
+  (let* ((guid (dds.rtps.discovery:endpoint-data-guid remote))
+         (kinds (let ((spdp (dds.pal:with-lock ((disc-node-lock node))
+                              (gethash (subseq guid 0 12) (disc-node-discovered node)))))
+                  (and spdp (%unaddressable-locator-kinds spdp))))
+         (first-time (dds.pal:with-lock ((disc-node-lock node))
+                       (unless (gethash guid (disc-node-unaddressable-reported node))
+                         (setf (gethash (copy-seq guid) (disc-node-unaddressable-reported node)) t)
+                         (incf (disc-node-unaddressable-count node))
+                         t))))
+    (when first-time
+      ;; REPORTED, not printed. The disc layer does not own the reporting surface: it raises the event on
+      ;; ON-UNADDRESSABLE exactly as it does ON-INCONSISTENT-TOPIC / ON-INCOMPATIBLE-QOS, and DCPS turns it
+      ;; into a real DDS communication status (bitmask bit + StatusCondition + listener + a get_*_status
+      ;; snapshot) through the %notify-status chokepoint. A print would be unconsumable by an application,
+      ;; untestable by a caller, and invisible in a service; a signalled condition is forbidden here
+      ;; (ADR 0064) and could unwind a receiver thread. Called OUTSIDE the node lock (hook = user code).
+      (let ((hook (disc-node-on-unaddressable node)))
+        (when hook (funcall hook guid kinds)))))
+  t)
+
 (defun* %park-match (node direction remote)
     (function (disc-node (member :remote-writer :remote-reader) dds.rtps.discovery:endpoint-data) (eql t))
   "Park a TYPE-GATE :pending match decision as (DIRECTION . REMOTE) (lock-guarded),
@@ -2217,6 +2298,16 @@
           ;; incompatibility below type consistency -> silent non-match (RTPS 2.5 §9.3.1.2)
           ((and ok (not (eq (%endpoint-keyed-p (dds.rtps.discovery:endpoint-data-guid local))
                             (%endpoint-keyed-p (dds.rtps.discovery:endpoint-data-guid remote))))))
+          ;; ADDRESSABILITY FIRST (owner directive 2026-07-22): anything that MATCHES must be ADDRESSABLE.
+          ;; Consulted ahead of the type/auth/permissions gates because it is more fundamental than any of
+          ;; them — there is no point deciding a peer is type-compatible if no datagram can ever reach it.
+          ;; :unaddressable ANNOUNCES and parks (never records the match); :pending parks silently (the
+          ;; participant's SPDP has not arrived yet, and a re-announce re-runs this).
+          ((and ok (not (eq (%consult-addressable-gate node remote) :compatible)))
+           (when (eq (%consult-addressable-gate node remote) :unaddressable)
+             (%announce-unaddressable node remote))
+           (%park-match node direction remote)
+           (setf parked t))
           (ok (case (%consult-type-gate node remote local)
                 (:incompatible
                  (setf inconsistent (dds.rtps.discovery:endpoint-data-topic-name local)))

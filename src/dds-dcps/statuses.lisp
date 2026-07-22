@@ -185,6 +185,27 @@
   (last-reason :not-rejected :type sample-rejected-reason)
   (last-instance-handle nil :type (or null (array (unsigned-byte 8) (*)))))
 
+(defconstant +status-unaddressable-peer+          (ash 1 24)
+  "VENDOR-EXTENSION StatusKind bit UNADDRESSABLE_PEER — NOT an OMG status. DDS 1.4 defines no status for
+   'a remote endpoint matched on topic/type/QoS but cannot be addressed', so this stack defines one rather
+   than report the condition unusably. Deliberately placed at bit 24, far above the OMG range (bits 0-14,
+   dds_rtf2_dcps.idl §80-92), so a future standard StatusKind can never collide with it. Owner directive
+   2026-07-22: anything that MATCHES must be ADDRESSABLE; if it is not, that is an ERROR and must be
+   announced through the normal status machinery — bitmask + StatusCondition + listener + get_*_status.")
+
+(defstruct* (unaddressable-peer-status (:constructor make-unaddressable-peer-status)
+                                       (:copier copy-unaddressable-peer-status))
+  "DomainParticipant UNADDRESSABLE_PEER status (VENDOR EXTENSION, see +status-unaddressable-peer+): a
+   remote endpoint was topic/type/QoS compatible but its participant advertises no user-data locator this
+   implementation can send to, so the match was REFUSED rather than recorded and silently never delivered.
+   LAST-GUID is the refused remote endpoint's 16-octet GUID; LAST-LOCATOR-KINDS are the Locator_t kinds it
+   did offer, which is what tells an operator what to change (typically: enable UDPv4 on the peer — RTPS
+   2.5 §7.5 makes UDP/IP the one PSM every implementation must support, and defines no other)."
+  (total-count 0 :type integer)
+  (total-count-change 0 :type integer)
+  (last-guid nil :type t)
+  (last-locator-kinds '() :type list))
+
 (defstruct* (inconsistent-topic-status (:constructor make-inconsistent-topic-status)
                                       (:copier copy-inconsistent-topic-status))
   "Topic INCONSISTENT_TOPIC status (dds_rtf2_dcps.idl §94): a remote topic of the same
