@@ -58,6 +58,23 @@ stop_peer() {
   kill -TERM -- -"$g" 2>/dev/null; sleep 1; kill -9 -- -"$g" 2>/dev/null; wait "$g" 2>/dev/null; return 0
 }
 
+# wait_peer <pgid> <max-seconds> — let the peer EXIT ON ITS OWN, then return.
+#
+# WHY THIS EXISTS, and it is not optional. A peer started by start_peer runs in a command substitution, so it
+# is NOT a child of this shell and `wait` on it returns IMMEDIATELY — meaning stop_peer used to SIGKILL every
+# peer the instant its publisher finished. A C++ peer writing to a FILE has fully-buffered stdout, so a peer
+# killed before it flushes leaves an EMPTY LOG and its leg scores ZERO no matter how many samples it actually
+# received. That is a false RED, and it is invisible: the log looks like the peer never ran. The Shapes legs
+# only escaped it by receiving enough lines (>4 KB) to force intermediate flushes; the large-data legs, at ~15
+# lines, never did. Every foreign peer here takes a <seconds> argument and exits normally on its own — so wait
+# for that, and keep stop_peer only as the backstop for a peer that hangs.
+wait_peer() {
+  local g="${1:-}" max="${2:-60}" i=0
+  [[ -n "$g" ]] || return 0
+  while kill -0 "$g" 2>/dev/null && [[ "$i" -lt "$max" ]]; do sleep 1; i=$((i+1)); done
+  return 0
+}
+
 # A leg is only green if it moved a MEANINGFUL number of samples. ">0" is nearly vacuous: one sample can
 # arrive from a stale peer, a retained sample, or a single lucky datagram, and it cannot demonstrate a
 # steady stream. MIN_SAMPLES is the floor every leg is judged against.
@@ -152,7 +169,7 @@ if [[ "$have_connext" -eq 1 ]]; then
     --eval "(asdf:load-system :dds-shapes)" \
     --eval "(uiop:symbol-call :dds.shapes :run-publisher :domain $DOMAIN :type :canonical :data-representation :xcdr1 :advertise-address \"$ADV\" :color \"BLUE\" :count $((SECONDS_RUN * 20)) :rate 20)" \
     --eval '(uiop:quit 0)' >/dev/null 2>&1
-  wait "$g" 2>/dev/null; stop_peer "$g"
+  wait_peer "$g" $((SECONDS_RUN + 30)); stop_peer "$g"
   n="$(grep -c 'color=BLUE' "$log" || true)"
   if [[ "$n" -ge "$MIN_SAMPLES" ]]; then note "ok" "us -> Connext: $n BLUE sample(s) accepted by the STRICT oracle"; else
     note "FAIL" "us -> Connext: only $n sample(s), need >= $MIN_SAMPLES (log: $log)"; fails=1; fi
@@ -169,10 +186,56 @@ if [[ "$have_fastdds" -eq 1 ]]; then
     --eval "(asdf:load-system :dds-shapes)" \
     --eval "(uiop:symbol-call :dds.shapes :run-publisher :domain $DOMAIN :type :canonical :data-representation :xcdr1 :advertise-address \"127.0.0.1\" :peers \"127.0.0.1:7410\" :color \"GREEN\" :count $((SECONDS_RUN * 20)) :rate 20)" \
     --eval '(uiop:quit 0)' >/dev/null 2>&1
-  wait "$g" 2>/dev/null; stop_peer "$g"
+  wait_peer "$g" $((SECONDS_RUN + 30)); stop_peer "$g"
   n="$(grep -c 'color=GREEN' "$log" || true)"
   if [[ "$n" -ge "$MIN_SAMPLES" ]]; then note "ok" "us -> Fast DDS: $n GREEN sample(s) (LENIENT peer)"; else
     note "FAIL" "us -> Fast DDS: only $n sample(s), need >= $MIN_SAMPLES (log: $log)"; fails=1; fi
+fi
+
+# ---- Legs 5 + 6: LARGE DATA (DATA_FRAG) vs Connext, BOTH directions. ----
+# The only fragmentation leg against a foreign stack, and the one whose absence let ADR 0079 ship: our
+# emitted datagram size is an interop contract (RTPS 2.5 §8.4.14.1 — fragmentSize is fixed per writer and
+# bounded by the SMALLEST max message size across the writer's transports), and Shapes samples are far below
+# any MTU so no Shapes leg can exercise it. The peer's profile deliberately sets message_size_max=1400.
+# FALSIFIED: with the pre-ADR-0079 default (*fragment-size* 63000) an 8000-octet sample rides unfragmented in
+# one ~8 KB datagram and Connext receives ZERO — same-host AND cross-machine.
+if [[ "$have_connext" -eq 1 ]]; then
+  export NDDSHOME
+  # The peer binaries link their Connext dylibs via @loader_path, so each peer dir needs the symlinks the
+  # shapes dirs already have. They are gitignored (per-clone setup), so create them if absent rather than
+  # failing a fresh clone for a reason that has nothing to do with interop.
+  for l in libnddsc libnddscore libnddscpp2; do
+    [[ -e "interop/connext/large-data/$l.dylib" ]] ||       ln -sf "$NDDSHOME/lib/${CONNEXTDDS_ARCH:-arm64Darwin20clang12.0}/$l.dylib" "interop/connext/large-data/$l.dylib" 2>/dev/null
+  done
+  export DYLD_LIBRARY_PATH="$NDDSHOME/lib/${CONNEXTDDS_ARCH:-arm64Darwin20clang12.0}:${DYLD_LIBRARY_PATH:-}"
+  ADV="${ADVERTISE:-$(ipconfig getifaddr en0 2>/dev/null || echo 127.0.0.1)}"
+
+  # Leg 5: us -> Connext (the direction ADR 0079 broke).
+  log="$(mktemp)"
+  g="$(start_peer "$log" bash -c "cd interop/connext/large-data && exec ./large_sub $DOMAIN $((SECONDS_RUN + 10))")"
+  sleep 5
+  tmout $((SECONDS_RUN + 25)) ./scripts/with-sbcl.sh \
+    --eval "(asdf:load-system :dds-shapes)" \
+    --eval "(uiop:symbol-call :dds.shapes :run-large-publisher :domain $DOMAIN :size 8000 :count $((SECONDS_RUN + 5)) :rate 2 :advertise-address \"$ADV\")" \
+    --eval '(uiop:quit 0)' >/dev/null 2>&1
+  wait_peer "$g" $((SECONDS_RUN + 30)); stop_peer "$g"
+  n="$(grep -c 'payload-len=8000 pattern=OK' "$log" || true)"
+  if [[ "$n" -ge "$MIN_SAMPLES" ]]; then note "ok" "us -> Connext LARGE: $n fragmented sample(s), pattern OK"; else
+    note "FAIL" "us -> Connext LARGE: only $n verified sample(s), need >= $MIN_SAMPLES (log: $log)"; fails=1; fi
+
+  # Leg 6: Connext -> us. Our reader reassembles from the WIRE's own fragmentSize/sampleSize, so this leg is
+  # independent of our *fragment-size* — it gates DATA_FRAG REASSEMBLY, which nothing else does.
+  log="$(mktemp)"
+  g="$(start_peer "$log" ./scripts/with-sbcl.sh \
+        --eval "(asdf:load-system :dds-shapes)" \
+        --eval "(uiop:symbol-call :dds.shapes :run-large-subscriber :domain $DOMAIN :seconds $((SECONDS_RUN + 10)) :advertise-address \"$ADV\")" \
+        --eval "(uiop:quit 0)")"
+  sleep 8
+  tmout $((SECONDS_RUN + 20)) bash -c "cd interop/connext/large-data && exec ./large_pub $DOMAIN 8000 $((SECONDS_RUN + 5))" >/dev/null 2>&1
+  wait_peer "$g" $((SECONDS_RUN + 30)); stop_peer "$g"
+  n="$(grep -c 'payload-length=8000 pattern=OK' "$log" || true)"
+  if [[ "$n" -ge "$MIN_SAMPLES" ]]; then note "ok" "Connext -> us LARGE: $n reassembled sample(s), pattern OK"; else
+    note "FAIL" "Connext -> us LARGE: only $n verified sample(s), need >= $MIN_SAMPLES (log: $log)"; fails=1; fi
 fi
 
 if [[ "$fails" -ne 0 ]]; then
@@ -186,7 +249,8 @@ echo "gate-interop: PASS — live cross-vendor interop validated (Connext = the 
 echo "gate-interop: COVERAGE — BOTH DIRECTIONS, both vendors: vendor->us and us->vendor (the latter is"
 echo "              the direction that hid ADR 0057, and it is gated here with REP=xcdr1 because a stock"
 echo "              foreign reader advertises XCDR1 only and DATA_REPRESENTATION is RxO)."
-echo "gate-interop: NOT COVERED — the SHAPES topic only. Per-feature legs (keyed/nokey, TypeLookup,"
-echo "              large-data fragmentation, keyed FlatData, liveliness, deadline, durability, security)"
-echo "              have drivers under scripts/ and interop/ but are NOT gated here yet. Say so rather"
-echo "              than let a green line read as 'interop is covered'."
+echo "gate-interop: NOT COVERED — Shapes + large-data only, and large-data only vs CONNEXT (there is no"
+echo "              Fast DDS LargeData peer, so FRAGMENTATION IS UNTESTED against the second vendor)."
+echo "              Per-feature legs (keyed/nokey, TypeLookup, keyed FlatData, liveliness, deadline,"
+echo "              durability, security) have drivers under scripts/ and interop/ but are NOT gated yet."
+echo "              Say so rather than let a green line read as 'interop is covered'."

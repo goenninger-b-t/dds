@@ -1,6 +1,6 @@
 # ADR 0079 — the emitted datagram size is an INTEROP contract: a fixed MTU-safe fragment size, and per-transport packing
 
-- **Status:** PARTIALLY LANDED — defect B (the fragment packing budget) is FIXED here; defect A (the `*fragment-size*` default) is an owner decision because it trades against a measured performance win
+- **Status:** ACCEPTED and LANDED — both defects fixed. Owner decision on A taken 2026-07-22: interoperate across platforms and machines with both vendors; the same-host cost is accepted and is recoverable per §8.4.14.1 (see Consequences)
 - **Date:** 2026-07-21 (revised 2026-07-22 against the RTPS 2.5 spec text)
 - **Requirements:** FR-IO (interop with Connext 7.x + one open-source DDS), NFR-PERF (the large-sample throughput win this collides with)
 - **Spec:** DDSI-RTPS 2.5 §8.4.14.1 (Large Data), §8.3.8.3 (DataFrag) — read from `docs/specs/rtps-2_5.pdf`, quoted below
@@ -103,7 +103,15 @@ the transport anyway. Nothing re-ran the large-data interop leg, **because that 
 
 Second time the un-gated half of interop hid a total delivery failure; the first was ADR 0057.
 
-## Decision needed on A
+## Decision taken on A (owner, 2026-07-22): option 1
+
+`*fragment-size*` 63000 -> **1024**, fixed per writer, MTU-derived. The derivation is in the special's own
+docstring: one fragment costs 56 octets of framing (20 RTPS header + 4 submessage header + 32 DATA_FRAG
+fields), an Ethernet path carries 1472, so the ceiling is 1416 and `*coalesce-datagram-budget*` (1400)
+tightens it to 1344; 1024 sits under that with headroom for IPv6, VLAN tags, tunnelled paths, and the
+DDS-Security SEC_PREFIX/POSTFIX wrapping.
+
+### The options as they stood
 
 1. **Set `*fragment-size*` MTU-safe (~1024–1400) and recover throughput per transport.** Conformant reading
    of §8.4.14.1: fixed size = min across the writer's transports; then let SHMEM/loopback concatenate many
@@ -122,9 +130,46 @@ throughput should come back through per-transport packing, not through a fragmen
 carry. **Not taken unilaterally**: the defaults came from a measured performance work-package under an
 explicit owner directive.
 
+## Consequences — measured, both directions, both vendors, and across machines
+
+**Interop (the reason for the change).** Live, 8000-octet `LargeData`, `pattern=OK` verified octet-by-octet:
+
+| leg | at 63000 (old) | at 1024 (new) |
+|---|---|---|
+| same host, us -> Connext | **0** | 14 |
+| same host, Connext -> us | 15 | 20 |
+| **cross machine**, Linux -> Connext (Mac), real Ethernet | **0** | **14** |
+
+The cross-machine pair is the decisive one: identical setup, publisher discovers the peer (`peers=1`) and
+sends 20 in both arms, and the only variable is the fragment size. Also proven cross-machine: ours (Linux)
+-> ours (Mac) 13/16 `pattern=OK`, and ours (Linux) -> Fast DDS (Mac) 258 samples with 258 ACKNACKs.
+
+**Performance (the cost, stated plainly).** Round-trip p50, same host, 4 KB payload:
+
+| path | 63000 | 1024 |
+|---|---|---|
+| SHMEM available | **10.0 us** | 84.0 us |
+| UDP only | 27.0 us | 69.1 us |
+
+So ~2.7x is losing the SHMEM path and ~2.6x is genuine fragmentation overhead. **This is a real same-host
+regression and it is not hidden.** Two things put it in proportion: the 27 us at 63000 is a *loopback*
+number — on a 1500-MTU path a 4 KB datagram is IP-fragmented anyway, which is strictly worse (whole-datagram
+loss on any fragment loss, no selective repair) — and a stack that cannot exchange a large sample with a
+stock MTU-configured peer is not meeting FR-IO at any latency.
+
+**The recovery path is the spec's, and it is not yet implemented.** §8.4.14.1: *"If multiple transports are
+available to the Writer and some transports do not require fragmentation, a regular Data Submessage **must**
+be sent on those transports instead."* Today a sample larger than `*fragment-size*` takes a UDP-only
+fragmented path (`%sample-plan`, "large samples: UDP only (v1)"), so a 4 KB sample stops using SHMEM at all.
+Implementing that MUST — plain `Data` to a destination whose transport can carry the sample whole — should
+return same-host 4 KB to roughly the 10 us figure while keeping the MTU-safe fragment size for UDP. **That is
+the tracked follow-on**, and it is a conformance gap as well as a performance one.
+
 ## Regardless of the decision
 
 - Defect B is fixed here; 574/574 both impls, gate-build/hotpath/types/nocond/corpus green.
 - `make interop` gained both **outbound** Shapes legs, which is what makes this class catchable at all.
-- **The large-data leg must be gated** once A is decided. It is the only DATA_FRAG / NACK_FRAG leg against a
-  foreign stack, and it would have caught this the day it regressed.
+- **The large-data leg is now GATED**, both directions, in `make interop` (legs 5 and 6). FALSIFIED: with
+  `*fragment-size*` back at 63000 the outbound leg reports `only 0 verified sample(s)` and the gate goes RED.
+  Fragmentation against **Fast DDS remains untested** — there is no Fast DDS `LargeData` peer, and the gate
+  says so on every run.

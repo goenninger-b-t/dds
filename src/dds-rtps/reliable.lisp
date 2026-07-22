@@ -5,8 +5,31 @@
 ;;;; testable; the byte/transport wiring is a later increment. CLOS-free; the
 ;;;; consing here (per-reader proxies, resend lists) is a documented v1 concern.
 
-(defparameter *fragment-size* 63000
-  "Outbound RTPS fragmentSize in octets (uint16, <=65535; RTPS 2.5 §9.4.5.5 DATA_FRAG). A sample whose serialized size exceeds this is sent as DATA_FRAG submessages.")
+(defparameter *fragment-size* 1024
+  "Outbound RTPS fragmentSize in octets (uint16, <=65535; RTPS 2.5 §9.4.5.5 DATA_FRAG). A sample whose
+   serialized size exceeds this is sent as DATA_FRAG submessages.
+
+   THIS IS AN INTEROP CONTRACT, NOT A TUNING KNOB (ADR 0079). RTPS 2.5 §8.4.14.1 requires it to be FIXED for
+   a given Writer and IDENTICAL for all remote Readers — fragment numbers are the wire identity of byte
+   ranges (reassembly offset is (fragmentStartingNum-1) * fragmentSize), so a NackFrag naming fragment 3
+   must mean the same bytes to every reader. The spec explicitly forbids re-deriving it for newly discovered
+   Readers, and it must be set by 'the transport with the smallest maximum message size' across ALL
+   transports available to the Writer — NOT merely those reaching the currently known peers.
+
+   WHY 1024. Our smallest transport is UDPv4 across an Ethernet path: MTU 1500 - 20 IPv4 - 8 UDP = 1472
+   octets of payload. One fragment costs 56 octets of framing (20 RTPS header + 4 submessage header + 32
+   DATA_FRAG fields, see write-data-frag), so the MTU ceiling is 1416 and *coalesce-datagram-budget* (1400)
+   tightens it to 1344. 1024 is chosen under that with deliberate headroom for IPv6 (40-octet header), VLAN
+   tags, tunnelled/VPN paths with a reduced effective MTU, and the DDS-Security SEC_PREFIX/SEC_POSTFIX
+   wrapping that grows every protected submessage. Measured: 1024 yields a 1080-octet RTPS datagram, 1108 on
+   the wire.
+
+   The previous default of 63000 made a multi-KB sample ride UNFRAGMENTED in a single oversized datagram,
+   which a peer whose UDPv4 transport is MTU-bounded silently discards, and which any real 1500-MTU path
+   must IP-fragment. Live proof: RTI Connext with the ordinary message_size_max=1400 received ZERO of our
+   8000-octet samples at 63000. Large-sample THROUGHPUT is recovered where the spec puts it — per transport,
+   by concatenating as many fragments as a transport can accommodate (%pack-budget) — not by a fragment size
+   the network cannot carry.")
 
 (defparameter *max-reassembly-bytes* (* 4 1024 1024)
   "Reject an inbound DATA_FRAG sampleSize larger than this BEFORE allocating the reassembly buffer (resource-exhaustion guard, NFR-SEC-POSTURE).")
