@@ -3,3 +3,6 @@ shmprobe
 # Run artifacts from the observation scripts.
 *.log
 sweep-qos.xml
+wrap-qos.xml
+extent-qos.xml
+c.xml

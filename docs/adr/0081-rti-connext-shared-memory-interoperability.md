@@ -173,6 +173,25 @@ useful failure.**
   measured configurations: (1048576, 65536, 64) → 1115312 exactly; (2048, 2048, 8) → 4456 exactly;
   (777216, 20480, 37) → 795 rounds to 800, giving 798496. A three-point fit with one rounding, so recorded
   as consistent-with rather than proven.
+- **The ring is SOLVED for geometry.** Diffing whole-segment snapshots against the cursor
+  (`interop/connext/shmem-layout/ring-extent.sh`) gives the write offset of each record directly, because
+  the bytes that changed *are* the record just written. Across 54 consecutive samples the offset was exactly
+  `cursor + 236`, and at the wrap it fell from 4336 to **304** where an unwrapped value would have been
+  4400 — a difference of exactly 4096. The whole run, wrap included, fits
+
+      offset = 304 + ((cursor - 68) mod 4096)
+
+  **The modulus is `receive_buffer_size + message_size_max`, and `2 * receive_buffer_size` is ruled out.**
+  Those two were indistinguishable in the run above (both 2048), so four further configurations were
+  measured with them unequal: in every one `2 * receive_buffer_size` **exceeds the whole segment**, which
+  the ring cannot. Ring start was 304 in the measured configuration; whether that is `176 + 16 * count` or
+  `size - ring_length - 56` needs one more wrap at a different `count` to separate — both fit the single
+  point, so neither is claimed.
+- **The segment-size formula is confirmed, not fitted.** `receive_buffer_size + message_size_max +
+  align8(240 + 15 * received_message_count_max)` was used to PREDICT four new configurations before
+  measuring them, and all four landed exactly: (4096, 2048, 8) → 6504, (8192, 2048, 8) → 10600,
+  (4096, 2048, 16) → 6624, (16384, 4096, 8) → 20840. Seven configurations total. `0x50` likewise predicted
+  240, 240, 304, 240 and read back 240, 240, 304, 240.
 - **The cursor is a CUMULATIVE BYTE COUNT, not an offset into the segment — and this falsifies the claim
   above that "those positions are absolute byte offsets".** Run long enough (90 samples), the producer
   position climbed monotonically to **6084 in a segment of 4456**. A number larger than the segment cannot
