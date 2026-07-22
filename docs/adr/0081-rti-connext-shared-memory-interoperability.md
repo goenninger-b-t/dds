@@ -311,10 +311,11 @@ samples in the second, the excess being protocol records (heartbeats and the lik
 the ring. **A sits exactly one record ahead of B at all times**, which is the shape of a (next, current)
 pair rather than two independent structures.
 
-One further observation, on **two points only** and so recorded as a lead rather than a result: within each
-block, fields 2–4 sit above fields 0–1 by 4 with one publisher and by 12 with three — consistent with 4
-bytes per sender, but two points do not establish that and this ADR has already paid once for treating a
-two-point fit as a fact.
+**Within a block, fields 2–4 sit above fields 0–1 by exactly 4 bytes per SENDER** — swept over 1, 2, 4 and
+6 publishers and matching 4, 8, 16 and 24 exactly. Over the same sweep A − B stayed at +64 bytes and +1
+counter throughout, so the per-sender quantity lives *inside* a block while the A/B relationship does not
+depend on it at all. Four points, one parameter varied, prediction matching at each — this one is a result,
+not the two-point lead it started as.
 
 **Still NOT established, and not to be guessed at:** the `semop` sequence itself (see above — obtainable,
 just not by me); what the A/B one-record offset MEANS (the shape is clear, the purpose is not); whether the
