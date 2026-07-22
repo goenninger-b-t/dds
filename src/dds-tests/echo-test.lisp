@@ -3976,6 +3976,7 @@
                  ("dcps-type-gate-legacy-reader" . run-dcps-type-gate-legacy-reader-test)
                  ("dcps-state-masks"         . run-dcps-state-masks-test)
                  ("dcps-rx-store-bounded"    . run-dcps-rx-store-bounded-test)
+                 ("unfragmented-to-shmem-dest" . run-unfragmented-to-shmem-dest-test)
                  ("dcps-disabled-endpoint-silent" . run-dcps-disabled-endpoint-silent-test)
                  ("dcps-builtin-topics"      . run-dcps-builtin-topics-test)
                  ("dcps-type-compat"         . run-dcps-type-compat-test)

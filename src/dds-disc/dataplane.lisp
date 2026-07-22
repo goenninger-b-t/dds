@@ -904,6 +904,33 @@
       (<= (dds.rtps.history:cache-change-payload-len change)   ; TRUE length (a secured change's payload is an oversized pooled vec, T5a)
           dds.rtps.reliable:*fragment-size*)))
 
+(defun* %unfragmented-to-dest-p (change shmem-dest buf)
+    (function (dds.rtps.history:cache-change t dds.core.buffer:octet-buffer) t)
+  "T iff CHANGE may be sent WHOLE, as one DATA submessage, to THIS destination even though it is larger than
+   *fragment-size* — RTPS 2.5 §8.4.14.1: 'Data must only be fragmented if required. If multiple transports
+   are available to the Writer and some transports do not require fragmentation, a regular Data Submessage
+   MUST be sent on those transports instead.'
+
+   The fragment SIZE is a per-Writer constant the spec forbids varying per reader (ADR 0079); what varies
+   per destination is whether fragmentation is needed AT ALL. *fragment-size* is derived from our SMALLEST
+   transport (UDPv4 across an Ethernet path), so it is the wrong bound for a destination reached over shared
+   memory, whose ring carries ~64 KB records.
+
+   WHY THIS IS SAFE, and it rests on what SHMEM-DEST means. It is non-NIL only for a peer %shmem-dest
+   resolved as SAME-HOST via our own vendor host-UUID parameter — i.e. another node of THIS stack on THIS
+   machine. So a whole-sample datagram taken here can never reach a foreign peer, and never leaves the
+   machine. Its one degradation path is benign: if the SHMEM send cannot proceed, %send-raw-buf falls back
+   to UDP at the same host, which is loopback (a large MTU) to a peer whose receive buffer is
+   *max-datagram-bytes*. A cross-host destination has SHMEM-DEST NIL and keeps fragmenting, which is what
+   keeps us MTU-safe on the wire.
+
+   Bounded by the send buffer with headroom for the RTPS header + DATA submessage header; a sample larger
+   than that fragments as before. Dispose/unregister changes carry no payload and are already packable."
+  (and shmem-dest
+       (eq (dds.rtps.history:cache-change-kind change) :data)
+       (<= (dds.rtps.history:cache-change-payload-len change)   ; TRUE length (a secured change's payload is an oversized pooled vec, T5a)
+           (- (dds.core.buffer:octet-buffer-capacity buf) 128))))
+
 (defun* %ns->rtps-time (ns)
     (function (integer) (values (unsigned-byte 32) (unsigned-byte 32)))
   "Split a nanosecond source_timestamp into the RTPS Time_t (seconds, 2^-32 fraction) for an INFO_TS
@@ -1405,7 +1432,10 @@
           ;; payload (NIL is expected) and is emitted as before.
           ((and (eq (dds.rtps.history:cache-change-kind change) :data)
                 (null (%ensure-change-payload node change))))   ; pinned :data, resolve failed -> drop this datagram
-          ((%small-change-p change) (push (%data-builder node change) items))
+          ;; RTPS 2.5 §8.4.14.1: send a regular Data on a transport that does not require fragmentation.
+          ((or (%small-change-p change)
+               (%unfragmented-to-dest-p change shmem-dest buf))
+           (push (%data-builder node change) items))
           (t (dolist (thunk (%sample-plan node sn (dds.rtps.history:cache-change-serialized-payload change)
                                           (dds.rtps.history:cache-change-payload-len change)   ; TRUE length (T5a)
                                           budget))   ; ADR 0079: the SAME MTU-bounded budget the small-submessage path uses, NOT the raw buffer capacity

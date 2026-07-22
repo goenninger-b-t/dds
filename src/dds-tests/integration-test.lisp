@@ -5430,6 +5430,54 @@
       (dds.disc:stop-node node)))
   t)
 
+(defun* run-unfragmented-to-shmem-dest-test ()
+    (function () t)
+  "RTPS 2.5 §8.4.14.1 regression (ADR 0079): a sample larger than *fragment-size* must be sent WHOLE, as one
+   DATA submessage, to a destination whose transport does not require fragmentation — and must still be
+   FRAGMENTED to one that does.
+
+   WHY THIS TEST EXISTS AT THE PLAN LEVEL. The spec sentence is a MUST: 'If multiple transports are
+   available to the Writer and some transports do not require fragmentation, a regular Data Submessage must
+   be sent on those transports instead.' Not doing it cost 8.4x on a same-host 4 KB round trip once
+   *fragment-size* became MTU-derived, because a >fragment-size sample took a UDP-only fragmented path and
+   stopped using shared memory at all. It is asserted on %changes-datagram-plan rather than on a predicate
+   because the WIRING is what broke before: a correct predicate that nothing consults is worth nothing.
+
+   The plan is pure (it builds thunks, sends nothing), so a non-NIL SHMEM-DEST stand-in is enough to select
+   the destination class — exactly what the production path passes it for.
+
+   FALSIFIED: drop %unfragmented-to-dest-p from %changes-datagram-plan and the SHMEM arm produces the same
+   multi-datagram fragmented plan as the UDP arm, failing :unfrag-shmem-single."
+  (let ((node (dds.disc:make-disc-node
+               :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element 9)
+               :host "127.0.0.1" :port 0)))
+    (unwind-protect
+         (progn
+           (dds.disc:enable-publisher node :history-kind :keep-all)
+           (%seed-reader-participant node #x59 7709)
+           (let* ((writer (dds.disc::disc-node-user-writer node))
+                  (big (make-array 8000 :element-type '(unsigned-byte 8) :initial-element 7)))
+             (%check :unfrag-premise (> (length big) dds.rtps.reliable:*fragment-size*)
+                     "premise: the sample must exceed *fragment-size*, or the test proves nothing")
+             (dds.rtps.reliable:writer-write writer big)
+             (let* ((buf (dds.core.buffer:make-octet-buffer dds.disc:*max-datagram-bytes*))
+                    ;; a FRESH opaque reader key starts at unsent-base 1, so this returns every change once
+                    (changes (dds.rtps.reliable:writer-unsent-list writer :unfrag-test-reader))
+                    (udp-plan (dds.disc::%changes-datagram-plan node buf changes nil nil 0))
+                    (shm-plan (dds.disc::%changes-datagram-plan node buf changes nil :a-shmem-dest 0)))
+               (dds.pal:free-static (dds.core.buffer:octet-buffer-vec buf))
+               (%check :unfrag-udp-fragments (> (length udp-plan) 1)
+                       (format nil "to a UDP destination an ~d-octet sample must FRAGMENT (plan had ~d datagram(s))"
+                               (length big) (length udp-plan)))
+               (%check :unfrag-shmem-single (= 1 (length shm-plan))
+                       (format nil "to a SHMEM destination the same sample must ride WHOLE in ONE datagram (RTPS 2.5 §8.4.14.1 MUST; plan had ~d)"
+                               (length shm-plan)))
+               (%check :unfrag-shmem-carries-dest
+                       (eq :a-shmem-dest (cdr (first shm-plan)))
+                       "the whole-sample datagram must be routed to the SHMEM destination, not silently to UDP"))))
+      (dds.disc:stop-node node)))
+  t)
+
 (defun* run-coalesce-split-test ()
     (function () t)
   "A small datagram budget forces the same 10-sample burst across ≥2 datagrams WITHOUT losing or

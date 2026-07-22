@@ -157,13 +157,33 @@ number — on a 1500-MTU path a 4 KB datagram is IP-fragmented anyway, which is 
 loss on any fragment loss, no selective repair) — and a stack that cannot exchange a large sample with a
 stock MTU-configured peer is not meeting FR-IO at any latency.
 
-**The recovery path is the spec's, and it is not yet implemented.** §8.4.14.1: *"If multiple transports are
+**The recovery path is the spec's, and it is now IMPLEMENTED.** §8.4.14.1: *"If multiple transports are
 available to the Writer and some transports do not require fragmentation, a regular Data Submessage **must**
-be sent on those transports instead."* Today a sample larger than `*fragment-size*` takes a UDP-only
-fragmented path (`%sample-plan`, "large samples: UDP only (v1)"), so a 4 KB sample stops using SHMEM at all.
-Implementing that MUST — plain `Data` to a destination whose transport can carry the sample whole — should
-return same-host 4 KB to roughly the 10 us figure while keeping the MTU-safe fragment size for UDP. **That is
-the tracked follow-on**, and it is a conformance gap as well as a performance one.
+be sent on those transports instead."* A sample larger than `*fragment-size*` used to take a UDP-only
+fragmented path unconditionally (`%sample-plan`, "large samples: UDP only (v1)"), so a 4 KB sample stopped
+using shared memory at all. `%unfragmented-to-dest-p` now lets a change ride WHOLE, as one `Data`
+submessage, to a destination reached over SHMEM — the fragment SIZE stays the per-writer constant the spec
+requires; what varies per destination is whether fragmentation is needed at all.
+
+It is safe because of what a SHMEM destination *is*: `%shmem-dest` resolves one only for a peer identified
+as same-host through our own vendor host-UUID parameter — i.e. another node of this stack, on this machine.
+A whole-sample datagram taken on that arm can never reach a foreign peer and never leaves the box, and its
+one degradation path is benign (a SHMEM send that cannot proceed falls back to UDP at the same host, which
+is loopback). A cross-host destination has no SHMEM dest and keeps fragmenting — which is what keeps the
+wire MTU-safe.
+
+**Measured, same host, round-trip p50:**
+
+| payload | 63000 (pre-ADR) | 1024 alone | 1024 + the MUST |
+|---|---|---|---|
+| 4 KB | 10.0 us | 84.0 us | **9.0 us** |
+| 16 KB | — | 192.6 us | **13.1 us** |
+
+So the interop fix costs nothing same-host once the MUST is honoured — 4 KB is marginally *better* than the
+pre-ADR default, and 16 KB is far better. Gated by `run-unfragmented-to-shmem-dest-test`, which asserts the
+PLAN (the wiring), not the predicate: the same over-size change must produce a multi-datagram fragmented
+plan for a UDP destination and exactly ONE datagram, carrying the SHMEM destination, for a SHMEM one.
+Falsified — removing the wiring makes the SHMEM arm produce 9 datagrams and the test goes red.
 
 ## Regardless of the decision
 

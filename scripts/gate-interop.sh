@@ -127,7 +127,11 @@ if [[ "$have_connext" -eq 1 ]]; then
     --eval "(uiop:symbol-call :dds.shapes :run-subscriber :domain $DOMAIN :advertise-address \"$ADV\" :type :canonical :seconds $SECONDS_RUN)" \
     --eval '(uiop:quit 0)' > "$log" 2>&1
   kill -9 $cxpid 2>/dev/null; wait $cxpid 2>/dev/null
-  n="$(grep -c '^\[sub\] Square' "$log" || true)"
+    # NOTE THE TRAILING SPACE. The subscriber's BANNER is "[sub] Square/ShapeType[canonical] domain=0 ...",
+  # so the obvious pattern '^\[sub\] Square' MATCHES IT and a leg that received NOTHING scores 1. With the
+  # old ">0 samples" test that read GREEN — a totally failing leg reported as passing interop. A per-sample
+  # line is "[sub] Square BLUE x=.. y=.. size=..", hence 'Square ' with the space.
+  n="$(grep -c '^\[sub\] Square [A-Za-z]' "$log" || true)"
   if [[ "$n" -ge "$MIN_SAMPLES" ]]; then note "ok" "Connext -> us: $n sample(s) received"; else
     note "FAIL" "Connext -> us: only $n sample(s), need >= $MIN_SAMPLES (log: $log)"; fails=1; fi
 fi
@@ -145,7 +149,11 @@ if [[ "$have_fastdds" -eq 1 ]]; then
     --eval "(uiop:symbol-call :dds.shapes :run-subscriber :domain $DOMAIN :advertise-address \"127.0.0.1\" :type :canonical :peers \"127.0.0.1:7410\" :seconds $SECONDS_RUN)" \
     --eval '(uiop:quit 0)' > "$log" 2>&1
   kill -9 $fdpid 2>/dev/null; wait $fdpid 2>/dev/null
-  n="$(grep -c '^\[sub\] Square' "$log" || true)"
+    # NOTE THE TRAILING SPACE. The subscriber's BANNER is "[sub] Square/ShapeType[canonical] domain=0 ...",
+  # so the obvious pattern '^\[sub\] Square' MATCHES IT and a leg that received NOTHING scores 1. With the
+  # old ">0 samples" test that read GREEN — a totally failing leg reported as passing interop. A per-sample
+  # line is "[sub] Square BLUE x=.. y=.. size=..", hence 'Square ' with the space.
+  n="$(grep -c '^\[sub\] Square [A-Za-z]' "$log" || true)"
   if [[ "$n" -ge "$MIN_SAMPLES" ]]; then note "ok" "Fast DDS -> us: $n sample(s) (LENIENT peer — proves less than Connext)"; else
     note "FAIL" "Fast DDS -> us: only $n sample(s), need >= $MIN_SAMPLES (log: $log)"; fails=1; fi
 fi
