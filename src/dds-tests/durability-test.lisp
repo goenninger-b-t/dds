@@ -1106,7 +1106,13 @@
              (let* ((lj-prefix (%make-test-prefix #xE7))
                     (lj-node (dds.disc:make-disc-node :guid-prefix lj-prefix :domain (test-domain +td-relay-emit+)
                                                       :host "127.0.0.1" :port 0 :multicast nil))
-                    (captured (make-array 0 :element-type t :adjustable t :fill-pointer 0)))
+                    (captured (make-array 0 :element-type t :adjustable t :fill-pointer 0))
+                    ;; The sink fires on the SERVICE's receiver thread(s), and vector-push-extend is NOT
+                    ;; atomic: two concurrent pushes can both read the same fill-pointer, one write wins, and
+                    ;; the pointer still advances twice — leaving a slot BELOW the fill-pointer that was
+                    ;; never written. It then reads back as 0 and the parse dies with
+                    ;; "The value 0 is not of type (SIMPLE-ARRAY (UNSIGNED-BYTE 8) (*))". Seen in CI.
+                    (captured-lock (dds.pal:make-lock "relay-emit-capture")))
                (unwind-protect
                     (progn
                       (dds.disc:add-local-reader lj-node :topic "RSquare" :type "ShapeType"
@@ -1134,7 +1140,10 @@
                       (unwind-protect
                            (progn
                              (setf dds.disc:*datagram-sink*
-                                   (lambda (dg) (vector-push-extend (copy-seq dg) captured)))
+                                   (lambda (dg)
+                                     (let ((copy (copy-seq dg)))   ; copy OUTSIDE the lock; the buffer is reused
+                                       (dds.pal:with-lock (captured-lock)
+                                         (vector-push-extend copy captured)))))
                              (%await-match lj-node svc-node :retries 300 :sleep-s 0.02)
                              (%await-sample-count lj-node n :retries 1200 :sleep-s 0.005))
                         (setf dds.disc:*datagram-sink* nil))
