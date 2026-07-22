@@ -297,8 +297,28 @@ and whether `IPC_NOWAIT` is what produces the observed post-once-do-not-stack be
 State observation cannot answer this: cursors, semaphore values and segment bytes reveal *what* changed,
 never the *order* of the calls that changed them.
 
+**The two control blocks are NOT per-sender.** Comparing one publisher against three (with the participant
+index scanned across its full range, which an earlier attempt failed to do):
+
+| publishers | samples received | A@`0x78` counter | B@`0xb0` counter | A − B |
+|---|---|---|---|---|
+| 1 | 17 | 18 | **17** | +64 bytes, +1 |
+| 3 | 51 | 54 | **53** | +64 bytes, +1 |
+
+The offset between the blocks is **invariant to the number of senders**, so they do not partition senders.
+B's counter tracks records actually taken — exactly the 17 samples in the first run, and 53 against 51
+samples in the second, the excess being protocol records (heartbeats and the like) that are also records in
+the ring. **A sits exactly one record ahead of B at all times**, which is the shape of a (next, current)
+pair rather than two independent structures.
+
+One further observation, on **two points only** and so recorded as a lead rather than a result: within each
+block, fields 2–4 sit above fields 0–1 by 4 with one publisher and by 12 with three — consistent with 4
+bytes per sender, but two points do not establish that and this ADR has already paid once for treating a
+two-point fit as a fact.
+
 **Still NOT established, and not to be guessed at:** the `semop` sequence itself (see above — obtainable,
-just not by me); what distinguishes the two control blocks (and whether the
+just not by me); what the A/B one-record offset MEANS (the shape is clear, the purpose is not); whether the
+within-block delta really scales with sender count (and whether the
 56/112/168 stride implies a third); the meaning of the two position families four bytes apart; whether 688
 is the ring base — it is the value at `0x50`, equals `176 + 8 * received_message_count_max`, and one baseline
 producer position of 708 sits exactly 20 octets above it, but that is suggestive, not proof; wraparound
