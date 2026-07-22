@@ -238,6 +238,28 @@ if [[ "$have_connext" -eq 1 ]]; then
     note "FAIL" "Connext -> us LARGE: only $n verified sample(s), need >= $MIN_SAMPLES (log: $log)"; fails=1; fi
 fi
 
+# ---- Leg 7: us -> Fast DDS, LARGE DATA. Fragmentation against the SECOND vendor. ----
+# Fast DDS is the LENIENT peer, so this proves strictly less than the Connext large leg — but until this
+# existed, fragmentation had exactly ONE vendor behind it, and "our emitted datagram size interoperates" is
+# a claim about both. Fast DDS's profile whitelists 127.0.0.1 only and never sees LAN multicast SPDP, so we
+# must announce unicast to its builtin metatraffic port. The peer verifies the payload octet-by-octet.
+if [[ "$have_fastdds" -eq 1 && -x interop/fastdds/largedata/large_sub ]]; then
+  log="$(mktemp)"
+  g="$(start_peer "$log" ./scripts/with-fastdds.sh bash -c "cd interop/fastdds/largedata && exec ./large_sub $((SECONDS_RUN + 10))")"
+  sleep 6
+  tmout $((SECONDS_RUN + 25)) ./scripts/with-sbcl.sh \
+    --eval "(asdf:load-system :dds-shapes)" \
+    --eval "(uiop:symbol-call :dds.shapes :run-large-publisher :domain $DOMAIN :size 8000 :count $((SECONDS_RUN + 5)) :rate 2 :advertise-address \"127.0.0.1\" :peers \"127.0.0.1:7410\")" \
+    --eval '(uiop:quit 0)' >/dev/null 2>&1
+  wait_peer "$g" $((SECONDS_RUN + 30)); stop_peer "$g"
+  n="$(grep -c 'payload-len=8000 pattern=OK' "$log" || true)"
+  if [[ "$n" -ge "$MIN_SAMPLES" ]]; then note "ok" "us -> Fast DDS LARGE: $n fragmented sample(s), pattern OK (LENIENT peer)"; else
+    note "FAIL" "us -> Fast DDS LARGE: only $n verified sample(s), need >= $MIN_SAMPLES (log: $log)"; fails=1; fi
+elif [[ "$have_fastdds" -eq 1 ]]; then
+  note "FAIL" "Fast DDS LARGE peer not built — run: ./scripts/with-fastdds.sh bash -c 'cd interop/fastdds/largedata && make'"
+  fails=1
+fi
+
 if [[ "$fails" -ne 0 ]]; then
   echo "gate-interop: FAIL — see above." >&2
   exit 1
@@ -249,8 +271,9 @@ echo "gate-interop: PASS — live cross-vendor interop validated (Connext = the 
 echo "gate-interop: COVERAGE — BOTH DIRECTIONS, both vendors: vendor->us and us->vendor (the latter is"
 echo "              the direction that hid ADR 0057, and it is gated here with REP=xcdr1 because a stock"
 echo "              foreign reader advertises XCDR1 only and DATA_REPRESENTATION is RxO)."
-echo "gate-interop: NOT COVERED — Shapes + large-data only, and large-data only vs CONNEXT (there is no"
-echo "              Fast DDS LargeData peer, so FRAGMENTATION IS UNTESTED against the second vendor)."
+echo "gate-interop: NOT COVERED — Shapes + large-data only. Large-data now runs against BOTH vendors"
+echo "              (Connext both directions; Fast DDS outbound — there is no Fast DDS LargeData publisher,"
+echo "              so DATA_FRAG REASSEMBLY is gated against Connext only)."
 echo "              Per-feature legs (keyed/nokey, TypeLookup, keyed FlatData, liveliness, deadline,"
 echo "              durability, security) have drivers under scripts/ and interop/ but are NOT gated yet."
 echo "              Say so rather than let a green line read as 'interop is covered'."

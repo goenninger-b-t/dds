@@ -20,6 +20,7 @@ tshark RTPS dissector — the same dissector `make wire` uses — not by eye.
 | us -> Fast DDS | **outbound** | |
 | us -> Connext, `LargeData` | outbound | **DATA_FRAG**; 8000-octet payload verified octet-by-octet |
 | Connext -> us, `LargeData` | inbound | **DATA_FRAG reassembly**; independent of our own fragment size |
+| us -> Fast DDS, `LargeData` | outbound | **DATA_FRAG** vs the second vendor (`interop/fastdds/largedata/`) |
 
 The two large-data legs are the only fragmentation legs against a foreign stack, and their absence let
 ADR 0079 ship: Shapes samples sit far below any MTU, so no Shapes leg can exercise the emitted datagram
@@ -53,8 +54,13 @@ takes a `<seconds>` argument; `wait_peer` waits for that, and `stop_peer` is onl
 The Shapes legs had been escaping this by accident (249 lines overflow the 4 KB buffer and force a flush);
 the large-data legs, at ~15 lines, did not.
 
-Not covered: Shapes and large-data only, and large-data only against **Connext** — there is no Fast DDS
-`LargeData` peer, so fragmentation is untested against the second vendor. Per-feature legs (keyed/nokey,
+The Fast DDS `LargeData` peer lives in `interop/fastdds/largedata/` (build:
+`./scripts/with-fastdds.sh bash -c 'cd interop/fastdds/largedata && make'`). It verifies the payload
+octet-by-octet like the Connext peer, and it needs a **unicast** SPDP announce — its profile whitelists
+127.0.0.1 only, so it never sees LAN multicast; `run-large-publisher` therefore takes `:peers`.
+
+Not covered: Shapes and large-data only, and DATA_FRAG **reassembly** is gated against Connext only (there
+is no Fast DDS `LargeData` publisher). Per-feature legs (keyed/nokey,
 TypeLookup, keyed FlatData, liveliness, deadline, durability, security) have drivers under `scripts/` and
 `interop/` but are not gated yet — the gate says so on every run rather than letting a green line read as
 "interop is covered".

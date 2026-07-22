@@ -606,18 +606,23 @@
   (payload (:sequence :byte)))
 
 (defun* run-large-publisher (&key (domain 0) (size 8000) (rate 2) (count 0)
-                                  (advertise-address "127.0.0.1") drop-fragments)
+                                  (advertise-address "127.0.0.1") (peers nil) drop-fragments)
     (function (&key (:domain (integer 0)) (:size (integer 1)) (:rate (integer 1))
-                    (:count (integer 0)) (:advertise-address string) (:drop-fragments list)) t)
+                    (:count (integer 0)) (:advertise-address string) (:peers (or null string))
+                    (:drop-fragments list)) t)
   "Publish LargeData samples on DOMAIN via multicast discovery. SIZE is the octet count of
    the payload (default 8000, well above *fragment-size*=1024); RATE updates/sec; COUNT 0
    = forever (Ctrl-C). The payload is filled with i*7 mod 256 so the subscriber can verify.
    DROP-FRAGMENTS (a list of 1-based fragment numbers) sets
    dds.disc:*debug-drop-fragment-numbers* for the duration of the run (globally — the
    ACKNACK retransmit path runs on the receiver thread): those fragments are never
-   pushed, so a reliable peer must NACK_FRAG them back (fragment-loss injection)."
+   pushed, so a reliable peer must NACK_FRAG them back (fragment-loss injection).
+   PEERS is an optional \"host:port[,host:port]\" list of unicast SPDP announce targets on top of
+   multicast (FR-DISC-4) — REQUIRED to reach a Fast DDS peer, whose profile whitelists 127.0.0.1 only and
+   therefore never sees LAN multicast SPDP: announce to its builtin metatraffic port, 127.0.0.1:7410."
   (let ((node (dds.disc:make-disc-node :guid-prefix (%make-prefix #x4c) :domain domain
-                                       :multicast t :advertise-address advertise-address)))
+                                       :multicast t :advertise-address advertise-address
+                                       :peers (%parse-peers peers))))
     (dds.disc:add-local-writer node :topic "LargeData" :type "LargeData"
                                :reliability dds.rtps.discovery:+reliability-reliable+)
     (dds.disc:enable-publisher node)

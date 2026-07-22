@@ -3143,3 +3143,17 @@ public GitHub master for understanding only; no code copied into `src/`.
   **libsqlite3** (3.51.0 verified on this host). All three added to `sbom.spdx.json` via
   `scripts/generate-sbom.py`. **No RTI Connext source/headers/generated code consulted or copied.**
   **No other DDS implementation's persistence code read.** CLEAN-ROOM.
+
+## ADR 0079 (2026-07-22) — Fast DDS LargeData peer (`interop/fastdds/largedata/`, DATA_FRAG leg 7)
+
+- **Same provenance basis as the M4 Fast DDS shapes harness above.** `LargeData.idl` is COPIED from this
+  repo's own `interop/connext/large-data/LargeData.idl` (our harness type: `@final`, `@key long id`,
+  unbounded `sequence<octet> payload`) — our IDL, not a vendor's. `large_sub.cpp` is written against the
+  public Fast DDS DDS-PIM API from its published documentation, and is structurally modelled on this repo's
+  own `interop/fastdds/shapes/shapes_sub.cpp`; `participant_guard.hpp` is copied verbatim from that same
+  in-repo harness.
+- The `fastddsgen` output under `interop/fastdds/largedata/gen/` is **committed verbatim**, on the same
+  terms as `interop/fastdds/shapes/gen/` (see the M4 entry): it is generated FROM OUR OWN IDL by the
+  vendor's generator, it is harness-only, and **no part of it is read into or reused by `src/`**.
+- **No RTI Connext source/headers/generated code consulted or copied. No Fast DDS library source read** —
+  only its public API documentation. CLEAN-ROOM.

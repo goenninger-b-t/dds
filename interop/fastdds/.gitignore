@@ -14,3 +14,4 @@ tshark.err
 !captures/
 !captures/*.pcap
 !captures/*.out
+largedata/large_sub

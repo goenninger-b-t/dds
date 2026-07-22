@@ -1,0 +1,10 @@
+// LargeData for the DATA_FRAG oracle harness.
+// Defined to match THIS stack's generated `large-data` (src/dds-shapes/shapes.lisp):
+//   @final, @key long id (member id 0), unbounded sequence<octet> payload (member id 1).
+// rtiddsgen needs -unboundedSupport or it silently bounds the sequence (see README.md).
+
+@final
+struct LargeData {
+    @key long id;
+    sequence<octet> payload;
+};
