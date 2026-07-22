@@ -135,6 +135,11 @@
      3. wrong magic                         -> (NIL :NOT-AN-RTI-SHMEM-SEGMENT)
      4. unmeasured protocol major version   -> (NIL :UNVALIDATED-SHMEM-PROTOCOL-VERSION)
      5. no segment at that key              -> (NIL :NO-SUCH-SEGMENT)
+     6. a segment SHORTER than the header   -> (NIL :NO-SUCH-SEGMENT), refused at ATTACH
+
+   Case 6 is the security property the reader rests on (NFR-SEC-POSTURE): a truncated or hostile segment
+   must fail to attach rather than be read past its end, and because shmget enforces the requested extent
+   the check cannot be forgotten by a caller. Verified to behave identically on macOS and Linux.
 
    Case 4 is the one that matters most and the reason this is not merely a happy-path test: RTI names five
    protocol revisions and specifies none, so a reader that parsed version 5 with version-2 offsets would
@@ -154,6 +159,16 @@
     (multiple-value-bind (stale status) (dds.pal:sysv-shm-attach-readonly key +rti-shmem-header-bytes+)
       (declare (ignore status))
       (when stale (dds.pal:sysv-shm-destroy stale) (dds.pal:sysv-shm-detach stale)))
+    ;; A TRUNCATED segment must fail to ATTACH, not be read past its end. This is the security property
+    ;; the whole reader rests on: the extent is a precondition the kernel enforces (shmget returns EINVAL
+    ;; below the requested size), so no caller can forget to check it. Verified on macOS AND Linux.
+    (multiple-value-bind (short status) (dds.pal:sysv-shm-create key (1- +rti-shmem-header-bytes+))
+      (when (null status)
+        (multiple-value-bind (same st) (rti-shmem-same-host-p mine port)
+          (dds.pal:sysv-shm-destroy short)
+          (dds.pal:sysv-shm-detach short)
+          (assert (and (null same) (eq st :no-such-segment)) ()   ; HOTPATH-COND(TEST): in-file self-test
+                  "a segment SHORTER than the header must refuse to attach, got ~s/~s" same st))))
     (multiple-value-bind (seg status) (dds.pal:sysv-shm-create key +rti-shmem-header-bytes+)
       (assert (null status) () "System V shm unusable (~s) — ADR 0081 slice 3 rests on it" status)   ; HOTPATH-COND(TEST): in-file self-test
       (unwind-protect
