@@ -199,13 +199,24 @@ useful failure.**
   `0x50` plus 64 — confirmed at both points, and it also refutes *both* candidates the previous revision
   offered (`176 + 16 * count` predicts 432, `size - ring_length - 56` predicts 424; the measurement is 368).
 
-  The general form, exact at both points, is
+  **The mapping is now complete, with every parameter varied INDEPENDENTLY before anything was asserted** —
+  the discipline the correction above demanded:
 
-      offset = ring_start + ((cursor - 68) mod M),  ring_start = 240 + 8 * count
+      offset      = ring_start + ((cursor - 68) mod M)
+      ring_start  = 240 + 8 * received_message_count_max          (= the value at 0x50, plus 64)
+      M           = receive_buffer_size + message_size_max + 8 * received_message_count_max - 64
 
-  with the additive constant 68 invariant across both. **`M` fits `4032 + 8 * count` on two points at
-  `rbs = msm = 2048`, and its dependence on `receive_buffer_size` and `message_size_max` is UNTESTED** —
-  recorded as an open question rather than generalised, which is exactly the mistake being corrected here.
+  | `rbs` | `msm` | `count` | M observed | formula | what was varied |
+  |---|---|---|---|---|---|
+  | 2048 | 2048 | 8 | 4096 | 4096 | baseline |
+  | 2048 | 2048 | 16 | **4160** | 4160 | `count` alone |
+  | 4096 | 2048 | 8 | **6144** | 6144 | `receive_buffer_size` alone |
+  | 4096 | 4096 | 8 | **8192** | 8192 | `message_size_max` alone |
+
+  Each of the last three moved exactly one parameter from the baseline, so each coefficient is measured
+  rather than assumed — and the last two rows were **predicted before the run**, along with their segment
+  sizes (6504, 8552) and ring starts (304, 304), all of which landed. The additive constant 68 is invariant
+  across all four.
 - **The segment-size formula is confirmed, not fitted.** `receive_buffer_size + message_size_max +
   align8(240 + 15 * received_message_count_max)` was used to PREDICT four new configurations before
   measuring them, and all four landed exactly: (4096, 2048, 8) → 6504, (8192, 2048, 8) → 10600,
