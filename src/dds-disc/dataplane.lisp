@@ -1334,7 +1334,7 @@
 
    ⚠️ BUDGET MUST BE THE TRANSPORT'S DATAGRAM BOUND (%pack-budget), not the send buffer's capacity.
    RTPS 2.5 §8.4.14.1 recommends concatenating as many fragments as possible into one DataFrag — but
-   conditioned on "IF A TRANSPORT CAN ACCOMMODATE" them. Passing the raw buffer capacity dropped that
+   conditioned on IF A TRANSPORT CAN ACCOMMODATE them (spec wording). Passing the raw buffer capacity dropped that
    condition and re-assembled the fragments we had just cut into a single ~8 KB datagram, which a peer
    whose UDPv4 transport is MTU-bounded silently discards: we fragmented for the wire and then undid it.
    Measured live against Connext 7.3.1 (message_size_max=1400): 0 samples received before, 13/16
