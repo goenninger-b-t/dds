@@ -76,6 +76,26 @@ Each run holds the three buffer properties constant and uses one fixed domain, s
 variable. Expect the low 12 bits of `host_id` rendered as four octal digits, one per octet, in address
 bytes 2–5.
 
+## 5. The ring — geometry and synchronisation (ADR 0081 §5.0)
+
+```sh
+./ring-roles.sh     # SIGSTOP the subscriber -> which control-block fields are the producer's
+./ring-extent.sh    # diff whole-segment snapshots against the cursor -> (cursor, write-offset) pairs
+./ring-wrap.sh      # shrink the ring through QoS so it wraps in a couple of minutes
+./ring-sync.sh      # SIGSTOP the subscriber -> is the semaphore a counter or a latch?
+./semprobe 801cf4   # semaphore  0x800000+port : value + blocked-waiter counts
+./semprobe b01cf4   # mutex      0xB00000+port
+```
+
+All four scripts work the same way: **drive the system to a boundary rather than sample it working.**
+Stopping the consumer is what separated the producer fields from the consumer fields, and what showed the
+semaphore is a wakeup latch rather than a message counter. Shrinking the ring through QoS is what made
+wraparound reachable, and varying one property at a time is what pinned each coefficient of the modulus.
+Four claims in this ADR were wrong before that discipline was applied consistently — sampling steady state
+and generalising is how each of them happened.
+
+`semprobe` issues only `semctl` GET* queries, which read and never modify, so a live peer is not perturbed.
+
 ## Hygiene
 
 System V segments outlive the process that created them. Remove the ones a probe run created, and leave

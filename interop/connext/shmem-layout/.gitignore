@@ -1,5 +1,6 @@
-# Built instrument — source is the artifact, the binary is not.
+# Built instruments — source is the artifact, the binaries are not.
 shmprobe
+semprobe
 # Run artifacts from the observation scripts.
 *.log
 sweep-qos.xml

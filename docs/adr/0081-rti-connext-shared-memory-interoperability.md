@@ -235,7 +235,31 @@ useful failure.**
 `MIGGenerator_addData:... message size max ... too small for propagating the participant discovery
 information`. Anything we advertise for our own segment must clear that, or nothing will discover us.
 
-**Still NOT established, and not to be guessed at:** what distinguishes the two blocks (and whether the
+**Synchronisation — the semaphore is a WAKEUP LATCH, not a message counter.** Every segment is accompanied
+by two System V semaphore sets (§4), each holding a single semaphore. Read statically
+(`interop/connext/shmem-layout/semprobe.c`, `semctl` GET* queries only, which read and never modify) the
+first sits at 0 with one process blocked waiting for it to increase, and the second at 1 with no waiters —
+which *looks* exactly like a counting "data available" semaphore plus a binary mutex. That reading is wrong,
+and `ring-sync.sh` shows it by stopping the consumer:
+
+| state | `0x800000+port` value | waiters |
+|---|---|---|
+| consumer parked, nothing pending | 0 | 1 |
+| **consumer SIGSTOPped, 10 messages produced** | **1** | 0 |
+| consumer resumed, backlog drained | 0 | 1 |
+
+A counting semaphore would have reached 10. It reaches 1 and stays there, so the producer posts once and does
+not stack while the flag is already raised; the consumer wakes, drains **everything** using the ring cursors,
+and re-parks. **The pending-message count lives in the cursors, not the semaphore** — consistent with the
+cursors being the authority for everything else.
+
+⚠️ **The mutex at `0xB00000+port` was observed only AT REST** (value 1, unlocked, no waiters, throughout).
+Two-second sampling cannot catch a critical section measured in microseconds, so its role is inferred from
+its key and its value — **it has NOT been observed being taken**, and that is recorded as unmeasured rather
+than assumed.
+
+**Still NOT established, and not to be guessed at:** the exact `semop` sequence; whether the mutex is in fact
+taken around ring updates; what distinguishes the two blocks (and whether the
 56/112/168 stride implies a third); the meaning of the two position families four bytes apart; whether 688
 is the ring base — it is the value at `0x50`, equals `176 + 8 * received_message_count_max`, and one baseline
 producer position of 708 sits exactly 20 octets above it, but that is suggestive, not proof; wraparound
