@@ -110,6 +110,37 @@ Little-endian, `arm64Darwin20clang12.0`, Connext 7.3.1, shmem protocol `majorVer
 Segment size is a function of the property block: 1115312 for the (1048576, 65536, 64) default and 798496
 for (777216, 20480, 37). Two points do not determine the formula; not yet derived.
 
+### 5.0 The ring — partially measured (slice 5 in progress, NOT implemented)
+
+Observed from a live Connext 7.3.1 `rtiddsping` publisher/subscriber pair exchanging over shared memory, by
+searching the subscriber's user-data segment for the RTPS magic (`52 54 50 53`, RTPS 2.5 §8.3.3.1.1) — a
+known needle again, rather than guesswork.
+
+**Established by direct observation:**
+
+- **Records are complete RTPS datagrams stored VERBATIM**, beginning with the `RTPS` magic and parsing
+  cleanly: version `02 05`, vendorId `01 01` (RTI), a 12-octet GUID prefix, then ordinary submessages
+  (`INFO_DST` `0x0e`, `HEARTBEAT` `0x08`, `INFO_TS` `0x09`, `DATA` `0x15`). **This is the important one:**
+  once the ring can be read, the datagrams inside need no special decoding — the existing RTPS parser
+  handles them unchanged.
+- Records are **packed contiguously and 8-byte aligned** — one record ended at `0x32c` and the next began
+  at `0x330`. Consecutive small records sat at a 64-byte stride.
+- **Two control blocks 56 bytes apart**, at `0x78` and `0xb0`, matching the 56/112/168 stride already logged
+  at `0x44`/`0x48`/`0x4c`. Each holds several byte positions followed by several equal counters.
+- **Those positions are absolute byte offsets pointing 20 octets INTO a record** — i.e. just past the
+  20-octet RTPS header. Verified at two independent positions: 5316 and 5380 both landed on an `INFO_TS`
+  submessage, and `RTPS` sat exactly 20 octets earlier at `0x14b0` and `0x14f0`.
+- At the moment of observation the two blocks' positions differed by **exactly one record stride** (5380 vs
+  5316 = 64) and their counters by **exactly one** (19 vs 18) — the shape of a producer/consumer pair with a
+  single unconsumed record.
+- `0x50` held 688 = `176 + 8 * received_message_count_max`, consistent with an 8-byte-per-entry table at 176
+  and the ring beginning at 688.
+
+**NOT established, and not to be guessed at:** which block is the producer and which the consumer; whether
+688 is in fact the ring base; wraparound behaviour at the end of the buffer; whether an explicit per-record
+length exists at all (an RTPS message is self-delimiting via `octetsToNextHeader`, so one may not be needed);
+and the synchronisation protocol — the semaphore and mutex keys are known (§4) but their use is unexamined.
+
 ### 5.1 The address is per-HOST, and that is what makes it usable
 
 The 12 significant octets were **byte-identical across unrelated processes on different domains**
@@ -181,7 +212,8 @@ we must still match.
    return a properties struct carrying the lie. **Live-validated** against a running Connext 7.3.1
    participant, where all three properties equal RTI's own published defaults (1048576 / 65536 / 64) and the
    segment size matches `ipcs` exactly.
-5. Ring and framing — derive by publishing known payloads and diffing.
+5. Ring and framing — **partially measured, not implemented.** Geometry and record format are in §5.0;
+   the producer/consumer roles, wraparound and synchronisation are still open. No code reads the ring yet.
 6. Receive a real RTPS datagram from Connext over shared memory.
 7. Transmit.
 
