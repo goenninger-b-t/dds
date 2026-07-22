@@ -5179,6 +5179,67 @@
 ;;; src-prefix; the test seeds two matched reader participants and asserts the fan-out set is 2
 ;;; while the targeted resolution picks exactly the originating one.
 
+(defun* run-rti-shmem-locator-test ()
+    (function () t)
+  "RTI Connext shared-memory Locator_t recognition (ADR 0081). The bytes asserted here were MEASURED from
+   ordinary RTPS SPDP discovery emitted by a live Connext 7.3.1 participant with transport_builtin mask
+   UDPv4|SHMEM — public discovery traffic this stack already parses — and cross-check RTI's published
+   NDDS_TRANSPORT_CLASSID_SHMEM constant.
+
+   WHAT WAS MEASURED, and why each part matters:
+   - kind #x01000000, advertised alongside its UDPv4 locators. A VENDOR kind: RTPS 2.5 reserves only
+     INVALID/RESERVED/UDPv4/UDPv6 and defines no shared-memory PSM, so every SHMEM kind is vendor-private.
+   - port = the ordinary RTPS port (7410 metatraffic / 7411 user for participant 0 on domain 0; 7412/7413
+     for participant 1), matching its own UDPv4 locators.
+   - address = 12 significant octets then 4 zeros. TWO DIFFERENT participants on the SAME machine
+     advertised the SAME 12 octets while their ports differed ⇒ those octets identify the HOST and the port
+     identifies the participant. 96 bits = 12 octets, consistent with the published ADDRESS_BIT_COUNT -96.
+
+   Recognising the kind is what lets ADR 0080's UNADDRESSABLE_PEER status tell an operator WHICH transport
+   a peer offered instead of reporting a bare number."
+  (let* ((addr (make-array 16 :element-type '(unsigned-byte 8)
+                           :initial-contents '(#x7D #xEA #x36 #x2B #x3F #xAC #x8E #x00
+                                               #x95 #x6A #x49 #x52 #x00 #x00 #x00 #x00)))
+         (loc (dds.rtps.discovery:make-locator
+               :kind dds.rtps.discovery:+locator-kind-rti-shmem+ :port 7411 :address addr))
+         (udp (dds.rtps.discovery:make-locator
+               :kind dds.rtps.discovery:+locator-kind-udpv4+ :port 7411
+               :address (dds.rtps.discovery:make-ipv4-locator
+                         (coerce #(192 168 2 148) '(simple-array (unsigned-byte 8) (4)))))))
+    (%check :rti-shmem-kind-value
+            (= #x01000000 dds.rtps.discovery:+locator-kind-rti-shmem+)
+            "the RTI SHMEM locator kind must be the published/observed #x01000000")
+    (%check :rti-shmem-recognised
+            (dds.rtps.discovery:rti-shmem-locator-p loc)
+            "an RTI shared-memory locator must be recognised as one")
+    (%check :rti-shmem-not-udpv4
+            (and (not (dds.rtps.discovery:rti-shmem-locator-p udp))
+                 (not (dds.rtps.discovery:locator-usable-udpv4-p loc)))
+            "the two kinds must not be confused — an RTI SHMEM locator is NOT a usable UDPv4 destination")
+    (%check :rti-shmem-host-id
+            (equalp (dds.rtps.discovery:rti-shmem-locator-host-id loc)
+                    (subseq addr 0 12))
+            "the host identifier is the first 12 octets (96 bits, per the published ADDRESS_BIT_COUNT -96)")
+    (%check :rti-shmem-host-id-nil-for-udp
+            (null (dds.rtps.discovery:rti-shmem-locator-host-id udp))
+            "a non-SHMEM locator has no shared-memory host id")
+    ;; Round-trip through the real Locator_t codec: a foreign vendor kind must survive our wire encoding
+    ;; unchanged, or we could neither report nor later address it.
+    (let* ((buf (dds.core.buffer:make-octet-buffer 64))
+           (c (dds.core.buffer:cursor buf)))
+      (dds.rtps.discovery:write-locator c dds.rtps.discovery:+locator-kind-rti-shmem+ 7411 addr)
+      (let ((rc (dds.core.buffer:cursor buf)))
+        (multiple-value-bind (kind port a) (dds.rtps.discovery:read-locator rc)
+          (%check :rti-shmem-wire-roundtrip
+                  (and (= kind dds.rtps.discovery:+locator-kind-rti-shmem+) (= port 7411) (equalp a addr))
+                  "an RTI SHMEM Locator_t must survive our Locator_t codec byte-for-byte")))
+      (dds.pal:free-static (dds.core.buffer:octet-buffer-vec buf)))
+    (%check :rti-shmem-named
+            (search "RTI" (dds.rtps.discovery:locator-kind-name
+                           dds.rtps.discovery:+locator-kind-rti-shmem+))
+            "the diagnostic name must identify the vendor, so an operator knows what the peer offered"))
+  t)
+
 (defun* run-unaddressable-match-refused-test ()
     (function () t)
   "OWNER DIRECTIVE 2026-07-22: anything that MATCHES must be ADDRESSABLE. A remote endpoint that is

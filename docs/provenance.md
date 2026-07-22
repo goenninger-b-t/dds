@@ -3157,3 +3157,22 @@ public GitHub master for understanding only; no code copied into `src/`.
   vendor's generator, it is harness-only, and **no part of it is read into or reused by `src/`**.
 - **No RTI Connext source/headers/generated code consulted or copied. No Fast DDS library source read** —
   only its public API documentation. CLEAN-ROOM.
+
+## ADR 0081 (2026-07-22) — RTI Connext shared-memory Locator_t recognition
+
+- **Public sources only.** The locator kind value is RTI's **published** constant
+  `NDDS_TRANSPORT_CLASSID_SHMEM` (`include/ndds/transport/transport_common_user.h`), also exposed in their
+  public API as `rti::core::Locator::Kind::SHMEM`. Addressing facts (segment named from the port number,
+  segment key `0x800000 + port`, mutex/semaphore keys `0xb00000 + port`, port a function of `domain_id` and
+  `participant_id`) come from RTI's **shipped public API documentation**
+  (`doc/api/connext_dds/api_c/group__NDDS__Transport__Shmem__Plugin.html`).
+- **Cross-checked against the ordinary RTPS wire.** A live Connext 7.3.1 participant with
+  `transport_builtin` mask `UDPv4 | SHMEM` was observed via **standard SPDP discovery**, which this stack
+  already parses. It advertised kind `#x01000000` alongside its UDPv4 locators, with `port` equal to the
+  ordinary RTPS port and an address of 12 significant octets then 4 zeros. Two participants on the SAME
+  machine advertised the SAME 12 octets with DIFFERENT ports, establishing host-vs-participant split; 96
+  bits = 12 octets matches the published `NDDS_TRANSPORT_SHMEM_ADDRESS_BIT_COUNT` of -96.
+- **NOT consulted:** no RTI source, no disassembly, no decompilation, and no inspection of shared-memory
+  segment contents. Nothing beyond published headers, published API documentation, and public RTPS
+  discovery traffic. **The on-segment format is NOT documented in either source and is NOT implemented
+  here** — this ADR covers locator RECOGNITION only.

@@ -3977,6 +3977,7 @@
                  ("dcps-state-masks"         . run-dcps-state-masks-test)
                  ("dcps-rx-store-bounded"    . run-dcps-rx-store-bounded-test)
                  ("unfragmented-to-shmem-dest" . run-unfragmented-to-shmem-dest-test)
+                 ("rti-shmem-locator"        . run-rti-shmem-locator-test)
                  ("unaddressable-match-refused" . run-unaddressable-match-refused-test)
                  ("dcps-disabled-endpoint-silent" . run-dcps-disabled-endpoint-silent-test)
                  ("dcps-builtin-topics"      . run-dcps-builtin-topics-test)

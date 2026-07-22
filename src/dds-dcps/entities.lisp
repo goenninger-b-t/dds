@@ -3637,7 +3637,11 @@
        (incf (unaddressable-peer-status-total-count s))
        (incf (unaddressable-peer-status-total-count-change s))
        (setf (unaddressable-peer-status-last-guid s) guid
-             (unaddressable-peer-status-last-locator-kinds s) kinds)
+             (unaddressable-peer-status-last-locator-kinds s) kinds
+             ;; Name the kinds, so the status says WHAT the peer offered (e.g. shared memory (RTI Connext))
+             ;; rather than a bare number an operator has to decode (ADR 0081).
+             (unaddressable-peer-status-last-locator-names s)
+             (mapcar #'dds.rtps.discovery:locator-kind-name kinds))
        (values t (copy-unaddressable-peer-status s)
                (lambda () (setf (unaddressable-peer-status-total-count-change s) 0))))))
   t)

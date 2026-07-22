@@ -113,7 +113,7 @@
            #:qos-policy-immutable-p
            #:get-subscription-matched-status #:get-unaddressable-peer-status
            #:unaddressable-peer-status #:unaddressable-peer-status-total-count #:unaddressable-peer-status-last-guid
-           #:unaddressable-peer-status-last-locator-kinds #:+status-unaddressable-peer+ #:get-publication-matched-status
+           #:unaddressable-peer-status-last-locator-kinds #:unaddressable-peer-status-last-locator-names #:+status-unaddressable-peer+ #:get-publication-matched-status
            #:get-requested-incompatible-qos-status #:get-offered-incompatible-qos-status
            #:inconsistent-topic-status #:inconsistent-topic-status-total-count
            #:inconsistent-topic-status-total-count-change

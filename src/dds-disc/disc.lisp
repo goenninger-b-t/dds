@@ -2192,6 +2192,15 @@
   (remove-duplicates (mapcar #'dds.rtps.discovery:locator-kind
                              (dds.rtps.discovery:spdp-data-default-unicast-locators spdp))))
 
+(defun* %unaddressable-locator-description (kinds)
+    (function (list) string)
+  "Render KINDS as names an operator can act on — 'shared memory (RTI Connext)' rather than a bare
+   #x01000000. Recognising a foreign vendor kind is the difference between a report that says what to
+   change and one that only says nothing worked (ADR 0080 / ADR 0081)."
+  (if (null kinds)
+      "none"
+      (format nil "~{~a~^, ~}" (mapcar #'dds.rtps.discovery:locator-kind-name kinds))))
+
 (defun* %consult-addressable-gate (node remote)
     (function (disc-node dds.rtps.discovery:endpoint-data) t)
   "ADDRESSABILITY gate (owner directive 2026-07-22) — a peer we cannot SEND to must never be reported as

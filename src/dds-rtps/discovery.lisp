@@ -8,6 +8,28 @@
 (defconstant +locator-kind-udpv4+ 1
   "LOCATOR_KIND_UDPv4 = 1 (RTPS 2.5 §9.3.2.1 IDL / §9.3.2.4).")
 
+(defconstant +locator-kind-rti-shmem+ #x01000000
+  "RTI Connext shared-memory Locator_t kind. A VENDOR kind, not a standard one: RTPS 2.5 reserves only
+   INVALID/RESERVED/UDPv4/UDPv6 and defines no shared-memory transport (§7.5 / Clause 9 give exactly one
+   PSM, UDP/IP), so every SHMEM locator kind is vendor-defined — ours is +locator-kind-shmem+.
+
+   PROVENANCE — public sources only, and cross-checked against the live wire:
+   (a) RTI's published header value NDDS_TRANSPORT_CLASSID_SHMEM (transport_common_user.h), also exposed in
+       their public API as rti::core::Locator::Kind::SHMEM;
+   (b) CONFIRMED by observation of ordinary RTPS SPDP discovery from a live Connext 7.3.1 participant
+       (transport_builtin mask UDPv4|SHMEM), which advertised kind #x01000000 alongside its UDPv4 locators.
+
+   WIRE SHAPE, as measured from that SPDP (2026-07-22):
+     port    = the ordinary RTPS port for the participant (metatraffic 7410 / user 7411 for participant 0
+               on domain 0; 7412/7413 for participant 1) — i.e. the same port as its UDPv4 locators, which
+               matches RTI's public statement that a receiver port on shared memory corresponds to a
+               segment named from the port number.
+     address = 12 SIGNIFICANT octets then 4 zero octets. Two DIFFERENT participants on the SAME machine
+               advertised the SAME 12 octets while their ports differed, so those octets identify the HOST,
+               not the participant. 96 bits = 12 octets, consistent with the published
+               NDDS_TRANSPORT_SHMEM_ADDRESS_BIT_COUNT of -96.
+   Structurally the same split our own SHMEM locator uses (a host identity plus a per-participant port).")
+
 (defconstant +locator-kind-shmem+ #x47420001
   "Vendor SHMEM Locator_t kind (GB|1); ours-to-ours intra-host only. No standard RTPS SHMEM kind exists;
    cross-vendor peers ignore an unknown kind (fail-open). Pinned in ADR 0013, not from any spec clause.")
@@ -244,6 +266,33 @@
    Tested on the OCTETS: the dotted-quad is a rendering of this address, never its identity."
   (let ((a (locator-address loc)))
     (and (zerop (aref a 12)) (zerop (aref a 13)) (zerop (aref a 14)) (zerop (aref a 15)))))
+
+(defun* rti-shmem-locator-p (loc)
+    (function (locator) t)
+  "T iff LOC is an RTI Connext shared-memory Locator_t (+locator-kind-rti-shmem+)."
+  (= (locator-kind loc) +locator-kind-rti-shmem+))
+
+(defun* rti-shmem-locator-host-id (loc)
+    (function (locator) (or null (simple-array (unsigned-byte 8) (12))))
+  "The 12-octet HOST identifier carried in an RTI shared-memory Locator_t's address, or NIL if LOC is not
+   one. Measured: two different Connext participants on the same machine advertise the SAME 12 octets while
+   their ports differ, so this identifies the machine and the port identifies the participant. Two peers
+   sharing this value are on one host and can in principle reach each other over shared memory."
+  (when (rti-shmem-locator-p loc)
+    (let ((out (make-array 12 :element-type '(unsigned-byte 8))))
+      (replace out (locator-address loc) :end2 12)
+      out)))
+
+(defun* locator-kind-name (kind)
+    (function (integer) string)
+  "A human name for a Locator_t KIND, for diagnostics that must tell an operator WHAT a peer offered rather
+   than only that nothing worked (ADR 0080's UNADDRESSABLE_PEER status). Standard kinds are named from RTPS
+   2.5; the rest are vendor kinds, named where we recognise them and reported numerically otherwise —
+   the spec defines no shared-memory transport, so every such kind is vendor-private by construction."
+  (cond ((= kind +locator-kind-udpv4+) "UDPv4")
+        ((= kind +locator-kind-shmem+) "shared memory (this stack)")
+        ((= kind +locator-kind-rti-shmem+) "shared memory (RTI Connext)")
+        (t (format nil "vendor kind #x~8,'0X" kind))))
 
 (defun* locator-usable-udpv4-p (loc)
     (function (locator) t)

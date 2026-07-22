@@ -134,7 +134,7 @@
    "Simple Participant Discovery Protocol (SPDP): the Locator_t codec (RTPS 2.5
     §9.3.2.4) and SPDPdiscoveredParticipantData ParameterList build/parse (§8.5.3/
     §9.6.2). PID values from §9.6.2.2; Duration/Locator layouts from §9.3.2.")
-  (:export #:+locator-kind-udpv4+ #:+locator-kind-shmem+ #:+locator-bytes+
+  (:export #:+locator-kind-udpv4+ #:+locator-kind-shmem+ #:+locator-kind-rti-shmem+ #:rti-shmem-locator-p #:rti-shmem-locator-host-id #:locator-kind-name #:+locator-bytes+
            #:make-shmem-locator-wire #:shmem-locator-wire-lane-count
            #:+entityid-spdp-writer+ #:+entityid-spdp-reader+
            #:+entityid-sedp-pub-writer+ #:+entityid-sedp-pub-reader+

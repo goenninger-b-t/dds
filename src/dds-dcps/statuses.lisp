@@ -204,7 +204,8 @@
   (total-count 0 :type integer)
   (total-count-change 0 :type integer)
   (last-guid nil :type t)
-  (last-locator-kinds '() :type list))
+  (last-locator-kinds '() :type list)
+  (last-locator-names '() :type list))
 
 (defstruct* (inconsistent-topic-status (:constructor make-inconsistent-topic-status)
                                       (:copier copy-inconsistent-topic-status))
