@@ -72,7 +72,9 @@
            #:rti-shmem-properties #:rti-shmem-properties-p
            #:rti-shmem-properties-segment-size #:rti-shmem-properties-receive-buffer-size
            #:rti-shmem-properties-message-size-max #:rti-shmem-properties-received-message-count-max
-           #:run-rti-shmem-recognition-test #:run-rti-shmem-properties-test))
+           #:rti-shmem-ring-start #:rti-shmem-ring-modulus #:rti-shmem-record-offset
+           #:run-rti-shmem-recognition-test #:run-rti-shmem-properties-test
+           #:run-rti-shmem-ring-address-test))
 
 (defpackage #:net.goenninger.dds.xport.zerocopy
   (:nicknames #:dds.xport.zerocopy)

@@ -216,6 +216,57 @@
    is a property of the peer, to be read rather than assumed."
   (<= bytes (rti-shmem-properties-message-size-max props)))
 
+;;; Ring addressing (ADR 0081 §5.0). The cursor in a control block is a CUMULATIVE BYTE COUNT, not an
+;;; offset — it exceeds the segment once enough has been written — so a record's location must be derived
+;;; from it. Every constant below was measured, and each coefficient was established by varying ONE
+;;; parameter alone from a common baseline rather than fitting a curve through convenient points; an
+;;; earlier revision that fitted instead of varying got the modulus wrong. Reproduce with
+;;; interop/connext/shmem-layout/ring-extent.sh.
+
+(defconstant +rti-shmem-ring-start-base+ 240
+  "Constant term of an RTI shared-memory ring's start offset. Measured: ring start is
+   `+rti-shmem-ring-start-base+ + 8 * received_message_count_max`, which is also the value at `0x50` plus
+   64. Confirmed at count 8 (304) and count 16 (368). ADR 0081 §5.0.")
+
+(defconstant +rti-shmem-ring-entry-stride+ 8
+  "Bytes of ring start, and of ring modulus, contributed per unit of `received_message_count_max`. Measured
+   by varying `count` alone: 8 → 16 moved ring start by 64 and the modulus by 64. ADR 0081 §5.0.")
+
+(defconstant +rti-shmem-ring-modulus-bias+ -64
+  "Additive bias of an RTI shared-memory ring's modulus:
+   `receive_buffer_size + message_size_max + 8 * count - 64`. Each coefficient was measured by varying that
+   one parameter alone from a common baseline — count, then `receive_buffer_size`, then `message_size_max`.
+   ADR 0081 §5.0.")
+
+(defconstant +rti-shmem-cursor-bias+ 68
+  "Subtracted from a control-block cursor before reducing it modulo the ring length. Invariant across all
+   four measured configurations. ADR 0081 §5.0.")
+
+(defun* rti-shmem-ring-start (count)
+    (function ((unsigned-byte 32)) (unsigned-byte 32))
+  "Byte offset at which the record ring begins, for a segment whose `received_message_count_max` is COUNT."
+  (+ +rti-shmem-ring-start-base+ (* +rti-shmem-ring-entry-stride+ count)))
+
+(defun* rti-shmem-ring-modulus (props)
+    (function (rti-shmem-properties) (unsigned-byte 32))
+  "Length of the record ring described by PROPS — the modulus a cumulative cursor is reduced by."
+  (+ (rti-shmem-properties-receive-buffer-size props)
+     (rti-shmem-properties-message-size-max props)
+     (* +rti-shmem-ring-entry-stride+ (rti-shmem-properties-received-message-count-max props))
+     +rti-shmem-ring-modulus-bias+))
+
+(defun* rti-shmem-record-offset (cursor props)
+    (function ((unsigned-byte 32) rti-shmem-properties) (unsigned-byte 32))
+  "Byte offset within the segment of the record a control-block CURSOR refers to, for a receiver described
+   by PROPS.
+
+   CURSOR is a running total of bytes, so this is the only correct way to locate a record: `cursor - 20`
+   happens to land on the `RTPS` magic, but ONLY until the ring first wraps, after which it addresses
+   nothing. That coincidence was recorded as fact in an earlier revision of ADR 0081 and had to be
+   retracted — hence this function rather than a subtraction at the call site."
+  (+ (rti-shmem-ring-start (rti-shmem-properties-received-message-count-max props))
+     (mod (- cursor +rti-shmem-cursor-bias+) (rti-shmem-ring-modulus props))))
+
 (defconstant +rti-shmem-test-port+ 65432
   "RTPS port used by RUN-RTI-SHMEM-RECOGNITION-TEST to key its synthetic segment. Chosen so the derived
    System V key cannot collide with a live Connext participant: no domain maps to it (7400+250*d+10+2*i
@@ -372,3 +423,46 @@
         (dds.pal:sysv-shm-destroy seg)
         (dds.pal:sysv-shm-detach seg)))
     t))
+
+(defun* run-rti-shmem-ring-address-test ()
+    (function () (eql t))
+  "ADR 0081 §5.0: the ring address arithmetic, checked against the ACTUAL MEASUREMENTS it was derived from.
+
+   The oracle is not a second implementation of the same formula — that would only prove the formula equals
+   itself. It is the nine (cursor -> offset) pairs literally observed from live Connext 7.3.1 segments by
+   interop/connext/shmem-layout/ring-extent.sh, across four configurations chosen so that each parameter
+   was varied ALONE from a common baseline:
+
+     (rbs, msm, count)   ring start   modulus   varied
+     (2048, 2048,  8)        304        4096    baseline
+     (2048, 2048, 16)        368        4160    count
+     (4096, 2048,  8)        304        6144    receive_buffer_size
+     (4096, 4096,  8)        304        8192    message_size_max
+
+   Each configuration contributes the last pre-wrap record and the first post-wrap record, so the modulus is
+   exercised at its boundary rather than only in its linear region — which is where an earlier version of
+   this arithmetic was wrong and looked right.
+
+   If someone edits a constant, this goes red against the observations rather than against an opinion."
+  (let ((cases
+          ;; rbs   msm   count  ring-start  modulus  ((cursor . offset) ...)
+          '((2048  2048   8      304   4096  ((644 . 880) (4100 . 4336) (4164 . 304)))
+            (2048  2048  16      368   4160  ((4164 . 4464) (4228 . 368)))
+            (4096  2048   8      304   6144  ((6148 . 6384) (6212 . 304)))
+            (4096  4096   8      304   8192  ((8196 . 8432) (8260 . 304))))))
+    (dolist (c cases t)
+      (destructuring-bind (rbs msm count start modulus pairs) c
+        (let ((props (make-rti-shmem-properties :segment-size (+ rbs msm 4096)
+                                                :receive-buffer-size rbs
+                                                :message-size-max msm
+                                                :received-message-count-max count)))
+          (assert (= (rti-shmem-ring-start count) start) ()   ; HOTPATH-COND(TEST): in-file self-test
+                  "ring start for count ~d: got ~d, measured ~d"
+                  count (rti-shmem-ring-start count) start)
+          (assert (= (rti-shmem-ring-modulus props) modulus) ()   ; HOTPATH-COND(TEST): in-file self-test
+                  "modulus for (~d ~d ~d): got ~d, measured ~d"
+                  rbs msm count (rti-shmem-ring-modulus props) modulus)
+          (dolist (p pairs)
+            (assert (= (rti-shmem-record-offset (car p) props) (cdr p)) ()   ; HOTPATH-COND(TEST): in-file self-test
+                    "cursor ~d in (~d ~d ~d): got offset ~d, MEASURED ~d"
+                    (car p) rbs msm count (rti-shmem-record-offset (car p) props) (cdr p))))))))

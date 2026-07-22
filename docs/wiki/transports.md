@@ -103,6 +103,9 @@ from the RTPS port. This package answers one question — **is that RTI peer on 
 | `+rti-shmem-protocol-major-validated+` `2` | The one shared-memory protocol version the layout was measured against. |
 | `rti-shmem-segment-properties` *port* → `(values props status)` | The receiver's embedded transport properties: `segment-size`, `receive-buffer-size`, `message-size-max`, `received-message-count-max`. |
 | `rti-shmem-datagram-fits-p` *props* *bytes* → *boolean* | Whether a `bytes`-octet datagram is within what that receiver carries in one message. |
+| `rti-shmem-ring-start` *count* → *offset* | Where the record ring begins: `240 + 8*count`. |
+| `rti-shmem-ring-modulus` *props* → *length* | Ring length: `receive_buffer_size + message_size_max + 8*count - 64`. |
+| `rti-shmem-record-offset` *cursor* *props* → *offset* | Where the record a control-block cursor refers to actually sits. |
 
 Get the `host-id` from a discovered locator with `dds.rtps.discovery:rti-shmem-locator-host-id`.
 
@@ -154,6 +157,12 @@ configured with a large `message_size_max` is never false-rejected.
       (dds.xport.rti-shmem:rti-shmem-datagram-fits-p props my-datagram-bytes)
       status))
 ```
+
+A control-block cursor is a **cumulative byte count, not an offset** — it exceeds the segment once enough
+has been written — so `rti-shmem-record-offset` is the only correct way to locate a record. Subtracting 20
+from the cursor appears to land on the `RTPS` magic and does, but only until the ring first wraps, after
+which it addresses nothing. That coincidence was recorded as fact during the reconstruction and had to be
+retracted; the function exists so no call site repeats it.
 
 The layout is **measured, not published**. See [ADR 0081](../adr/0081-rti-connext-shared-memory-interoperability.md)
 for what was established and how, and `interop/connext/shmem-layout/` to reproduce it.
