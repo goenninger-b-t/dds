@@ -102,6 +102,23 @@ and generalising is how each of them happened.
 
 `semprobe` issues only `semctl` GET* queries, which read and never modify, so a live peer is not perturbed.
 
+## 6. The `semop` sequence — needs root, so it is yours to run
+
+The only piece of ADR 0081 §5.0 still unmeasured. State observation gave the cursors, the semaphore
+values and the ring bytes, but it can never give the *order* of the calls that changed them.
+
+```sh
+rtiddsping -domainId 50 -subscriber &
+rtiddsping -domainId 50 -publisher -sendPeriod 0.5 &
+sudo dtrace -qs trace-semop.d
+```
+
+`dtrace` is installed; it needs root, which is the only reason this is a script rather than a result.
+Each line prints `sem_num`/`sem_op`/`sem_flg`, which answers directly whether the data semaphore is posted
+before or after the mutex is released, and whether `IPC_NOWAIT` (0x800 on Darwin) is what produces the
+post-once-do-not-stack behaviour measured in §5. Correlate `semid` against `ipcs -s`: `0x800000+port` is
+the data semaphore, `0xB00000+port` the mutex.
+
 ## Hygiene
 
 System V segments outlive the process that created them. Remove the ones a probe run created, and leave

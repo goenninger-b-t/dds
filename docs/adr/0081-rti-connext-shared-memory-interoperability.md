@@ -282,10 +282,23 @@ and five participants occupy 0 through 4. The run failed for a reason that had n
 question being asked — which is its own hazard, because a scan that silently finds nothing looks exactly
 like a system with nothing to find.
 
-**Still NOT established, and not to be guessed at:** the exact `semop` sequence (which operations, in what
-order, and what the mutex actually protects) — likely beyond observation on macOS, where SIP blocks the
-syscall tracing that would answer it directly, and worth revisiting on Linux if Connext ever lands there;
-what distinguishes the two control blocks (and whether the
+**The `semop` sequence is the one remaining unmeasured piece, and it is NOT blocked by the platform.** An
+earlier revision recorded it as likely unobservable on macOS because SIP blocks syscall tracing. That was
+asserted without being tested, and testing it says otherwise: `dtrace` and `dtruss` are both installed. What
+they need is **root**, which the reconstruction has no business acquiring for itself — so
+`interop/connext/shmem-layout/trace-semop.d` is provided ready to run:
+
+    sudo dtrace -qs interop/connext/shmem-layout/trace-semop.d
+
+with a Connext pair exchanging over shared memory. It prints `sem_num`/`sem_op`/`sem_flg` per call, which
+gives the ordering directly — whether the data semaphore is posted before or after the mutex is released,
+and whether `IPC_NOWAIT` is what produces the observed post-once-do-not-stack behaviour.
+
+State observation cannot answer this: cursors, semaphore values and segment bytes reveal *what* changed,
+never the *order* of the calls that changed them.
+
+**Still NOT established, and not to be guessed at:** the `semop` sequence itself (see above — obtainable,
+just not by me); what distinguishes the two control blocks (and whether the
 56/112/168 stride implies a third); the meaning of the two position families four bytes apart; whether 688
 is the ring base — it is the value at `0x50`, equals `176 + 8 * received_message_count_max`, and one baseline
 producer position of 708 sits exactly 20 octets above it, but that is suggestive, not proof; wraparound
