@@ -68,7 +68,11 @@
   (:export #:rti-shmem-same-host-p #:rti-shmem-segment-key
            #:+rti-shmem-segment-key-base+ #:+rti-shmem-semaphore-key-base+ #:+rti-shmem-mutex-key-base+
            #:+rti-shmem-protocol-major-validated+ #:+rti-shmem-uuid-bytes+
-           #:run-rti-shmem-recognition-test))
+           #:rti-shmem-segment-properties #:rti-shmem-datagram-fits-p
+           #:rti-shmem-properties #:rti-shmem-properties-p
+           #:rti-shmem-properties-segment-size #:rti-shmem-properties-receive-buffer-size
+           #:rti-shmem-properties-message-size-max #:rti-shmem-properties-received-message-count-max
+           #:run-rti-shmem-recognition-test #:run-rti-shmem-properties-test))
 
 (defpackage #:net.goenninger.dds.xport.zerocopy
   (:nicknames #:dds.xport.zerocopy)

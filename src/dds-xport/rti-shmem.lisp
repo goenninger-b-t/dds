@@ -66,6 +66,18 @@
   "The System V key of the RTI Connext shared-memory segment serving RTPS PORT."
   (+ +rti-shmem-segment-key-base+ port))
 
+(defun* %rti-shmem-header-status (sap)
+    (function (t) (or null keyword))
+  "NIL if the header at SAP is an RTI segment of a protocol version this layout was measured against, else
+   the refusal status. The single place both the co-location test and the property reader decide whether a
+   segment may be interpreted at all — they must never diverge on that."
+  (cond ((/= (dds.pal:load-sap-u32 sap +rti-shmem-off-magic+) +rti-shmem-header-magic+)
+         :not-an-rti-shmem-segment)
+        ((/= (dds.pal:load-sap-u32 sap +rti-shmem-off-protocol-major+)
+             +rti-shmem-protocol-major-validated+)
+         :unvalidated-shmem-protocol-version)
+        (t nil)))
+
 (defun* %rti-shmem-header-verdict (sap host-id)
     (function (t (simple-array (unsigned-byte 8) (12))) (values t (or null keyword)))
   "Verdict for an attached RTI segment header at SAP against the 12-octet HOST-ID from a locator.
@@ -75,15 +87,13 @@
 
    Split out from RTI-SHMEM-SAME-HOST-P so that function can attach, take a verdict, and DETACH on a single
    path: an early exit between attach and detach would leak the attachment."
-  (cond ((/= (dds.pal:load-sap-u32 sap +rti-shmem-off-magic+) +rti-shmem-header-magic+)
-         (values nil :not-an-rti-shmem-segment))
-        ((/= (dds.pal:load-sap-u32 sap +rti-shmem-off-protocol-major+)
-             +rti-shmem-protocol-major-validated+)
-         (values nil :unvalidated-shmem-protocol-version))
-        (t (values (dotimes (i +rti-shmem-uuid-bytes+ t)
-                     (unless (= (dds.pal:load-sap-u8 sap (+ +rti-shmem-off-uuid+ i)) (aref host-id i))
-                       (return nil)))
-                   nil))))
+  (let ((status (%rti-shmem-header-status sap)))
+    (if status
+        (values nil status)
+        (values (dotimes (i +rti-shmem-uuid-bytes+ t)
+                  (unless (= (dds.pal:load-sap-u8 sap (+ +rti-shmem-off-uuid+ i)) (aref host-id i))
+                    (return nil)))
+                nil))))
 
 (defun* rti-shmem-same-host-p (host-id port)
     (function ((simple-array (unsigned-byte 8) (12)) (unsigned-byte 16)) (values t (or null keyword)))
@@ -110,6 +120,101 @@
         (%rti-shmem-header-verdict (dds.pal:sysv-shm-sap segment) host-id)
       (dds.pal:sysv-shm-detach segment)
       (values same verdict-status))))
+
+;;; The property block. RTI's shipped API documentation states that a receiver's transport properties are
+;;; embedded in its segment and that a SENDER verifies the receiver's properties are compatible before
+;;; using it, so reading them is a prerequisite for ever writing into one. All three offsets below were
+;;; identified by setting the corresponding documented QoS property to a distinctive value and observing it
+;;; appear (ADR 0081 §5) — they are measured, not published.
+
+(defconstant +rti-shmem-off-segment-size+ #x0c
+  "Byte offset of the segment's own total size in octets. Proven: it matched `ipcs` segsz exactly in both
+   measured configurations. Treated as a CLAIM and verified against the kernel, never trusted — see
+   RTI-SHMEM-SEGMENT-PROPERTIES.")
+
+(defconstant +rti-shmem-off-receive-buffer-size+ #x58
+  "Byte offset of `receive_buffer_size`. Proven by variation: set 777216 through
+   `dds.transport.shmem.builtin.receive_buffer_size`, read 777216.")
+
+(defconstant +rti-shmem-off-message-size-max+ #x5c
+  "Byte offset of `message_size_max` — the largest single message this receiver's segment can carry, and so
+   the bound on any datagram we could hand it. Proven by variation: set 20480 through
+   `dds.transport.shmem.builtin.parent.message_size_max`, read 20480.")
+
+(defconstant +rti-shmem-off-received-message-count-max+ #x60
+  "Byte offset of `received_message_count_max` — how many messages the receive queue holds. Proven by
+   variation: set 37 through `dds.transport.shmem.builtin.received_message_count_max`, read 37.")
+
+(defstruct* rti-shmem-properties
+  "A Connext receiver's embedded shared-memory transport properties, as read from its segment. SEGMENT-SIZE
+   is kernel-verified; the other three are the documented properties of the same name."
+  (segment-size 0 :type (unsigned-byte 32))
+  (receive-buffer-size 0 :type (unsigned-byte 32))
+  (message-size-max 0 :type (unsigned-byte 32))
+  (received-message-count-max 0 :type (unsigned-byte 32)))
+
+(defun* %rti-shmem-properties-plausible-p (props)
+    (function (rti-shmem-properties) t)
+  "T iff PROPS are self-consistent against the segment's own kernel-verified size.
+
+   ⚠️ THE BOUNDS ARE PHYSICAL, NOT POLICY. Each property is checked only against what the segment can
+   physically hold — a buffer cannot be larger than the segment containing it — and never against an
+   invented ceiling. That is deliberate: a peer may legitimately be configured with any
+   `message_size_max` its segment accommodates, and REJECTING A CONFORMANT PEER is the worst failure class
+   this project recognises. A physical bound cannot false-reject a real segment; a guessed policy bound can."
+  (let ((size (rti-shmem-properties-segment-size props)))
+    (and (plusp (rti-shmem-properties-message-size-max props))
+         (plusp (rti-shmem-properties-received-message-count-max props))
+         (plusp (rti-shmem-properties-receive-buffer-size props))
+         (<= (rti-shmem-properties-receive-buffer-size props) size)
+         (<= (rti-shmem-properties-message-size-max props) size)
+         (<= (rti-shmem-properties-received-message-count-max props) size))))
+
+(defun* rti-shmem-segment-properties (port)
+    (function ((unsigned-byte 16)) (values (or null rti-shmem-properties) (or null keyword)))
+  "Read the embedded transport properties of the RTI Connext receiver serving RTPS PORT.
+
+   Returns (values properties NIL), or (values NIL status) with status :NO-SUCH-SEGMENT,
+   :NOT-AN-RTI-SHMEM-SEGMENT, :UNVALIDATED-SHMEM-PROTOCOL-VERSION, :SHMAT-FAILED, or
+   :IMPLAUSIBLE-SEGMENT-PROPERTIES when the block is not self-consistent with the segment holding it.
+
+   ⚠️ THE SEGMENT'S CLAIMED SIZE IS VERIFIED, NOT BELIEVED. The size at `+rti-shmem-off-segment-size+` is a
+   number written by another process, so it is re-attached at that size and the KERNEL decides: `shmget`
+   refuses a request larger than the segment, so a segment overstating its own extent fails here instead of
+   becoming a bound that later sizes a buffer. Same mechanism as the header extent check, used again —
+   every length taken off this segment is corroborated by something outside it before being trusted."
+  (multiple-value-bind (segment status)
+      (dds.pal:sysv-shm-attach-readonly (rti-shmem-segment-key port) +rti-shmem-header-bytes+)
+    (when status (bail status))
+    (let* ((sap (dds.pal:sysv-shm-sap segment))
+           (header-status (%rti-shmem-header-status sap))
+           (props (unless header-status
+                    (make-rti-shmem-properties
+                     :segment-size (dds.pal:load-sap-u32 sap +rti-shmem-off-segment-size+)
+                     :receive-buffer-size (dds.pal:load-sap-u32 sap +rti-shmem-off-receive-buffer-size+)
+                     :message-size-max (dds.pal:load-sap-u32 sap +rti-shmem-off-message-size-max+)
+                     :received-message-count-max
+                     (dds.pal:load-sap-u32 sap +rti-shmem-off-received-message-count-max+)))))
+      (dds.pal:sysv-shm-detach segment)
+      (when header-status (bail header-status))
+      ;; Corroborate the claimed extent with the kernel before any of it is believed.
+      (multiple-value-bind (whole vstatus)
+          (dds.pal:sysv-shm-attach-readonly (rti-shmem-segment-key port)
+                                            (max 1 (rti-shmem-properties-segment-size props)))
+        (when vstatus (bail :implausible-segment-properties))
+        (dds.pal:sysv-shm-detach whole))
+      (unless (%rti-shmem-properties-plausible-p props) (bail :implausible-segment-properties))
+      (values props nil))))
+
+(defun* rti-shmem-datagram-fits-p (props bytes)
+    (function (rti-shmem-properties (integer 0)) t)
+  "T iff a BYTES-octet datagram is within what this receiver's segment can carry in one message.
+
+   `message_size_max` is the documented maximum message size of RTI's shared-memory transport, so a larger
+   datagram cannot be delivered through it whatever the framing turns out to be. This is the shared-memory
+   analogue of the emitted-datagram-size contract ADR 0079 established for UDP: the size a peer will accept
+   is a property of the peer, to be read rather than assumed."
+  (<= bytes (rti-shmem-properties-message-size-max props)))
 
 (defconstant +rti-shmem-test-port+ 65432
   "RTPS port used by RUN-RTI-SHMEM-RECOGNITION-TEST to key its synthetic segment. Chosen so the derived
@@ -197,4 +302,73 @@
     (multiple-value-bind (same st) (rti-shmem-same-host-p mine port)
       (assert (and (null same) (eq st :no-such-segment)) ()   ; HOTPATH-COND(TEST): in-file self-test
               "an absent segment must read as :NO-SUCH-SEGMENT, got ~s/~s" same st))
+    t))
+
+(defconstant +rti-shmem-properties-test-port+ 65431
+  "RTPS port for RUN-RTI-SHMEM-PROPERTIES-TEST's synthetic segment. Distinct from
+   +RTI-SHMEM-TEST-PORT+ so the two self-tests cannot collide on a System V key.")
+
+(defun* run-rti-shmem-properties-test ()
+    (function () (eql t))
+  "ADR 0081 slice 4: the property block must be READ exactly, and every length taken off it corroborated
+   before it is believed.
+
+   The block is written by another process, so it is untrusted input whose numbers would later size buffers
+   and bound writes. This drives both halves:
+
+     1. exact read-back of all four fields from a segment built with chosen values;
+     2. RTI-SHMEM-DATAGRAM-FITS-P at the boundary — message_size_max fits, one octet more does not;
+     3. a segment CLAIMING to be larger than it is        -> :IMPLAUSIBLE-SEGMENT-PROPERTIES (the kernel
+        refuses the oversized re-attach, so a lie about extent cannot become a trusted bound);
+     4. receive_buffer_size larger than the whole segment -> :IMPLAUSIBLE-SEGMENT-PROPERTIES;
+     5. message_size_max of zero                          -> :IMPLAUSIBLE-SEGMENT-PROPERTIES.
+
+   Case 3 is the one worth having: it is the difference between reading a length and trusting it. The
+   plausibility bounds are PHYSICAL (a buffer cannot exceed the segment holding it), never an invented
+   ceiling, so a peer legitimately configured with a large message_size_max is not false-rejected."
+  (let* ((port +rti-shmem-properties-test-port+)
+         (key (rti-shmem-segment-key port))
+         (size 4096))
+    (multiple-value-bind (stale status) (dds.pal:sysv-shm-attach-readonly key +rti-shmem-header-bytes+)
+      (declare (ignore status))
+      (when stale (dds.pal:sysv-shm-destroy stale) (dds.pal:sysv-shm-detach stale)))
+    (multiple-value-bind (seg status) (dds.pal:sysv-shm-create key size)
+      (assert (null status) () "System V shm unusable (~s)" status)   ; HOTPATH-COND(TEST): in-file self-test
+      (unwind-protect
+           (let ((sap (dds.pal:sysv-shm-sap seg)))
+             (flet ((lay-out (seg-size rbs msm cnt)
+                      (%rti-shmem-put-u32-le sap +rti-shmem-off-magic+ +rti-shmem-header-magic+)
+                      (%rti-shmem-put-u32-le sap +rti-shmem-off-protocol-major+
+                                             +rti-shmem-protocol-major-validated+)
+                      (%rti-shmem-put-u32-le sap +rti-shmem-off-segment-size+ seg-size)
+                      (%rti-shmem-put-u32-le sap +rti-shmem-off-receive-buffer-size+ rbs)
+                      (%rti-shmem-put-u32-le sap +rti-shmem-off-message-size-max+ msm)
+                      (%rti-shmem-put-u32-le sap +rti-shmem-off-received-message-count-max+ cnt)))
+               (lay-out size 2048 512 8)
+               (multiple-value-bind (p st) (rti-shmem-segment-properties port)
+                 (assert (and p (null st)) () "a well-formed property block must read, got ~s/~s" p st)   ; HOTPATH-COND(TEST): in-file self-test
+                 (assert (= (rti-shmem-properties-segment-size p) size) () "segment-size misread")   ; HOTPATH-COND(TEST): in-file self-test
+                 (assert (= (rti-shmem-properties-receive-buffer-size p) 2048) () "rbs misread")   ; HOTPATH-COND(TEST): in-file self-test
+                 (assert (= (rti-shmem-properties-message-size-max p) 512) () "msm misread")   ; HOTPATH-COND(TEST): in-file self-test
+                 (assert (= (rti-shmem-properties-received-message-count-max p) 8) () "count misread")   ; HOTPATH-COND(TEST): in-file self-test
+                 (assert (rti-shmem-datagram-fits-p p 512) () "a datagram OF message_size_max must fit")   ; HOTPATH-COND(TEST): in-file self-test
+                 (assert (not (rti-shmem-datagram-fits-p p 513)) () "one octet over must NOT fit"))   ; HOTPATH-COND(TEST): in-file self-test
+               ;; 3. the segment lies about its own extent — the kernel, not us, catches it.
+               (lay-out (* 2 size) 2048 512 8)
+               (multiple-value-bind (p st) (rti-shmem-segment-properties port)
+                 (assert (and (null p) (eq st :implausible-segment-properties)) ()   ; HOTPATH-COND(TEST): in-file self-test
+                         "a segment overstating its extent must be refused, got ~s/~s" p st))
+               ;; 4. a buffer bigger than the segment holding it.
+               (lay-out size (* 2 size) 512 8)
+               (multiple-value-bind (p st) (rti-shmem-segment-properties port)
+                 (assert (and (null p) (eq st :implausible-segment-properties)) ()   ; HOTPATH-COND(TEST): in-file self-test
+                         "receive_buffer_size beyond the segment must be refused, got ~s/~s" p st))
+               ;; 5. a receiver that can carry nothing.
+               (lay-out size 2048 0 8)
+               (multiple-value-bind (p st) (rti-shmem-segment-properties port)
+                 (assert (and (null p) (eq st :implausible-segment-properties)) ()   ; HOTPATH-COND(TEST): in-file self-test
+                         "a zero message_size_max must be refused, got ~s/~s" p st))
+               t))
+        (dds.pal:sysv-shm-destroy seg)
+        (dds.pal:sysv-shm-detach seg)))
     t))

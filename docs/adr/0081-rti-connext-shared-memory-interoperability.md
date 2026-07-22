@@ -165,7 +165,22 @@ we must still match.
    **Live-validated** against a running Connext 7.3.1 `shapes_pub` (domain 0): its advertised UUID answers
    `T` at both its metatraffic port 7412 and its user port 7413; a wrong UUID at the same live port answers
    `(NIL NIL)`; and the real UUID at a port with no segment answers `(NIL :no-such-segment)`.
-4. Property block — parse and check compatibility before trusting a segment.
+4. **Property block** — landed. `rti-shmem-segment-properties` reads `receive_buffer_size`,
+   `message_size_max` and `received_message_count_max` plus the segment's own size, and
+   `rti-shmem-datagram-fits-p` answers whether a datagram is within what a receiver can carry in one
+   message — the shared-memory analogue of the emitted-datagram-size contract of ADR 0079.
+
+   **Every length is corroborated before it is believed.** The size the segment states about itself is a
+   number written by another process, so it is re-attached at that size and the kernel decides; a segment
+   overstating its extent is refused rather than becoming a bound that later sizes a buffer. The remaining
+   plausibility checks are **physical, never policy** — a buffer cannot exceed the segment holding it — so a
+   peer legitimately configured with a large `message_size_max` cannot be false-rejected.
+
+   `run-rti-shmem-properties-test` drives exact read-back, the fits/does-not-fit boundary, and three
+   refusals. **Falsified:** removing the kernel corroboration makes a segment claiming twice its real size
+   return a properties struct carrying the lie. **Live-validated** against a running Connext 7.3.1
+   participant, where all three properties equal RTI's own published defaults (1048576 / 65536 / 64) and the
+   segment size matches `ipcs` exactly.
 5. Ring and framing — derive by publishing known payloads and diffing.
 6. Receive a real RTPS datagram from Connext over shared memory.
 7. Transmit.

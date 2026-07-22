@@ -101,6 +101,8 @@ from the RTPS port. This package answers one question — **is that RTI peer on 
 | `rti-shmem-same-host-p` *host-id* *port* → `(values same-host status)` | Attaches read-only to that key and compares the segment's `shmemUUID` against the 12-octet `host-id` from the peer's advertised `Locator_t`. |
 | `+rti-shmem-segment-key-base+` `#x400000` | Segment key offset. Semaphore `#x800000` and mutex `#xB00000` bases are exported alongside it. |
 | `+rti-shmem-protocol-major-validated+` `2` | The one shared-memory protocol version the layout was measured against. |
+| `rti-shmem-segment-properties` *port* → `(values props status)` | The receiver's embedded transport properties: `segment-size`, `receive-buffer-size`, `message-size-max`, `received-message-count-max`. |
+| `rti-shmem-datagram-fits-p` *props* *bytes* → *boolean* | Whether a `bytes`-octet datagram is within what that receiver carries in one message. |
 
 Get the `host-id` from a discovered locator with `dds.rtps.discovery:rti-shmem-locator-host-id`.
 
@@ -136,6 +138,22 @@ The attachment is read-only: nothing here writes to a segment owned by Connext. 
 process's memory and is treated as untrusted input — the minimum extent is enforced by the kernel at attach
 time (see `sysv-shm-attach-readonly` below), so a truncated or hostile segment fails to attach rather than
 being read past its end.
+
+RTI documents that a receiver's transport properties are embedded in its segment and that a sender verifies
+them for compatibility, so `rti-shmem-segment-properties` reads them — and **corroborates every length
+before believing it**. The size a segment states about itself is a number written by another process, so it
+is re-attached at that size and the kernel decides; a segment overstating its extent is refused
+(`:implausible-segment-properties`) rather than becoming a bound that later sizes a buffer. The remaining
+checks are **physical, not policy** — a buffer cannot exceed the segment holding it — so a peer legitimately
+configured with a large `message_size_max` is never false-rejected.
+
+```lisp
+;; The largest datagram this Connext receiver will take in one shared-memory message.
+(multiple-value-bind (props status) (dds.xport.rti-shmem:rti-shmem-segment-properties 7412)
+  (if props
+      (dds.xport.rti-shmem:rti-shmem-datagram-fits-p props my-datagram-bytes)
+      status))
+```
 
 The layout is **measured, not published**. See [ADR 0081](../adr/0081-rti-connext-shared-memory-interoperability.md)
 for what was established and how, and `interop/connext/shmem-layout/` to reproduce it.
