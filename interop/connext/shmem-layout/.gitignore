@@ -1,6 +1,7 @@
 # Built instruments — source is the artifact, the binaries are not.
 shmprobe
 semprobe
+semwatch
 # Run artifacts from the observation scripts.
 *.log
 sweep-qos.xml

@@ -85,7 +85,13 @@ bytes 2–5.
 ./ring-sync.sh      # SIGSTOP the subscriber -> is the semaphore a counter or a latch?
 ./semprobe 801cf4   # semaphore  0x800000+port : value + blocked-waiter counts
 ./semprobe b01cf4   # mutex      0xB00000+port
+./semwatch b01cf4 8 # poll one semaphore flat out for 8s — catches a sub-microsecond critical section
 ```
+
+**Pair every absence-claim with a positive control.** `semwatch` on the mutex only means something if the
+same instrument, in the same run, catches the data semaphore — which is known to change. Without that,
+"never caught it held" is indistinguishable from "sampled too slowly". That control is what turned the
+mutex from inferred into measured.
 
 All four scripts work the same way: **drive the system to a boundary rather than sample it working.**
 Stopping the consumer is what separated the producer fields from the consumer fields, and what showed the

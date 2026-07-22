@@ -253,13 +253,26 @@ not stack while the flag is already raised; the consumer wakes, drains **everyth
 and re-parks. **The pending-message count lives in the cursors, not the semaphore** — consistent with the
 cursors being the authority for everything else.
 
-⚠️ **The mutex at `0xB00000+port` was observed only AT REST** (value 1, unlocked, no waiters, throughout).
-Two-second sampling cannot catch a critical section measured in microseconds, so its role is inferred from
-its key and its value — **it has NOT been observed being taken**, and that is recorded as unmeasured rather
-than assumed.
+**The mutex at `0xB00000+port` IS taken on the data path — now measured, not inferred.** Observing it at
+rest proved nothing, so `semwatch.c` polls `GETVAL` in a tight loop (~7.6M samples/s) while four publishers
+drive one subscriber at ~170 messages/s:
 
-**Still NOT established, and not to be guessed at:** the exact `semop` sequence; whether the mutex is in fact
-taken around ring updates; what distinguishes the two blocks (and whether the
+| semaphore | resting | caught off-resting | value range | waiters seen |
+|---|---|---|---|---|
+| `0x800000+port` (control) | 0 | 49091 / 62.0M = 0.079 % | 0..1 | 1 |
+| **`0xB00000+port` (mutex)** | 1 | **2190 / 61.0M = 0.0036 %** | **0..1** | **1** |
+
+The control matters: the data semaphore is *known* to change, so catching it proves the instrument can see a
+transition at all — without it, "never caught" would be indistinguishable from "sampled too slowly". The
+mutex was caught **held** 2190 times, and another process was observed **blocked** on it, so it is both used
+and contended. A 0.0036 % duty cycle at ~170 messages/s puts the critical section around **210 ns per
+message**, consistent with a few cursor updates.
+
+The same run re-confirms the wakeup latch independently and at 170× the earlier traffic: across 62 million
+samples the data semaphore **never exceeded 1**.
+
+**Still NOT established, and not to be guessed at:** the exact `semop` sequence (which operations, in what
+order, and what the mutex actually protects); what distinguishes the two blocks (and whether the
 56/112/168 stride implies a third); the meaning of the two position families four bytes apart; whether 688
 is the ring base — it is the value at `0x50`, equals `176 + 8 * received_message_count_max`, and one baseline
 producer position of 708 sits exactly 20 octets above it, but that is suggestive, not proof; wraparound
