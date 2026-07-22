@@ -271,8 +271,21 @@ message**, consistent with a few cursor updates.
 The same run re-confirms the wakeup latch independently and at 170× the earlier traffic: across 62 million
 samples the data semaphore **never exceeded 1**.
 
+**`0x44`/`0x48`/`0x4c` = 56, 112, 168 are offsets from `0x40`**, giving `0x78`, `0xb0` and `0xe8`. `0xe8`
+is **not** a third control block: it reads `4294967232 0` repeating — `-64, 0` as signed pairs — an array of
+8-byte entries sitting at a negative sentinel, i.e. an empty table. So the three offsets address two control
+blocks and one table, not three blocks.
+
+⚠️ **A methodological note worth keeping.** An attempt to compare the blocks under one publisher versus four
+found no segment at all in the four-publisher case: the port scan only covered participant indices 0 and 1,
+and five participants occupy 0 through 4. The run failed for a reason that had nothing to do with the
+question being asked — which is its own hazard, because a scan that silently finds nothing looks exactly
+like a system with nothing to find.
+
 **Still NOT established, and not to be guessed at:** the exact `semop` sequence (which operations, in what
-order, and what the mutex actually protects); what distinguishes the two blocks (and whether the
+order, and what the mutex actually protects) — likely beyond observation on macOS, where SIP blocks the
+syscall tracing that would answer it directly, and worth revisiting on Linux if Connext ever lands there;
+what distinguishes the two control blocks (and whether the
 56/112/168 stride implies a third); the meaning of the two position families four bytes apart; whether 688
 is the ring base — it is the value at `0x50`, equals `176 + 8 * received_message_count_max`, and one baseline
 producer position of 708 sits exactly 20 octets above it, but that is suggestive, not proof; wraparound
