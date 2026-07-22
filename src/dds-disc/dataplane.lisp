@@ -1330,7 +1330,15 @@
    SIZE octets (SIZE is the TRUE serialized length — for a secured change PL is the oversized pooled vec and
    SIZE < (length PL), T5a; the codec offsets all index within [0, SIZE)): one DATA datagram if SIZE fits
    *fragment-size*, else a DATA_FRAG series (packing as many fragments as fit
-   BUDGET per datagram, RTPS 2.5 §9.4.5.5) followed by a HEARTBEAT_FRAG. Loss injection is applied HERE,
+   BUDGET per datagram, RTPS 2.5 §9.4.5.5) followed by a HEARTBEAT_FRAG.
+
+   ⚠️ BUDGET MUST BE THE TRANSPORT'S DATAGRAM BOUND (%pack-budget), not the send buffer's capacity.
+   RTPS 2.5 §8.4.14.1 recommends concatenating as many fragments as possible into one DataFrag — but
+   conditioned on "IF A TRANSPORT CAN ACCOMMODATE" them. Passing the raw buffer capacity dropped that
+   condition and re-assembled the fragments we had just cut into a single ~8 KB datagram, which a peer
+   whose UDPv4 transport is MTU-bounded silently discards: we fragmented for the wire and then undid it.
+   Measured live against Connext 7.3.1 (message_size_max=1400): 0 samples received before, 13/16
+   pattern=OK after, with *max-datagram-bytes* untouched at its 65507 default (ADR 0079). Loss injection is applied HERE,
    via *DEBUG-DROP-SAMPLE-NUMBERS*: a small DATA whose SN is in *DEBUG-DROP-SAMPLE-NUMBERS* and
    a DATA_FRAG submessage covering a fragment in *DEBUG-DROP-FRAGMENT-NUMBERS* are omitted (no thunk). The
    HEARTBEAT_FRAG count side-effect (writer-frag-heartbeat increments a counter) runs ONCE here — exactly as
@@ -1400,7 +1408,7 @@
           ((%small-change-p change) (push (%data-builder node change) items))
           (t (dolist (thunk (%sample-plan node sn (dds.rtps.history:cache-change-serialized-payload change)
                                           (dds.rtps.history:cache-change-payload-len change)   ; TRUE length (T5a)
-                                          (- (dds.core.buffer:octet-buffer-capacity buf) 64)))
+                                          budget))   ; ADR 0079: the SAME MTU-bounded budget the small-submessage path uses, NOT the raw buffer capacity
                (push (cons thunk nil) frag-plans))))))   ; large samples: UDP only (v1), one datagram per thunk
     (when hb (push hb items))
     (let ((packed (loop for group in (%pack-plan (nreverse items) budget)
