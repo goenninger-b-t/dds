@@ -823,6 +823,23 @@
       (when (= (cffi:pointer-address p) +map-failed-addr+) (bail :shmat-failed))
       (values (make-sysv-shm-segment :key key :id id :sap p :size least-bytes) nil))))
 
+(defun* sysv-shm-attach-readwrite (key least-bytes)
+    (function ((unsigned-byte 31) (integer 1)) (values (or null sysv-shm-segment) (or null keyword)))
+  "Attach READ-WRITE to the EXISTING System V segment named KEY, at least LEAST-BYTES long. Returns
+   (values segment NIL), or (values NIL status) with :NO-SUCH-SEGMENT (absent or shorter than LEAST-BYTES —
+   the kernel enforces the extent exactly as in SYSV-SHM-ATTACH-READONLY) or :SHMAT-FAILED. Never signals.
+
+   ⚠️ THIS MAPS ANOTHER PROCESS'S MEMORY WRITABLE. It exists for the one case that requires it — writing a
+   record into an RTI Connext receiver's ring (ADR 0081 §5.0, the transmit path) — and its use must be
+   bracketed by that ring's mutex, because writing outside the lock races RTI's own senders. Everything that
+   only READS an RTI segment uses SYSV-SHM-ATTACH-READONLY instead, so an accidental write faults rather than
+   corrupting a live peer."
+  (let ((id (cffi:foreign-funcall "shmget" :int key :unsigned-long least-bytes :int 0 :int)))
+    (when (minusp id) (bail :no-such-segment))
+    (let ((p (cffi:foreign-funcall "shmat" :int id :pointer (cffi:null-pointer) :int 0 :pointer)))
+      (when (= (cffi:pointer-address p) +map-failed-addr+) (bail :shmat-failed))
+      (values (make-sysv-shm-segment :key key :id id :sap p :size least-bytes) nil))))
+
 (defun* sysv-shm-create (key size)
     (function ((unsigned-byte 31) (integer 1)) (values (or null sysv-shm-segment) (or null keyword)))
   "Create an EXCLUSIVE System V segment named KEY of SIZE bytes (shmget IPC_CREAT|IPC_EXCL, mode 0600) and
@@ -853,6 +870,105 @@
    only for a segment WE created; removing another process's segment would break it."
   (cffi:foreign-funcall "shmctl" :int (sysv-shm-segment-id segment) :int +ipc-rmid+
                         :pointer (cffi:null-pointer) :int))
+
+;; System V SEMAPHORE primitives (FR-XPORT-2, ADR 0081) — the sibling of the shared-memory surface above,
+;; needed to interoperate with RTI Connext's shared-memory ring, which is guarded by a SysV semaphore mutex
+;; and woken by a SysV semaphore data flag (measured, ADR 0081 §5.0: producer takes the mutex, writes,
+;; releases, then raises the data flag with semctl SETVAL 1). SEM_UNDO is identical on Darwin and Linux, but
+;; the semctl command NUMBERS differ — SETVAL/GETVAL are 8/5 on Darwin and 16/12 on Linux — so those alone
+;; need an OS reader conditional (permitted inside dds-pal/), like the open(2) flags above. Values read from
+;; sys/sem.h on both, and SETVAL=8 cross-checked against a live Connext semctl via dtrace.
+(defconstant +sem-undo+ #x1000 "SEM_UNDO — semop(2) reverses this adjustment if the process exits without undoing it. sys/sem.h, Darwin (010000) + Linux (0x1000), identical.")
+#+darwin (progn (defconstant +sem-setval+ 8)  (defconstant +sem-getval+ 5))
+#-darwin (progn (defconstant +sem-setval+ 16) (defconstant +sem-getval+ 12))
+
+(defstruct* sysv-sem-set
+  "An opened System V semaphore set: integer KEY and kernel ID."
+  (key 0 :type (unsigned-byte 31)) (id -1 :type fixnum))
+
+(defun* sysv-sem-open (key)
+    (function ((unsigned-byte 31)) (values (or null sysv-sem-set) (or null keyword)))
+  "Open the EXISTING System V semaphore set named KEY (semget with nsems 0, which never creates). Returns
+   (values set NIL), or (values NIL :NO-SUCH-SEMAPHORE) — the ordinary answer when no such set exists.
+   Never signals. Used to reach the mutex/data semaphores of an RTI Connext receiver we intend to write to."
+  (let ((id (cffi:foreign-funcall "semget" :int key :int 0 :int 0 :int)))
+    (when (minusp id) (bail :no-such-semaphore))
+    (values (make-sysv-sem-set :key key :id id) nil)))
+
+(defun* sysv-sem-create (key nsems)
+    (function ((unsigned-byte 31) (integer 1 32)) (values (or null sysv-sem-set) (or null keyword)))
+  "Create an EXCLUSIVE System V semaphore set named KEY with NSEMS semaphores (semget IPC_CREAT|IPC_EXCL,
+   mode 0600). Returns (values set NIL), or (values NIL :SEMGET-FAILED) when KEY already exists or a limit is
+   hit. Never signals. A SysV set OUTLIVES its creator, so the caller is responsible for SYSV-SEM-DESTROY."
+  (let ((id (cffi:foreign-funcall "semget" :int key :int nsems :int (logior +ipc-creat+ +ipc-excl+ #o600) :int)))
+    (when (minusp id) (bail :semget-failed))
+    (values (make-sysv-sem-set :key key :id id) nil)))
+
+(defun* sysv-sem-op (set semnum delta undo-p)
+    (function (sysv-sem-set (unsigned-byte 16) (integer -32768 32767) t) (values t (or null keyword)))
+  "One semop(2) on SET's semaphore SEMNUM: add DELTA (negative takes/waits — blocking until the value can
+   absorb it; positive posts/releases), with SEM_UNDO iff UNDO-P. Returns (values T NIL), or
+   (values NIL :SEMOP-FAILED). Never signals.
+
+   The struct sembuf is {unsigned short sem_num; short sem_op; short sem_flg} — the same 6-byte packed
+   layout on Darwin and Linux, built here in a foreign object; sem_op is the only non-variadic path in this
+   surface, so a plain foreign-funcall is correct on every platform.
+
+   SEM_UNDO on the mutex TAKE is why a writer of ours cannot deadlock RTI's receiver: if our process dies
+   while holding the ring mutex, the kernel reverses the take (ADR 0081 §5.0)."
+  (cffi:with-foreign-object (sb :short 3)
+    (setf (cffi:mem-aref sb :unsigned-short 0) semnum
+          (cffi:mem-aref sb :short 1) delta
+          (cffi:mem-aref sb :short 2) (if undo-p +sem-undo+ 0))
+    (if (minusp (cffi:foreign-funcall "semop" :int (sysv-sem-set-id set) :pointer sb :unsigned-long 1 :int))
+        (bail :semop-failed)
+        (values t nil))))
+
+(defun* sysv-sem-setval (set semnum value)
+    (function (sysv-sem-set (unsigned-byte 16) (unsigned-byte 31)) (values t (or null keyword)))
+  "Set SET's semaphore SEMNUM to VALUE (semctl SETVAL) — the idempotent wake RTI's producer uses to raise
+   its data-available flag (measured value 1, ADR 0081 §5.0). Returns (values T NIL), or
+   (values NIL :SEMCTL-FAILED). Never signals.
+
+   semctl is VARIADIC in its value argument, so it has the same Darwin-arm64 hazard as shm_open's mode: a
+   plain foreign-funcall passes the value in a register where the stack-based variadic ABI expects it. SBCL
+   uses FOREIGN-FUNCALL-VARARGS (stack, correct); Clasp uses a plain call (correct on Linux's register
+   varargs, the documented NFR-PORT gap on Darwin-arm64, ADR 0013). Reader conditionals permitted here."
+  (if (minusp #+sbcl (cffi:foreign-funcall-varargs "semctl" (:int (sysv-sem-set-id set) :int semnum :int +sem-setval+) :int value :int)
+              #-sbcl (cffi:foreign-funcall "semctl" :int (sysv-sem-set-id set) :int semnum :int +sem-setval+ :int value :int))
+      (bail :semctl-failed)
+      (values t nil)))
+
+(defun* sysv-sem-getval (set semnum)
+    (function (sysv-sem-set (unsigned-byte 16)) (values (or null (unsigned-byte 31)) (or null keyword)))
+  "Read SET's semaphore SEMNUM value (semctl GETVAL — no variadic argument, so a plain foreign-funcall is
+   correct everywhere). Returns (values value NIL), or (values NIL :SEMCTL-FAILED). Never signals."
+  (let ((v (cffi:foreign-funcall "semctl" :int (sysv-sem-set-id set) :int semnum :int +sem-getval+ :int)))
+    (if (minusp v) (bail :semctl-failed) (values v nil))))
+
+(defun* sysv-sem-destroy (set)
+    (function (sysv-sem-set) t)
+  "semctl(IPC_RMID) SET — remove the semaphore set. Call only for a set WE created; removing RTI's would
+   break its ring."
+  (cffi:foreign-funcall "semctl" :int (sysv-sem-set-id set) :int 0 :int +ipc-rmid+ :int))
+
+(defun* sysv-sem-setval-reliable-p ()
+    (function () t)
+  "T iff semctl(SETVAL) actually sets the value on this implementation+platform. FALSE on Clasp/macOS-arm64,
+   whose CFFI mispasses semctl's variadic value the same way it mispasses shm_open's mode (ADR 0013) — there
+   SETVAL silently no-ops, which would leave an RTI receiver un-woken and, worse, block a subsequent take on
+   an un-raised semaphore forever. A runtime PROBE, not a reader conditional: create a fresh IPC_PRIVATE set,
+   SETVAL 42, read it back, and require 42. Never touches another process's semaphore; never blocks (GETVAL
+   only). The RTI-SHMEM writer and its test gate on this, exactly as the SHMEM transport gates on
+   SHM-ATTACH-BY-NAME-RELIABLE-P."
+  (multiple-value-bind (set st) (sysv-sem-create 0 1)   ; IPC_PRIVATE (key 0) — always a fresh anonymous set
+    (if st
+        nil
+        (unwind-protect
+             (progn (sysv-sem-setval set 0 42)
+                    (multiple-value-bind (v gst) (sysv-sem-getval set 0)
+                      (and (null gst) (eql v 42))))
+          (sysv-sem-destroy set)))))
 
 ;; Cross-process PTHREAD_PROCESS_SHARED mutex+condvar primitives (FR-XPORT-2), living in a
 ;; shared segment for in-band notification. Replaces named POSIX semaphores: sem_open is

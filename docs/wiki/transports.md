@@ -107,6 +107,7 @@ from the RTPS port. This package answers one question — **is that RTI peer on 
 | `rti-shmem-ring-modulus` *props* → *length* | Ring length: `receive_buffer_size + message_size_max + 8*count - 64`. |
 | `rti-shmem-record-offset` *cursor* *props* → *offset* | Where the record a control-block cursor refers to actually sits. |
 | `rti-shmem-read-record` *port* *out* → `(values octets status)` | Copies the record the producer cursor designates into `out`, or refuses with `:not-an-rtps-record`. |
+| `rti-shmem-write-record` *port* *record* *len* → `(values ok status)` | Writes `record` into the receiver's ring by the measured producer protocol (take mutex → write → advance → release → `SETVAL` wake) and signals it. Refuses `:setval-unavailable` where the platform cannot signal. |
 
 Get the `host-id` from a discovered locator with `dds.rtps.discovery:rti-shmem-locator-host-id`.
 
@@ -249,6 +250,11 @@ in-segment `PTHREAD_PROCESS_SHARED` mutex/condvar. All thin CFFI wrappers; no ex
 | `dds.pal:sysv-shm-detach` | function | `(segment)` — `shmdt`. Deliberately does **not** destroy: we attach to other processes' segments and must never remove them. |
 | `dds.pal:sysv-shm-destroy` | function | `(segment)` — `shmctl(IPC_RMID)`. For segments **we** created only. A System V segment outlives its creating process, so a leaked one holds its key and makes the next create fail. |
 | `dds.pal:sysv-shm-sap` | function | `(segment)` — the `shmat` base SAP. |
+| `dds.pal:sysv-shm-attach-readwrite` | function | `(key least-bytes)` — like `-readonly` but maps **writable**, for the transmit path only; use must be bracketed by the ring mutex. |
+| `dds.pal:sysv-sem-open` / `-create` | function | Open an existing / create an exclusive System V semaphore set (`semget`). |
+| `dds.pal:sysv-sem-op` | function | `(set semnum delta undo-p)` — one `semop`: `delta<0` takes, `>0` posts, with `SEM_UNDO` iff `undo-p`. |
+| `dds.pal:sysv-sem-setval` / `-getval` | function | `semctl(SETVAL)` / `(GETVAL)` — set/read a semaphore value. `SETVAL` is the idempotent wake RTI's producer uses. |
+| `dds.pal:sysv-sem-setval-reliable-p` | function | `T` unless `semctl(SETVAL)` mispasses its variadic value (Clasp/macOS-arm64, ADR 0013). The RTI-SHMEM writer gates on it. |
 
 `least-bytes` on `sysv-shm-attach-readonly` **is the bounds check, and the kernel enforces it**: `shmget`
 returns `EINVAL` when a segment exists for `key` but is smaller than the requested size, so asking for the

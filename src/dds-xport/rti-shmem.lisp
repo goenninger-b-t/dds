@@ -3,7 +3,8 @@
 ;;;; Answers one question: is the peer that advertised this RTI shared-memory Locator_t running on OUR
 ;;;; machine? RTI's own published header states the test verbatim (transport_shmem.h:89-96) — attach to the
 ;;;; segment and compare the UUID in its header against the one in the received locator — so there is no
-;;;; locator-only way to decide it. Everything here is READ-ONLY; nothing writes to an RTI segment.
+;;;; locator-only way to decide it. Reads (recognition, properties, ring records) never write to an RTI
+;;;; segment; the transmit path (RTI-SHMEM-WRITE-RECORD, slice 7) does, bracketed by the ring mutex.
 
 (in-package #:net.goenninger.dds.xport.rti-shmem)
 
@@ -321,17 +322,85 @@
           (dds.pal:sysv-shm-detach segment)
           (if magic-p (values n nil) (values 0 :not-an-rtps-record)))))))
 
+;;; Transmit (ADR 0081 slice 7). Writing into an RTI Connext receiver's ring, following the producer
+;;; protocol traced in §5.0: take the ring mutex with SEM_UNDO, write the record at the producer cursor and
+;;; advance the cursor, release the mutex, then raise the data flag with `semctl SETVAL 1`. The mutex
+;;; serialises writers (the consumer is lockless), so this coordinates with RTI's own senders.
+
+(defconstant +rti-shmem-mutex-semnum+ 0
+  "Index of the semaphore within the mutex set (one per set, ADR 0081 §5.0).")
+(defconstant +rti-shmem-datasem-semnum+ 0
+  "Index of the semaphore within the data-flag set.")
+
+(defun* %rti-shmem-put-u32-le (sap offset value)
+    (function (t (integer 0) (unsigned-byte 32)) t)
+  "Store VALUE at SAP+OFFSET as four little-endian octets. The PAL exports an 8-bit SAP store only, and
+   writing the octets explicitly also states the byte order the cursor is read and written in."
+  (dotimes (i 4 t)
+    (dds.pal:store-sap-u8 sap (+ offset i) (ldb (byte 8 (* 8 i)) value))))
+
+(defun* %rti-shmem-align8 (n)
+    (function ((unsigned-byte 32)) (unsigned-byte 32))
+  "N rounded up to a multiple of 8 — records are packed 8-byte aligned (ADR 0081 §5.0)."
+  (logand (+ n 7) (lognot 7)))
+
+(defun* rti-shmem-write-record (port record len)
+    (function ((unsigned-byte 16) (simple-array (unsigned-byte 8) (*)) (unsigned-byte 32))
+              (values t (or null keyword)))
+  "Write RECORD (LEN octets, a complete RTPS datagram) into the ring of the RTI Connext receiver serving
+   RTPS PORT, by the measured producer protocol (ADR 0081 §5.0), and wake the receiver.
+
+   Returns (values T NIL), or (values NIL status): :SETVAL-UNAVAILABLE (this impl/platform cannot signal —
+   see below), :DATAGRAM-TOO-LARGE (LEN exceeds the receiver's `message_size_max`), the property-read
+   statuses (:NO-SUCH-SEGMENT / :NOT-AN-RTI-SHMEM-SEGMENT / :UNVALIDATED-SHMEM-PROTOCOL-VERSION /
+   :IMPLAUSIBLE-SEGMENT-PROPERTIES / :SHMAT-FAILED), or :NO-MUTEX / :NO-DATA-SEMAPHORE when a semaphore set
+   is missing. Never signals.
+
+   GATED on DDS.PAL:SYSV-SEM-SETVAL-RELIABLE-P. On Clasp/macOS-arm64 `semctl SETVAL` mispasses its variadic
+   value (ADR 0013), so it cannot wake the receiver; the write is REFUSED (:SETVAL-UNAVAILABLE) rather than
+   landing a record no one is signalled to read. Same NFR-PORT gap as the SHMEM transport; the primary
+   platform (Linux) and SBCL are unaffected.
+
+   SAFETY. The record is written under the ring mutex, taken with SEM_UNDO so a crash of this process cannot
+   leave the mutex locked and deadlock RTI's receiver. The mutex is released on every exit path. LEN is
+   bounded by `message_size_max` and the write is bounded by the ring end.
+
+   ⚠️ SCOPE (slice 7a). The cursor is advanced by `align8(LEN)` — the 8-byte-aligned record footprint. That
+   is self-consistent (a record written here is read back by RTI-SHMEM-READ-RECORD at the published cursor)
+   and is what RUN-RTI-SHMEM-WRITE-ROUNDTRIP-TEST proves, but the exact per-record framing RTI uses for a
+   datagram of arbitrary length is NOT yet measured against a live peer — that is slice 7b, and until it is
+   done this must not be pointed at a production Connext ring expecting multi-record correctness."
+  (unless (dds.pal:sysv-sem-setval-reliable-p) (bail :setval-unavailable))
+  (multiple-value-bind (props pstatus) (rti-shmem-segment-properties port)
+    (when pstatus (bail pstatus))
+    (unless (rti-shmem-datagram-fits-p props len) (bail :datagram-too-large))
+    (let ((size (rti-shmem-properties-segment-size props))
+          (ring-start (rti-shmem-ring-start (rti-shmem-properties-received-message-count-max props))))
+      (multiple-value-bind (seg astatus) (dds.pal:sysv-shm-attach-readwrite (rti-shmem-segment-key port) size)
+        (when astatus (bail astatus))
+        (multiple-value-bind (mutex mstatus) (dds.pal:sysv-sem-open (+ +rti-shmem-mutex-key-base+ port))
+          (when mstatus (dds.pal:sysv-shm-detach seg) (bail :no-mutex))
+          (multiple-value-bind (datasem dstatus) (dds.pal:sysv-sem-open (+ +rti-shmem-semaphore-key-base+ port))
+            (when dstatus (dds.pal:sysv-shm-detach seg) (bail :no-data-semaphore))
+            (let ((sap (dds.pal:sysv-shm-sap seg)))
+              (dds.pal:sysv-sem-op mutex +rti-shmem-mutex-semnum+ -1 t)   ; take, SEM_UNDO
+              (let* ((cursor (dds.pal:load-sap-u32 sap +rti-shmem-off-cursor+))
+                     (next (logand (+ cursor (%rti-shmem-align8 len)) #xFFFFFFFF))
+                     (offset (rti-shmem-record-offset next props))
+                     (fits (<= (+ offset len) size)))
+                (when fits
+                  (dotimes (i len) (dds.pal:store-sap-u8 sap (+ offset i) (aref record i)))
+                  (%rti-shmem-put-u32-le sap +rti-shmem-off-cursor+ next))
+                (dds.pal:sysv-sem-op mutex +rti-shmem-mutex-semnum+ 1 t)   ; release
+                (dds.pal:sysv-shm-detach seg)
+                (if fits
+                    (dds.pal:sysv-sem-setval datasem +rti-shmem-datasem-semnum+ 1)   ; wake
+                    (bail :ring-write-out-of-bounds))))))))))
+
 (defconstant +rti-shmem-test-port+ 65432
   "RTPS port used by RUN-RTI-SHMEM-RECOGNITION-TEST to key its synthetic segment. Chosen so the derived
    System V key cannot collide with a live Connext participant: no domain maps to it (7400+250*d+10+2*i
    has no integral solution here), so a real RTI segment never claims it.")
-
-(defun* %rti-shmem-put-u32-le (sap offset value)
-    (function (t (integer 0) (unsigned-byte 32)) t)
-  "Store VALUE at SAP+OFFSET as four little-endian octets. Test scaffolding: the PAL exports an 8-bit SAP
-   store only, and writing the octets explicitly also states the byte order the reader assumes."
-  (dotimes (i 4 t)
-    (dds.pal:store-sap-u8 sap (+ offset i) (ldb (byte 8 (* 8 i)) value))))
 
 (defun* run-rti-shmem-recognition-test ()
     (function () (eql t))
@@ -588,3 +657,90 @@
              t)
         (dds.pal:sysv-shm-destroy seg)
         (dds.pal:sysv-shm-detach seg)))))
+
+(defconstant +rti-shmem-write-test-port+ 65429
+  "RTPS port for RUN-RTI-SHMEM-WRITE-ROUNDTRIP-TEST's synthetic receiver; distinct from the other tests'.")
+
+(defun* run-rti-shmem-write-roundtrip-test ()
+    (function () (eql t))
+  "ADR 0081 slice 7a: RTI-SHMEM-WRITE-RECORD must land a record where RTI-SHMEM-READ-RECORD reads it, wake
+   the data flag, and leave the mutex as it found it — the write and read paths inverses through a real
+   System V segment and real semaphores, no Connext involved.
+
+   The test builds an RTI-shaped receiver (segment header + property block + a mutex set at 0xB00000+port
+   resting at 1 + a data set at 0x800000+port resting at 0), writes two records, and checks:
+
+     1. each record reads back byte-for-byte via RTI-SHMEM-READ-RECORD (the two paths agree on the cursor
+        mapping and on 8-byte-aligned advance — a SECOND record proves the advance, not just placement);
+     2. the data semaphore is raised to 1 (the SETVAL wake actually happened);
+     3. the mutex is back at 1 (taken and released, not left locked);
+     4. a datagram larger than message_size_max is refused with :DATAGRAM-TOO-LARGE, not written.
+
+   Pass-skips where SETVAL is unavailable (Clasp/macOS-arm64, ADR 0013) — there the writer correctly refuses
+   with :SETVAL-UNAVAILABLE and there is nothing to round-trip; asserting that refusal IS the Clasp check."
+  (let* ((port +rti-shmem-write-test-port+)
+         (segkey (rti-shmem-segment-key port))
+         (mtxkey (+ +rti-shmem-mutex-key-base+ port))
+         (datkey (+ +rti-shmem-semaphore-key-base+ port))
+         (size 4456) (rbs 2048) (msm 2048) (cnt 8)
+         (rec-a (make-array 16 :element-type '(unsigned-byte 8)
+                               :initial-contents '(#x52 #x54 #x50 #x53 #x02 #x05 #x01 #x01
+                                                   #xAA #xBB #xCC #xDD #xEE #xFF #x00 #x11)))
+         (rec-b (make-array 24 :element-type '(unsigned-byte 8)
+                               :initial-contents '(#x52 #x54 #x50 #x53 #x02 #x05 #x01 #x01
+                                                   #x01 #x02 #x03 #x04 #x05 #x06 #x07 #x08
+                                                   #x09 #x0A #x0B #x0C #x0D #x0E #x0F #x10))))
+    ;; Reclaim any leftovers from an aborted run.
+    (multiple-value-bind (s st) (dds.pal:sysv-shm-attach-readonly segkey +rti-shmem-header-bytes+)
+      (declare (ignore st)) (when s (dds.pal:sysv-shm-destroy s) (dds.pal:sysv-shm-detach s)))
+    (dolist (k (list mtxkey datkey))
+      (multiple-value-bind (s st) (dds.pal:sysv-sem-open k) (declare (ignore st)) (when s (dds.pal:sysv-sem-destroy s))))
+    (multiple-value-bind (seg segst) (dds.pal:sysv-shm-create segkey size)
+      (assert (null segst) () "System V shm unusable (~s)" segst)   ; HOTPATH-COND(TEST): in-file self-test
+      (multiple-value-bind (mtx mst) (dds.pal:sysv-sem-create mtxkey 1)
+        (assert (null mst) () "sem create (mutex) failed (~s)" mst)   ; HOTPATH-COND(TEST): in-file self-test
+        (multiple-value-bind (dat dst) (dds.pal:sysv-sem-create datkey 1)
+          (assert (null dst) () "sem create (data) failed (~s)" dst)   ; HOTPATH-COND(TEST): in-file self-test
+          (unwind-protect
+               (let ((sap (dds.pal:sysv-shm-sap seg)))
+                 (%rti-shmem-put-u32-le sap +rti-shmem-off-magic+ +rti-shmem-header-magic+)
+                 (%rti-shmem-put-u32-le sap +rti-shmem-off-protocol-major+ +rti-shmem-protocol-major-validated+)
+                 (%rti-shmem-put-u32-le sap +rti-shmem-off-segment-size+ size)
+                 (%rti-shmem-put-u32-le sap +rti-shmem-off-receive-buffer-size+ rbs)
+                 (%rti-shmem-put-u32-le sap +rti-shmem-off-message-size-max+ msm)
+                 (%rti-shmem-put-u32-le sap +rti-shmem-off-received-message-count-max+ cnt)
+                 (%rti-shmem-put-u32-le sap +rti-shmem-off-cursor+ 0)
+                 (dds.pal:sysv-sem-setval mtx 0 1)   ; mutex rests unlocked
+                 (dds.pal:sysv-sem-setval dat 0 0)   ; data flag rests clear
+                 (cond
+                   ((not (dds.pal:sysv-sem-setval-reliable-p))
+                    ;; Clasp/macOS-arm64: the writer must REFUSE, not write.
+                    (multiple-value-bind (ok st) (rti-shmem-write-record port rec-a (length rec-a))
+                      (assert (and (null ok) (eq st :setval-unavailable)) ()   ; HOTPATH-COND(TEST): in-file self-test
+                              "SETVAL unavailable here, write must refuse, got ~s/~s" ok st)))
+                   (t
+                    (let ((out (make-array 64 :element-type '(unsigned-byte 8))))
+                      ;; too-large is refused up front
+                      (let ((big (make-array (1+ msm) :element-type '(unsigned-byte 8) :initial-element #x52)))
+                        (multiple-value-bind (ok st) (rti-shmem-write-record port big (length big))
+                          (assert (and (null ok) (eq st :datagram-too-large)) ()   ; HOTPATH-COND(TEST): in-file self-test
+                                  "oversized datagram must be refused, got ~s/~s" ok st)))
+                      ;; record A
+                      (multiple-value-bind (ok st) (rti-shmem-write-record port rec-a (length rec-a))
+                        (assert (and ok (null st)) () "write A must succeed, got ~s/~s" ok st))   ; HOTPATH-COND(TEST): in-file self-test
+                      (assert (eql 1 (dds.pal:sysv-sem-getval dat 0)) () "data flag must be raised after write A")   ; HOTPATH-COND(TEST): in-file self-test
+                      (assert (eql 1 (dds.pal:sysv-sem-getval mtx 0)) () "mutex must be released after write A")   ; HOTPATH-COND(TEST): in-file self-test
+                      (multiple-value-bind (n st) (rti-shmem-read-record port out)
+                        (assert (and (plusp n) (null st)) () "record A must read back, got ~s/~s" n st)   ; HOTPATH-COND(TEST): in-file self-test
+                        (dotimes (i (length rec-a))
+                          (assert (= (aref out i) (aref rec-a i)) () "record A octet ~d mismatch" i)))   ; HOTPATH-COND(TEST): in-file self-test
+                      ;; record B — a second record, so the 8-byte-aligned advance is exercised, not just placement
+                      (multiple-value-bind (ok st) (rti-shmem-write-record port rec-b (length rec-b))
+                        (assert (and ok (null st)) () "write B must succeed, got ~s/~s" ok st))   ; HOTPATH-COND(TEST): in-file self-test
+                      (multiple-value-bind (n st) (rti-shmem-read-record port out)
+                        (assert (and (plusp n) (null st)) () "record B must read back, got ~s/~s" n st)   ; HOTPATH-COND(TEST): in-file self-test
+                        (dotimes (i (length rec-b))
+                          (assert (= (aref out i) (aref rec-b i)) () "record B octet ~d mismatch" i))))))   ; HOTPATH-COND(TEST): in-file self-test
+                 t)
+            (dds.pal:sysv-shm-destroy seg) (dds.pal:sysv-shm-detach seg)
+            (dds.pal:sysv-sem-destroy mtx) (dds.pal:sysv-sem-destroy dat)))))))

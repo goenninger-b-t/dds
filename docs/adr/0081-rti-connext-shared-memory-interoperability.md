@@ -444,10 +444,26 @@ we must still match.
    ⚠️ It is an **observer, not a receive path**: it takes no lock. The mutex is measured as real and
    contended, so a delivery path must honour it, and that needs the `semop` ordering (still unmeasured).
    The magic check is what makes the unlocked read safe to use — refusal instead of corruption.
-7. **Transmit** — unblocked. The producer protocol is measured, so a writer can take the ring mutex, write a
-   record at the producer cursor, advance it, release, and raise the data semaphore with `SETVAL 1`. Needs a
-   System V *semaphore* PAL surface (`semget`/`semop`/`semctl`) alongside the shared-memory one, and
-   `SEM_UNDO` on the mutex take.
+7. **Transmit.**
+   - (a) landed. A System V *semaphore* PAL surface (`sysv-sem-open`/`-create`/`-op`/`-setval`/`-getval`/
+     `-destroy`, and `sysv-shm-attach-readwrite`) plus `rti-shmem-write-record`, which follows the measured
+     protocol: take the ring mutex with `SEM_UNDO`, write the record at the producer cursor and advance it,
+     release, then raise the data flag with `semctl SETVAL 1`. `run-rti-shmem-write-roundtrip-test` builds a
+     real RTI-shaped receiver (segment + mutex set + data set) and proves the write and read paths are
+     inverses through actual System V objects — two records, so the 8-byte-aligned advance is exercised, not
+     just placement; the data flag is confirmed raised and the mutex confirmed released. Falsified two ways
+     (remove the wake → the flag-raised check fails; drop the advance → the second record fails to read
+     back). `SETVAL` is gated on `dds.pal:sysv-sem-setval-reliable-p`: on Clasp/macOS-arm64 its variadic
+     value mispasses (ADR 0013), so the writer *refuses* with `:setval-unavailable` rather than landing an
+     un-signalled record; SBCL (both platforms) and Clasp/Linux are unaffected. 582/582 both impls on macOS,
+     582/582 SBCL on Linux where `SEM_UNDO` and `SETVAL` were both confirmed to work.
+   - (b) **NOT done, and gated on one unmeasured fact: the exact per-record framing.** 7a advances the
+     producer cursor by `align8(len)`, which is self-consistent (a reader of ours reads back what a writer of
+     ours wrote) but has *not* been checked against how RTI frames a datagram of arbitrary length in the
+     ring. Writing into a **live** Connext ring needs that measured first — vary a Connext publisher's
+     payload size and observe how the cursor advance tracks it — otherwise a wrong advance would gap or
+     overwrite records in a running peer. This is the one place left where being wrong corrupts rather than
+     misreads, so it stays behind a measurement.
 
 ## 7. Consequences and risks
 
