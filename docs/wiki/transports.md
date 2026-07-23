@@ -190,6 +190,19 @@ A synthetic round-trip cannot catch that. This stack's writer and reader were in
 four live runs while RTI rejected every record. **Interop is established against the other implementation or
 not at all.**
 
+**RTI's application receives samples this stack writes.** Ring-level acceptance is not delivery: a record
+the consumer drains can still be discarded above the ring. It was — twice — for one reason, and the reason
+is worth knowing before anyone repeats the experiment. **Every record still lying in a ring has by
+definition already been delivered**, so replaying one verbatim presents a sequence number the reader has
+already seen, and RTPS duplicate suppression drops it before the application (RTPS 2.5 §8.4.13.2: a
+best-effort reader accepts only `SN > max received`; §8.4.12: an already-received change is not
+re-delivered). Re-issuing the newest sample at `SN + 1` — the reader's next expected number — is what
+closes the gap: against a live Connext 7.3.1 subscriber the `issue received` counter advanced while the
+publisher was frozen and proven steady, so nothing but our write could have moved it.
+
+With the read path, this stack now interoperates with RTI Connext over shared memory in **both directions,
+up to and including application-level sample delivery.**
+
 The layout is **measured, not published**. See [ADR 0081](../adr/0081-rti-connext-shared-memory-interoperability.md)
 for what was established and how, and `interop/connext/shmem-layout/` to reproduce it — including
 `ring-records.lisp`, which parses, replays and re-issues ring records using this stack's own RTPS parser.

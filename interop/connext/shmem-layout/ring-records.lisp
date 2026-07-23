@@ -337,12 +337,24 @@
       (multiple-value-bind (seg astatus)
           (dds.pal:sysv-shm-attach-readonly (dds.xport.rti-shmem:rti-shmem-segment-key port) size)
         (when astatus (return-from ring-records (values nil astatus)))
-        (let ((sap (dds.pal:sysv-shm-sap seg)))
+        (let* ((sap (dds.pal:sysv-shm-sap seg))
+               ;; The NEWEST record has no following record to bound it, and bounding it by the copy
+               ;; window makes its submessage walk run off its own end into the alignment padding —
+               ;; which excluded it from selection and made the first live run re-issue the
+               ;; SECOND-newest sample's SN + 1, i.e. the newest sample's own SN: a duplicate.
+               ;; Block A index 0 is the head and block B index 0 is the tail (ADR 0081 §5.0), and the
+               ;; producer sets the tail to the pre-write head — so head - tail IS the newest record's
+               ;; align8 footprint, read straight off the ring rather than inferred.
+               (head (dds.pal:load-sap-u32 sap +block-a-offset+))
+               (tail (dds.pal:load-sap-u32 sap +block-b-offset+))
+               (newest-stride (let ((d (- head tail))) (if (and (plusp d) (<= d *record-window*)) d 0))))
           (loop for off from start below (- end 4) by 8
                 do (when (%rtps-magic-at-p sap off) (push off offsets)))
           (setf offsets (nreverse offsets))
           (loop for (off . rest) on offsets
-                for stride = (min *record-window* (- (or (first rest) end) off))
+                for stride = (if (and (null rest) (plusp newest-stride))
+                                 newest-stride
+                                 (min *record-window* (- (or (first rest) end) off)))
                 do (let ((vec (make-array stride :element-type '(unsigned-byte 8))))
                      (dotimes (i stride) (setf (aref vec i) (dds.pal:load-sap-u8 sap (+ off i))))
                      (let* ((report (record-report vec stride))
@@ -383,18 +395,40 @@
    are the CONSUMER's position and counter, and those advancing is RTI accepting the record. The data
    semaphore is read at three points because it separates two different failures: `1 then 1` means the
    consumer never woke, `1 then 0` means it woke and declined (ADR 0081 §5.0)."
-  (format t "<<RT>> BEFORE A@0x78 = ~s~%" (control-block port +block-a-offset+))
-  (format t "<<RT>>        B@0xb0 = ~s   data-sem = ~s~%"
-          (control-block port +block-b-offset+) (data-semaphore-value port))
-  (multiple-value-bind (ok status) (dds.xport.rti-shmem:rti-shmem-write-record port vec len)
-    (format t "<<RT>> WRITE ok=~s status=~s (~d octets)   data-sem just after = ~s~%"
-            ok status len (data-semaphore-value port))
-    (sleep 0.6)
-    (format t "<<RT>> AFTER  A@0x78 = ~s~%" (control-block port +block-a-offset+))
+  (let* ((before (ring-records port))
+         (last-before (car (last before)))
+         (prev-offset (and last-before (car last-before)))
+         (prev-len (and last-before (getf (getf (cdr last-before) :report) :len))))
+    (format t "<<RT>> BEFORE A@0x78 = ~s~%" (control-block port +block-a-offset+))
     (format t "<<RT>>        B@0xb0 = ~s   data-sem = ~s~%"
             (control-block port +block-b-offset+) (data-semaphore-value port))
-    (format t "<<RT>> RING-level acceptance iff a consumer field (A index 1 / index 5) advanced.~%")
-    (and ok (null status))))
+    (multiple-value-bind (ok status) (dds.xport.rti-shmem:rti-shmem-write-record port vec len)
+      (format t "<<RT>> WRITE ok=~s status=~s (~d octets)   data-sem just after = ~s~%"
+              ok status len (data-semaphore-value port))
+      (sleep 0.6)
+      (format t "<<RT>> AFTER  A@0x78 = ~s~%" (control-block port +block-a-offset+))
+      (format t "<<RT>>        B@0xb0 = ~s   data-sem = ~s~%"
+              (control-block port +block-b-offset+) (data-semaphore-value port))
+      (format t "<<RT>> RING-level acceptance iff a consumer field (A index 1 / index 5) advanced.~%")
+      ;; PLACEMENT CHECK. Records are packed contiguously and 8-byte aligned (ADR 0081 §5.0), so the
+      ;; next record belongs at prev_offset + align8(prev_len). Our writer instead derives its offset
+      ;; from RTI-SHMEM-RECORD-OFFSET. If the two disagree, the consumer reads our record at ITS
+      ;; computed location, finds stale octets where the RTPS magic should be, and the parse fails —
+      ;; while the cursors still advance, because the cursor advance rides the descriptor. That is
+      ;; exactly the signature of "accepted at ring level, never delivered to the application", so it
+      ;; is measured here rather than argued about.
+      (when (and prev-offset prev-len)
+        (let* ((predicted (+ prev-offset (logand (+ prev-len 7) (lognot 7))))
+               (after (ring-records port))
+               (ours (find-if (lambda (e) (> (car e) prev-offset)) after)))
+          (format t "<<RT>> PLACEMENT: previous newest record at ~d len ~d => contiguous slot ~d~%"
+                  prev-offset prev-len predicted)
+          (if ours
+              (format t "<<RT>>   our record landed at ~d  (delta ~@d)~:[~;  <-- MISPLACED~]~%"
+                      (car ours) (- (car ours) predicted) (/= (car ours) predicted))
+              (format t "<<RT>>   no record found past ~d — our write is not where a scan can see it~%"
+                      prev-offset))))
+      (and ok (null status)))))
 
 (defun* newest-user-data (records)
     (function (list) list)

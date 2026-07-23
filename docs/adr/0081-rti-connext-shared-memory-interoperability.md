@@ -613,10 +613,47 @@ we must still match.
      rather than assuming it.
 
      The parse-and-patch logic is falsified off-line before it is ever aimed at a live ring (mode `selftest`,
-     twelve checks against the real captured record): the patched sequence number must read back through the
+     thirteen checks against the real captured record): the patched sequence number must read back through the
      production parser, and — the checks that give that one its meaning — a one-octet-off patch and a
      wrong-byte-order patch must **not** read back, a builtin `writerId` must not classify as user data, and
      a truncated record must be refused rather than half-parsed. Breaking the offset constant turns it red.
+
+     **First live run — a duplicate again, for a new reason, and the scanner's fault.** Records are bounded
+     by the distance to the *next* record's magic. The newest record has no next, so it was bounded by the
+     copy window, its submessage walk ran off its own end into the alignment padding, corroboration failed,
+     and it was excluded from selection. Selection then took the *second*-newest (SN 7) and injected
+     SN + 1 = 8 — the newest record's own sequence number. The counts corroborate it: SN 2..8 is seven
+     records and the subscriber had logged seven issues. Fixed by bounding the newest record with the ring
+     itself: block A index 0 is the head, block B index 0 the tail, and the producer sets the tail to the
+     pre-write head, so **head − tail is the newest record's `align8` footprint**, read off the ring rather
+     than inferred.
+
+     That run also produced a false lead worth recording so it is not re-derived: every record appeared to
+     start four octets below where `rti-shmem-record-offset` predicts. It looked like a placement bias that
+     would explain both failures at once — the consumer would read stale octets where the magic should be,
+     failing the RTPS parse while the cursors still advanced on the descriptor. **It was wrong.** The
+     comparison was made *across two runs* whose ring origins differ (offsets 808.. in one, 816.. in the
+     other; cursors 512 and 516), which is not a comparison at all. A placement check was added rather than
+     argued about — it reports where our record lands against the contiguous slot
+     `prev_offset + align8(prev_len)` — and it measured **delta +0**. The address arithmetic is correct.
+
+   - (h) **DELIVERED — RTI's application received a sample this stack wrote.** Domain 79, throwaway pair,
+     publisher frozen and *proven* steady (the harness requires the `issue received` counter to stand still
+     for two seconds before it writes, so a freeze that did not take cannot read as success). The newest
+     user record, SN 8, was re-issued at SN 9. Ring level: the consumer's own fields advanced — A index 1
+     `516 → 580`, indexes 2 and 3 `520 → 584`, indexes 5 and 6 `8 → 9` — and the data semaphore cycled
+     `0 → 1 → 0`. Application level: **`issue received` went 7 → 8**, the new line reading
+     `rtiddsping, issue received: 0000007` — a repeat of a payload counter already seen, which is exactly
+     the expected signature, because only `writerSN` was patched and the payload was carried over verbatim.
+
+     **Slice 7 is complete end to end.** Combined with the read path (slices 1–6, live-validated), this
+     stack now interoperates with RTI Connext over shared memory in **both directions, up to and including
+     application-level sample delivery.**
+
+     The whole of slice 7c reduces to one fact: what a verbatim replay can never carry is a *fresh sequence
+     number*. Every record still in the ring has by definition been delivered, so RTPS duplicate suppression
+     drops it above the ring — which is why the ring-level milestone could be real while the subscriber's
+     counter never moved. Nothing about the segment layout was ever missing.
 
 ## 7. Consequences and risks
 
