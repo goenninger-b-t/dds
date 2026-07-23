@@ -166,6 +166,113 @@
             "the enum member's TypeIdentifier is TK_INT32 today (documented gap)"))
   t)
 
+;; v2 IS v1 plus a trailing member — the whole point of APPENDABLE. Both must be able to read the
+;; other's samples, which is the property tested, not merely that a DHEADER appears.
+(dds.gen:define-dds-type appendable-v1 (:extensibility :appendable)
+  (a :i32 :key t)
+  (b :i32))
+
+(dds.gen:define-dds-type appendable-v2 (:extensibility :appendable)
+  (a :i32 :key t)
+  (b :i32)
+  (c :i32))
+
+(defun* run-gen-appendable-test ()
+    (function () t)
+  "Test: `:appendable` extensibility (DDS-XTypes 1.3 §7.4.3.5 rules 29/30, §7.4.3.4.1).
+
+   Rule (30): XCDR[2] serializes an APPENDABLE type as DHEADER(O):UInt32 then the members as if
+   FINAL. Rule (29): XCDR[1] serializes it EXACTLY as FINAL — no DHEADER. §7.4.2 says the same in
+   prose. And Table 60 (§7.6.3.1.2) makes the ENCAPSULATION ID depend on extensibility, not just the
+   encoding version: APPENDABLE+v2+LE is D_CDR2_LE 0x0009, not CDR2_LE 0x0007.
+
+   The label and the framing must agree. A DHEADER under an 0x0007 label tells a conformant peer
+   there is no DHEADER, so it would read the DHEADER's four octets as the first member."
+  (let* ((arena (dds.core.arena:init-arena :bytes (* 64 1024)))
+         (pool (dds.core.arena:make-buffer-pool arena 512 4)))
+    ;; 1. serialized-size must ACCOUNT for the DHEADER. %serialize-sample sizes the payload buffer
+    ;;    from it, so an under-estimate here is a buffer overflow, not a cosmetic mismatch.
+    (let* ((s2 (make-appendable-v2 :a 1 :b 2 :c 3))
+           (b (dds.core.arena:pool-acquire pool))
+           (wc (dds.core.buffer:cursor b :endianness :little)))
+      (serialize-appendable-v2 s2 wc :xcdr2)
+      (%check :appendable-size (= (dds.core.buffer:cursor-position wc)
+                                  (serialized-size-appendable-v2 s2 :xcdr2))
+              "serialized-size must include the DHEADER")
+      ;; 2. THE COMPATIBILITY PROPERTY, forward: a v2 sample read by a v1 reader. The shared members
+      ;;    decode, and the reader stops at the DHEADER extent instead of walking into member c.
+      (let* ((rc (dds.core.buffer:cursor b :endianness :little))
+             (q (deserialize-appendable-v1 rc :xcdr2)))
+        (%check :appendable-v2-as-v1 (and (= 1 (appendable-v1-a q)) (= 2 (appendable-v1-b q)))
+                (format nil "shared members must decode; got a=~s b=~s"
+                        (appendable-v1-a q) (appendable-v1-b q)))
+        (%check :appendable-v2-as-v1-consumed-extent
+                (= (dds.core.buffer:cursor-position rc) (dds.core.buffer:cursor-position wc))
+                (format nil "a v1 reader must skip to the DHEADER end (~d); stopped at ~d"
+                        (dds.core.buffer:cursor-position wc) (dds.core.buffer:cursor-position rc))))
+      (dds.core.arena:pool-release pool b))
+    ;; 3. THE COMPATIBILITY PROPERTY, reverse: a v1 sample read by a v2 reader. Member c was never
+    ;;    sent, so it must keep its default — and the reader must NOT read past the DHEADER extent
+    ;;    to invent it.
+    (let* ((s1 (make-appendable-v1 :a 7 :b 8))
+           (b (dds.core.arena:pool-acquire pool))
+           (wc (dds.core.buffer:cursor b :endianness :little)))
+      (serialize-appendable-v1 s1 wc :xcdr2)
+      (let* ((rc (dds.core.buffer:cursor b :endianness :little))
+             (q (deserialize-appendable-v2 rc :xcdr2)))
+        (%check :appendable-v1-as-v2 (and (= 7 (appendable-v2-a q)) (= 8 (appendable-v2-b q))
+                                          (= 0 (appendable-v2-c q)))
+                (format nil "an absent appended member must stay at its default; got a=~s b=~s c=~s"
+                        (appendable-v2-a q) (appendable-v2-b q) (appendable-v2-c q))))
+      (dds.core.arena:pool-release pool b))
+    (dds.core.arena:teardown-arena arena))
+  ;; 4. THE LABEL MUST MATCH THE FRAMING (Table 60). XCDR2 -> D_CDR2_LE 0x0009 with a DHEADER;
+  ;;    XCDR1 -> CDR_LE 0x0001 with NO DHEADER (rule 29), so the XCDR1 payload is 4 octets shorter.
+  (let* ((ts (dds.types:find-type-support "appendable-v1"))
+         (s (make-appendable-v1 :a #x11111111 :b #x22222222))
+         (x2 (dds.dcps::%serialize-sample ts s :xcdr2))
+         (x1 (dds.dcps::%serialize-sample ts s :xcdr1)))
+    (%check :appendable-encap-xcdr2 (and (= 0 (aref x2 0)) (= #x09 (aref x2 1)))
+            (format nil "APPENDABLE+XCDR2 must be D_CDR2_LE 0x0009 (Table 60); got ~2,'0x~2,'0x"
+                    (aref x2 0) (aref x2 1)))
+    (%check :appendable-encap-xcdr1 (and (= 0 (aref x1 0)) (= #x01 (aref x1 1)))
+            (format nil "APPENDABLE+XCDR1 must be CDR_LE 0x0001 (rule 29); got ~2,'0x~2,'0x"
+                    (aref x1 0) (aref x1 1)))
+    ;; The DHEADER is the first thing in the body and covers the two i32 members = 8 octets.
+    (%check :appendable-dheader-value
+            (= 8 (logior (aref x2 4) (ash (aref x2 5) 8) (ash (aref x2 6) 16) (ash (aref x2 7) 24)))
+            "the DHEADER must carry the body size excluding itself (§7.4.3.4.1)")
+    (%check :appendable-xcdr1-has-no-dheader (= (length x1) (- (length x2) 4))
+            (format nil "XCDR1 must carry NO DHEADER (rule 29); lengths were xcdr1=~d xcdr2=~d"
+                    (length x1) (length x2)))
+    ;; 5. THE DHEADER IS WIRE DATA. A hostile or truncated peer can claim any extent, so a DHEADER
+    ;;    larger than the buffer must be REFUSED, not followed off the end (NFR-SEC-POSTURE). The
+    ;;    condition is contained here at the test boundary exactly as the receiver contains it.
+    ;;    ⚠️ HONEST LIMIT: this is an ASSERTION, not a falsifiable gate. Deleting the DHEADER's
+    ;;    check-room leaves it GREEN, because every member read is independently bounds-checked and
+    ;;    the final skip-to-extent is itself checked — so no removal of the DHEADER check produces
+    ;;    an out-of-bounds read for this to catch. The check earns its place by failing FAST, before
+    ;;    any attacker-controlled member is parsed against a bogus extent, not by being observable
+    ;;    here. Recorded rather than presented as proof (the alloc-static-zeroed precedent).
+    (let* ((vec (make-array 12 :element-type '(unsigned-byte 8) :initial-element 0))
+           (refused nil))
+      (setf (aref vec 0) #xff (aref vec 1) #xff (aref vec 2) #xff (aref vec 3) #x7f)   ; DHEADER = 2^31-1
+      (handler-case
+          (deserialize-appendable-v1
+           (dds.core.buffer:cursor (dds.core.buffer:octet-buffer-over vec) :endianness :little)
+           :xcdr2)
+        (dds.core.buffer:buffer-overflow () (setf refused t)))
+      (%check :appendable-dheader-bounds-checked refused
+              "a DHEADER claiming more than the buffer holds must be refused, never followed"))
+    ;; 6. RX must ACCEPT its own conformant 0x0009 payload — a false-REJECT here is the worst class.
+    (multiple-value-bind (q status)
+        (dds.dcps::%deserialize-payload
+         ts (dds.core.buffer:octet-buffer-over x2))
+      (%check :appendable-rx-accepts-delimited
+              (and (null status) q (= #x11111111 (appendable-v1-a q)))
+              (format nil "RX must accept D_CDR2_LE 0x0009; got status ~s" status))))
+  t)
+
 (dds.gen:define-dds-type gseq (:extensibility :final)
   (n :u16)
   (vals (:sequence :i32))

@@ -413,8 +413,9 @@
 
 ;;; ---- type-support serialization helpers (PLAIN_CDR(2)_LE SerializedPayload) ----
 
-(defun* %rep->codec (rep)
-    (function (symbol) (values dds.cdr:cdr-mode (member :plain-cdr2-le :plain-cdr-le)))
+(defun* %rep->codec (rep &optional ext)
+    (function (symbol &optional symbol)
+              (values dds.cdr:cdr-mode (member :plain-cdr2-le :plain-cdr-le :delimited-cdr-le)))
   "Map a writer's OFFERED data-representation keyword (DDS-XTypes 1.3 §7.6.3.1.1) to the
    (values CODEC-MODE ENCAP-REP) the TX SerializedPayload uses: :xcdr2 -> (:xcdr2 :plain-cdr2-le),
    :xcdr1 -> (:xcdr1 :plain-cdr-le). CODEC-MODE drives the generated serializer's alignment cap
@@ -422,9 +423,18 @@
    4-octet header carries (XCDR2-LE 0x0007 / XCDR1-LE 0x0001). The XML / BE representations are out
    of scope on TX (we send LE); a NIL (absent) rep maps to the :xcdr2 default (back-compat), and any
    other unmapped rep (e.g. :xml) SIGNALS via the ecase — a FINAL PLAIN-encapsulated writer sends only
-   XCDR1/XCDR2-LE."
+   XCDR1/XCDR2-LE.
+
+   EXT is the TYPE'S EXTENSIBILITY, and it changes the encapsulation id — DDS-XTypes 1.3 Table 60
+   keys the id on extensibility as well as encoding version: FINAL+v2+LE is CDR2_LE 0x0007 but
+   APPENDABLE+v2+LE is D_CDR2_LE 0x0009. The id must agree with the framing the codec emits, because
+   0x0007 tells a conformant peer there is NO DHEADER and it would read the DHEADER's four octets as
+   the first member. Under XCDR1 rule (29) serializes APPENDABLE exactly as FINAL, so both map to
+   PLAIN_CDR_LE and no distinction is needed there."
   (ecase rep
-    ((:xcdr2 nil) (values :xcdr2 :plain-cdr2-le))
+    ((:xcdr2 nil) (if (eq ext :appendable)
+                      (values :xcdr2 :delimited-cdr-le)
+                      (values :xcdr2 :plain-cdr2-le)))
     (:xcdr1       (values :xcdr1 :plain-cdr-le))))
 
 (defun* %writer-tx-rep (dw)
@@ -445,7 +455,7 @@
    payload, NEVER to the keyhash (always XCDR2-BE, RTPS 2.5 §9.6.4.8) or discovery. For a FlatData type
    the :xcdr2 path stays the 0-copy identity serialize; an :xcdr1 FlatData write TX-transcodes via the
    flatdata-builder (decode XCDR2 -> struct -> re-encode XCDR1) — R6, off the measured hot path."
-  (multiple-value-bind (mode encap) (%rep->codec rep)
+  (multiple-value-bind (mode encap) (%rep->codec rep (dds.types:type-support-extensibility ts))
     (let ((fd-tx (dds.types:type-support-flatdata-builder ts)))
       ;; FlatData + non-XCDR2 offered rep: the identity serializer copies XCDR2 bytes, so transcode (R6).
       (when (and fd-tx (not (eq mode :xcdr2)))
@@ -478,7 +488,7 @@
 
    A FlatData type with a non-XCDR2 offered rep still needs the transcoding builder (which allocates), so that
    case is not eligible — the caller (write-sample) routes it to the allocating path."
-  (multiple-value-bind (mode encap) (%rep->codec rep)
+  (multiple-value-bind (mode encap) (%rep->codec rep (dds.types:type-support-extensibility ts))
     (let ((ser (dds.types:type-support-serialize ts)))
       (lambda (buf)
         (let ((wc (dds.core.buffer:cursor buf :endianness :little)))
@@ -502,15 +512,23 @@
    PLAIN_CDR_LE -> (:xcdr1 :little), PLAIN_CDR_BE -> (:xcdr1 :big), PLAIN_CDR2_LE -> (:xcdr2 :little),
    PLAIN_CDR2_BE -> (:xcdr2 :big). The inverse of %rep->codec for RX: a reader accepting (:xcdr2 :xcdr1)
    reads whichever representation a peer wrote (WP-DATA-REPRESENTATION; the 8-vs-4 alignment + endianness
-   come from the wire, not a hardcoded :xcdr2). A NIL (absent) encap maps to the XCDR2-LE default
-   (back-compat); a known-but-unmapped encap (PL_CDR / DELIMITED / XML) is unexpected for a
-   PLAIN-encapsulated FINAL type and SIGNALS via the ecase — the correct conservative reject (such a body
-   is not decodable here; truly-unknown ids are already rejected upstream by parse-encapsulation-header)."
+   come from the wire, not a hardcoded :xcdr2). DELIMITED_CDR_LE/BE (0x0009/0x0008) is an APPENDABLE
+   type under encoding version 2 (Table 60) and maps to the same XCDR2 mode — its leading DHEADER is
+   consumed by the generated deserializer, not here. A NIL (absent) encap maps to the XCDR2-LE default
+   (back-compat); a known-but-unmapped encap (PL_CDR / XML) is unexpected for a PLAIN- or
+   DELIMITED-encapsulated non-mutable type and SIGNALS via the ecase — the correct conservative reject
+   (such a body is not decodable here; truly-unknown ids are already rejected upstream by
+   parse-encapsulation-header)."
   (ecase encap
     (:plain-cdr-le   (values :xcdr1 :little))
     (:plain-cdr-be   (values :xcdr1 :big))
     ((:plain-cdr2-le nil) (values :xcdr2 :little))
-    (:plain-cdr2-be  (values :xcdr2 :big))))
+    (:plain-cdr2-be  (values :xcdr2 :big))
+    ;; DELIMITED_CDR = an APPENDABLE type under encoding version 2 (Table 60). Same XCDR2 codec
+    ;; mode; the leading DHEADER is consumed by the generated deserializer, not here. Rejecting it
+    ;; would be a false-REJECT of a conformant peer's appendable sample.
+    (:delimited-cdr-le (values :xcdr2 :little))
+    (:delimited-cdr-be (values :xcdr2 :big))))
 
 (defun* %deserialize-payload (ts ob)
     (function (t dds.core.buffer:octet-buffer) (values t (or null keyword)))

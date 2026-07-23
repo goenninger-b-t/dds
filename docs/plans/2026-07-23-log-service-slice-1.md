@@ -214,8 +214,33 @@ XTypes 1.3 §7.4.3.4.1: an APPENDABLE type is serialized in XCDR2 as a **DHEADER
 size) followed by the members, and a reader that runs out of members before the DHEADER's extent stops
 and skips the remainder. That is exactly what makes adding a field compatible.
 
+> **⚠️ SCOPE CORRECTION FOUND DURING STEP 1 (2026-07-23) — THIS TASK IS A THREE-LAYER SLICE, NOT A
+> DSL CHANGE.** Read from the in-repo spec (`docs/specs/xtypes-1_3.pdf`), not from memory:
+>
+> - Rule **(29)** `XCDR[1] << {O : APPENDABLE_TYPE} = XCDR << { O : AsFinal(O.type) }` — under XCDR1
+>   an APPENDABLE type is serialized **exactly as FINAL, with no DHEADER**.
+> - Rule **(30)** `XCDR[2] << {O : APPENDABLE_TYPE} = XCDR << { DHEADER(O) : UInt32 } << { O :
+>   AsFinal(O.type) }`. §7.4.2 agrees in prose: *"not delimited if serialized with encoding version 1."*
+> - **Table 60 / §7.6.3.1.2 — THE PART THE PLAN MISSED:** the encapsulation id depends on
+>   **extensibility**, not just the encoding version. `FINAL`+v2+LE = `CDR2_LE` **0x0007**, but
+>   `APPENDABLE`+v2+LE = **`D_CDR2_LE` 0x0009**. (`APPENDABLE`+v1+LE = `CDR_LE` 0x0001, same as FINAL.)
+>
+> Today the stack is extensibility-blind at BOTH ends, so the DSL change alone would ship a defect:
+> - **TX** — `%rep->codec` (`src/dds-dcps/entities.lisp:416`) maps `:xcdr2 -> :plain-cdr2-le`
+>   unconditionally (its return type is even declared `(member :plain-cdr2-le :plain-cdr-le)`). An
+>   appendable sample would carry a DHEADER while labelled `0x0007`, which tells a conformant peer
+>   there is no DHEADER — it would read the DHEADER's four octets as the first member.
+> - **RX** — `%encap->codec` (`entities.lisp:509`) has no `:delimited-cdr-*` branch and its own
+>   docstring says the `ecase` signals for DELIMITED. So we would **reject a conformant peer's
+>   correctly-labelled appendable sample** — a false-REJECT, the worst class.
+>
+> Task 3 therefore covers three layers: (1) the DSL/codec DHEADER, (2) TX encap-id selection by
+> extensibility, (3) RX acceptance of `0x0008`/`0x0009`. That is the thinnest slice that actually
+> works end-to-end, which is the mandated model — a DSL-only Task 3 would be a layer in isolation.
+
 **Files:**
 - Modify: `src/dds-gen/dsl.lisp` (the `:final`-only rejection at :262, and the codec emitters)
+- Modify: `src/dds-dcps/entities.lisp` (`%rep->codec` TX id selection; `%encap->codec` RX acceptance)
 - Test: `src/dds-tests/gen-test.lisp`
 
 **Interfaces:**

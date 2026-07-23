@@ -361,8 +361,12 @@
          (fd-ssz (%sym pkg "SERIALIZED-SIZE-" (string name) "-FD"))
          (fd-tx (%sym pkg "TX-TRANSCODE-" (string name) "-FD"))
          (tname (string-downcase (string name))))
-    (unless (eq ext :final)   ; NOCOND(MACRO): macroexpansion-time — compile-time rejection
-      (error "define-dds-type: only :final extensibility is supported in v1 (got ~s)" ext))
+    (unless (member ext '(:final :appendable))   ; NOCOND(MACRO): macroexpansion-time — compile-time rejection
+      (error "define-dds-type: extensibility must be :final or :appendable (got ~s); :mutable needs EMHEADER framing and is a later increment" ext))
+    ;; FlatData's in-memory layout IS the wire, so a DHEADER in front of it would break the identity
+    ;; block-copy the whole mechanism rests on (ADR 0015).
+    (when (and (getf options :flatdata) (eq ext :appendable))   ; NOCOND(MACRO): macroexpansion-time
+      (error "define-dds-type: :flatdata requires :final extensibility (got :appendable)"))
     ;; FlatData v1 gate: :flatdata t requires every member to be a fixed-size scalar (FR-PF-4, ADR 0015).
     ;; This already constrains @key members to fixed-size scalars (WP-KEYED-FLATDATA): a string/sequence/
     ;; variable-size @key still errors here; the keyhash is read from the buffer via key-hash-<name>-fd below.
@@ -410,33 +414,101 @@
                                     (progn (setf (,(acc m) sample) value) (values t nil)))))))
          (declaim (ftype (function (,name dds.core.buffer:cursor &optional symbol) ,name) ,ser))
          (defun ,ser (sample cursor &optional (mode :xcdr2))
-           ,@(loop for m in parsed collect
-                   (ecase (getf m :kind)
-                     (:scalar `(,(getf m :put) cursor (,(acc m) sample) mode))
-                     (:sequence (%seq-put-form m `(,(acc m) sample)))
-                     (:nested `(,(getf m :ser) (,(acc m) sample) cursor mode))))
+           ;; APPENDABLE + XCDR2 = DHEADER then the members AS IF FINAL (XTypes 1.3 §7.4.3.5 rule
+           ;; 30). Under XCDR1 rule (29) says AsFinal — no DHEADER — so :final emits exactly what it
+           ;; always did and stays byte-identical (make corpus is the guard on that).
+           ,@(let ((forms (loop for m in parsed collect
+                                (ecase (getf m :kind)
+                                  (:scalar `(,(getf m :put) cursor (,(acc m) sample) mode))
+                                  (:sequence (%seq-put-form m `(,(acc m) sample)))
+                                  (:nested `(,(getf m :ser) (,(acc m) sample) cursor mode)))))
+                   (dh (gensym "DH")) (e (gensym "END")))
+               (if (eq ext :appendable)
+                   `((let ((,dh (when (eq mode :xcdr2)
+                                  ;; Placeholder, backpatched below — the size is not known yet.
+                                  ;; Same mechanism as %dheader-begin/%dheader-end; not a second one.
+                                  (dds.cdr:cdr-align cursor 4 mode)
+                                  (let ((p (dds.core.buffer:cursor-position cursor)))
+                                    (dds.core.buffer:put-u32 cursor 0)
+                                    p))))
+                       ,@forms
+                       (when ,dh
+                         (let ((,e (dds.core.buffer:cursor-position cursor)))
+                           (dds.core.buffer:cursor-set-position cursor ,dh)
+                           ;; §7.4.3.4.1: the size EXCLUDES the DHEADER itself.
+                           (dds.core.buffer:put-u32 cursor (- ,e ,dh 4))
+                           (dds.core.buffer:cursor-set-position cursor ,e)))))
+                   forms))
            sample)
          (declaim (ftype (function (dds.core.buffer:cursor &optional symbol) ,name) ,des))
          (defun ,des (cursor &optional (mode :xcdr2))
-           (let ,(loop for m in parsed collect
-                       (ecase (getf m :kind)
-                         (:scalar `(,(getf m :slot) (,(getf m :get) cursor mode)))
-                         (:sequence `(,(getf m :slot) ,(%seq-get-form m)))
-                         (:nested `(,(getf m :slot) (,(getf m :des) cursor mode)))))
-             (,ctor ,@(loop for m in parsed
-                            append (list (intern (string (getf m :slot)) :keyword)
-                                         (getf m :slot))))))
+           ;; An APPENDABLE reader must stop at the DHEADER's extent: a peer built from an OLDER
+           ;; revision sent fewer members, and reading past the extent would decode the next
+           ;; sample's octets as this one's trailing members. Members not covered keep their
+           ;; defaults, and whatever a NEWER peer appended is skipped. That is the property
+           ;; extensibility exists for (XTypes 1.3 §7.4.3.5 rules 29/30).
+           ,(let* ((binds (loop for m in parsed collect
+                                (ecase (getf m :kind)
+                                  (:scalar `(,(getf m :slot) (,(getf m :get) cursor mode)))
+                                  (:sequence `(,(getf m :slot) ,(%seq-get-form m)))
+                                  (:nested `(,(getf m :slot) (,(getf m :des) cursor mode))))))
+                   (end (gensym "END"))
+                   (ctor-call `(,ctor ,@(loop for m in parsed
+                                              append (list (intern (string (getf m :slot)) :keyword)
+                                                           (getf m :slot))))))
+              (if (eq ext :appendable)
+                  `(let* ((,end (when (eq mode :xcdr2)
+                                  (let ((n (dds.cdr:cdr-get-dheader cursor mode)))
+                                    ;; WIRE DATA — a DHEADER claiming more than the buffer holds is
+                                    ;; refused, never followed (NFR-SEC-POSTURE). DEFENSE IN DEPTH,
+                                    ;; not the sole guard: every member read is independently
+                                    ;; bounds-checked, so removing this does NOT turn the suite red.
+                                    ;; It fails FAST, before any attacker-controlled member is parsed
+                                    ;; against a bogus extent. Treat it as a contract assertion.
+                                    (dds.core.buffer:check-room cursor n)
+                                    (+ (dds.core.buffer:cursor-position cursor) n))))
+                          ,@(loop for b in binds for m in parsed
+                                  collect `(,(first b)
+                                            (if (or (null ,end)
+                                                    (< (dds.core.buffer:cursor-position cursor) ,end))
+                                                ,(second b)
+                                                ,(getf m :default)))))
+                     (when ,end (dds.core.buffer:cursor-set-position cursor ,end))
+                     ,ctor-call)
+                  `(let ,binds ,ctor-call))))
          (declaim (ftype (function (,name dds.core.buffer:cursor &optional symbol) ,name) ,dnto))
          (defun ,dnto (sample cursor &optional (mode :xcdr2))
-           ,@(loop for m in parsed collect
-                   (ecase (getf m :kind)
-                     (:scalar `(setf (,(acc m) sample) (,(getf m :get) cursor mode)))
-                     (:sequence `(setf (,(acc m) sample) ,(%seq-get-form m)))
-                     (:nested `(,(getf m :des-into) (,(acc m) sample) cursor mode))))
+           ;; Same extent rule as ,des. An uncovered member is reset to its DEFAULT rather than
+           ;; left alone: this fills a POOLED sample in place, so keeping the previous occupant's
+           ;; value would leak one sample's data into the next.
+           ,@(let ((forms (loop for m in parsed collect
+                                (ecase (getf m :kind)
+                                  (:scalar `(setf (,(acc m) sample) (,(getf m :get) cursor mode)))
+                                  (:sequence `(setf (,(acc m) sample) ,(%seq-get-form m)))
+                                  (:nested `(,(getf m :des-into) (,(acc m) sample) cursor mode)))))
+                   (end (gensym "END")))
+               (if (eq ext :appendable)
+                   `((let ((,end (when (eq mode :xcdr2)
+                                   (let ((n (dds.cdr:cdr-get-dheader cursor mode)))
+                                     (dds.core.buffer:check-room cursor n)   ; wire data (NFR-SEC-POSTURE)
+                                     (+ (dds.core.buffer:cursor-position cursor) n)))))
+                       ,@(loop for f in forms for m in parsed
+                               collect `(if (or (null ,end)
+                                                (< (dds.core.buffer:cursor-position cursor) ,end))
+                                            ,f
+                                            (setf (,(acc m) sample) ,(getf m :default))))
+                       (when ,end (dds.core.buffer:cursor-set-position cursor ,end))))
+                   forms))
            sample)
          (declaim (ftype (function (,name (integer 0) &optional symbol) (integer 0)) ,sszi))
          (defun ,sszi (sample pos &optional (mode :xcdr2))
            (declare (type (integer 0) pos) (ignorable sample))
+           ;; The DHEADER is part of the serialized size. %serialize-sample sizes the payload buffer
+           ;; from this number, so omitting it here is a buffer overflow, not a cosmetic mismatch.
+           ,@(when (eq ext :appendable)
+               `((when (eq mode :xcdr2)
+                   (setf pos (dds.cdr:cdr-size-align pos 4 mode))
+                   (incf pos 4))))
            ,@(loop for m in parsed append
                    (ecase (getf m :kind)
                      (:scalar
