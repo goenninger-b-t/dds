@@ -564,10 +564,16 @@ we must still match.
      2 records) pointed straight at **a per-record counter at byte `0xd4`** — between block B and the
      descriptor table — that the real producer increments (+1/record) and our writer never touches; the only
      other real-write changes were the consumer's own fields (expected) and a descriptor-slot difference. A
-     refined diff with the consumer stopped isolates the producer-only write-set to confirm `0xd4` is a
-     producer field. If it is, it is the prime candidate for what the consumer reads to detect a new record —
-     which our write omits, so the consumer wakes and finds nothing. **Transmit remains unproven after four
-     live attempts; the read path (slices 1-6) is complete, live-validated, and unaffected.**
+     refined diff with the consumer stopped then settled it, and `0xd4` was a red herring — with the consumer
+     stopped it does not change, so it is a CONSUMER field our writer rightly ignores. The producer-only
+     write-set is exactly our seven fields at the same offsets, with ONE difference: the descriptor VALUE. The
+     real producer writes `+datagram_length` (`0 -> 64`); our writer wrote `-datagram_length`
+     (`0 -> 4294967232`). That sign is the whole bug — the negative is the value the *consumer* sets when it
+     has drained a record, so writing it made RTI's consumer read our fresh record as **already consumed** and
+     skip it, waking and finding nothing to do. (The original `-D` reading was of already-consumed records;
+     the producer writes `+D` and the consumer flips it.) Fixed to `+len`, synthetic test updated. **This is
+     the data-confirmed cause of non-acceptance; the decisive check is a live acceptance retest with the sign
+     corrected.** The read path (slices 1-6) is complete, live-validated, and unaffected.
 
 ## 7. Consequences and risks
 
