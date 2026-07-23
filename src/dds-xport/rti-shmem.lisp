@@ -344,8 +344,11 @@
 (defconstant +rti-shmem-off-b-pos2+ #xc0 "Block B position index 4 (`0xb0`+16). ADR 0081 §5.0.")
 (defconstant +rti-shmem-off-b-counter+ #xcc "Block B counter, index 7 (`0xb0`+28). ADR 0081 §5.0.")
 (defconstant +rti-shmem-off-descriptor-table+ #xe8
-  "Base of the descriptor table — one 8-byte `(-datagram_length, 0)` entry per record, indexed by the
-   wrapping counter (ADR 0081 §5.0). Each entry's first `u32` is the exact datagram length, negated.")
+  "Base of the descriptor table — one 8-byte entry per record, indexed by the wrapping counter (ADR 0081
+   §5.0). The producer writes the entry's first u32 as the POSITIVE datagram length (an unconsumed/available
+   record); the consumer flips it to the negative on drain. An earlier reading saw only the negative because
+   it read already-consumed records — writing the negative made RTI's consumer treat our record as already
+   consumed and skip it (measured by a producer-only control-region diff).")
 
 (defconstant +rti-shmem-pos2-delta+ 4
   "A block's second position field (index 4) rests at index 0 plus this. Measured across nine snapshots
@@ -390,7 +393,7 @@
     (%rti-shmem-put-u32-le sap +rti-shmem-off-b-pos2+                  ; B idx4 (0xc0) = tail + 4
                            (logand (+ old-head +rti-shmem-pos2-delta+) #xFFFFFFFF))
     (%rti-shmem-put-u32-le sap +rti-shmem-off-b-counter+ (logand (1+ b-cnt) #xFFFFFFFF))
-    (%rti-shmem-put-u32-le sap slot-off (logand (- len) #xFFFFFFFF))   ; descriptor: -datagram_length
+    (%rti-shmem-put-u32-le sap slot-off len)   ; descriptor: +datagram_length (unconsumed; consumer flips to -D)
     (%rti-shmem-put-u32-le sap (+ slot-off 4) 0)))
 
 (defun* rti-shmem-write-record (port record len)
@@ -801,8 +804,8 @@
                         (assert (= 2 (dds.pal:load-sap-u32 sap +rti-shmem-off-a-counter+)) () "A counter must bump 1 -> 2")   ; HOTPATH-COND(TEST): in-file self-test
                         (assert (= 2 (dds.pal:load-sap-u32 sap +rti-shmem-off-b-counter+)) () "B counter must bump 1 -> 2")   ; HOTPATH-COND(TEST): in-file self-test
                         (assert (= (dds.pal:load-sap-u32 sap +rti-shmem-off-descriptor-table+)   ; HOTPATH-COND(TEST): in-file self-test
-                                   (logand (- (length rec-a)) #xFFFFFFFF)) ()
-                                "descriptor[0] must be the negated datagram length"))
+                                   (length rec-a)) ()
+                                "descriptor[0] must be the POSITIVE datagram length (unconsumed)"))
                       (multiple-value-bind (n st) (rti-shmem-read-record port out)
                         (assert (and (plusp n) (null st)) () "record A must read back, got ~s/~s" n st)   ; HOTPATH-COND(TEST): in-file self-test
                         (dotimes (i (length rec-a))
