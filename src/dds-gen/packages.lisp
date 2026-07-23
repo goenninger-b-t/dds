@@ -11,4 +11,4 @@
     type-support (IMPLEMENTATION-PLAN §7.2/§7.3, FR-TOOL-1). v1 supports :final
     extensibility with primitive and string members; appendable/mutable framing,
     sequences, nested types, and key-hash are later increments.")
-  (:export #:define-dds-type))
+  (:export #:define-dds-type #:define-dds-enum))

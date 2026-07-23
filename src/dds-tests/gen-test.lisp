@@ -68,6 +68,104 @@
             "keyless type should have keyed-p NIL"))
   t)
 
+;; Deliberately NON-CONTIGUOUS and not starting the gap at 1: an enum's wire value is the DECLARED
+;; constant, never the ordinal position, and only a gapped enum can tell the two apart.
+(dds.gen:define-dds-enum genum-hue (:red 0) (:green 3) (:blue 7))
+
+(dds.gen:define-dds-type genum-t (:extensibility :final)
+  (id :i32 :key t)
+  (hue (:enum genum-hue)))
+
+(defun* run-gen-enum-test ()
+    (function () t)
+  "Test: `(:enum name)` members (XTypes 1.3 §7.3.1.2.1 — an enum's default bit bound is 32, so the
+   wire representation is int32). The accessor takes and returns the KEYWORD; the codec reads and
+   writes the INTEGER.
+
+   The assertion that matters is the LAST one. A foreign publisher of a newer revision of the type
+   WILL send values this build has never heard of, and the only two honest things a decoder may do
+   with one are report it or drop it. Inventing a keyword — or silently substituting a neighbouring
+   literal — is how a decoder lies about what was on the wire."
+  ;; 1. The mapping is by DECLARED VALUE, both ways, including the gap.
+  (%check :enum-to-i32 (and (eql 0 (genum-hue-to-i32 :red))
+                            (eql 3 (genum-hue-to-i32 :green))
+                            (eql 7 (genum-hue-to-i32 :blue)))
+          "keyword -> declared i32 value")
+  (%check :enum-from-i32 (and (eq :red (genum-hue-from-i32 0))
+                              (eq :green (genum-hue-from-i32 3))
+                              (eq :blue (genum-hue-from-i32 7)))
+          "declared i32 value -> keyword")
+  ;; 2. An UNKNOWN value is reported, never invented. 2 is the ordinal index of :blue and 1 is the
+  ;;    ordinal index of :green — an implementation that confused position with value would return
+  ;;    a plausible-looking wrong keyword for both, which is exactly the failure being excluded.
+  (multiple-value-bind (kw status) (genum-hue-from-i32 42)
+    (%check :enum-unknown-reported (and (null kw) (eq status :unknown-enum-value))
+            (format nil "an unknown wire value must report, not invent; got ~s ~s" kw status)))
+  (multiple-value-bind (kw status) (genum-hue-from-i32 2)
+    (%check :enum-ordinal-is-not-value (and (null kw) (eq status :unknown-enum-value))
+            (format nil "2 is :blue's ORDINAL, not a declared value — must be unknown; got ~s ~s" kw status)))
+  (multiple-value-bind (v status) (genum-hue-to-i32 :chartreuse)
+    (%check :enum-unknown-keyword-reported (and (null v) (eq status :unknown-enum-value))
+            (format nil "an undeclared keyword must report, not encode; got ~s ~s" v status)))
+  ;; 3. Round-trip through the generated codec, and the WIRE OCTETS carry the declared value.
+  (let* ((arena (dds.core.arena:init-arena :bytes (* 64 1024)))
+         (pool (dds.core.arena:make-buffer-pool arena 512 4))   ; 3 held at once below
+         (s (make-genum-t :id 1 :hue :blue))
+         (b (dds.core.arena:pool-acquire pool))
+         (wc (dds.core.buffer:cursor b :endianness :little)))
+    (serialize-genum-t s wc :xcdr2)
+    (%check :enum-size (= (dds.core.buffer:cursor-position wc) (serialized-size-genum-t s :xcdr2))
+            "serialized-size must equal bytes written for an enum member")
+    ;; Read the enum field's four octets RAW — buffer primitives, not the enum codec, so this is an
+    ;; oracle rather than the code under test agreeing with itself. Body: i32 id @0, i32 hue @4, LE.
+    (let ((rc (dds.core.buffer:cursor b :endianness :little)))
+      (dotimes (i 4) (dds.core.buffer:get-u8 rc))
+      (let ((o0 (dds.core.buffer:get-u8 rc)) (o1 (dds.core.buffer:get-u8 rc))
+            (o2 (dds.core.buffer:get-u8 rc)) (o3 (dds.core.buffer:get-u8 rc)))
+        (%check :enum-wire-is-declared-value (and (= o0 7) (= o1 0) (= o2 0) (= o3 0))
+                (format nil "the wire must carry the DECLARED value 7 for :blue, not its ordinal 2; got ~2,'0x ~2,'0x ~2,'0x ~2,'0x"
+                        o0 o1 o2 o3))))
+    (let* ((rc (dds.core.buffer:cursor b :endianness :little))
+           (q (deserialize-genum-t rc :xcdr2)))
+      (%check :enum-roundtrip (and (= 1 (genum-t-id q)) (eq :blue (genum-t-hue q)))
+              (format nil "enum round-trip mismatch; got id ~s hue ~s" (genum-t-id q) (genum-t-hue q))))
+    ;; 4. An unknown value ARRIVING ON THE WIRE is kept VERBATIM — never a wrong keyword, and never
+    ;;    flattened to a sentinel. The re-serialize is the assertion that matters: a relay must put
+    ;;    back exactly what the sender sent. A NIL/sentinel slot would pass a "not a keyword" check
+    ;;    and still corrupt the value on its way out, so checking the decode alone proves too little.
+    (let ((wb (dds.core.arena:pool-acquire pool))
+          (rb (dds.core.arena:pool-acquire pool)))
+      (let ((c (dds.core.buffer:cursor wb :endianness :little)))
+        (dds.cdr:cdr-put-i32 c 1 :xcdr2)
+        (dds.cdr:cdr-put-i32 c 42 :xcdr2))
+      (let ((q (deserialize-genum-t (dds.core.buffer:cursor wb :endianness :little) :xcdr2)))
+        (%check :enum-unknown-on-wire-kept-verbatim (eql 42 (genum-t-hue q))
+                (format nil "an unknown wire value must be kept as the raw int32, not a keyword; got ~s"
+                        (genum-t-hue q)))
+        (serialize-genum-t q (dds.core.buffer:cursor rb :endianness :little) :xcdr2)
+        (let ((c (dds.core.buffer:cursor rb :endianness :little)))
+          (dotimes (i 4) (dds.core.buffer:get-u8 c))
+          (%check :enum-unknown-relayed-unchanged
+                  (and (= 42 (dds.core.buffer:get-u8 c)) (= 0 (dds.core.buffer:get-u8 c))
+                       (= 0 (dds.core.buffer:get-u8 c)) (= 0 (dds.core.buffer:get-u8 c)))
+                  "re-serializing an undecodable enum value must emit it unchanged")))
+      (dds.core.arena:pool-release pool rb)
+      (dds.core.arena:pool-release pool wb))
+    (dds.core.arena:pool-release pool b)
+    (dds.core.arena:teardown-arena arena))
+  ;; 5. KNOWN GAP, asserted so it cannot change silently: the member's TypeObject TypeIdentifier is
+  ;;    TK_INT32, not a real XTypes enum. Our model HAS minimal-enumerated-type, but the TypeObject
+  ;;    SERIALIZER cannot emit one (equivalence-hash takes a minimal-struct-type only), and those
+  ;;    bytes are oracle-sensitive — the same reason sequence-member TypeIdentifiers deliberately
+  ;;    error rather than guess. This is the ADR 0009 defect class and it is DEBT, not the target.
+  (let* ((ts (dds.types:find-type-support "genum-t"))
+         (m (second (dds.types:minimal-struct-type-members (dds.types:type-support-typeobject ts)))))
+    (%check :enum-typeobject-is-int32-known-gap
+            (= (dds.types:type-identifier-kind (dds.types:minimal-struct-member-type-identifier m))
+               dds.types:+tk-int32+)
+            "the enum member's TypeIdentifier is TK_INT32 today (documented gap)"))
+  t)
+
 (dds.gen:define-dds-type gseq (:extensibility :final)
   (n :u16)
   (vals (:sequence :i32))

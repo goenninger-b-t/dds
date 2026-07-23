@@ -30,6 +30,75 @@
   "Intern the concatenation of PARTS (string designators) as a symbol in PACKAGE."
   (intern (apply #'concatenate 'string (mapcar #'string parts)) package))
 
+(defparameter *dds-enum-literals* (make-hash-table :test 'eq)
+  "Enum name symbol -> the list of its declared keywords, in declaration order. Populated at
+   COMPILE time by define-dds-enum so a later define-dds-type can give an (:enum name) member an
+   exact slot type. Define-before-use, exactly as nested struct members require.")
+
+(defmacro define-dds-enum (name &rest literals)
+  "Define the DDS enumerated type NAME from LITERALS, each `(keyword value)`.
+
+   The wire representation is int32: DDS-XTypes 1.3 §7.3.1.2.1 gives an enumeration a default bit
+   bound of 32, and the value on the wire is the DECLARED constant, never the literal's ordinal
+   position — which is why the values are written out rather than inferred.
+
+   Emits `NAME-TO-I32` and `NAME-FROM-I32`, each returning `(values result status)` where status is
+   `:unknown-enum-value` for an input this build does not declare. A newer revision of a type will
+   send values we have never heard of; reporting one is honest, inventing a keyword for it is not.
+   Emits the codec pair the type compiler wires into a member, and registers the literal list so
+   `(:enum NAME)` members get an exact slot type."
+  (let* ((pkg (or (symbol-package name) *package*))
+         (to (%sym pkg (string name) "-TO-I32"))
+         (from (%sym pkg (string name) "-FROM-I32"))
+         (put (%sym pkg "%PUT-" (string name)))
+         (get (%sym pkg "%GET-" (string name)))
+         (kws (mapcar #'first literals))
+         (vals (mapcar #'second literals)))
+    (unless literals   ; NOCOND(MACRO): macroexpansion-time — compile-time rejection
+      (error "define-dds-enum: ~s declares no literals" name))
+    (unless (every (lambda (l) (and (consp l) (= 2 (length l)) (keywordp (first l))
+                                    (typep (second l) '(signed-byte 32))))
+                   literals)   ; NOCOND(MACRO): macroexpansion-time — compile-time rejection
+      (error "define-dds-enum: each literal must be (keyword (signed-byte 32)); got ~s" literals))
+    (unless (= (length kws) (length (remove-duplicates kws)))   ; NOCOND(MACRO): macroexpansion-time
+      (error "define-dds-enum: duplicate keyword in ~s" name))
+    ;; Two literals sharing a value make FROM-I32 ambiguous — the wire could not say which was meant.
+    (unless (= (length vals) (length (remove-duplicates vals)))   ; NOCOND(MACRO): macroexpansion-time
+      (error "define-dds-enum: duplicate value in ~s — a wire value must decode to ONE literal" name))
+    `(progn
+       (eval-when (:compile-toplevel :load-toplevel :execute)
+         (setf (gethash ',name dds.gen::*dds-enum-literals*) ',kws))
+       (declaim (ftype (function (t) (values (or null (signed-byte 32)) (or null keyword))) ,to))
+       (defun ,to (keyword)
+         ,(format nil "The declared int32 value of KEYWORD in ~(~a~), or ~
+                       (values NIL :UNKNOWN-ENUM-VALUE) if it declares no such literal." name)
+         (case keyword
+           ,@(loop for l in literals collect `(,(first l) (values ,(second l) nil)))
+           (t (values nil :unknown-enum-value))))
+       (declaim (ftype (function ((signed-byte 32)) (values (or null keyword) (or null keyword))) ,from))
+       (defun ,from (value)
+         ,(format nil "The ~(~a~) literal with int32 VALUE, or (values NIL :UNKNOWN-ENUM-VALUE) if ~
+                       this build declares none — a peer built from a newer revision of the type ~
+                       will send values this one does not know, and the only honest answers are to ~
+                       report it or drop it, never to invent a literal." name)
+         (case value
+           ,@(loop for l in literals collect `(,(second l) (values ,(first l) nil)))
+           (t (values nil :unknown-enum-value))))
+       (declaim (ftype (function (dds.core.buffer:cursor t &optional symbol) t) ,put))
+       (defun ,put (cursor value &optional (mode :xcdr2))
+         ,(format nil "Write ~(~a~) VALUE as int32 (XTypes 1.3 §7.3.1.2.1). A declared keyword is ~
+                       written as its declared constant; an int32 (what an undecodable wire value ~
+                       decodes to) is written back UNCHANGED, so relaying a sample cannot ~
+                       fabricate a value the sender never sent." name)
+         (dds.cdr:cdr-put-i32 cursor (if (keywordp value) (,to value) value) mode))
+       (declaim (ftype (function (dds.core.buffer:cursor &optional symbol) t) ,get))
+       (defun ,get (cursor &optional (mode :xcdr2))
+         ,(format nil "Read an int32 and map it to its ~(~a~) literal, or return the RAW INT32 when ~
+                       this build declares no literal for it. Never a wrong keyword." name)
+         (let ((v (dds.cdr:cdr-get-i32 cursor mode)))
+           (or (,from v) v)))
+       ',name)))
+
 (defun* %parse-member (spec)
     (function (list) list)
   "Parse a member spec into a codegen plist. Member type is a primitive keyword,
@@ -72,6 +141,28 @@
            (list :slot slot :kind :scalar :ltype ltype :default default :put put :get get
                  :align align :var t :size 0
                  :dds-type :string :bound bound :key (getf opts :key)))))
+      ;; (:enum NAME) — a previously-defined define-dds-enum. Wire is int32 (XTypes 1.3 §7.3.1.2.1
+      ;; default bit bound 32), so it reuses the :i32 row's width/alignment; only the codec pair
+      ;; differs, mapping keyword <-> declared constant.
+      ((and (consp dds-type) (eq (car dds-type) :enum))
+       (let* ((ename (second dds-type))
+              (epkg (or (and (symbolp ename) (symbol-package ename)) *package*))
+              (kws (and (symbolp ename) (gethash ename *dds-enum-literals*))))
+         (unless kws   ; NOCOND(MACRO): macroexpansion-time — compile-time rejection
+           (error "define-dds-type: unknown enum ~s in ~s — define-dds-enum it first (define-before-use)"
+                  ename spec))
+         (destructuring-bind (ltype default put get align size) (cdr (assoc :i32 *dds-type-map*))
+           (declare (ignore ltype default put get))
+           ;; The slot admits the declared literals OR a raw int32: an undecodable wire value is
+           ;; kept verbatim rather than flattened to a wrong literal, and the type declaration is
+           ;; what stops an undeclared keyword ever reaching the wire.
+           (list :slot slot :kind :scalar
+                 :ltype `(or (member ,@kws) (signed-byte 32))
+                 :default (first kws)
+                 :put (%sym epkg "%PUT-" (string ename))
+                 :get (%sym epkg "%GET-" (string ename))
+                 :align align :var nil :size size
+                 :dds-type :enum :enum ename :key (getf opts :key)))))
       ((symbolp dds-type)            ; nested, previously-defined dds type
        (let ((tpkg (or (symbol-package dds-type) *package*)))
          (list :slot slot :kind :nested :ltype dds-type
@@ -275,11 +366,13 @@
     ;; FlatData v1 gate: :flatdata t requires every member to be a fixed-size scalar (FR-PF-4, ADR 0015).
     ;; This already constrains @key members to fixed-size scalars (WP-KEYED-FLATDATA): a string/sequence/
     ;; variable-size @key still errors here; the keyhash is read from the buffer via key-hash-<name>-fd below.
+    ;; An enum member is excluded too: its slot holds a keyword, but a FlatData Offset accessor
+    ;; reads/writes the raw XCDR2 field, so the two would disagree about what the member IS.
     (when (getf options :flatdata)
-      (when (some (lambda (m) (or (getf m :var) (not (eq (getf m :kind) :scalar)))) parsed)
+      (when (some (lambda (m) (or (getf m :var) (getf m :enum) (not (eq (getf m :kind) :scalar)))) parsed)
         ;; NOCOND(MACRO): macroexpansion-time — compile-time rejection
-        (error "define-dds-type: :flatdata v1 requires FINAL + fixed-size scalar members (no string/sequence/nested/variable); got ~s"
-               (find-if (lambda (m) (or (getf m :var) (not (eq (getf m :kind) :scalar)))) parsed))))
+        (error "define-dds-type: :flatdata v1 requires FINAL + fixed-size scalar members (no string/sequence/nested/variable/enum); got ~s"
+               (find-if (lambda (m) (or (getf m :var) (getf m :enum) (not (eq (getf m :kind) :scalar)))) parsed))))
     (when (some (lambda (m) (not (eq (getf m :kind) :scalar))) keys)   ; NOCOND(MACRO): macroexpansion-time
       (error "define-dds-type: only scalar/string @key members are supported in v1"))
     (multiple-value-bind (fd-offs fd-body) (when flatp (%flatdata-offsets parsed))
@@ -672,10 +765,19 @@
                                       ,(ecase (getf m :kind)
                                          ;; A bounded string is STRING8 with its bound, not the
                                          ;; unbounded STRING8 primitive-type-identifier yields.
-                                         (:scalar (if (getf m :bound)
-                                                      `(dds.types:string8-type-identifier ,(getf m :bound))
-                                                      `(dds.types:primitive-type-identifier
-                                                        ,(getf m :dds-type))))
+                                         ;; An enum is TK_INT32 — its wire type. KNOWN GAP: a
+                                         ;; conformant peer declares TK_ENUM, so the two TypeObjects
+                                         ;; differ (the ADR 0009 class). Emitting a real enum TI
+                                         ;; needs MinimalEnumeratedType serialization, whose bytes
+                                         ;; are oracle-sensitive — the same reason sequence-member
+                                         ;; TypeIdentifiers deliberately error rather than guess.
+                                         (:scalar (cond
+                                                    ((getf m :bound)
+                                                     `(dds.types:string8-type-identifier ,(getf m :bound)))
+                                                    ((getf m :enum)
+                                                     `(dds.types:primitive-type-identifier :i32))
+                                                    (t `(dds.types:primitive-type-identifier
+                                                         ,(getf m :dds-type)))))
                                          (:sequence `(dds.types:sequence-type-identifier
                                                       (dds.types:primitive-type-identifier
                                                        ,(getf m :elt-type))))

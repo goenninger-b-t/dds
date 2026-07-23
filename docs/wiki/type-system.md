@@ -8,7 +8,9 @@ See also: [CDR codec, buffers & the arena](cdr-and-memory.md) for the codecs and
 
 ### Code generation — `dds.gen`
 
-- **`dds.gen:define-dds-type`** — macro; defines a DDS topic type `NAME` from an s-expr spec. `OPTIONS` is a plist (only `:extensibility`, default `:final`, in v1). Each member is `(slot-name member-type &key key)`, where `member-type` is a primitive keyword, `(:string N)` for a bounded string, `(:sequence element)`, or the name of a previously-defined dds type (nested struct). Emits a `defstruct`, `ftype`-declared `serialize-`/`deserialize-`/`serialized-size-` monomorphic functions (plus an internal `%ssize-` position-threading helper and a `deserialize-into-` in-place variant), a 16-octet key-hash for keyed types, and a registered `type-support`. A `(:string N)` member additionally emits the constant `+NAME-SLOT-BOUND+` and the checked setter `set-NAME-SLOT`.
+- **`dds.gen:define-dds-type`** — macro; defines a DDS topic type `NAME` from an s-expr spec. `OPTIONS` is a plist (only `:extensibility`, default `:final`, in v1). Each member is `(slot-name member-type &key key)`, where `member-type` is a primitive keyword, `(:string N)` for a bounded string, `(:enum NAME)` for a previously-defined enum, `(:sequence element)`, or the name of a previously-defined dds type (nested struct). Emits a `defstruct`, `ftype`-declared `serialize-`/`deserialize-`/`serialized-size-` monomorphic functions (plus an internal `%ssize-` position-threading helper and a `deserialize-into-` in-place variant), a 16-octet key-hash for keyed types, and a registered `type-support`. A `(:string N)` member additionally emits the constant `+NAME-SLOT-BOUND+` and the checked setter `set-NAME-SLOT`.
+
+- **`dds.gen:define-dds-enum`** — macro; defines the DDS enumerated type `NAME` from literals `(keyword value)`. Emits `NAME-TO-I32` and `NAME-FROM-I32`, each returning `(values result status)` with status `:unknown-enum-value` for an input this build does not declare, plus the codec pair `(:enum NAME)` members are wired to. Rejects at macroexpansion: no literals, a malformed literal, a duplicate keyword, and a duplicate *value* (two literals sharing a value would make the wire ambiguous — the receiver could not say which was meant).
 
 The DSL recognizes these member-type keywords (from `*dds-type-map*`): `:bool`, `:byte` (alias `:octet`), `:u8`, `:u16`, `:u32`, `:u64`, `:i8`, `:i16`, `:i32`, `:i64`, `:string`. `:u8`/`:i8` are the numeric 8-bit integers (`TK_UINT8`/`TK_INT8`); `:byte`/`:octet` is the opaque octet (`TK_BYTE`, IDL `octet`) — all three share the one-octet wire codec but carry distinct XTypes kinds (model an IDL `sequence<octet>` with `:byte`). A `(:sequence element)` member takes one of those keywords as its fixed-size primitive element (variable-size sequence elements, e.g. sequences of strings, are not supported in v1). v1 restricts `:extensibility` to `:final` and `@key` to scalar/string members.
 
@@ -167,6 +169,30 @@ A bounded member declares IDL `string<N>`. Two things come out of it, and they d
 ```
 
 The last assertion is the whole point of measuring in octets: a bound that counted characters would let a 16-octet value past a bound of 8 and overflow the peer's `char[9]` buffer — the exact overflow the bound exists to prevent.
+
+### 1.2 Enum members — `(:enum NAME)`
+
+The wire representation is `int32` (DDS-XTypes 1.3 §7.3.1.2.1 gives an enumeration a default bit bound of 32), and the value on the wire is the **declared constant, never the literal's ordinal position** — so the values are written out rather than inferred (adapted from `run-gen-enum-test` in `src/dds-tests/gen-test.lisp`).
+
+```lisp
+(dds.gen:define-dds-enum genum-hue (:red 0) (:green 3) (:blue 7))   ; gapped on purpose
+
+(dds.gen:define-dds-type genum-t (:extensibility :final)
+  (id :i32 :key t)
+  (hue (:enum genum-hue)))
+
+(assert (eql 7 (genum-hue-to-i32 :blue)))      ; the declared value, not the ordinal 2
+(assert (eq :green (genum-hue-from-i32 3)))
+
+;; An input this build does not declare is REPORTED, never invented.
+(multiple-value-bind (kw status) (genum-hue-from-i32 42)
+  (assert (null kw))
+  (assert (eq status :unknown-enum-value)))
+```
+
+**What happens to a value we do not know.** A peer built from a newer revision of the type will send literals this build has never heard of. The member's slot admits either a declared literal *or* a raw `int32`, and an undecodable value is kept **verbatim**: it never becomes a neighbouring keyword, and re-serializing the sample emits exactly what arrived, so relaying cannot fabricate a value the sender never sent. The slot's declared type is `(or (member ...declared literals...) (signed-byte 32))`, which is also what stops an *undeclared keyword* ever reaching the wire — the type system refuses it rather than a runtime check.
+
+> **Known gap.** The member's TypeObject TypeIdentifier is **`TK_INT32`**, not a real XTypes enum. The structural model has `minimal-enumerated-type` / `enumerated-type-identifier`, but the TypeObject *serializer* cannot emit one — `equivalence-hash` accepts only a `minimal-struct-type`, so an `EK_MINIMAL` TypeIdentifier referencing an enum hits `%put-type-identifier`'s "no EquivalenceHash" branch. Emitting a real `MinimalEnumeratedType` means new, **oracle-sensitive** bytes, which is exactly why sequence-member TypeIdentifiers deliberately error today rather than guess. Consequence: a peer whose IDL declares this member as an `enum` presents `TK_ENUM` while we present `TK_INT32` — structurally different types, the same defect class as ADR 0009. The wire bytes are identical; only structural matching is affected. This is **debt, not the target**, and it is pinned by the `enum-typeobject-is-int32-known-gap` assertion so it cannot change unnoticed.
 
 ### 2. Drive the type purely through the registered `type-support` vtable
 
@@ -403,7 +429,7 @@ A FlatData type's canonical sample buffer is `PLAIN_CDR2_LE` (`0x0007`). Origina
 
 This is mid-M4 (P3 XTypes), built **verifiable-first**: anything checkable offline against the spec's own worked examples is landed and tested; anything that needs a conformant peer to lock the exact wire bytes is built but flagged PROVISIONAL.
 
-- **The generator (v1) is deliberately narrow.** Only `:final` extensibility is accepted by `define-dds-type` (appendable/mutable framing for *generated* types is a later increment — note that the assignability relation already handles all three extensibility kinds for hand-built TypeObjects). `@key` is restricted to scalar/string members. Sequence members must have a fixed-size primitive element; sequences of strings/variable-size elements are rejected. **Bounded strings `(:string N)` are accepted** and emit `TI_STRING8_SMALL` + the SBound octet — the same field the externally-confirmed path already exercises (it carries `0` for an unbounded string), so only the *value* is new, not the framing; a bound **> 255** selects the `TI_STRING8_LARGE` LBound `UInt32` form instead, which **no live peer has yet exercised** — treat a `(:string N)` with `N > 255` as PROVISIONAL until an oracle confirms it. A nested-struct member must reference a previously-defined dds type (define-before-use; the DSL is acyclic).
+- **The generator (v1) is deliberately narrow.** Only `:final` extensibility is accepted by `define-dds-type` (appendable/mutable framing for *generated* types is a later increment — note that the assignability relation already handles all three extensibility kinds for hand-built TypeObjects). `@key` is restricted to scalar/string members. Sequence members must have a fixed-size primitive element; sequences of strings/variable-size elements are rejected. **Enum members `(:enum NAME)` are accepted** (wire = `int32`), but carry `TK_INT32` in the TypeObject rather than a real `TK_ENUM` — see the known-gap note in [Example 1.2](#12-enum-members--enum-name). An enum member is rejected in a `:flatdata t` type: the slot holds a keyword while a FlatData Offset accessor reads the raw field, so the two would disagree about what the member is. **Bounded strings `(:string N)` are accepted** and emit `TI_STRING8_SMALL` + the SBound octet — the same field the externally-confirmed path already exercises (it carries `0` for an unbounded string), so only the *value* is new, not the framing; a bound **> 255** selects the `TI_STRING8_LARGE` LBound `UInt32` form instead, which **no live peer has yet exercised** — treat a `(:string N)` with `N > 255` as PROVISIONAL until an oracle confirms it. A nested-struct member must reference a previously-defined dds type (define-before-use; the DSL is acyclic).
 
 - **The TypeObject serializer + EquivalenceHash are EXTERNALLY CONFIRMED for the exercised path** (live Fast DDS 3.6.1, an independent conformant peer — Connext never emits the minimal hash, ADR 0009). For the identical ShapeType IDL, Fast DDS's SEDP `PID_TYPE_INFORMATION` announces `EK_MINIMAL` hash `bf e2 a6 2e d8 11 ac 46 3c 40 c9 7d 30 ee` with `typeobject_serialized_size` 87 — byte-identical to ours; that 92-octet parameter value is locked as a regression vector (test `fastdds-type-information-vector`, from `interop/fastdds/captures/s1-forward-lo0.pcap` frames 236/237). MD5 equality pins the **whole** 87-octet MinimalTypeObject serialization, so the three formerly-provisional byte-level choices are confirmed for this path: (1) the hash is over the raw TypeObject XCDR2-LE bytes with **no** 4-byte encapsulation header; (2) `struct_flags` carries the extensibility bit only (minimal-masked); (3) `member_flags` is `TRY_CONSTRUCT=DISCARD` OR'd with `@optional`/`@must_understand`/`@key`. The exercised path is a FINAL struct with `i32` + unbounded `string8` members; PROVISIONAL now narrows to the unexercised serialization-VM edges — unions, MUTABLE structs, the `TK_NONE` base framing under the hash, sequence-member TypeIdentifiers, and nested-dependency hashes.
 

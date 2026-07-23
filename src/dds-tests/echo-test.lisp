@@ -3866,6 +3866,7 @@
                  ("cdr-utf8-decode"          . run-utf8-decode-test)
                  ("cdr-utf8-size-estimate"   . run-utf8-size-estimate-test)
                  ("gen-bounded-string"       . run-bounded-string-test)
+                 ("gen-enum"                 . run-gen-enum-test)
                  ("xcdr-encap-options-pad"   . run-encap-options-pad-test)
                  ("xcdr-generated-type"      . run-generated-type-test)
                  ("xcdr-generated-sequence"  . run-generated-sequence-test)

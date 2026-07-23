@@ -104,7 +104,7 @@ Both halves are required and they do different jobs: the **TypeObject** bound is
 while the **checked setter** is what stops an over-long value reaching the wire in the first place.
 Neither substitutes for the other, and neither belongs in the log layer.
 
-- [ ] **Step 1: Write the failing test.** In `src/dds-tests/gen-test.lisp`:
+- [x] **Step 1: Write the failing test.** In `src/dds-tests/gen-test.lisp`:
 
 ```lisp
 (dds.gen:define-dds-type bounded-str-t (:extensibility :final)
@@ -146,11 +146,11 @@ Neither substitutes for the other, and neither belongs in the log layer.
   Adjust `serialize-`/`deserialize-`/`type-object-for` to the exact names `define-dds-type` emits —
   read `dsl.lisp:275-310` and use what is actually generated rather than what this plan guessed.
 
-- [ ] **Step 2: Run it and watch it fail.**
+- [x] **Step 2: Run it and watch it fail.**
   `./scripts/with-sbcl.sh --non-interactive --eval '(asdf:load-system :dds-tests)'`
   Expected: FAIL at macroexpansion — `define-dds-type: unsupported member type (:STRING 8)`.
 
-- [ ] **Step 3: Implement.** In `%parse-member`, add a branch ahead of the `keywordp` branch for
+- [x] **Step 3: Implement.** In `%parse-member`, add a branch ahead of the `keywordp` branch for
   `(and (consp dds-type) (eq (car dds-type) :string))`: reuse the `:string` row of `*dds-type-map*`
   for codec ops and add `:bound (second dds-type)` to the plist. Reject a non-positive-integer bound
   at macroexpansion time with `; NOCOND(MACRO)`. Emit three things: the `+<type>-<slot>-bound+`
@@ -158,16 +158,16 @@ Neither substitutes for the other, and neither belongs in the log layer.
   emission so the member's type is a bounded string. Measure with `dds.cdr:utf8-octet-length` (the prerequisite change)
   — **the bound is octets, not characters** (IDL `string<N>` bounds octets).
 
-- [ ] **Step 4: Run the test and watch it pass**, then falsify twice: (a) drop `:bound` from the
+- [x] **Step 4: Run the test and watch it pass**, then falsify twice: (a) drop `:bound` from the
   TypeObject emission and confirm `bounded-typeobject` goes red — that assertion is the whole interop
   point, and an unfalsified version of it proves nothing; (b) measure the setter's length with
   `length` instead of `utf8-octet-length` and confirm `bounded-octets-not-characters` goes red.
   Restore both.
 
-- [ ] **Step 5: Register + run both suites.** Add `("gen-bounded-string" . run-bounded-string-test)`
+- [x] **Step 5: Register + run both suites.** Add `("gen-bounded-string" . run-bounded-string-test)`
   to `run-all-tests`. Run `make test-clasp` then `make test LISP=./scripts/with-sbcl.sh`.
 
-- [ ] **Step 6: Commit.** `git add src/dds-gen/dsl.lisp src/dds-tests/gen-test.lisp src/dds-tests/echo-test.lisp`
+- [x] **Step 6: Commit.** `git add src/dds-gen/dsl.lisp src/dds-tests/gen-test.lisp src/dds-tests/echo-test.lisp`
 
 ### Task 2: enum members in the type DSL
 
@@ -180,20 +180,33 @@ Neither substitutes for the other, and neither belongs in the log layer.
   Wire representation is `int32` (XTypes 1.3 §7.3.1.2.1 default enum bit bound 32). The generated
   accessor takes and returns the **keyword**; the codec reads and writes the **integer**.
 
-- [ ] **Step 1: Write the failing test** asserting: a keyword round-trips through serialize/deserialize;
+- [x] **Step 1: Write the failing test** asserting: a keyword round-trips through serialize/deserialize;
   an explicit value is honoured (define an enum with a gap, e.g. `(:a 0) (:c 7)`, and assert the wire
   octets carry 7 for `:c`); an unknown integer on the wire decodes to `(values nil :unknown-enum-value)`
   rather than to a wrong keyword. That last one is the one that matters: a foreign publisher of a newer
   revision will send values we do not know, and inventing a keyword for them is how a decoder lies.
-- [ ] **Step 2: Run it, watch it fail** (`unsupported member type (:ENUM ...)`).
-- [ ] **Step 3: Implement.** `define-dds-enum` builds a load-time bidirectional table (keyword→i32 and
+- [x] **Step 2: Run it, watch it fail** (`unsupported member type (:ENUM ...)`).
+- [x] **Step 3: Implement.** `define-dds-enum` builds a load-time bidirectional table (keyword→i32 and
   i32→keyword). `%parse-member` gains an `(:enum name)` branch reusing the `:i32` row for codec ops
   with `:enum-table` in the plist; the get path maps integer→keyword and returns the status form on an
   unknown value; the put path maps keyword→integer.
-- [ ] **Step 4: Run, watch it pass; falsify** by making the unknown-value path return the raw integer
-  and confirming the test goes red. Restore.
-- [ ] **Step 5: Register `("gen-enum" . run-gen-enum-test)`; both suites.**
-- [ ] **Step 6: Commit.**
+- [x] **Step 4: Run, watch it pass; falsify.**
+  **⚠️ AS BUILT — THIS STEP'S PREMISE WAS INVERTED, owner decision 2026-07-23.** It named "the
+  unknown-value path returns the raw integer" as the *falsification*. That is the **behaviour**.
+  The NIL design this plan assumed has a hole it did not notice: re-serializing a sample whose enum
+  member failed to decode must still write *some* int32, and every available choice puts a value on
+  the wire the sender never sent. Keeping the raw int32 cannot lie and a relay re-emits exactly what
+  arrived. `NAME-FROM-I32` still returns `(values nil :unknown-enum-value)` exactly as specified —
+  the conversion function reports, the slot preserves. Slot type is
+  `(or (member ...literals...) (signed-byte 32))`, which is also what stops an *undeclared keyword*
+  reaching the wire. Consumers test with `keywordp`.
+  **Three guards were falsified INDIVIDUALLY** (one falsification could not have covered them):
+  (a) ordinal-for-declared-value → red at `ENUM-TO-I32`; (b) invent a neighbouring keyword for an
+  unknown value → red at `ENUM-UNKNOWN-ON-WIRE-KEPT-VERBATIM` (reporting `got :RED`); (c) corrupt
+  only the relay path → red at `ENUM-UNKNOWN-RELAYED-UNCHANGED` while the decode assertion stayed
+  green, proving the re-serialize assertion does work the decode assertion cannot. All restored.
+- [x] **Step 5: Register `("gen-enum" . run-gen-enum-test)`; both suites.**
+- [x] **Step 6: Commit.**
 
 ### Task 3: `:appendable` extensibility in generated codecs
 
