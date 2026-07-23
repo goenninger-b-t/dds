@@ -1,0 +1,27 @@
+// AppendableShape for the Fast DDS interop harness — interop Leg 1 (cross-DDS half), Fast DDS.
+//
+// An @appendable struct named ShapeType, matching THIS stack generated `appendable-shape` EXACTLY
+// (and the @appendable interop/appendable/AppendableShape.idl used for the Connext leg):
+//   - @appendable extensibility (our define-dds-type uses :appendable)
+//   - @key on color
+//   - color is an UNBOUNDED string  (our :string member -> TI_STRING8_SMALL bound 0)
+//   - three 32-bit longs
+//   - default @autoid(SEQUENTIAL) -> member ids 0,1,2,3 (matches our decl-index ids)
+//   - the SAME registered type name "ShapeType" this stack advertises the appendable topic under,
+//     so type-consistency matches and extensibility is the only intended difference.
+//
+// The point of the leg: DDS-XTypes 1.3 rule (30) frames an appendable body with a DHEADER under
+// XCDR2 (D_CDR2_LE 0x0009), rule (29) omits it under XCDR1 (CDR_LE 0x0001). A second independent
+// vendor's appendable writer -> our reader is the cross-DDS oracle, alongside the Connext leg.
+//
+// Unlike rtiddsgen (which silently bounds an unbounded string at 255, see ADR 0009), fastddsgen
+// keeps the string unbounded. (No apostrophes in these comments: the fastddsgen preprocessor warns.)
+
+@appendable
+struct ShapeType
+{
+    @key string color;
+    long x;
+    long y;
+    long shapesize;
+};

@@ -22,13 +22,35 @@ oracle: every claim below is dissected with the tshark RTPS dissector under a cl
 | leg | writer | reader | result |
 |---|---|---|---|
 | self | NeoDDS (XCDR2) | NeoDDS | ✅ **rule (30)** — `D_CDR2_LE 0x0009` + `DHEADER=24`, wire-dissected |
-| B (foreign → ours) | Connext (XCDR1) | NeoDDS | ✅ **rule (29)** — `CDR_LE 0x0001`, no DHEADER, wire-dissected; 476 samples decoded |
+| B — Connext → ours | Connext (XCDR1) | NeoDDS | ✅ **rule (29)** — `CDR_LE 0x0001`, no DHEADER, wire-dissected; 476 decoded |
+| B — Fast DDS → ours | Fast DDS (XCDR1) | NeoDDS | ✅ **rule (29)** — `CDR_LE 0x0001`, no DHEADER, wire-dissected; 20 decoded, `matched:1` |
 | A (ours → foreign) | NeoDDS (XCDR2) | Connext | ⏳ blocked on a host reachability issue **unrelated to appendable** (see below) |
-| Connext emits 0x0009 | Connext (XCDR2) | — | ⏳ not run — Connext defaults to XCDR1 for appendable; needs a DataRepresentation=XCDR2 QoS on its writer |
-| Fast DDS | — | — | ⏳ not started |
+| foreign emits 0x0009 | Connext/FastDDS (XCDR2) | — | ⏳ not run — **both vendors default appendable to XCDR1**; needs a DataRepresentation=XCDR2 QoS on the foreign writer |
 
-Both extensibility rules and both encapsulation ids are therefore **observed on a real wire**, one
-of them (rule 29) driven end-to-end by an independent vendor. The remaining legs are open.
+Both extensibility rules and both encapsulation ids are **observed on a real wire**, and rule (29) is
+driven end-to-end by **both** major vendors (Connext + Fast DDS). A notable convergence: both vendors
+DEFAULT an appendable type to XCDR1 (`0x0001`, no DHEADER, rule 29), not XCDR2 — so our reader's
+rule-(29) path is the one a real foreign appendable peer exercises by default, and it is now
+cross-DDS-validated. The remaining legs (our writer → foreign, and forcing a foreign XCDR2 writer)
+are open.
+
+## Fast DDS leg — Fast DDS writer → NeoDDS reader, rule (29), `0x0001` no DHEADER
+
+```sh
+./scripts/with-fastdds.sh bash -c 'cd interop/fastdds/appendable && make gen && make appendable_pub'
+# our reader (Fast DDS is loopback-whitelisted, so peer it on loopback):
+make square-sub TYPE=appendable SECONDS=28 PEERS=127.0.0.1:7410 &
+./scripts/with-fastdds.sh bash -c 'cd interop/fastdds/appendable && ./appendable_pub GREEN 60'
+```
+
+Fast DDS logged `matched change: 1`; our reader decoded 20 samples. The lo0 capture shows Fast DDS,
+like Connext, chose XCDR1 with no DHEADER:
+
+```
+encapsulation kind: CDR_LE (0x0001)
+issueData: 06000000 475245454e00 0000 48000000 68000000 1e000000
+           └─len 6─┘ └"GREEN\0"─┘ └pad┘ └x=72──┘ └y=104┘ └size=30┘
+```
 
 ## Self leg — NeoDDS writer, rule (30), `0x0009` + DHEADER
 

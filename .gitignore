@@ -44,3 +44,9 @@ interop/appendable/AppendableShape*.cxx
 interop/appendable/.gen.stamp
 interop/appendable/appendable_pub
 interop/appendable/appendable_sub
+
+# Fast DDS appendable leg: fastddsgen output + binary + copied shared files (clean-room / duplicates)
+interop/fastdds/appendable/gen/
+interop/fastdds/appendable/appendable_pub
+interop/fastdds/appendable/participant_guard.hpp
+interop/fastdds/appendable/profiles.xml
