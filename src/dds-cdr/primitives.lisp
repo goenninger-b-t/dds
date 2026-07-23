@@ -84,39 +84,163 @@
 (defun* cdr-get-enum (c mode)
     (function (dds.core.buffer:cursor cdr-mode) (integer 0))   "Read a 32-bit enum from cursor C." (cdr-get-u32 c mode))
 
-;;; string: 4-byte length (INCLUDING the NUL) + octets + NUL (FR-CDR-1).
-;;; Latin-1 for M1; UTF-8 byte-exactness is pinned by the corpus (FR-CDR-8).
+;;; string: 4-byte length (INCLUDING the NUL) + octets + NUL (FR-CDR-1), the octets encoded as
+;;; UTF-8 (RFC 3629 §3) — which is what IDL and XTypes mean by `string`. Byte-exactness is pinned
+;;; by the corpus (FR-CDR-8); ASCII is a UTF-8 subset, so ASCII vectors are unaffected by encoding.
+(defconstant +utf8-max-code-point+ #x10FFFF
+  "The largest code point UTF-8 encodes (RFC 3629 §3). The encoding was deliberately restricted to
+   the range reachable by UTF-16, so an octet sequence decoding above this is MALFORMED — not merely
+   unusual — and a decoder must refuse it rather than pass on whatever it computed.")
+
+(defun* utf8-octet-length (s)
+    (function (string) (integer 0))
+  "The number of octets S occupies encoded as UTF-8 (RFC 3629 §3), excluding the terminating NUL.
+
+   An IDL `string<N>` bound counts OCTETS, so this — never CL:LENGTH — is what a bound must be
+   measured against. The two coincide only for ASCII, which is exactly why using the character count
+   looks correct until the first multi-byte character arrives and the buffer is too small."
+  (let ((n 0))
+    (declare (type (integer 0) n))
+    (dotimes (i (length s) n)
+      (let ((cp (char-code (char s i))))
+        (incf n (cond ((< cp #x80) 1)        ; RFC 3629 §3: 0xxxxxxx
+                      ((< cp #x800) 2)       ;              110xxxxx 10xxxxxx
+                      ((< cp #x10000) 3)     ;              1110xxxx 10xxxxxx 10xxxxxx
+                      (t 4)))))))            ;              11110xxx 10xxxxxx 10xxxxxx 10xxxxxx
+
+(defun* %cdr-put-utf8-char (c cp)
+    (function (dds.core.buffer:cursor (integer 0)) t)
+  "Write code point CP to cursor C as one to four UTF-8 octets (RFC 3629 §3, the table quoted in
+   UTF8-OCTET-LENGTH). Each continuation octet carries six payload bits under the 10xxxxxx tag."
+  (cond ((< cp #x80)
+         (dds.core.buffer:put-u8 c cp))
+        ((< cp #x800)
+         (dds.core.buffer:put-u8 c (logior #xC0 (ash cp -6)))
+         (dds.core.buffer:put-u8 c (logior #x80 (logand cp #x3F))))
+        ((< cp #x10000)
+         (dds.core.buffer:put-u8 c (logior #xE0 (ash cp -12)))
+         (dds.core.buffer:put-u8 c (logior #x80 (logand (ash cp -6) #x3F)))
+         (dds.core.buffer:put-u8 c (logior #x80 (logand cp #x3F))))
+        (t
+         (dds.core.buffer:put-u8 c (logior #xF0 (ash cp -18)))
+         (dds.core.buffer:put-u8 c (logior #x80 (logand (ash cp -12) #x3F)))
+         (dds.core.buffer:put-u8 c (logior #x80 (logand (ash cp -6) #x3F)))
+         (dds.core.buffer:put-u8 c (logior #x80 (logand cp #x3F))))))
+
 (defun* cdr-put-string (c s mode)
     (function (dds.core.buffer:cursor string cdr-mode) string)
-  "Write string S to cursor C: 4-byte length (including the NUL) + octets + NUL
-   (FR-CDR-1). Latin-1 for M1; signals cdr-not-implemented on non-Latin-1 input."
+  "Write string S to cursor C as UTF-8: a 4-octet length (octets INCLUDING the NUL), the encoded
+   octets, then the NUL (FR-CDR-1; RFC 3629 §3 for the encoding).
+
+   THE LENGTH PREFIX COUNTS OCTETS, NOT CHARACTERS. For a multi-byte string the two differ; the
+   prefix was always defined in octets, and only a one-octet-per-character codec made them look
+   interchangeable. Any caller sizing a buffer for a string member must use UTF8-OCTET-LENGTH.
+
+   This replaces a Latin-1 codec that was wrong in both directions: it refused every character above
+   U+00FF outright, and for U+0080..U+00FF it emitted a single octet that a conformant peer decodes
+   as a malformed UTF-8 sequence. Topic and type names travel through here in SPDP/SEDP, so that
+   defect reached discovery, not only user payloads."
   (cdr-align c 4 mode)
-  (let ((n (length s)))
-    (dds.core.buffer:put-u32 c (1+ n))
-    (dotimes (i n)
-      (let ((code (char-code (char s i))))
-        (when (> code 255)
-          (error 'cdr-not-implemented :what "non-Latin-1 string (UTF-8 deferred)"))   ; HOTPATH-COND(GUARD): non-Latin-1 string on the SERIALIZE path (UTF-8 deferred). CAUGHT at the public API — write-sample maps it to RETCODE_BAD_PARAMETER, so it never unwinds into the application (gate-nocond rule 2). Remove when UTF-8 lands.
-        (dds.core.buffer:put-u8 c code)))
-    (dds.core.buffer:put-u8 c 0)
-    s))
+  (dds.core.buffer:put-u32 c (1+ (utf8-octet-length s)))
+  (dotimes (i (length s))
+    (%cdr-put-utf8-char c (char-code (char s i))))
+  (dds.core.buffer:put-u8 c 0)
+  s)
+(defun* %utf8-lead-length (b0)
+    (function ((unsigned-byte 8)) (integer 0 4))
+  "Octets in the UTF-8 sequence introduced by lead octet B0, or 0 when B0 cannot lead one
+   (RFC 3629 §3): 0xxxxxxx = 1, 110xxxxx = 2, 1110xxxx = 3, 11110xxx = 4. A continuation octet
+   (10xxxxxx) is not a lead, and the 5- and 6-octet forms of the original UTF-8 were REMOVED by
+   RFC 3629 — accepting either is how a decoder admits sequences the encoder can never produce."
+  (cond ((< b0 #x80) 1)
+        ((< b0 #xC0) 0)     ; 10xxxxxx — a continuation octet cannot lead a sequence
+        ((< b0 #xE0) 2)
+        ((< b0 #xF0) 3)
+        ((< b0 #xF8) 4)
+        (t 0)))             ; 11111xxx — the retired 5/6-octet leads
+
+(defun* %utf8-decode-at (vec pos limit)
+    (function ((simple-array (unsigned-byte 8) (*)) (integer 0) (integer 0)) (values t (integer 0 4)))
+  "Decode the UTF-8 sequence at VEC[POS], where LIMIT is the first index past the string's octets.
+   Returns (values code-point octets), or (values NIL 0) when the sequence is malformed.
+
+   REFUSES, rather than repairs, every ill-formed case (RFC 3629 §3 and the §10 security rationale):
+   a bad lead octet; a sequence truncated by LIMIT; a continuation octet that is not 10xxxxxx; an
+   OVER-LONG encoding (a code point written in more octets than it needs — `C0 AF` decodes to '/'
+   and is the classic way past a filter that checked the one-octet form); a UTF-16 surrogate
+   (U+D800..U+DFFF, which is not a character); and anything above +UTF8-MAX-CODE-POINT+.
+
+   Substituting U+FFFD would be the other option and is wrong here: it hands the caller a string it
+   cannot distinguish from one the peer actually sent."
+  (let ((seq (%utf8-lead-length (aref vec pos))))
+    (when (or (zerop seq) (> (+ pos seq) limit))
+      (return-from %utf8-decode-at (values nil 0)))
+    (let ((cp (ecase seq
+                (1 (aref vec pos))
+                (2 (logand (aref vec pos) #x1F))
+                (3 (logand (aref vec pos) #x0F))
+                (4 (logand (aref vec pos) #x07)))))
+      (loop for i from 1 below seq
+            do (let ((b (aref vec (+ pos i))))
+                 (unless (= (logand b #xC0) #x80)          ; every continuation octet is 10xxxxxx
+                   (return-from %utf8-decode-at (values nil 0)))
+                 (setf cp (logior (ash cp 6) (logand b #x3F)))))
+      (when (or (and (= seq 2) (< cp #x80))                ; over-long: fits in fewer octets
+                (and (= seq 3) (< cp #x800))
+                (and (= seq 4) (< cp #x10000))
+                (<= #xD800 cp #xDFFF)                      ; surrogate half — not a character
+                (> cp +utf8-max-code-point+))
+        (return-from %utf8-decode-at (values nil 0)))
+      (values cp seq))))
+
 (defun* cdr-get-string (c mode)
-    (function (dds.core.buffer:cursor cdr-mode) string)
-  "Read a string from cursor C: 4-byte length (including the NUL) + octets + NUL
-   (FR-CDR-1). The wire length is pre-validated against the remaining buffer
-   extent BEFORE the result string is allocated, signalling buffer-overflow on a
-   hostile length (NFR-SEC-POSTURE). Note: allocates the result string. The
-   pooled, zero-alloc deserialize path is a tracked M1-perf follow-up
-   (FR-LANG-5/NFR-DET)."
+    (function (dds.core.buffer:cursor cdr-mode) (values string (or null keyword)))
+  "Read a UTF-8 string from cursor C: 4-octet length (octets INCLUDING the NUL) + the octets + NUL
+   (FR-CDR-1; RFC 3629 §3 for the encoding).
+
+   Returns (values string NIL), or (values \"\" :MALFORMED-UTF8) when the octets are not well-formed
+   UTF-8. The primary value stays a STRING on the failure path deliberately: generated deserializers
+   assign it into a slot declared `string`, and handing them NIL would turn a peer's malformed octets
+   into a type violation at (safety 0). Callers that must not accept corrupt text — discovery's topic
+   and type names, TypeLookup, TypeObject — check the status and refuse the record; a caller that
+   ignores it gets an empty string, never garbage that reads as data.
+
+   The wire length is validated against the remaining buffer extent BEFORE anything is allocated
+   (NFR-SEC-POSTURE), and every octet the decoder touches is bounded by that same extent, so a
+   sequence truncated at the end of a datagram is refused rather than read past. Note: allocates the
+   result string; the pooled zero-alloc deserialize path is a tracked follow-up (FR-LANG-5/NFR-DET)."
   (cdr-align c 4 mode)
   (let ((len (dds.core.buffer:get-u32 c)))
     ;; LEN includes the NUL: exactly LEN octets follow (NFR-SEC-POSTURE)
     (dds.core.buffer:check-room c len)
     (let* ((n (max 0 (1- len)))
-           (s (make-string n)))   ; HOTPATH-ALLOC(TRACKED): decoded string, per string field. An RX DESERIALIZATION PRODUCT — pooling it collides with loan semantics (ADR 0062)
-      (dotimes (i n) (setf (char s i) (code-char (dds.core.buffer:get-u8 c))))
-      (dds.core.buffer:get-u8 c)
-      s)))
+           (vec (dds.core.buffer:octet-buffer-vec (dds.core.buffer:cursor-buffer c)))
+           (start (dds.core.buffer:cursor-position c))
+           (limit (+ start n))
+           (chars 0))
+      (declare (type (integer 0) chars))
+      ;; Pass 1 validates and counts characters, because the decoded length is not the octet length
+      ;; and the result string is sized before it is filled. Both passes share %UTF8-DECODE-AT, so
+      ;; the validation and the decode can never drift apart.
+      (let ((i start))
+        (loop while (< i limit)
+              do (multiple-value-bind (cp seq) (%utf8-decode-at vec i limit)
+                   (declare (ignore cp))
+                   (when (zerop seq)
+                     (dds.core.buffer:cursor-set-position c (+ start len))
+                     (return-from cdr-get-string (values "" :malformed-utf8)))
+                   (incf chars)
+                   (incf i seq))))
+      (let ((s (make-string chars))   ; HOTPATH-ALLOC(TRACKED): decoded string, per string field. An RX DESERIALIZATION PRODUCT — pooling it collides with loan semantics (ADR 0062)
+            (i start) (k 0))
+        (declare (type (integer 0) k))
+        (loop while (< i limit)
+              do (multiple-value-bind (cp seq) (%utf8-decode-at vec i limit)
+                   (setf (char s k) (code-char cp))
+                   (incf k)
+                   (incf i seq)))
+        (dds.core.buffer:cursor-set-position c (+ start len))
+        (values s nil)))))
 
 ;;; sequence: 4-byte element count + elements (FR-CDR-1)
 (defun* cdr-put-sequence (c vec elem-writer mode)

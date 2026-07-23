@@ -1404,8 +1404,14 @@
   ;; serializes the KEY fields — so a keyed type whose key is a string (ShapeType's key IS its colour)
   ;; signals from %write-key-hash, before the publish is even reached. DDS 1.4 §2.2.4.4: an unencodable
   ;; sample is RETCODE_BAD_PARAMETER, a STATUS, not a stack unwind. Nothing is published.
+  ;; The guard covers the SERIALIZATION FAILURE CLASSES, not one condition type. It used to name
+  ;; cdr-not-implemented alone, which made the promise above false in two ways: an over-long sample
+  ;; signalled dds.core.buffer:buffer-overflow straight past it into the application, and once the codec
+  ;; stopped refusing non-Latin-1 strings the handler caught nothing at all. A sample that cannot be
+  ;; encoded — whatever the reason — is RETCODE_BAD_PARAMETER (DDS 1.4 §2.2.4.4), and nothing is published.
   (handler-case
       (%write-sample-1 dw sample source-timestamp)
+    (dds.core.buffer:buffer-overflow () +retcode-bad-parameter+)
     (dds.cdr:cdr-not-implemented () +retcode-bad-parameter+)))
 
 (defun* %write-sample-1 (dw sample source-timestamp)

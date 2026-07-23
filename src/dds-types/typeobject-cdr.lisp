@@ -449,7 +449,8 @@
    a PRESENT type-level annotation is beyond the modeled subset (:UNSUPPORTED)."
   (if (and (zerop (dds.core.buffer:get-u8 c))
            (zerop (dds.core.buffer:get-u8 c)))
-      (dds.cdr:cdr-get-string c :xcdr2)
+      (multiple-value-bind (name status) (dds.cdr:cdr-get-string c :xcdr2)
+        (if status :unsupported name))   ; malformed UTF-8 rides the existing :unsupported channel
       :unsupported))
 
 (defun* %complete-member-detail (c ti c2m)
@@ -462,8 +463,10 @@
   (let ((rti (%remap-complete-ti ti c2m)))
     (if (not (type-identifier-p rti))
         (values :unsupported nil nil)
-        (let ((name (dds.cdr:cdr-get-string c :xcdr2)))
-          (values name (member-name-hash name) rti)))))
+        (multiple-value-bind (name status) (dds.cdr:cdr-get-string c :xcdr2)
+          (if status
+              (values :unsupported nil nil)   ; malformed UTF-8 member name: same channel as an unmapped TI
+              (values name (member-name-hash name) rti))))))
 
 (defun* complete-to-minimal-type-object (octets c2m)
     (function ((simple-array (unsigned-byte 8) (*)) list)

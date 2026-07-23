@@ -24,7 +24,7 @@
            #:cdr-put-i8 #:cdr-get-i8 #:cdr-put-i16 #:cdr-get-i16
            #:cdr-put-i32 #:cdr-get-i32 #:cdr-put-i64 #:cdr-get-i64
            #:cdr-put-bool #:cdr-get-bool #:cdr-put-enum #:cdr-get-enum
-           #:cdr-put-string #:cdr-get-string
+           #:cdr-put-string #:cdr-get-string #:utf8-octet-length #:+utf8-max-code-point+
            #:cdr-put-sequence #:cdr-get-sequence #:cdr-get-sequence-typed
            #:cdr-put-octet-sequence #:cdr-get-octet-sequence
            ;; XCDR2 framing (FR-CDR-2, XTypes 1.3 §7.4.3.4)

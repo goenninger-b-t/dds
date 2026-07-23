@@ -788,12 +788,18 @@
     ((= pid dds.rtps.message:+pid-endpoint-guid+)
      (when (>= len 16)
        (dds.core.buffer:get-octets cursor (endpoint-data-guid data) 0 16)))
+    ;; A malformed topic or type name is LEFT UNSET rather than stored: the record then carries no
+    ;; name, matches nothing, and is unusable — which is the correct outcome for an endpoint whose
+    ;; identity arrived corrupt. Storing the decoder's empty string instead would silently create an
+    ;; endpoint announcing the empty topic.
     ((= pid dds.rtps.message:+pid-topic-name+)
      (when (>= len 4)
-       (setf (endpoint-data-topic-name data) (dds.cdr:cdr-get-string cursor :xcdr1))))
+       (multiple-value-bind (s status) (dds.cdr:cdr-get-string cursor :xcdr1)
+         (unless status (setf (endpoint-data-topic-name data) s)))))
     ((= pid dds.rtps.message:+pid-type-name+)
      (when (>= len 4)
-       (setf (endpoint-data-type-name data) (dds.cdr:cdr-get-string cursor :xcdr1))))
+       (multiple-value-bind (s status) (dds.cdr:cdr-get-string cursor :xcdr1)
+         (unless status (setf (endpoint-data-type-name data) s)))))
     ((= pid dds.rtps.message:+pid-reliability+)
      (when (>= len 4)
        (setf (dds.qos:qos-reliability (endpoint-data-qos data))

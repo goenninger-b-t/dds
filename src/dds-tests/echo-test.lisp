@@ -196,6 +196,138 @@
     (dds.core.arena:teardown-arena arena)
     t))
 
+(defun* run-utf8-encode-test ()
+    (function () t)
+  "Test: CDR-PUT-STRING emits UTF-8 (RFC 3629 §3), the encoding IDL/XTypes `string` requires.
+
+   Asserted as EXACT OCTETS rather than by round-trip: a round-trip through this stack's own decoder
+   passes even when both halves are wrong the same way, which is precisely the failure mode a codec
+   change risks. ASCII must be byte-identical to the previous Latin-1 codec — UTF-8 is an ASCII
+   superset — which is what leaves every existing corpus vector untouched."
+  (let* ((arena (dds.core.arena:init-arena :bytes (* 64 1024)))
+         (pool (dds.core.arena:make-buffer-pool arena 64 8)))
+    (flet ((octets-of (s)
+             (let ((c (dds.core.buffer:cursor (dds.core.arena:pool-acquire pool) :endianness :little)))
+               (dds.cdr:cdr-put-string c s :xcdr2)
+               (%first-bytes (dds.core.buffer:cursor-buffer c) (dds.core.buffer:cursor-position c)))))
+      ;; Characters are written as (code-char #xNNNN), never as source literals, so the assertion
+      ;; cannot be perturbed by the encoding this file happens to be saved in.
+      (%check :utf8-ascii (equal '(3 0 0 0 65 66 0) (octets-of "AB"))
+              "ASCII unchanged: length 3 (incl. NUL) + 'A' 'B' + NUL")
+      (%check :utf8-2-octet (equal '(3 0 0 0 #xC3 #xA4 0) (octets-of (string (code-char #xE4))))
+              "U+00E4 is TWO octets C3 A4 in UTF-8, not the single octet E4 Latin-1 wrote")
+      (%check :utf8-3-octet (equal '(4 0 0 0 #xE2 #x82 #xAC 0) (octets-of (string (code-char #x20AC))))
+              "U+20AC encodes as E2 82 AC")
+      (%check :utf8-4-octet (equal '(5 0 0 0 #xF0 #x9F #x98 #x80 0)
+                                   (octets-of (string (code-char #x1F600))))
+              "U+1F600 encodes as F0 9F 98 80")
+      (%check :utf8-length-multibyte (= 3 (dds.cdr:utf8-octet-length (string (code-char #x20AC))))
+              "utf8-octet-length counts OCTETS, not characters")
+      (%check :utf8-length-ascii (= 2 (dds.cdr:utf8-octet-length "AB"))
+              "utf8-octet-length of ASCII equals its character count")))
+  t)
+
+(defun* run-utf8-decode-test ()
+    (function () t)
+  "Test: CDR-GET-STRING decodes UTF-8 (RFC 3629 §3) and REFUSES every ill-formed sequence with
+   :MALFORMED-UTF8 instead of repairing it.
+
+   The refusals are the substance. A decoder that substitutes U+FFFD hands its caller a string
+   indistinguishable from one the peer actually sent, and the over-long case is a documented security
+   bug, not a curiosity: `C0 AF` decodes to '/' written in two octets, which is how an attacker walks
+   past a filter that only checked the one-octet form (RFC 3629 §10). Truncation is checked because a
+   multi-byte sequence cut off by the end of a datagram is the obvious hostile input."
+  (let* ((arena (dds.core.arena:init-arena :bytes (* 64 1024)))
+         (pool (dds.core.arena:make-buffer-pool arena 64 16)))
+    (flet ((decode (octets)
+             ;; OCTETS are the string's octets WITHOUT the NUL; the length prefix counts it.
+             (let ((c (dds.core.buffer:cursor (dds.core.arena:pool-acquire pool) :endianness :little)))
+               (dds.core.buffer:put-u32 c (1+ (length octets)))
+               (dolist (b octets) (dds.core.buffer:put-u8 c b))
+               (dds.core.buffer:put-u8 c 0)
+               (dds.core.buffer:cursor-set-position c 0)
+               (multiple-value-bind (s status) (dds.cdr:cdr-get-string c :xcdr2)
+                 (list s status (dds.core.buffer:cursor-position c)))))
+           (decode-underdeclared (declared octets)
+             ;; The length prefix says DECLARED octets (including the NUL) while OCTETS actually
+             ;; follow — an under-declaring peer. Only the decoder's LIMIT check stops it reading
+             ;; into the next field; the continuation-octet check cannot, because the octets past
+             ;; the field are themselves valid continuations.
+             (let ((c (dds.core.buffer:cursor (dds.core.arena:pool-acquire pool) :endianness :little)))
+               (dds.core.buffer:put-u32 c declared)
+               (dolist (b octets) (dds.core.buffer:put-u8 c b))
+               (dds.core.buffer:put-u8 c 0)
+               (dds.core.buffer:cursor-set-position c 0)
+               (multiple-value-bind (s status) (dds.cdr:cdr-get-string c :xcdr2)
+                 (list s status (dds.core.buffer:cursor-position c))))))
+      (flet ((ok-case (name octets expected)
+               (let ((r (decode octets)))
+                 (%check name (and (string= (first r) expected) (null (second r)))
+                         (format nil "~a: got ~s status ~s" name (first r) (second r)))))
+             (bad-case (name octets)
+               (let ((r (decode octets)))
+                 (%check name (and (string= (first r) "") (eq (second r) :malformed-utf8))
+                         (format nil "~a must be refused; got ~s status ~s" name (first r) (second r)))
+                 ;; A refusal must still leave the cursor past the whole field, or the caller's next
+                 ;; read desynchronises and one bad string corrupts every field after it.
+                 (%check (intern (format nil "~a-CURSOR" name) :keyword)
+                         (= (third r) (+ 4 (length octets) 1))
+                         (format nil "~a: cursor must advance past the field, at ~s" name (third r))))))
+        (ok-case :utf8-dec-ascii '(65 66) "AB")
+        (ok-case :utf8-dec-2-octet '(#xC3 #xA4) (string (code-char #xE4)))
+        (ok-case :utf8-dec-3-octet '(#xE2 #x82 #xAC) (string (code-char #x20AC)))
+        (ok-case :utf8-dec-4-octet '(#xF0 #x9F #x98 #x80) (string (code-char #x1F600)))
+        (bad-case :utf8-bare-continuation '(#x80))              ; 10xxxxxx cannot lead
+        (bad-case :utf8-overlong '(#xC0 #xAF))                  ; '/' in two octets — the filter bypass
+        (bad-case :utf8-truncated '(#xE2 #x82))                 ; 3-octet sequence cut short
+        (bad-case :utf8-surrogate '(#xED #xA0 #x80))            ; U+D800 is not a character
+        (bad-case :utf8-above-max '(#xF5 #x80 #x80 #x80))       ; beyond U+10FFFF
+        (bad-case :utf8-retired-lead '(#xF8 #x88 #x80 #x80 #x80))      ; the removed 5-octet form
+        ;; ONLY the field-extent check catches this one. The prefix declares 2 octets + NUL while a
+        ;; complete 3-octet sequence follows, so the third octet (0xAC) IS a valid continuation and
+        ;; the continuation check waves it through — a decoder without the extent bound reads past
+        ;; the field into the next one and returns U+20AC for octets the field never contained.
+        (let ((r (decode-underdeclared 3 '(#xE2 #x82 #xAC))))
+          (%check :utf8-underdeclared-length
+                  (and (string= (first r) "") (eq (second r) :malformed-utf8))
+                  (format nil "an under-declared length must not let the decoder read into the next ~
+                               field; got ~s status ~s" (first r) (second r)))))))
+  t)
+
+(dds.gen:define-dds-type utf8-size-t (:extensibility :final)
+  (id :i32 :key t)
+  (label :string))
+
+(defun* run-utf8-size-estimate-test ()
+    (function () t)
+  "Test: the generated SERIALIZED-SIZE must never UNDER-estimate a string member.
+
+   It computed 4 + (LENGTH s) + 1 — one octet per character — which was true only while the codec was
+   Latin-1. Under UTF-8 a character can occupy up to four octets, so the estimate came out SHORTER
+   than the encoding and the buffer sized from it was too small. That is a latent overflow, not a
+   cosmetic error: the estimate is what sizes the buffer the sample is serialized into.
+
+   Asserted as `estimate >= actual` rather than equality, because an over-estimate is safe and an
+   under-estimate is the bug."
+  (let* ((arena (dds.core.arena:init-arena :bytes (* 64 1024)))
+         (pool (dds.core.arena:make-buffer-pool arena 256 4)))
+    (flet ((actual-octets (s)
+             (let ((c (dds.core.buffer:cursor (dds.core.arena:pool-acquire pool) :endianness :little)))
+               (serialize-utf8-size-t (make-utf8-size-t :id 1 :label s) c :xcdr2)
+               (dds.core.buffer:cursor-position c))))
+      (dolist (probe (list (cons "ascii" "ABCD")
+                           (cons "2-octet" (make-string 4 :initial-element (code-char #xE4)))
+                           (cons "3-octet" (make-string 4 :initial-element (code-char #x20AC)))
+                           (cons "4-octet" (make-string 4 :initial-element (code-char #x1F600)))))
+        (let* ((s (cdr probe))
+               (estimate (serialized-size-utf8-size-t (make-utf8-size-t :id 1 :label s) :xcdr2))
+               (actual (actual-octets s)))
+          (%check (intern (format nil "UTF8-SIZE-~:@(~a~)" (car probe)) :keyword)
+                  (>= estimate actual)
+                  (format nil "~a: estimate ~d must be >= the ~d octets actually written"
+                          (car probe) estimate actual))))))
+  t)
+
 (defun* run-byte-exact-test ()
     (function () t)
   "Test: XCDR1 vs XCDR2 byte-exact seed vectors + the 8-byte-alignment divergence (FR-CDR, P0)."
@@ -3690,6 +3822,9 @@
                  ("pal-pshared"              . run-pal-pshared-test)
                  ("xcdr-codec-roundtrip"     . run-codec-roundtrip-test)
                  ("xcdr-byte-exact-seed"     . run-byte-exact-test)
+                 ("cdr-utf8-encode"          . run-utf8-encode-test)
+                 ("cdr-utf8-decode"          . run-utf8-decode-test)
+                 ("cdr-utf8-size-estimate"   . run-utf8-size-estimate-test)
                  ("xcdr-encap-options-pad"   . run-encap-options-pad-test)
                  ("xcdr-generated-type"      . run-generated-type-test)
                  ("xcdr-generated-sequence"  . run-generated-sequence-test)

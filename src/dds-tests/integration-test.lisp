@@ -10943,25 +10943,40 @@
   "Owner directive (NON-NEGOTIABLE): NO Lisp condition may escape the toplevel DDS API — the public API
    returns a DDS ReturnCode_t, never a stack unwind.
 
-   DataWriter::write violated it: the generated codec SIGNALS on an unencodable field (cdr-put-string
-   signals cdr-not-implemented for a non-Latin-1 string — UTF-8 is deferred), and that raw Lisp condition
-   unwound straight out of write-sample into the application. DDS 1.4 §2.2.4.4 says an illegal parameter
-   value is RETCODE_BAD_PARAMETER: a STATUS.
+   DataWriter::write violated it: the generated codec SIGNALS on an unencodable field, and that raw Lisp
+   condition unwound straight out of write-sample into the application. DDS 1.4 §2.2.4.4 says an illegal
+   parameter value is RETCODE_BAD_PARAMETER: a STATUS.
 
-   Asserts: writing a sample with a UTF-8 string returns :bad-parameter and does NOT signal."
+   THE ORIGINAL TRIGGER IS GONE, AND THAT IS THE POINT OF KEEPING THIS TEST HONEST. It used a non-Latin-1
+   string, because cdr-put-string signalled on one. The codec now encodes UTF-8 (RFC 3629), so that sample
+   is perfectly encodable — a test asserting it still fails would be asserting a defect. It now asserts the
+   opposite for that input, and re-anchors the no-unwind property on an input that is STILL unencodable: a
+   string far larger than any serialization buffer.
+
+   That re-anchoring exposed a real hole. The boundary caught exactly ONE condition class
+   (cdr-not-implemented) while its own comment claimed no condition may escape — so a buffer-overflow from
+   an over-long sample unwound into the application, and once the UTF-8 codec removed the only signaller
+   the handler caught nothing at all. The boundary now covers the serialization failures as a class."
   (let* ((ts (dds.types:find-type-support "shape-type"))
          (p (dds.dcps:create-participant :domain (test-domain))))
     (unwind-protect
          (let* ((tp (dds.dcps:create-topic p "NoCond" "shape-type" ts))
                 (dw (dds.dcps:create-datawriter (dds.dcps:create-publisher p) tp))
-                (utf8 (make-shape-type :color (string (code-char #x263A))   ; ☺ — not Latin-1
+                (utf8 (make-shape-type :color (string (code-char #x263A))   ; U+263A — beyond Latin-1
                                        :x 1 :y 2 :shapesize 3))
                 (rc (handler-case (dds.dcps:write-sample dw utf8)
-                      (error (e) (declare (ignore e)) :SIGNALLED))))
-           (%check :nocond-no-unwind (not (eq rc :SIGNALLED))
+                      (error (e) (declare (ignore e)) :SIGNALLED)))
+                ;; Still unencodable, and always will be: no buffer holds it.
+                (huge (make-shape-type :color (make-string 200000 :initial-element #\A)
+                                       :x 1 :y 2 :shapesize 3))
+                (rc2 (handler-case (dds.dcps:write-sample dw huge)
+                       (error (e) (declare (ignore e)) :SIGNALLED))))
+           (%check :nocond-utf8-encodes (eq rc :ok)
+                   (format nil "a UTF-8 sample must now WRITE, not be refused as unencodable; got ~s" rc))
+           (%check :nocond-no-unwind (not (eq rc2 :SIGNALLED))
                    "write-sample SIGNALLED on an unencodable sample — no Lisp condition may escape the DDS API")
-           (%check :nocond-bad-parameter (eq rc :bad-parameter)
-                   (format nil "write-sample must return RETCODE_BAD_PARAMETER for an unencodable sample, got ~s" rc)))
+           (%check :nocond-bad-parameter (eq rc2 :bad-parameter)
+                   (format nil "write-sample must return RETCODE_BAD_PARAMETER for an unencodable sample, got ~s" rc2)))
       (dds.dcps:delete-participant p)))
   t)
 

@@ -319,7 +319,11 @@
                        (return-from parse-type-lookup-request nil))
                      ;; rewind to the length and re-read via the cdr-put-string inverse
                      (dds.core.buffer:cursor-set-position c (- spos 4))
-                     (let* ((iname (dds.cdr:cdr-get-string c :xcdr2))
+                     (let* ((iname (multiple-value-bind (s status) (dds.cdr:cdr-get-string c :xcdr2)
+                                     ;; a malformed instance name DROPS the request (its existing
+                                     ;; failure channel) rather than querying for an empty name
+                                     (when status (return-from parse-type-lookup-request nil))
+                                     s))
                             ;; TypeLookup_Call: appendable union DHEADER bounds disc + arm
                             (usize (dds.cdr:cdr-get-dheader c :xcdr2))
                             (uend (+ (dds.core.buffer:cursor-position c) usize)))

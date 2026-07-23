@@ -312,8 +312,12 @@
                    (ecase (getf m :kind)
                      (:scalar
                       (if (getf m :var)
+                          ;; 4 (length prefix) + the UTF-8 OCTETS + 1 (NUL). It must be the octet
+                          ;; count, never (LENGTH s): a character occupies up to four octets
+                          ;; (RFC 3629 §3), and this number sizes the buffer the sample is
+                          ;; serialized into, so under-estimating it is a buffer overflow.
                           `((setf pos (dds.cdr:cdr-size-align pos 4 mode))
-                            (incf pos (+ 5 (length (,(acc m) sample)))))
+                            (incf pos (+ 5 (dds.cdr:utf8-octet-length (,(acc m) sample)))))
                           `((setf pos (dds.cdr:cdr-size-align pos ,(getf m :align) mode))
                             (incf pos ,(getf m :size)))))
                      (:sequence
