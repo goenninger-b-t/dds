@@ -44,7 +44,8 @@ Structured fields, `@appendable`, bounded throughout, keyed on source. The IDL l
 generated from the IDL, and a divergence between the two is a match failure nobody can see.
 
 ```idl
-module dds { module log {
+module dds {
+module log {
 
   // Severity values are the syslog numbering of RFC 5424 §6.2.1 Table 2, so the mapping to the UDP syslog
   // sink is the identity. TRACE extends the range below DEBUG; RFC 5424 defines 0..7 only.
@@ -61,7 +62,7 @@ module dds { module log {
     string<40>      participant_uuid; // DDS participant UUID; detected once at logger creation
     string<46>      host_ip;          // host machine IP address; detected once at logger creation
     uint32          thread;           // informational
-    uint64          sequence;    // per-source monotonic; gaps are visible loss
+    uint64          seq;              // per-source monotonic; gaps are visible loss
     int64           timestamp;   // UTC nanoseconds since the POSIX epoch
     Severity        severity;
     string<16>      category;    // "SUP", "MEM"
@@ -73,7 +74,9 @@ module dds { module log {
     boolean         truncated;   // message exceeded its bound
     string<1024>    message;
   };
-}};
+
+};   // module log — each module closes with its own `};` (rtiddsgen rejects the compact `}};`)
+};   // module dds
 ```
 
 **The severity constants are read from RFC 5424 at implementation time and cited at the definition, never
@@ -86,7 +89,7 @@ Four decisions in that struct are load-bearing:
 - **`timestamp` is a field, not the DDS source timestamp.** A queue sits between the log call and `write()`,
   so the source timestamp records when the *worker* published, not when the event happened. Under load —
   precisely when timing matters — the two diverge by exactly the queueing delay.
-- **`sequence` makes loss observable.** With per-source monotonic numbering, a collector can compute what it
+- **`seq` makes loss observable.** With per-source monotonic numbering, a collector can compute what it
   never received, independently of whatever the publisher's drop counters claim.
 - **Bounds are permanent.** `@appendable` (XTypes 1.3 §7.2.2) lets fields be *added* compatibly; it does not
   let a string bound be *widened* compatibly. The bounds above are therefore a one-time contract. `message`

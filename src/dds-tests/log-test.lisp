@@ -21,7 +21,7 @@
          (pool (dds.core.arena:make-buffer-pool arena 2048 2))
          (e (dds.log:build-log-event :host "node-1" :process 4242
                                      :participant-uuid "8b619879-4ffe-4fca-ad01-05b39d987dbc"
-                                     :host-ip "192.168.2.148" :thread 7 :sequence 99
+                                     :host-ip "192.168.2.148" :thread 7 :seq 99
                                      :timestamp -123456789 :severity :crit :category "MEM"
                                      :function "gbt_init()" :file "src/core.c" :line 1234
                                      :event-kind :exit :elapsed-ns 12000 :message "hello")))
@@ -39,7 +39,7 @@
                      (string= (dds.log:log-event-participant-uuid q) "8b619879-4ffe-4fca-ad01-05b39d987dbc")
                      (string= (dds.log:log-event-host-ip q) "192.168.2.148")
                      (= (dds.log:log-event-thread q) 7)
-                     (= (dds.log:log-event-sequence q) 99)
+                     (= (dds.log:log-event-seq q) 99)
                      (= (dds.log:log-event-timestamp q) -123456789)
                      (eq (dds.log:log-event-severity q) :crit)
                      (string= (dds.log:log-event-category q) "MEM")

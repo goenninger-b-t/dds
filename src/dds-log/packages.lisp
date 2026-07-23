@@ -16,7 +16,7 @@
    ;; the type + generated surface (dds.gen:define-dds-type)
    #:log-event #:make-log-event #:log-event-p
    #:log-event-host #:log-event-process #:log-event-participant-uuid #:log-event-host-ip
-   #:log-event-thread #:log-event-sequence
+   #:log-event-thread #:log-event-seq
    #:log-event-timestamp #:log-event-severity #:log-event-category #:log-event-function
    #:log-event-file #:log-event-line #:log-event-event-kind #:log-event-elapsed-ns
    #:log-event-truncated #:log-event-message

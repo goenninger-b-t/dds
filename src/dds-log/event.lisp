@@ -36,7 +36,9 @@
   (participant-uuid (:string 40))
   (host-ip (:string 46))
   (thread :u32)
-  (sequence :u64)
+  ;; `seq`, not `sequence`: `sequence` is an IDL reserved word (the collection type), so a foreign
+  ;; publisher cannot be generated from an IDL with a member named `sequence` (rtiddsgen rejects it).
+  (seq :u64)
   (timestamp :i64)
   (severity (:enum severity))
   (category (:string 16))
@@ -68,12 +70,12 @@
         (values (subseq string 0 end) t))))
 
 (defun* build-log-event (&key (host "") (process 0) (participant-uuid "") (host-ip "")
-                              (thread 0) (sequence 0) (timestamp 0)
+                              (thread 0) (seq 0) (timestamp 0)
                               (severity :info) (category "") (function "") (file "") (line 0)
                               (event-kind :message) (elapsed-ns 0) (message ""))
     (function (&key (:host string) (:process (unsigned-byte 32)) (:participant-uuid string)
                     (:host-ip string) (:thread (unsigned-byte 32))
-                    (:sequence (unsigned-byte 64)) (:timestamp (signed-byte 64)) (:severity keyword)
+                    (:seq (unsigned-byte 64)) (:timestamp (signed-byte 64)) (:severity keyword)
                     (:category string) (:function string) (:file string) (:line (unsigned-byte 32))
                     (:event-kind keyword) (:elapsed-ns (unsigned-byte 64)) (:message string))
               log-event)
@@ -89,7 +91,7 @@
      :process process
      :participant-uuid (values (truncate-utf8 participant-uuid +log-event-participant-uuid-bound+))
      :host-ip (values (truncate-utf8 host-ip +log-event-host-ip-bound+))
-     :thread thread :sequence sequence :timestamp timestamp
+     :thread thread :seq seq :timestamp timestamp
      :severity severity
      :category (values (truncate-utf8 category +log-event-category-bound+))
      :function (values (truncate-utf8 function +log-event-function-bound+))

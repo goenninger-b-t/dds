@@ -71,3 +71,12 @@ interop/string-large/stringlarge_pub
 # Loopback QoS profile copied for the direction-A experiment (duplicate of interop/connext/typeobject-probe/)
 interop/appendable/USER_QOS_PROFILES.xml
 interop/enum-typeobject/USER_QOS_PROFILES.xml
+
+# LogEvent interop leg: rtiddsgen output + binary + copied loopback profile (clean-room)
+interop/log/DdsLog.hpp
+interop/log/DdsLog.cxx
+interop/log/DdsLogPlugin.hpp
+interop/log/DdsLogPlugin.cxx
+interop/log/.gen.stamp
+interop/log/log_pub
+interop/log/USER_QOS_PROFILES.xml
