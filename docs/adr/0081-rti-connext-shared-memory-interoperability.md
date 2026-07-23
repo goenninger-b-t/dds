@@ -571,9 +571,17 @@ we must still match.
      (`0 -> 4294967232`). That sign is the whole bug — the negative is the value the *consumer* sets when it
      has drained a record, so writing it made RTI's consumer read our fresh record as **already consumed** and
      skip it, waking and finding nothing to do. (The original `-D` reading was of already-consumed records;
-     the producer writes `+D` and the consumer flips it.) Fixed to `+len`, synthetic test updated. **This is
-     the data-confirmed cause of non-acceptance; the decisive check is a live acceptance retest with the sign
-     corrected.** The read path (slices 1-6) is complete, live-validated, and unaffected.
+     the producer writes `+D` and the consumer flips it.) Fixed to `+len`, synthetic test updated.
+   - (f) **ACCEPTED — live, against RTI Connext.** With the sign corrected, the acceptance retest (throwaway
+     subscriber, publisher frozen and matched) showed the consumer **drain our record**: after the write the
+     consumer position advanced `516 -> 580` (+64, one record) and the consumer counter `8 -> 9`, with every
+     field ending in sync at the new head and the data semaphore cycling `0 -> 1 -> 0`. **A record written by
+     this stack, into a live RTI Connext shared-memory ring, was accepted and consumed by RTI's own
+     consumer.** Ring-level SHMEM transmit interoperability is achieved. What is not yet separately shown is
+     RTI's *application-level* delivery of a USER-DATA sample (the replayed record was a participant-message,
+     so the subscriber's `issue received` count — which counts user samples — did not move); writing a valid
+     user DATA record and seeing that count advance is the remaining end-to-end confirmation, but the hard
+     part — RTI accepting a record our writer produced — is done.
 
 ## 7. Consequences and risks
 
