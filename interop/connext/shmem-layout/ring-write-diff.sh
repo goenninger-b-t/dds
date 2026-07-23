@@ -34,16 +34,19 @@ echo "# ring 0x$KEY port $PORT"
 O=$($PROBE "$KEY" find 52545053 2>/dev/null | grep '^hit' | sed -n '2p' | awk '{print $4}' | tr -d '()')
 $PROBE "$KEY" dump "$O" 64 | sed -n '2,5p' | sed 's/|.*//' | awk '{$1="";print}' | tr -s ' ' | tr -d '\n' | sed 's/^ //' > /tmp/wd-record.hex
 
+# STOP the consumer for the whole test, so the real-write delta is PRODUCER-only (no consumer fields mixed in)
+# and the two deltas are directly comparable.
+kill -STOP -- -$SUB 2>/dev/null
 freeze() { kill -STOP -- -$PUB 2>/dev/null; sleep 0.6
   local mk; mk=$(printf '%x' $((0xB00000 + PORT)))
-  for t in 1 2 3 4 5; do local mv; mv=$($PROBE >/dev/null 2>&1; ./semprobe "$mk" 2>/dev/null | awk '/\[0\]/{gsub(/[a-z=-]+/,"",$2);print $2}')
+  for t in 1 2 3 4 5; do local mv; mv=$(./semprobe "$mk" 2>/dev/null | awk '/\[0\]/{gsub(/[a-z=-]+/,"",$2);print $2}')
     [ "${mv:-1}" = "1" ] && return; kill -CONT -- -$PUB 2>/dev/null; sleep 0.2; kill -STOP -- -$PUB 2>/dev/null; sleep 0.3; done; }
 thaw()  { kill -CONT -- -$PUB 2>/dev/null; }
 snap()  { $PROBE "$KEY" u32 0x40 72; }   # 0x40..0x160, 72 u32s = both blocks + descriptor active region
 
 freeze;              S0=$(snap)
-thaw; sleep 1.15;    freeze; S1=$(snap)   # exactly ~1 real record
-# our write (publisher stays frozen)
+thaw; sleep 1.05;    freeze; S1=$(snap)   # ~1 real record (consumer stopped, so it does not drain it)
+# our write (publisher stays frozen, consumer stopped)
 cat > /tmp/wd-write.lisp <<LISP
 (asdf:load-system :dds-xport)
 (let* ((port $PORT)
@@ -57,11 +60,12 @@ LISP
 "$REPO/scripts/with-sbcl.sh" --non-interactive --load /tmp/wd-write.lisp >/tmp/wd-write.out 2>&1
 S2=$(snap)
 
-echo "# offsets 0x40.. as u32 index i -> byte 0x$(printf '%x' $((0x40)))+4i"
-echo "# REAL write (S1-S0):"
-paste <(echo "$S0" | tr ' ' '\n') <(echo "$S1" | tr ' ' '\n') | awk '$1!=$2{printf "    0x%x: %s -> %s\n",0x40+4*(NR-1),$1,$2}'
-echo "# OUR write  (S2-S1):"
-paste <(echo "$S1" | tr ' ' '\n') <(echo "$S2" | tr ' ' '\n') | awk '$1!=$2{printf "    0x%x: %s -> %s\n",0x40+4*(NR-1),$1,$2}'
-echo "# => any offset in the REAL list but NOT the OUR list is a field we are not writing."
+# base 64 (=0x40) written in decimal so awk parses it (POSIX awk reads 0x40 as 0)
+echo "# consumer STOPPED throughout; both deltas are producer-only and directly comparable."
+echo "# REAL producer write (S1-S0):"
+paste <(echo "$S0" | tr ' ' '\n') <(echo "$S1" | tr ' ' '\n') | awk '$1!=$2{printf "    0x%x: %s -> %s\n",64+4*(NR-1),$1,$2}'
+echo "# OUR write (S2-S1):"
+paste <(echo "$S1" | tr ' ' '\n') <(echo "$S2" | tr ' ' '\n') | awk '$1!=$2{printf "    0x%x: %s -> %s\n",64+4*(NR-1),$1,$2}'
+echo "# => any offset the REAL producer changed that OURS did not is a producer field we omit."
 
 kill -9 -- -$SUB -$PUB 2>/dev/null

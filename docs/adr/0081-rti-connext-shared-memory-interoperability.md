@@ -560,8 +560,14 @@ we must still match.
      semaphore/wake protocol is therefore correct; the gap is a field or check RTI's consumer uses to
      recognise a valid record, one not yet in our write-set. The definitive next diagnostic is a full control-
      region diff: capture the region drained, after one REAL producer write, and after one of OUR writes, and
-     whatever the real write changes that ours does not is the missing field. **Transmit remains unproven
-     after four live attempts; the read path (slices 1-6) is complete, live-validated, and unaffected.**
+     whatever the real write changes that ours does not is the missing field. The first diff (consumer live,
+     2 records) pointed straight at **a per-record counter at byte `0xd4`** — between block B and the
+     descriptor table — that the real producer increments (+1/record) and our writer never touches; the only
+     other real-write changes were the consumer's own fields (expected) and a descriptor-slot difference. A
+     refined diff with the consumer stopped isolates the producer-only write-set to confirm `0xd4` is a
+     producer field. If it is, it is the prime candidate for what the consumer reads to detect a new record —
+     which our write omits, so the consumer wakes and finds nothing. **Transmit remains unproven after four
+     live attempts; the read path (slices 1-6) is complete, live-validated, and unaffected.**
 
 ## 7. Consequences and risks
 
