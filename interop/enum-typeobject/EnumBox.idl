@@ -1,0 +1,27 @@
+// EnumBox for the NeoDDS enum-TypeObject interop probe (log-service Task 2 debt; ADR 0082 §9.0).
+//
+// The question this answers: NeoDDS's (:enum ...) member emits TK_INT32 in the TypeObject, because
+// the serializer cannot yet emit a real MinimalEnumeratedType (equivalence-hash takes a
+// minimal-struct-type only). A conformant peer whose IDL declares an `enum` presents TK_ENUM. Under
+// strict XTypes type-consistency the two are structurally different types (the ADR 0009 defect
+// class). Does a real RTI Connext peer REJECT the match, or TOLERATE it (Connext's default
+// TypeConsistencyEnforcement is ALLOW_TYPE_COERCION, and an enum is int32-backed)?
+//
+// The answer decides whether log-service Phase B can ship LogEvent with an enum-as-int32 against
+// strict Connext, or whether the MinimalEnumeratedType serializer must land first.
+//
+// Kind is a real IDL enum -> TK_ENUM on this side. NeoDDS's matching enum-box type declares the same
+// member as (:enum ...) -> TK_INT32. Same topic name "EnumBox", same registered type name "EnumBox",
+// @key long id, so the enum member is the ONLY intended difference.
+
+enum Kind {
+    KIND_TRACE,
+    KIND_INFO,
+    KIND_ERROR
+};
+
+@final
+struct EnumBox {
+    @key long id;
+    Kind kind;
+};

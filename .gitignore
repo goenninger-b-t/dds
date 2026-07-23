@@ -50,3 +50,9 @@ interop/fastdds/appendable/gen/
 interop/fastdds/appendable/appendable_pub
 interop/fastdds/appendable/participant_guard.hpp
 interop/fastdds/appendable/profiles.xml
+
+# Enum-TypeObject probe: rtiddsgen output + binary (clean-room: never checked in)
+interop/enum-typeobject/EnumBox*.hpp
+interop/enum-typeobject/EnumBox*.cxx
+interop/enum-typeobject/.gen.stamp
+interop/enum-typeobject/enum_pub
