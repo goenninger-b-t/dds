@@ -1,4 +1,4 @@
-# IMPLEMENTATION PLAN — Common Lisp DDS/RTPS Stack (XCDR-based)
+# IMPLEMENTATION PLAN — NeoDDS (Common Lisp DDS/RTPS Stack, XCDR-based)
 
 **Companion to:** `REQUIREMENTS.md` (read first). **Tone:** normative, sequencing-focused.
 **Method:** subagent-driven, contract-first. **Targets:** SBCL, AllegroCL, Clasp.

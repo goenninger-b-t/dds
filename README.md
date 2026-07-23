@@ -1,4 +1,4 @@
-# Common Lisp DDS
+# NeoDDS
 
 A from-scratch, **data-centric publish/subscribe** middleware in Common Lisp implementing
 the **OMG DDS 1.4** application model over the **OMG DDSI-RTPS 2.5** wire protocol, with
@@ -18,7 +18,7 @@ The two authoritative specs for this repository are [`REQUIREMENTS.md`](REQUIREM
 
 ## What it is
 
-DDS is a peer-to-peer, brokerless pub/sub standard: applications declare **Topics** (a name + a strongly-typed schema) and exchange **samples** through **DataWriters** and **DataReaders** whose **QoS** policies must be compatible for them to match. Underneath, **RTPS** is the interoperable wire protocol (discovery, reliability, fragmentation) and **XCDR** is the binary serialization. **Common Lisp DDS** implements that stack natively:
+DDS is a peer-to-peer, brokerless pub/sub standard: applications declare **Topics** (a name + a strongly-typed schema) and exchange **samples** through **DataWriters** and **DataReaders** whose **QoS** policies must be compatible for them to match. Underneath, **RTPS** is the interoperable wire protocol (discovery, reliability, fragmentation) and **XCDR** is the binary serialization. **NeoDDS** implements that stack natively:
 
 - **CLOS where it's free, `defstruct` where it counts.** The control plane (entities, QoS,
   listeners, conditions, discovery, the type compiler, tooling) is idiomatic CLOS. The
@@ -284,7 +284,7 @@ Regenerate manually with `make sbom`. Do not hand-edit it.
 
 ## License
 
-The Common Lisp DDS code and documentation are © 2026 **Gönninger B&T GmbH, Deutschland**
+The NeoDDS code and documentation are © 2026 **Gönninger B&T GmbH, Deutschland**
 (author: Frank Gönninger), licensed under **Creative Commons Attribution-NoDerivatives 4.0
 International (CC BY-ND 4.0)** — share verbatim with attribution; no derivatives. See
 [`LICENSE.md`](LICENSE.md) and [`COPYRIGHT.md`](COPYRIGHT.md). Third-party dependencies keep

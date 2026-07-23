@@ -3,7 +3,7 @@
   "@graph": [
     {
       "@id": "_:creationinfo",
-      "created": "2026-07-23T16:47:14Z",
+      "created": "2026-07-23T17:06:41Z",
       "createdBy": [
         "https://github.com/goenninger-b-t/dds/sbom#agent/goenninger-b-t"
       ],
@@ -64,7 +64,7 @@
     },
     {
       "creationInfo": "_:creationinfo",
-      "name": "common-lisp-dds scripts/generate-sbom.py",
+      "name": "neodds scripts/generate-sbom.py",
       "spdxId": "https://github.com/goenninger-b-t/dds/sbom#tool/generate-sbom",
       "type": "Tool"
     },
@@ -95,17 +95,17 @@
     {
       "comment": "OMG DDS 1.4 / DDSI-RTPS 2.5 / XCDR middleware in Common Lisp. Project code + documentation licensed CC-BY-ND-4.0 (see LICENSE.md / COPYRIGHT.md). Third-party dependencies retain their own licences.",
       "creationInfo": "_:creationinfo",
-      "name": "common-lisp-dds",
+      "name": "neodds",
       "originatedBy": [
         "https://github.com/goenninger-b-t/dds/sbom#agent/frank-goenninger"
       ],
       "software_declaredLicense": "https://github.com/goenninger-b-t/dds/sbom#license/CC-BY-ND-4.0",
       "software_downloadLocation": "https://github.com/goenninger-b-t/dds",
       "software_homePage": "https://github.com/goenninger-b-t/dds",
-      "software_packageUrl": "pkg:github/goenninger-b-t/dds@6db4bce",
-      "software_packageVersion": "0.0.0-dev+git.6db4bce",
+      "software_packageUrl": "pkg:github/goenninger-b-t/dds@39c81e4",
+      "software_packageVersion": "0.0.0-dev+git.39c81e4",
       "software_primaryPurpose": "library",
-      "spdxId": "https://github.com/goenninger-b-t/dds/sbom#package/common-lisp-dds",
+      "spdxId": "https://github.com/goenninger-b-t/dds/sbom#package/neodds",
       "suppliedBy": "https://github.com/goenninger-b-t/dds/sbom#agent/goenninger-b-t",
       "type": "software_Package"
     },
@@ -123,7 +123,7 @@
     },
     {
       "creationInfo": "_:creationinfo",
-      "from": "https://github.com/goenninger-b-t/dds/sbom#package/common-lisp-dds",
+      "from": "https://github.com/goenninger-b-t/dds/sbom#package/neodds",
       "relationshipType": "dependsOn",
       "spdxId": "https://github.com/goenninger-b-t/dds/sbom#relationship/dependsOn-bordeaux-threads",
       "to": [
@@ -145,7 +145,7 @@
     },
     {
       "creationInfo": "_:creationinfo",
-      "from": "https://github.com/goenninger-b-t/dds/sbom#package/common-lisp-dds",
+      "from": "https://github.com/goenninger-b-t/dds/sbom#package/neodds",
       "relationshipType": "dependsOn",
       "spdxId": "https://github.com/goenninger-b-t/dds/sbom#relationship/dependsOn-cffi",
       "to": [
@@ -166,7 +166,7 @@
     },
     {
       "creationInfo": "_:creationinfo",
-      "from": "https://github.com/goenninger-b-t/dds/sbom#package/common-lisp-dds",
+      "from": "https://github.com/goenninger-b-t/dds/sbom#package/neodds",
       "relationshipType": "dependsOn",
       "spdxId": "https://github.com/goenninger-b-t/dds/sbom#relationship/dependsOn-chipz",
       "to": [
@@ -187,7 +187,7 @@
     },
     {
       "creationInfo": "_:creationinfo",
-      "from": "https://github.com/goenninger-b-t/dds/sbom#package/common-lisp-dds",
+      "from": "https://github.com/goenninger-b-t/dds/sbom#package/neodds",
       "relationshipType": "dependsOn",
       "spdxId": "https://github.com/goenninger-b-t/dds/sbom#relationship/dependsOn-sqlite",
       "to": [
@@ -209,7 +209,7 @@
     },
     {
       "creationInfo": "_:creationinfo",
-      "from": "https://github.com/goenninger-b-t/dds/sbom#package/common-lisp-dds",
+      "from": "https://github.com/goenninger-b-t/dds/sbom#package/neodds",
       "relationshipType": "dependsOn",
       "spdxId": "https://github.com/goenninger-b-t/dds/sbom#relationship/dependsOn-static-vectors",
       "to": [
@@ -231,7 +231,7 @@
     },
     {
       "creationInfo": "_:creationinfo",
-      "from": "https://github.com/goenninger-b-t/dds/sbom#package/common-lisp-dds",
+      "from": "https://github.com/goenninger-b-t/dds/sbom#package/neodds",
       "relationshipType": "dependsOn",
       "spdxId": "https://github.com/goenninger-b-t/dds/sbom#relationship/dependsOn-xmls",
       "to": [
@@ -253,7 +253,7 @@
     {
       "comment": "runtime dependency",
       "creationInfo": "_:creationinfo",
-      "from": "https://github.com/goenninger-b-t/dds/sbom#package/common-lisp-dds",
+      "from": "https://github.com/goenninger-b-t/dds/sbom#package/neodds",
       "relationshipType": "dependsOn",
       "spdxId": "https://github.com/goenninger-b-t/dds/sbom#relationship/runtime-sbcl",
       "to": [
@@ -284,7 +284,7 @@
     {
       "comment": "native runtime dependency (dds-dare CNSA-2.0 DARE; OpenSSL >= 3.5)",
       "creationInfo": "_:creationinfo",
-      "from": "https://github.com/goenninger-b-t/dds/sbom#package/common-lisp-dds",
+      "from": "https://github.com/goenninger-b-t/dds/sbom#package/neodds",
       "relationshipType": "dependsOn",
       "spdxId": "https://github.com/goenninger-b-t/dds/sbom#relationship/runtime-openssl",
       "to": [
@@ -314,7 +314,7 @@
     {
       "comment": "transitive dependency (via cl-sqlite)",
       "creationInfo": "_:creationinfo",
-      "from": "https://github.com/goenninger-b-t/dds/sbom#package/common-lisp-dds",
+      "from": "https://github.com/goenninger-b-t/dds/sbom#package/neodds",
       "relationshipType": "dependsOn",
       "spdxId": "https://github.com/goenninger-b-t/dds/sbom#relationship/depends-iterate",
       "to": [
@@ -344,7 +344,7 @@
     {
       "comment": "native runtime dependency (durability SQLite backend, ADR 0049)",
       "creationInfo": "_:creationinfo",
-      "from": "https://github.com/goenninger-b-t/dds/sbom#package/common-lisp-dds",
+      "from": "https://github.com/goenninger-b-t/dds/sbom#package/neodds",
       "relationshipType": "dependsOn",
       "spdxId": "https://github.com/goenninger-b-t/dds/sbom#relationship/runtime-libsqlite3",
       "to": [
@@ -377,7 +377,7 @@
         "https://github.com/goenninger-b-t/dds/sbom#relationship/runtime-libsqlite3"
       ],
       "rootElement": [
-        "https://github.com/goenninger-b-t/dds/sbom#package/common-lisp-dds"
+        "https://github.com/goenninger-b-t/dds/sbom#package/neodds"
       ],
       "software_sbomType": [
         "source"
@@ -402,7 +402,7 @@
         "https://github.com/goenninger-b-t/dds/sbom#license/CC0-1.0",
         "https://github.com/goenninger-b-t/dds/sbom#license/CC-BY-ND-4.0",
         "https://github.com/goenninger-b-t/dds/sbom#license/Apache-2.0",
-        "https://github.com/goenninger-b-t/dds/sbom#package/common-lisp-dds",
+        "https://github.com/goenninger-b-t/dds/sbom#package/neodds",
         "https://github.com/goenninger-b-t/dds/sbom#package/bordeaux-threads",
         "https://github.com/goenninger-b-t/dds/sbom#package/cffi",
         "https://github.com/goenninger-b-t/dds/sbom#package/chipz",
@@ -419,7 +419,7 @@
         "https://github.com/goenninger-b-t/dds/sbom#sbom",
         "https://github.com/goenninger-b-t/dds/sbom#sbom"
       ],
-      "name": "common-lisp-dds SBOM",
+      "name": "neodds SBOM",
       "profileConformance": [
         "core",
         "software",

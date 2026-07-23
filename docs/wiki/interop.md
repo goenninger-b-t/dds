@@ -1,6 +1,6 @@
 # Interop with RTI Connext (and other DDS)
 
-Common Lisp DDS is built to **interoperate on the wire with RTI Connext 7.x** and at least
+NeoDDS is built to **interoperate on the wire with RTI Connext 7.x** and at least
 one open-source DDS (FR-IO). Three assets support that: the **Connext oracle/interop harness**
 under [`interop/connext/`](../../interop/connext/), the **Fast DDS peer harness** under
 [`interop/fastdds/`](../../interop/fastdds/), and the standalone **Shapes harness**

@@ -1,4 +1,4 @@
-# REQUIREMENTS — Common Lisp DDS/RTPS Stack (XCDR-based), Connext-class
+# REQUIREMENTS — NeoDDS (Common Lisp DDS/RTPS Stack, XCDR-based), Connext-class
 
 **Status:** Draft for review · **Audience:** implementing engineers + coding subagents · **Tone:** normative, terse.
 **Scope owner:** DG1SBG. **Working name in this doc:** `dds` (rename at will).

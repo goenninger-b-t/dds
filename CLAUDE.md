@@ -1,4 +1,4 @@
-# CLAUDE.md — Common Lisp DDS/RTPS Stack (XCDR-based, Connext-class core)
+# CLAUDE.md — NeoDDS (Common Lisp DDS/RTPS Stack, XCDR-based, Connext-class core)
 
 This file is the operating contract for every Claude Code session on this repository. Read it fully, then read the two authoritative specs before doing anything else.
 

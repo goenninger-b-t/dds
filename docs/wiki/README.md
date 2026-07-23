@@ -1,6 +1,6 @@
-# Common Lisp DDS — wiki
+# NeoDDS — wiki
 
-The API + use-case guide for **Common Lisp DDS** (the OMG DDS/RTPS/XCDR stack). Each page covers
+The API + use-case guide for **NeoDDS** (the OMG DDS/RTPS/XCDR stack). Each page covers
 one layer/feature area: what it's for, the public API (grounded in the source docstrings),
 and worked examples (grounded in the verified test suite under `src/dds-tests/`).
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate sbom.spdx.json — an SPDX 3.0.1 JSON-LD SBOM for Common Lisp DDS.
+"""Generate sbom.spdx.json — an SPDX 3.0.1 JSON-LD SBOM for NeoDDS.
 
 EU Cyber Resilience Act (Reg. (EU) 2024/2847, Annex I Part II §1) requires an SBOM
 "covering at the very least the top-level dependencies"; BSI TR-03183-2 is its de-facto
@@ -125,7 +125,7 @@ def main():
     author = NS + "agent/frank-goenninger"
     sbom_id = NS + "sbom"
     doc_id = NS + "document"
-    root_pkg = NS + "package/common-lisp-dds"
+    root_pkg = NS + "package/neodds"
     rt_pkg = NS + "package/sbcl"
     openssl_pkg = NS + "package/openssl"
     iterate_pkg = NS + "package/iterate"
@@ -153,7 +153,7 @@ def main():
             graph.append({"spdxId": sid, "type": "Organization", "creationInfo": ci, "name": sup})
             elements.append(sid)
     graph.append({"spdxId": tool, "type": "Tool", "creationInfo": ci,
-                  "name": "common-lisp-dds scripts/generate-sbom.py"})
+                  "name": "neodds scripts/generate-sbom.py"})
     elements.append(tool)
 
     # Licences (referenced by software_declaredLicense / dataLicense).
@@ -169,7 +169,7 @@ def main():
 
     # Root product package.
     root = {"spdxId": root_pkg, "type": "software_Package", "creationInfo": ci,
-            "name": "common-lisp-dds", "software_packageVersion": version,
+            "name": "neodds", "software_packageVersion": version,
             "software_downloadLocation": REPO_URL, "software_homePage": REPO_URL,
             "software_packageUrl": "pkg:github/goenninger-b-t/dds@" + revision,
             "software_primaryPurpose": "library", "suppliedBy": org_root,
@@ -306,7 +306,7 @@ def main():
 
     # The containing document.
     graph.append({"spdxId": doc_id, "type": "SpdxDocument", "creationInfo": ci,
-                  "name": "common-lisp-dds SBOM", "profileConformance":
+                  "name": "neodds SBOM", "profileConformance":
                   ["core", "software", "simplelicensing"], "dataLicense": lic_cc0,
                   "rootElement": [sbom_id], "element": elements + [sbom_id]})
 
