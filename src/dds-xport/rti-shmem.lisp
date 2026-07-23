@@ -372,12 +372,16 @@
     (function (t (unsigned-byte 32) (unsigned-byte 32) (unsigned-byte 32) (unsigned-byte 32)) t)
   "Write the producer's full per-record control state for a record just placed at NEW-HEAD, where OLD-HEAD
    was the cursor before this record (ADR 0081 §5.0 write-set): block A (head) positions → NEW-HEAD, block B
-   (tail) positions → OLD-HEAD, both counters bumped, and a `(-LEN, 0)` descriptor entry at the counter's
+   (tail) positions → OLD-HEAD, both counters bumped, and a `(+LEN, 0)` descriptor entry at the counter's
    slot. Called under the ring mutex.
 
-   ⚠️ The descriptor SLOT index (the counter, taken modulo COUNT-MAX) and the initial counter relationship
-   are the two facts still unvalidated against a live peer (ADR 0081 §7 slice 7b); the position and counter
-   fields themselves were measured directly. RUN-RTI-SHMEM-WRITE-ROUNDTRIP-TEST exercises this whole update."
+   THE DESCRIPTOR SIGN IS THE PRODUCER/CONSUMER HANDSHAKE, and it is why an otherwise byte-identical
+   write-set was refused for four live runs: the producer writes `+datagram_length` meaning UNCONSUMED, and
+   the consumer flips it to `-datagram_length` when it drains the record. Writing the negative made RTI read
+   a fresh record as already consumed and skip it (ADR 0081 §6 slice 7). The whole write-set — both blocks'
+   positions and counters, the slot index, and this sign — is validated against a live Connext 7.3.1 ring,
+   which accepted and consumed a record written by it. RUN-RTI-SHMEM-WRITE-ROUNDTRIP-TEST exercises the
+   update field by field."
   (let* ((a-cnt (dds.pal:load-sap-u32 sap +rti-shmem-off-a-counter+))
          (b-cnt (dds.pal:load-sap-u32 sap +rti-shmem-off-b-counter+))
          ;; The descriptor for the record that takes the counter from C to C+1 goes in slot C-1 (measured:
@@ -419,14 +423,15 @@
 
    STATE (slice 7b). Besides the record, the full producer control state is written under the lock
    (`%rti-shmem-publish-record`): block A (head) and block B (tail) positions and counters, and a
-   `(-LEN, 0)` descriptor-table entry — the complete per-record write-set measured in ADR 0081 §5.0. The
-   cursor advance `align8(LEN)` and the descriptor entry `-LEN` are both validated against a live peer.
+   `(+LEN, 0)` descriptor-table entry — the complete per-record write-set measured in ADR 0081 §5.0. The
+   cursor advance `align8(LEN)`, the descriptor slot index and the descriptor's POSITIVE sign are each
+   validated against a live peer.
 
-   ⚠️ NOT cleared for a LIVE Connext ring (slice 7b live). Two facts remain unvalidated against a running
-   peer: the descriptor SLOT index (counter mod count_max) and the initial counter relationship between the
-   two blocks. RUN-RTI-SHMEM-WRITE-ROUNDTRIP-TEST proves the write and read paths are inverses and that every
-   field is written, but a live write must be validated against a THROWAWAY participant first — a wrong field
-   corrupts a running peer rather than misreading it."
+   LIVE-VALIDATED (ADR 0081 §6 slice 7f). A record written by this function into a running RTI Connext 7.3.1
+   shared-memory ring was accepted and consumed by RTI's own consumer: the consumer's position advanced by
+   the record's footprint, its counter by one, and the data semaphore cycled — ring-level transmit
+   interoperability. Validate any change here the same way, against a THROWAWAY participant: a wrong field
+   corrupts a running peer rather than merely misreading it."
   (unless (dds.pal:sysv-sem-setval-reliable-p) (bail :setval-unavailable))
   (multiple-value-bind (props pstatus) (rti-shmem-segment-properties port)
     (when pstatus (bail pstatus))

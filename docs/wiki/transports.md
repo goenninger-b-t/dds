@@ -107,7 +107,7 @@ from the RTPS port. This package answers one question — **is that RTI peer on 
 | `rti-shmem-ring-modulus` *props* → *length* | Ring length: `receive_buffer_size + message_size_max + 8*count - 64`. |
 | `rti-shmem-record-offset` *cursor* *props* → *offset* | Where the record a control-block cursor refers to actually sits. |
 | `rti-shmem-read-record` *port* *out* → `(values octets status)` | Copies the record the producer cursor designates into `out`, or refuses with `:not-an-rtps-record`. |
-| `rti-shmem-write-record` *port* *record* *len* → `(values ok status)` | Writes `record` into the receiver's ring by the measured producer protocol (take mutex → write → advance → release → `SETVAL` wake) and signals it. Refuses `:setval-unavailable` where the platform cannot signal. |
+| `rti-shmem-write-record` *port* *record* *len* → `(values ok status)` | Writes `record` into the receiver's ring by the measured producer protocol (take mutex → write → advance → release → `SETVAL` wake) and signals it. **Live-validated: a record it wrote was accepted and consumed by a running Connext 7.3.1 receiver.** Refuses `:setval-unavailable` where the platform cannot signal. |
 
 Get the `host-id` from a discovered locator with `dds.rtps.discovery:rti-shmem-locator-host-id`.
 
@@ -173,8 +173,26 @@ read safe to *use* rather than merely safe to perform is the RTPS magic check: a
 reported as `:not-an-rtps-record` instead of being handed on as data. Verified against a live Connext 7.3.1
 ring, where it returns datagrams parsing as version 2.5, vendorId `0x0101`, `INFO_TS` first.
 
+`rti-shmem-write-record` **has been accepted by a live Connext ring.** Writing into another process's ring
+is not merely reading it back: RTI's consumer checks the producer's control state before it will take a
+record, and a record it declines is indistinguishable, from the writer's side, from one it took. Against a
+throwaway subscriber with the publisher frozen, RTI's own consumer **drained** a record this function wrote
+— its position advanced by the record's footprint, its counter by one, the data semaphore cycled.
+
+Five live iterations were needed, and the last one is the instructive one: the descriptor entry is
+`+datagram_length`, not `-datagram_length`. **The sign is the producer/consumer handshake** — the producer
+writes the positive length meaning *unconsumed*, and the consumer flips it negative when it drains. The
+original measurement read `-D` because it was taken from records that had already been consumed, so writing
+`-D` made RTI read a brand-new record as spent and skip it. It woke, found nothing to do, and re-parked,
+which is exactly what a correct-looking write-set with one wrong field looks like from outside.
+
+A synthetic round-trip cannot catch that. This stack's writer and reader were inverses of each other for
+four live runs while RTI rejected every record. **Interop is established against the other implementation or
+not at all.**
+
 The layout is **measured, not published**. See [ADR 0081](../adr/0081-rti-connext-shared-memory-interoperability.md)
-for what was established and how, and `interop/connext/shmem-layout/` to reproduce it.
+for what was established and how, and `interop/connext/shmem-layout/` to reproduce it — including
+`ring-records.lisp`, which parses, replays and re-issues ring records using this stack's own RTPS parser.
 
 ### The PAL contract — `dds.pal`
 

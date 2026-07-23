@@ -510,7 +510,8 @@ we must still match.
    - (b) **code done; live validation deferred.** `rti-shmem-write-record` now writes the *full* producer
      control state under the lock (`%rti-shmem-publish-record`): block A (head) and block B (tail) positions
      and counters, and the `(-datagram_length, 0)` descriptor entry — the complete write-set measured in
-     §5.0, not just the cursor. `run-rti-shmem-write-roundtrip-test` verifies every field (A leads B by one
+     §5.0, not just the cursor. (**That sign is wrong**, and finding out why took four live runs — see (f).
+     The producer writes `+datagram_length`; the negative is what the *consumer* writes on drain.) `run-rti-shmem-write-roundtrip-test` verifies every field (A leads B by one
      footprint, both counters bump, the descriptor is the negated length) and that write/read remain
      inverses; falsifying the descriptor sign or the counter bump turns it red. Two facts stay unvalidated
      against a **live** peer — the descriptor slot index (counter mod count_max) and the initial counter
@@ -578,10 +579,44 @@ we must still match.
      field ending in sync at the new head and the data semaphore cycling `0 -> 1 -> 0`. **A record written by
      this stack, into a live RTI Connext shared-memory ring, was accepted and consumed by RTI's own
      consumer.** Ring-level SHMEM transmit interoperability is achieved. What is not yet separately shown is
-     RTI's *application-level* delivery of a USER-DATA sample (the replayed record was a participant-message,
-     so the subscriber's `issue received` count — which counts user samples — did not move); writing a valid
-     user DATA record and seeing that count advance is the remaining end-to-end confirmation, but the hard
-     part — RTI accepting a record our writer produced — is done.
+     RTI's *application-level* delivery of a USER-DATA sample: the subscriber's `issue received` count did
+     not move.
+   - (g) **Why that count did not move — the first explanation was wrong, and the correction is the whole of
+     slice 7c.** The run was recorded as having replayed a participant-message, i.e. a record carrying no
+     application sample. Re-parsing the captured record with this stack's own RTPS parser
+     (`interop/connext/shmem-layout/ring-records.lisp`, mode `analyze`) shows otherwise:
+
+     ```
+     @ 20 INFO_TS  flags=0x01 octetsToNextHeader=8
+     @ 32 DATA     flags=0x05 octetsToNextHeader=28
+     DATA readerId=0x00000000 writerId=0x80000003 (USER-DEFINED) SN=2 payload=8 octets
+     ```
+
+     `0x80000003` is a **user-defined** EntityId_t — RTPS 2.5 §9.3.1.2 puts the class in the two most
+     significant bits of `entityKind`, and `0x03` is `00` (user-defined writer), not the `11` of a builtin.
+     So the record RTI accepted *was* an application sample. It was dropped above the ring for a different
+     reason: **its sequence number had already been delivered.** Every record still lying in the ring has by
+     definition been consumed, so a verbatim replay is a duplicate, and RTPS suppresses it before the
+     application (§8.4.13.2 best-effort accepts only `SN > max received`; §8.4.12 does not re-deliver an
+     already-received change). The replayed record carried `SN 2` while the subscriber's log had already
+     reached seven issues.
+
+     This matters beyond the bookkeeping: it says the remaining gap is **not** another unmapped segment
+     field. The write-set is complete and the record kind was right all along. What a verbatim replay can
+     never produce is a *fresh* sequence number, so that is the one thing slice 7c changes.
+   - **Slice 7c — re-issue at the next sequence number.** `live-userdata-retest.sh` stages a throwaway pair,
+     freezes the publisher, scans the ring for the newest user-data record, rewrites its `writerSN` to
+     `SN + 1` (and a co-resident HEARTBEAT's `lastSN` with it, so the announced range does not contradict the
+     sample) and writes it. The oracle is the subscriber's `issue received` counter; the control that makes
+     it conclusive is that **the publisher is frozen**, so nothing but our record can move it — and the
+     script proves the freeze took, by requiring the counter to stand still for two seconds before writing,
+     rather than assuming it.
+
+     The parse-and-patch logic is falsified off-line before it is ever aimed at a live ring (mode `selftest`,
+     twelve checks against the real captured record): the patched sequence number must read back through the
+     production parser, and — the checks that give that one its meaning — a one-octet-off patch and a
+     wrong-byte-order patch must **not** read back, a builtin `writerId` must not classify as user data, and
+     a truncated record must be refused rather than half-parsed. Breaking the offset constant turns it red.
 
 ## 7. Consequences and risks
 
