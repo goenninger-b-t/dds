@@ -546,9 +546,17 @@ we must still match.
      dead source no matter how correct the write-set is, and its receive thread may no longer be waiting on
      the data semaphore at all. So none of the three runs was a fair test of acceptance. The fix is to
      **`SIGSTOP`** the publisher instead — frozen, not dead, so the consumer stays matched and listening while
-     the ring is static — and to re-open the exact `idx4` semantics (it varies at rest, so it encodes
-     something beyond the head). Until a `SIGSTOP`-based run shows the consumer counter advancing, transmit is
-     unproven; the write mechanics and every measured field are correct as far as they go.
+     the ring is static.
+   - **The fair (frozen-publisher) run STILL did not show acceptance.** Every writer field moved correctly —
+     head +64, `idx4 = head + 4` (this drained state read +4, so the earlier +0 was a transient and `idx4` is
+     fine), both counters +1, block B tracking, the descriptor in the right slot — yet the consumer's
+     position and counter did not move. So the kill-unmatch was not the (whole) cause: the writer is missing
+     something upstream of the fields we have mapped. The one unexamined link is the WAKE — the write does
+     `semctl(datasem, SETVAL, 1)`, but whether that wakes RTI's consumer (or it polls, or waits on something
+     else) has never been observed. The retest now reads the data semaphore before the write, right after our
+     SETVAL, and after a settle: `1 then 1` = the consumer never woke; `1 then 0` = it woke but did not
+     consume. That reading is the next decisive datum. **Transmit remains unproven after four live attempts;
+     the read path (slices 1–6) is complete, live-validated, and unaffected.**
 
 ## 7. Consequences and risks
 
