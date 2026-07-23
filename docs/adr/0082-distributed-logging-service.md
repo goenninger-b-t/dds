@@ -56,9 +56,11 @@ module dds { module log {
 
   @extensibility(APPENDABLE)
   struct LogEvent {
-    @key string<64> host;        // node identity
-    @key uint32     process;     // OS process id
-    uint32          thread;      // informational
+    @key string<64> host;             // node identity
+    @key uint32     process;          // OS process id
+    string<40>      participant_uuid; // DDS participant UUID; detected once at logger creation
+    string<46>      host_ip;          // host machine IP address; detected once at logger creation
+    uint32          thread;           // informational
     uint64          sequence;    // per-source monotonic; gaps are visible loss
     int64           timestamp;   // UTC nanoseconds since the POSIX epoch
     Severity        severity;
@@ -93,6 +95,12 @@ Four decisions in that struct are load-bearing:
   incompatible with its Connext twin (ADR 0009) — unbounded is not an option here.
 - **`event_kind` and `elapsed_ns` are fields, not prose.** "EXIT after 12 us" parsed back out of a message is
   not structured logging. This is why TRACE belongs in slice 1: adding these later is a wire change.
+- **`participant_uuid` and `host_ip` are per-source identity on the wire, detected once at logger creation**
+  (owner directive, 2026-07-23). They ride the event because a *collector* renders a *remote* source's line
+  and must show that source's identity, not the collector's — a formatter-local value cannot do that. They
+  are non-key (the instance key stays `(host, process)`), constant per logger, and stamped on every event.
+  Because `LogEvent` is `@appendable`, they were added compatibly (a reader that predates them stops at the
+  DHEADER extent). They render in the text format directly after the timestamp (§7).
 
 **Keyed on `(host, process)`** — one instance per logging process. That buys per-source ordering and history,
 lets a dead process's instance be disposed and its resources reclaimed, and makes RESOURCE_LIMITS per-source,
@@ -193,17 +201,21 @@ Both are **structs of closures**, the same vtable pattern the durability store u
 must be formattable by a formatter function" is satisfied literally: the formatter *is* a function, and
 replacing it is a configuration change.
 
-**Text format**, deduced from the owner's examples and pinned here:
+**Text format**, deduced from the owner's examples, extended per the owner directive of 2026-07-23
+(participant UUID + host IP directly after the timestamp), and pinned here:
 
 ```
-2026-07-23T11:28:53.645329Z | NOTICE | SUP | gbt_sup_log() - gbttctools/src/core/l6/sup/sup.c:93 | supervisor up with 2 children
-2026-07-23T11:20:13.501947Z | CRIT   | MEM | gbt_tc_core_mem_init() - gbttctools/src/src.c:1234 | Segmentation Fault encountered. …
+2026-07-23T11:28:53.645329Z | 8b619879-4ffe-4fca-ad01-05b39d987dbc | 192.168.2.148 | NOTICE | SUP | gbt_sup_log() - gbttctools/src/core/l6/sup/sup.c:93 | supervisor up with 2 children
+2026-07-23T11:20:13.501947Z | 8b619879-4ffe-4fca-ad01-05b39d987dbc | 192.168.2.148 | CRIT   | MEM | gbt_tc_core_mem_init() - gbttctools/src/src.c:1234 | Segmentation Fault encountered. …
 ```
 
-Five ` | `-separated fields: ISO 8601 UTC with **six** fractional digits and a `Z`; severity **left-aligned in
-6 columns**; category; `<function>() - <file>:<line>`; message. The 6-column severity is what fixes the
-spelling: `NOTICE` is 6 characters and is the longest name that fits, so **`WARNING` is rendered `WARN`**.
-Both example lines are golden test vectors (§8).
+Seven ` | `-separated fields: ISO 8601 UTC with **six** fractional digits and a `Z`; the **participant UUID**;
+the **host machine IP address**; severity **left-aligned in 6 columns**; category; `<function>() -
+<file>:<line>`; message. The participant UUID and host IP come from the `participant_uuid` / `host_ip` event
+fields (§3), so a collector renders the originating logger's identity even for a remote source; both are
+detected once when the logger instance is created. The 6-column severity is what fixes the spelling: `NOTICE`
+is 6 characters and is the longest name that fits, so **`WARNING` is rendered `WARN`**. Both example lines
+are golden test vectors (§8); the UUID/IP shown are illustrative and are supplied by the emitting logger.
 
 **JSON**: newline-delimited, one object per event — the framing logstash's `json_lines` codec expects, and
 the framing `filebeat` and `vector` read unchanged. The escaper is hand-written: a log object is a fixed

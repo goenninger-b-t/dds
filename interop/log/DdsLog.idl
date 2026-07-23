@@ -1,0 +1,40 @@
+// DdsLog — the distributed logging service wire type (ADR 0082 §3, FR-LOG).
+//
+// KEPT IN LOCKSTEP with src/dds-log/event.lisp's dds.gen:define-dds-type form, exactly as
+// interop/perftest/common/PerfData.idl mirrors dds.bench's perf-data — the same discipline for the
+// same reason: a foreign publisher (Connext / Fast DDS) is generated from THIS IDL, and any
+// divergence between the IDL and the Lisp type is a match failure nobody can see. If you change one,
+// change the other, and re-verify with `make corpus` (byte-exact) + the live interop legs.
+//
+// Severity values are the syslog numbering of RFC 5424 §6.2.1 Table 2, so the mapping to a UDP syslog
+// sink is the identity. TRACE (8) extends the range below DEBUG; RFC 5424 defines 0..7 only.
+
+module dds { module log {
+
+  enum Severity { SEV_EMERG = 0, SEV_ALERT = 1, SEV_CRIT  = 2, SEV_ERR   = 3,
+                  SEV_WARN  = 4, SEV_NOTICE= 5, SEV_INFO  = 6, SEV_DEBUG = 7,
+                  SEV_TRACE = 8 };
+
+  enum EventKind { EV_MESSAGE, EV_ENTRY, EV_EXIT };
+
+  @extensibility(APPENDABLE)
+  struct LogEvent {
+    @key string<64> host;             // node identity
+    @key uint32     process;          // OS process id
+    string<40>      participant_uuid; // DDS participant UUID; detected once at logger creation
+    string<46>      host_ip;          // host machine IP address; detected once at logger creation
+    uint32          thread;           // informational
+    uint64          sequence;    // per-source monotonic; gaps are visible loss
+    int64           timestamp;   // UTC nanoseconds since the POSIX epoch
+    Severity        severity;
+    string<16>      category;    // "SUP", "MEM"
+    string<128>     function;
+    string<256>     file;
+    uint32          line;
+    EventKind       event_kind;
+    uint64          elapsed_ns;  // EV_EXIT only; 0 otherwise
+    boolean         truncated;   // message exceeded its bound
+    string<1024>    message;
+  };
+
+}};

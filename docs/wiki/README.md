@@ -29,6 +29,7 @@ and worked examples (grounded in the verified test suite under `src/dds-tests/`)
 | [Interop with RTI Connext](interop.md) | `interop/connext`, `interop/fastdds`, `dds-shapes` | the Connext oracle/interop harness, the Fast DDS peer harness, the Shapes harness, tshark wire validation |
 | [Durability & DARE](durability.md) | `dds-durability`, `dds-dare` | TRANSIENT_LOCAL retention + late-joiner replay, the TRANSIENT/PERSISTENT durability service, dedup, always-on CNSA-2.0 Data-At-Rest Encryption |
 | [Security](security.md) | `dds-security` | the DDS-Security 1.1 Cryptographic plugin — the AES256-GCM `SecuredPayload` wire format + the §9.5.3.3.4.2 HMAC-SHA256 session-key KDF |
+| [Distributed logging](logging.md) | `dds-log` | the `LogEvent` wire type (ADR 0082) — `@appendable`, source-keyed, bounded, RFC 5424 severities; the emit path/formatters/sinks/service are follow-on slices |
 
 ## Conventions used in the examples
 

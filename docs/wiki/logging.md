@@ -1,0 +1,60 @@
+# Distributed logging service — `dds.log`
+
+The logging service (ADR 0082, FR-LOG) is an in-scope exception to the "no Connext service suite" rule: a `LogEvent` wire type plus a collector that renders structured JSON, text, and aggregator output. This page tracks what has landed.
+
+**Status: the wire type is landed (slice 1 / Task 4).** The emit API, formatters, sinks, the service, the multi-service runner, the OTP-style supervisor, and the `log-service-main` CLI are follow-on slices (ADR 0082 §9). This page will grow with them.
+
+## The `LogEvent` wire type
+
+`LogEvent` (ADR 0082 §3) is `@appendable`, source-keyed on `(host, process)`, and bounded throughout. It is defined by a `dds.gen:define-dds-type` form in `src/dds-log/event.lisp` and kept in **lockstep** with `interop/log/DdsLog.idl` — a foreign publisher (Connext / Fast DDS) is generated from the IDL, and a divergence between the two is a match failure nobody can see (the same discipline `interop/perftest/common/PerfData.idl` follows). It is the first non-trivial user of the type compiler's slice-1 additions — bounded strings, enums, and `@appendable` (Tasks 1–3).
+
+Four decisions in the struct are load-bearing (ADR 0082 §3): `timestamp` is a field, not the DDS source timestamp (a queue sits between the log call and `write()`); `sequence` is per-source monotonic so a collector can compute loss independently of the publisher's drop counters; the bounds are a permanent contract (`@appendable` lets fields be *added* compatibly, not string bounds *widened*); and `event_kind`/`elapsed_ns` are fields, not prose parsed back out of a message.
+
+### API reference — `dds.log`
+
+- **`dds.log:log-event`** / **`dds.log:make-log-event`** / **`dds.log:log-event-p`** — the generated struct, its raw constructor, and its predicate. Accessors `log-event-{host,process,participant-uuid,host-ip,thread,sequence,timestamp,severity,category,function,file,line,event-kind,elapsed-ns,truncated,message}`. `participant-uuid` (the DDS participant UUID) and `host-ip` (the host machine IP) are per-source identity detected once at logger creation and stamped on every event, so a collector renders the *originating* logger's identity even for a remote source (owner directive 2026-07-23); in the text format they render directly after the timestamp. `severity` and `event-kind` accessors take/return a **keyword** (`:crit`, `:exit`); an undecodable wire value reads back as the raw `int32` (never an invented keyword). `serialize-log-event` / `deserialize-log-event` / `serialized-size-log-event` are the generated `@appendable` codecs (XCDR2 = `D_CDR2_LE 0x0009` + a DHEADER; XCDR1 = no DHEADER, rule 29).
+- **`dds.log:build-log-event`** — the constructor a logging call should use. It **truncates** each bounded string to its octet bound rather than refusing it — a logging call must never fail because a value is long — and sets `truncated` **T** iff the *message* was truncated (the IDL semantics: "message exceeded its bound"). `host`/`category`/`function`/`file` truncate silently. All truncation is on a UTF-8 codepoint boundary.
+- **`dds.log:truncate-utf8`** — `(string max-octets) → (values result truncated-p)`. Truncates to at most `max-octets` UTF-8 octets on a codepoint boundary (never mid-character, RFC 3629 §3). The per-character octet width is derived from the code point.
+- **`dds.log:+severity-emerg+` … `+severity-trace+`** — the RFC 5424 §6.2.1 Table 2 syslog severity values (`emerg=0` … `debug=7`), plus `+severity-trace+ = 8`, this stack's extension below `DEBUG`. Pinning the numbering to RFC 5424 makes the UDP-syslog `PRI = facility*8 + severity` mapping the identity. **These are read from the RFC and cited at the definition, never recalled** — a severity table is exactly the shape of thing that feels too familiar to check.
+- **`dds.log:severity-to-i32` / `severity-from-i32` / `event-kind-to-i32` / `event-kind-from-i32`** — the enum ↔ int32 converters. `-from-i32` returns `(values nil :unknown-enum-value)` for a value this build does not declare.
+- **`dds.log:+log-event-{host,category,function,file,message}-bound+`** — the declared octet bounds (`message` is 1024).
+
+### Example
+
+```lisp
+(let ((e (dds.log:build-log-event
+          :host "node-1" :process 4242
+          :participant-uuid "8b619879-4ffe-4fca-ad01-05b39d987dbc" :host-ip "192.168.2.148"
+          :severity :crit :category "MEM"
+          :function "gbt_tc_core_mem_init()" :file "gbttctools/src/src.c" :line 1234
+          :event-kind :exit :elapsed-ns 12000 :message "Segmentation Fault encountered")))
+  (assert (eq :crit (dds.log:log-event-severity e)))
+  (assert (string= "192.168.2.148" (dds.log:log-event-host-ip e)))
+  (assert (null (dds.log:log-event-truncated e))))   ; message fit its bound
+
+;; A message past 1024 octets truncates (on a codepoint boundary) and sets the flag — never refused.
+(let ((e (dds.log:build-log-event :message (make-string 2000 :initial-element #\x))))
+  (assert (eq t (dds.log:log-event-truncated e)))
+  (assert (= 1024 (length (dds.log:log-event-message e)))))
+```
+
+### Text format (spec — rendered by the formatter slice)
+
+The collector's text renderer emits seven ` | `-separated fields (ADR 0082 §7), extended per the owner directive of 2026-07-23 to carry the source identity directly after the timestamp:
+
+```
+<ISO-8601-UTC.6frac Z> | <participant-uuid> | <host-ip> | <SEVER> | <category> | <function>() - <file>:<line> | <message>
+```
+
+Severity is left-aligned in 6 columns (so `WARNING` renders `WARN`, the longest name that fits being `NOTICE`). The `participant-uuid` and `host-ip` come from the event fields, so the line reflects the originating logger even when a collector renders a remote source. The formatter itself (text + JSON, as replaceable closures) is a follow-on slice; this defines the format it produces.
+
+### Interop status (inherited TypeObject notes)
+
+The type exercises two TypeObject paths that were flagged as debt in Tasks 1–2 and have since been checked against a live Connext peer (direction: our reader ← foreign writer):
+
+- `message` is bound **1024 > 255**, so it emits **`TI_STRING8_LARGE`** — confirmed to interoperate against a Connext `string<1024>` writer (`interop/string-large/`).
+- the `severity`/`event_kind` enum members emit **`TK_INT32`**, not `TK_ENUM` (the serializer cannot yet emit a `MinimalEnumeratedType`) — Connext **coerces** `TK_ENUM ↔ TK_INT32` under its default `ALLOW_TYPE_COERCION`, in both directions (`interop/enum-typeobject/`).
+
+Still open: byte-exact `LogEvent` corpus vectors and the live Connext/Fast DDS **publisher** legs feeding our reader (FR-IO-1/2) — the next slice.
+
+See also: [Type system & code generation](type-system.md) for the `define-dds-type` DSL this is built on, and [CDR codec, buffers & the arena](cdr-and-memory.md) for the UTF-8 string codec.

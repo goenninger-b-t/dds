@@ -287,24 +287,24 @@ and skips the remainder. That is exactly what makes adding a field compatible.
   timestamp,severity,category,function,file,line,event-kind,elapsed-ns,truncated,message}`;
   `dds.log:+severity-emerg+` … `+severity-trace+`; `dds.log:make-log-event`.
 
-- [ ] **Step 1: Read RFC 5424 §6.2.1 Table 2** and write the severity values down from the RFC text.
+- [x] **Step 1: Read RFC 5424 §6.2.1 Table 2** and write the severity values down from the RFC text.
   Do not type them from memory — this project's most expensive bug class is a recalled wire constant.
   Cite `RFC 5424 §6.2.1` in the docstring of each constant.
-- [ ] **Step 2: Write `interop/log/DdsLog.idl`** exactly as ADR 0082 §3 specifies, with a header
+- [x] **Step 2: Write `interop/log/DdsLog.idl`** exactly as ADR 0082 §3 specifies, with a header
   comment stating it is kept in lockstep with `event.lisp` (mirroring `interop/perftest/PerfData.idl`).
-- [ ] **Step 3: Write the failing test** in `src/dds-tests/log-test.lisp`: construct a `log-event` with
+- [x] **Step 3: Write the failing test** in `src/dds-tests/log-test.lisp`: construct a `log-event` with
   every field set, serialize, deserialize, assert every field round-trips; assert a message longer than
   1024 octets is **truncated with `truncated` set T**, not refused and not silently cut; assert the
   severity constants equal the RFC values.
-- [ ] **Step 4: Run it, watch it fail** (no such package `DDS.LOG`).
-- [ ] **Step 5: Implement** `packages.lisp` + `event.lisp` with the `define-dds-enum` forms and the
+- [x] **Step 4: Run it, watch it fail** (no such package `DDS.LOG`).
+- [x] **Step 5: Implement** `packages.lisp` + `event.lisp` with the `define-dds-enum` forms and the
   `define-dds-type` from ADR 0082 §3, plus `dds-log.asd` (`:depends-on ("dds-core" "dds-pal" "dds-qos"
   "dds-types" "dds-gen" "dds-disc" "dds-dcps")`, `:serial t`). Add `"dds-log"` to `dds-tests.asd`
   `:depends-on` and a `(:file "log-test")` component.
-- [ ] **Step 6: Run, watch it pass.**
+- [x] **Step 6: Run, watch it pass.**
 - [ ] **Step 7: Capture corpus vectors.** Add `LogEvent` to the corpus (`scripts/capture-corpus.sh`,
   `make corpus`) in **both endiannesses**. These are the vectors a foreign publisher is checked against.
-- [ ] **Step 8: Both suites + `make corpus` + `make gate-types`.**
+- [x] **Step 8: Both suites + `make corpus` + `make gate-types`.**
 - [ ] **Step 9: Commit.**
 
 ---
