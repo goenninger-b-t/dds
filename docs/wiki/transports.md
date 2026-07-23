@@ -106,6 +106,7 @@ from the RTPS port. This package answers one question — **is that RTI peer on 
 | `rti-shmem-ring-start` *count* → *offset* | Where the record ring begins: `240 + 8*count`. |
 | `rti-shmem-ring-modulus` *props* → *length* | Ring length: `receive_buffer_size + message_size_max + 8*count - 64`. |
 | `rti-shmem-record-offset` *cursor* *props* → *offset* | Where the record a control-block cursor refers to actually sits. |
+| `rti-shmem-read-record` *port* *out* → `(values octets status)` | Copies the record the producer cursor designates into `out`, or refuses with `:not-an-rtps-record`. |
 
 Get the `host-id` from a discovered locator with `dds.rtps.discovery:rti-shmem-locator-host-id`.
 
@@ -163,6 +164,13 @@ has been written — so `rti-shmem-record-offset` is the only correct way to loc
 from the cursor appears to land on the `RTPS` magic and does, but only until the ring first wraps, after
 which it addresses nothing. That coincidence was recorded as fact during the reconstruction and had to be
 retracted; the function exists so no call site repeats it.
+
+`rti-shmem-read-record` is an **observer, not a receive path**. It takes no lock, so it can read a record
+while the producer is rewriting it — the mutex at `0xB00000+port` *is* taken on the data path (measured:
+held ~210 ns per message, and contended), and a real receive path must honour it. What makes an unlocked
+read safe to *use* rather than merely safe to perform is the RTPS magic check: a torn or mislocated read is
+reported as `:not-an-rtps-record` instead of being handed on as data. Verified against a live Connext 7.3.1
+ring, where it returns datagrams parsing as version 2.5, vendorId `0x0101`, `INFO_TS` first.
 
 The layout is **measured, not published**. See [ADR 0081](../adr/0081-rti-connext-shared-memory-interoperability.md)
 for what was established and how, and `interop/connext/shmem-layout/` to reproduce it.

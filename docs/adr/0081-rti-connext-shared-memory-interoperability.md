@@ -400,7 +400,16 @@ we must still match.
    segment size matches `ipcs` exactly.
 5. Ring and framing — **partially measured, not implemented.** Geometry and record format are in §5.0;
    the producer/consumer roles, wraparound and synchronisation are still open. No code reads the ring yet.
-6. Receive a real RTPS datagram from Connext over shared memory.
+6. **Receive** — (a) landed: the ring address arithmetic as code, tested against the nine measured
+   (cursor → offset) pairs rather than against a second copy of the formula. (b) landed:
+   `rti-shmem-read-record` copies the record the producer cursor designates out of a live ring, refusing
+   with `:not-an-rtps-record` rather than handing on a torn or mislocated read. **Live-validated against a
+   Connext 7.3.1 ring**, returning datagrams that parse as RTPS 2.5, vendorId `0x0101`, `INFO_TS` first —
+   the first RTPS datagram this stack has read out of an RTI shared-memory segment.
+
+   ⚠️ It is an **observer, not a receive path**: it takes no lock. The mutex is measured as real and
+   contended, so a delivery path must honour it, and that needs the `semop` ordering (still unmeasured).
+   The magic check is what makes the unlocked read safe to use — refusal instead of corruption.
 7. Transmit.
 
 ## 7. Consequences and risks

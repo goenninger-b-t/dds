@@ -4017,6 +4017,7 @@
                  ("rti-shmem-recognition"    . dds.xport.rti-shmem:run-rti-shmem-recognition-test)
                  ("rti-shmem-properties"     . dds.xport.rti-shmem:run-rti-shmem-properties-test)
                  ("rti-shmem-ring-address"   . dds.xport.rti-shmem:run-rti-shmem-ring-address-test)
+                 ("rti-shmem-read-record"    . dds.xport.rti-shmem:run-rti-shmem-read-record-test)
                  ("zc-ref-codec"             . run-zc-ref-codec-test)
                  ("zc-sedp-flag"             . run-zc-sedp-flag-test)
                  ("zc-resolve-drop"          . run-zc-resolve-drop-test)

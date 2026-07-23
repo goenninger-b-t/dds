@@ -267,6 +267,60 @@
   (+ (rti-shmem-ring-start (rti-shmem-properties-received-message-count-max props))
      (mod (- cursor +rti-shmem-cursor-bias+) (rti-shmem-ring-modulus props))))
 
+(defconstant +rti-shmem-off-cursor+ #x78
+  "Byte offset of the control block whose first field is the producer's cumulative byte cursor. Established
+   by stopping the consumer and watching which fields kept moving (ADR 0081 §5.0).")
+
+(defconstant +rti-shmem-rtps-magic+ #x53505452
+  "The four octets every RTPS message begins with — 'R','T','P','S' (RTPS 2.5 §8.3.3.1.1) — read as one
+   native 32-bit word, the same way +RTI-SHMEM-HEADER-MAGIC+ stores its octets. Records in an RTI
+   shared-memory ring are complete RTPS datagrams stored verbatim, so this is both how a record is
+   recognised and the reason no bespoke framing decoder is needed: what comes out of the ring is exactly
+   what the existing RTPS parser already accepts.")
+
+(defun* rti-shmem-read-record (port out)
+    (function ((unsigned-byte 16) (simple-array (unsigned-byte 8) (*)))
+              (values (unsigned-byte 32) (or null keyword)))
+  "Copy the record the producer cursor currently designates, in the RTI Connext receiver serving RTPS PORT,
+   into OUT. Returns (values octets-copied NIL), or (values 0 status).
+
+   Status is :NO-SUCH-SEGMENT, :NOT-AN-RTI-SHMEM-SEGMENT, :UNVALIDATED-SHMEM-PROTOCOL-VERSION or
+   :IMPLAUSIBLE-SEGMENT-PROPERTIES from the property read, or :NOT-AN-RTPS-RECORD when the computed
+   location does not begin with the RTPS magic.
+
+   ⚠️ THIS IS AN OBSERVER, NOT A RECEIVE PATH. It takes no lock, so it can read a record while the producer
+   is rewriting it — the mutex at `0xB00000+port` IS taken on the data path (measured: held ~210 ns per
+   message, contended) and a real receive path must honour it. Doing so needs the `semop` ordering, which is
+   not yet measured (ADR 0081 §5.0). Reading without the lock is sound for what this is for — validating the
+   address arithmetic against a live peer and diagnostics — and is not sound for delivering samples.
+
+   The magic check is what makes an unlocked read safe to USE rather than merely safe to perform: a torn or
+   mislocated read is reported as :NOT-AN-RTPS-RECORD instead of being handed on as data.
+
+   Untrusted input throughout (NFR-SEC-POSTURE): the segment belongs to another process, the copy is bounded
+   by both OUT's length and the ring's end, and the ring extent is itself derived from properties the kernel
+   has already corroborated."
+  (multiple-value-bind (props status) (rti-shmem-segment-properties port)
+    (when status (bail status))
+    (let* ((ring-start (rti-shmem-ring-start (rti-shmem-properties-received-message-count-max props)))
+           (ring-end (+ ring-start (rti-shmem-ring-modulus props)))
+           (size (rti-shmem-properties-segment-size props)))
+      (when (> ring-end size) (bail :implausible-segment-properties))
+      (multiple-value-bind (segment astatus)
+          (dds.pal:sysv-shm-attach-readonly (rti-shmem-segment-key port) size)
+        (when astatus (bail astatus))
+        (let* ((sap (dds.pal:sysv-shm-sap segment))
+               (offset (rti-shmem-record-offset (dds.pal:load-sap-u32 sap +rti-shmem-off-cursor+) props))
+               (avail (if (and (>= offset ring-start) (< offset ring-end)) (- ring-end offset) 0))
+               (n (min (length out) avail))
+               ;; Check the magic BEFORE copying: a mislocated read then costs nothing.
+               (magic-p (and (>= avail 4)
+                             (= (dds.pal:load-sap-u32 sap offset) +rti-shmem-rtps-magic+))))
+          (when magic-p
+            (dotimes (i n) (setf (aref out i) (dds.pal:load-sap-u8 sap (+ offset i)))))
+          (dds.pal:sysv-shm-detach segment)
+          (if magic-p (values n nil) (values 0 :not-an-rtps-record)))))))
+
 (defconstant +rti-shmem-test-port+ 65432
   "RTPS port used by RUN-RTI-SHMEM-RECOGNITION-TEST to key its synthetic segment. Chosen so the derived
    System V key cannot collide with a live Connext participant: no domain maps to it (7400+250*d+10+2*i
@@ -466,3 +520,71 @@
             (assert (= (rti-shmem-record-offset (car p) props) (cdr p)) ()   ; HOTPATH-COND(TEST): in-file self-test
                     "cursor ~d in (~d ~d ~d): got offset ~d, MEASURED ~d"
                     (car p) rbs msm count (rti-shmem-record-offset (car p) props) (cdr p))))))))
+
+(defconstant +rti-shmem-read-test-port+ 65430
+  "RTPS port for RUN-RTI-SHMEM-READ-RECORD-TEST's synthetic segment; distinct from the other self-tests'
+   ports so none of them can collide on a System V key.")
+
+(defun* run-rti-shmem-read-record-test ()
+    (function () (eql t))
+  "ADR 0081 slice 6b: RTI-SHMEM-READ-RECORD must land on the record the cursor designates, and must refuse
+   rather than hand on anything that is not one.
+
+   The segment is built here, with a geometry taken from a REAL measured configuration —
+   receive_buffer_size 2048, message_size_max 2048, count 8, segment 4456 — so ring start is 304 and the
+   modulus 4096, exactly as measured from live Connext. A cursor of 644 must therefore resolve to offset
+   880, and a record is planted precisely there.
+
+     1. a planted record at the computed offset reads back byte-for-byte;
+     2. the SAME cursor after the magic is broken -> :NOT-AN-RTPS-RECORD, not garbage;
+     3. a cursor whose record was never planted -> :NOT-AN-RTPS-RECORD.
+
+   Cases 2 and 3 are the point. The reader takes no lock, so it CAN read a record mid-rewrite; the magic
+   check is what converts that from silent corruption into a refusal, and a test that only planted a good
+   record would never exercise it."
+  (let* ((port +rti-shmem-read-test-port+)
+         (key (rti-shmem-segment-key port))
+         (size 4456) (rbs 2048) (msm 2048) (cnt 8)
+         (cursor 644) (expect-offset 880)
+         (payload #(#x52 #x54 #x50 #x53 #x02 #x05 #x01 #x01 #xDE #xAD #xBE #xEF)))
+    (multiple-value-bind (stale st) (dds.pal:sysv-shm-attach-readonly key +rti-shmem-header-bytes+)
+      (declare (ignore st))
+      (when stale (dds.pal:sysv-shm-destroy stale) (dds.pal:sysv-shm-detach stale)))
+    (multiple-value-bind (seg status) (dds.pal:sysv-shm-create key size)
+      (assert (null status) () "System V shm unusable (~s)" status)   ; HOTPATH-COND(TEST): in-file self-test
+      (unwind-protect
+           (let ((sap (dds.pal:sysv-shm-sap seg))
+                 (out (make-array 32 :element-type '(unsigned-byte 8))))
+             (%rti-shmem-put-u32-le sap +rti-shmem-off-magic+ +rti-shmem-header-magic+)
+             (%rti-shmem-put-u32-le sap +rti-shmem-off-protocol-major+ +rti-shmem-protocol-major-validated+)
+             (%rti-shmem-put-u32-le sap +rti-shmem-off-segment-size+ size)
+             (%rti-shmem-put-u32-le sap +rti-shmem-off-receive-buffer-size+ rbs)
+             (%rti-shmem-put-u32-le sap +rti-shmem-off-message-size-max+ msm)
+             (%rti-shmem-put-u32-le sap +rti-shmem-off-received-message-count-max+ cnt)
+             (%rti-shmem-put-u32-le sap +rti-shmem-off-cursor+ cursor)
+             ;; The arithmetic must agree with the measurement before anything is planted by it.
+             (let ((props (make-rti-shmem-properties :segment-size size :receive-buffer-size rbs
+                                                     :message-size-max msm
+                                                     :received-message-count-max cnt)))
+               (assert (= (rti-shmem-record-offset cursor props) expect-offset) ()   ; HOTPATH-COND(TEST): in-file self-test
+                       "cursor ~d must resolve to the measured offset ~d, got ~d"
+                       cursor expect-offset (rti-shmem-record-offset cursor props)))
+             (dotimes (i (length payload))
+               (dds.pal:store-sap-u8 sap (+ expect-offset i) (aref payload i)))
+             (multiple-value-bind (n st) (rti-shmem-read-record port out)
+               (assert (and (plusp n) (null st)) () "a planted record must read, got ~s/~s" n st)   ; HOTPATH-COND(TEST): in-file self-test
+               (dotimes (i (length payload))
+                 (assert (= (aref out i) (aref payload i)) ()   ; HOTPATH-COND(TEST): in-file self-test
+                         "octet ~d: read ~2,'0X, planted ~2,'0X" i (aref out i) (aref payload i))))
+             (dds.pal:store-sap-u8 sap expect-offset #x00)      ; break the magic where the cursor points
+             (multiple-value-bind (n st) (rti-shmem-read-record port out)
+               (assert (and (zerop n) (eq st :not-an-rtps-record)) ()   ; HOTPATH-COND(TEST): in-file self-test
+                       "a broken magic must be refused, got ~s/~s" n st))
+             (dds.pal:store-sap-u8 sap expect-offset #x52)
+             (%rti-shmem-put-u32-le sap +rti-shmem-off-cursor+ (+ cursor 128))   ; nothing planted there
+             (multiple-value-bind (n st) (rti-shmem-read-record port out)
+               (assert (and (zerop n) (eq st :not-an-rtps-record)) ()   ; HOTPATH-COND(TEST): in-file self-test
+                       "an unplanted location must be refused, got ~s/~s" n st))
+             t)
+        (dds.pal:sysv-shm-destroy seg)
+        (dds.pal:sysv-shm-detach seg)))))
