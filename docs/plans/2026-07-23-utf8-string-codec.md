@@ -153,19 +153,29 @@ into.
 - [ ] **Step 4: Run, watch it pass. Falsify:** restore `length` and confirm it goes red.
 - [ ] **Step 5: Both suites + `make corpus`. Commit.**
 
-### Task 4: retire `cdr-not-implemented`
+### Task 4: retire `cdr-not-implemented` — ❌ VOID, the premise was false
 
-**Files:** Modify `src/dds-cdr/cdr.lisp:3`, `src/dds-cdr/packages.lisp:19`,
-`src/dds-cdr/primitives.lisp:99`, `src/dds-dcps/entities.lisp:1409`
+**This task must not be done.** It assumed the Latin-1 restriction was the condition's only reason to
+exist, on the strength of the annotation at `primitives.lisp:99` saying *"Remove when UTF-8 lands."*
+Step 1 falsified that in one grep: the condition has **two live signallers** unrelated to strings —
+`cdr.lisp:34` (unknown representation *name*) and `cdr.lisp:181` (unsupported representation *id*) —
+and the fuzz suite asserts on it as one of the two controlled outcomes a forged body may produce
+(`pbt-test.lisp:536,559,578`).
 
-- [ ] **Step 1:** Confirm the condition has no remaining signaller: `grep -rn "cdr-not-implemented" src/`.
-  Only the definition, the export, and the `handler-case` should remain.
-- [ ] **Step 2:** Delete the definition, the export, and the `handler-case` at `entities.lisp:1409`.
-  **Check what that handler was protecting** — it mapped the signal to `+retcode-bad-parameter+`, so
-  confirm the surrounding function still returns a sane ReturnCode on the paths that reached it.
-- [ ] **Step 3:** Both suites; `make gate-nocond` (the ceiling stays 0 and the condition count drops);
-  `make gate-build` clean on both implementations.
-- [ ] **Step 4: Commit.**
+Consequences, recorded rather than quietly dropped:
+
+- The condition, its export and its `handler-case` clause at `entities.lisp:1415` all **stay**. That
+  clause is not dead code: an unsupported representation configured on a writer still reaches it, and
+  it is what turns that into `RETCODE_BAD_PARAMETER`.
+- The annotation at `primitives.lisp:99` was **misleading** — the condition's string signaller was
+  only one of three, so "remove when UTF-8 lands" was never true. It went with the Latin-1 code.
+- The condition-surface reduction this task claimed does not exist. The real reduction delivered by
+  this change is the opposite of what was planned: the `write-sample` boundary got **wider**, because
+  it was only catching one class while promising to catch all.
+
+**Lesson worth keeping: an in-code comment stating what a future change should do is a claim, not a
+fact.** This one had been true when written and quietly stopped being true when the condition
+acquired other signallers.
 
 ### Task 5: corpus, bench, docs
 

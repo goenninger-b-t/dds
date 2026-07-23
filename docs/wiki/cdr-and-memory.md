@@ -46,7 +46,7 @@ The 4-octet RTPS `SerializedPayloadHeader` and the representation-identifier tab
 | `dds.cdr:finalize-encapsulation-options` | After the body is serialized, backpatch the encapsulation options field: set the low 2 bits of the second options byte to the trailing-padding count (0..3) the payload needs to reach the next 4-byte boundary, so the receiver can find the exact payload end (DDS-XTypes 1.3 §7.6.3.1.2). The clause is universal — its normative example sets the bits on PLAIN_CDR (XCDR1) — so this applies to every CDR representation; only the non-CDR XML representation is skipped. Allocation-free one-octet in-place patch. |
 | `dds.cdr:parse-encapsulation-header` | Read and validate the 4-octet header, reset the alignment origin past it, and return `(values representation-keyword options pad)` where `pad` is the trailing-padding count from the options low 2 bits (DDS-XTypes 1.3 §7.6.3.1.2 — the receiver interprets it to find the exact payload end); a non-zero options value from a conformant peer is tolerated, never rejected. Bounds-checked. |
 | `dds.cdr:extensibility-kind` | Type `(member :final :appendable :mutable)` — the XTypes extensibility kinds. |
-| `dds.cdr:cdr-not-implemented` | Condition signalled for unknown representations / not-yet-implemented codec paths (e.g. non-Latin-1 strings). |
+| `dds.cdr:cdr-not-implemented` | Condition signalled for an unknown or unsupported encapsulation **representation** (`cdr.lisp` — by name and by id). It no longer has anything to do with strings; the string signaller went with the Latin-1 codec. |
 
 ### Primitives (`dds.cdr`)
 
@@ -73,7 +73,8 @@ Mode-aware primitive encode/decode. Every op takes the trailing `mode` argument
 
 | Symbol | Description |
 |---|---|
-| `dds.cdr:cdr-put-string` / `cdr-get-string` | String as 4-byte length (**including** the NUL) + octets + NUL (FR-CDR-1). Latin-1 for M1; `cdr-put-string` signals `cdr-not-implemented` on non-Latin-1 input. `cdr-get-string` pre-validates the wire length against the remaining buffer extent **before** allocating the result string, signalling `dds.core.buffer:buffer-overflow` on a hostile length (NFR-SEC-POSTURE); the pooled zero-alloc deserialize path is a tracked follow-up. |
+| `dds.cdr:cdr-put-string` / `cdr-get-string` | String as 4-byte length (**including** the NUL) + **UTF-8** octets + NUL (FR-CDR-1; RFC 3629 §3). The prefix counts OCTETS, not characters. `cdr-get-string` returns **`(values string status)`** — `:malformed-utf8` for ill-formed input, with `""` as the primary value so a generated deserializer assigning into a `string`-declared slot cannot be handed NIL. It pre-validates the wire length against the remaining buffer extent **before** allocating (signalling `dds.core.buffer:buffer-overflow` on a hostile length) and bounds every octet it decodes by that same extent (NFR-SEC-POSTURE); the pooled zero-alloc deserialize path is a tracked follow-up. |
+| `dds.cdr:utf8-octet-length` | Octets a string occupies as UTF-8, excluding the NUL. **This — never `cl:length` — is what an IDL `string<N>` bound and any buffer sizing must use.** |
 | `dds.cdr:cdr-put-sequence` / `cdr-get-sequence` | Sequence as 4-byte element count + elements; each element is written/read via a supplied `elem-writer`/`elem-reader` closure called as `(funcall fn cursor element mode)` / `(funcall fn cursor mode)`. `cdr-get-sequence` pre-validates the wire count against the remaining buffer extent (every CDR element is at least 1 octet) **before** allocating the result vector, signalling `buffer-overflow` on a hostile count (NFR-SEC-POSTURE). It allocates an **unspecialized** `simple-vector` (element-type `T`) — see the typed variant below, and prefer it on any data path. |
 | `dds.cdr:cdr-get-sequence-typed` *(c elem-reader mode element-type)* | As `cdr-get-sequence`, but allocates a vector **specialized to ELEMENT-TYPE**. This is what the generated codecs call: the DSL type map knows each element's Lisp type at macroexpansion, so the specialization is a compile-time constant at every call site. **Why it matters:** an untyped `(make-array n)` is one machine word (**8 B**) per element regardless of element type, so a 256-octet `sequence<octet>` cost ~2 KB of heap to carry 256 B of data (8× the payload), a 63 KB one cost ~504 KB. Specialized, they cost 272 B and 63 KB. This was the largest allocation on the DCPS receive path, and it is also an **8× memory-amplification** an attacker could drive: `check-room` bounds the element *count* against the buffer extent, but each counted element was costing 8 B (NFR-SEC-POSTURE). Amplification is now 1×. |
 
@@ -294,9 +295,16 @@ NameHash example: `MD5("color")[0:4]` = `70 dd a5 df`. (From `run-md5-test`.)
   so 8-byte members are only 4-aligned — this is why a struct with an `i64` after an
   `i32` serializes to a different length than under `:xcdr1`. Don't assume 8-byte
   alignment in XCDR2.
-- **Strings are Latin-1 for now.** `cdr-put-string` signals `cdr-not-implemented` on
-  any character above code point 255; UTF-8 byte-exactness is pinned by the corpus as a
-  follow-up (FR-CDR-8).
+- **Strings are UTF-8** (RFC 3629 §3), which is what IDL and XTypes mean by `string`. The length
+  prefix counts **octets**, not characters — the two coincide only for ASCII, and a caller sizing a
+  buffer for a string member must use `dds.cdr:utf8-octet-length`, never `cl:length`. The decoder
+  **refuses** ill-formed input with `:malformed-utf8` rather than repairing it: over-long forms
+  (`C0 AF` decodes to `/` in two octets, the classic filter bypass), surrogates, code points above
+  U+10FFFF, truncated sequences, and bad continuation octets. Substituting U+FFFD would hand the
+  caller a string indistinguishable from one the peer actually sent.
+  ASCII encodes byte-identically to the previous Latin-1 codec, so existing corpus vectors are
+  unaffected; what changed is that U+0080..U+00FF now takes two octets, which is the fix — the single
+  octet the old codec emitted was decoded as a malformed sequence by every conformant peer.
 - **An OCTET sequence is copied in BULK, never element-by-element** (`cdr-put-octet-sequence` /
   `cdr-get-octet-sequence`, which the generated codecs emit for `:u8`/`:byte`/`:octet`). The generic
   per-element path funcalls a closure **once per octet** — measured **~12 ns/octet, perfectly linear**:
