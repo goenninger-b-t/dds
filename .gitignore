@@ -66,3 +66,6 @@ interop/string-large/StringLargePlugin.hpp
 interop/string-large/StringLargePlugin.cxx
 interop/string-large/.gen.stamp
 interop/string-large/stringlarge_pub
+
+# Loopback QoS profile copied for the direction-A experiment (duplicate of interop/connext/typeobject-probe/)
+interop/appendable/USER_QOS_PROFILES.xml
