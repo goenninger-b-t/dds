@@ -230,6 +230,25 @@ useful failure.**
   cursor−20 happened to land on the `RTPS` magic. **The ring offset must therefore be derived from the
   cursor** — by a modulus not yet determined — and `RTPS` at cursor−20 is true only before the first wrap.
 
+- **The per-record framing is `align8(datagram_length)` — validated against a live peer, not assumed.** A
+  writer must advance the producer cursor by a record's footprint; slice 7a used `align8(len)` and this
+  measures whether that is what RTI does. With `perf_pinger`'s variable payload over shared memory, all
+  records in a run are one size, so the gap between consecutive `RTPS` magics *is* the footprint. Across five
+  payloads the stride equals `align8(D)` exactly, where `D` is the true datagram length read from the RTPS
+  submessages (`D = 92 + payload` for this type):
+
+  | payload | D | align8(D) | measured stride |
+  |---|---|---|---|
+  | 40 | 132 | 136 | 136 |
+  | 100 | 192 | 192 | 192 |
+  | 200 | 292 | 296 | 296 |
+  | 400 | 492 | 496 | 496 |
+  | 800 | 892 | 896 | 896 |
+
+  So the slice-7a advance is not merely self-consistent — it is byte-for-byte what RTI does. (`perf_pinger`
+  fills its payload with a counting pattern, so the record's true end is visible; `rtiddsping`'s fixed size
+  could not have shown the relationship.)
+
 ⚠️ **`message_size_max` has a floor set by discovery.** At 1024 the participant's own SPDP announcement
 (1020 octets) no longer fit and discovery failed outright — Connext logs
 `MIGGenerator_addData:... message size max ... too small for propagating the participant discovery
@@ -457,13 +476,16 @@ we must still match.
      value mispasses (ADR 0013), so the writer *refuses* with `:setval-unavailable` rather than landing an
      un-signalled record; SBCL (both platforms) and Clasp/Linux are unaffected. 582/582 both impls on macOS,
      582/582 SBCL on Linux where `SEM_UNDO` and `SETVAL` were both confirmed to work.
-   - (b) **NOT done, and gated on one unmeasured fact: the exact per-record framing.** 7a advances the
-     producer cursor by `align8(len)`, which is self-consistent (a reader of ours reads back what a writer of
-     ours wrote) but has *not* been checked against how RTI frames a datagram of arbitrary length in the
-     ring. Writing into a **live** Connext ring needs that measured first — vary a Connext publisher's
-     payload size and observe how the cursor advance tracks it — otherwise a wrong advance would gap or
-     overwrite records in a running peer. This is the one place left where being wrong corrupts rather than
-     misreads, so it stays behind a measurement.
+   - (b) **NOT done. The framing is now measured** — the cursor advance is `align8(datagram_length)`,
+     confirmed against a live peer across five payloads (§5.0), so slice 7a's `align8(len)` is exactly right.
+     What remains before a **live** write is the rest of the producer's per-record bookkeeping: besides the
+     cursor at `0x78`, the producer also advances a wrapping counter (`0x94`) and there is an 8-byte-per-slot
+     descriptor table at offset 176 whose contents under a write are not characterised. This stack's *reader*
+     locates records with the cursor and the RTPS magic alone and needs neither — so they may be
+     producer-internal — but whether RTI's consumer *accepts* a record written without them is unproven, and
+     a live write is the one action that corrupts rather than misreads if it is wrong. So 7b stays behind
+     either a trace of what the producer writes to `0x94` and offset 176 per record, or a carefully-sandboxed
+     live-write experiment against a throwaway Connext participant.
 
 ## 7. Consequences and risks
 
