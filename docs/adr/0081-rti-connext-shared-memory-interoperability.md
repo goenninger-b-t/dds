@@ -555,8 +555,13 @@ we must still match.
      `semctl(datasem, SETVAL, 1)`, but whether that wakes RTI's consumer (or it polls, or waits on something
      else) has never been observed. The retest now reads the data semaphore before the write, right after our
      SETVAL, and after a settle: `1 then 1` = the consumer never woke; `1 then 0` = it woke but did not
-     consume. That reading is the next decisive datum. **Transmit remains unproven after four live attempts;
-     the read path (slices 1–6) is complete, live-validated, and unaffected.**
+     consume. That reading came back **`0 -> 1 -> 0`**: our SETVAL raised the flag and, with the publisher frozen, only
+     the consumer could have lowered it — so **the consumer WOKE and re-parked without consuming**. The
+     semaphore/wake protocol is therefore correct; the gap is a field or check RTI's consumer uses to
+     recognise a valid record, one not yet in our write-set. The definitive next diagnostic is a full control-
+     region diff: capture the region drained, after one REAL producer write, and after one of OUR writes, and
+     whatever the real write changes that ours does not is the missing field. **Transmit remains unproven
+     after four live attempts; the read path (slices 1-6) is complete, live-validated, and unaffected.**
 
 ## 7. Consequences and risks
 
