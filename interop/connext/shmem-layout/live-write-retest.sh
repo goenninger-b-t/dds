@@ -48,37 +48,46 @@ NEGD=$($PROBE "$KEY" u32 0xe8 1); D=$(( (4294967296 - NEGD) % 4294967296 )); [ "
 $PROBE "$KEY" dump "$O" "$D" | sed -n '2,20p' | sed 's/|.*//' | awk '{$1="";print}' | tr -s ' ' | tr -d '\n' | sed 's/^ //' > /tmp/rt-record.hex
 echo "# port $PORT ring 0x$KEY  captured record D=$D bytes at offset $O"
 
-# stop the publisher (whole process group, so the real binary dies, not just the /bin/sh wrapper),
-# then VERIFY no publisher survives before writing — a surviving producer contaminates the result.
-kill -9 -- -$PUB 2>/dev/null; sleep 2
-if ps -eo command | grep -q "[r]tiddsping -domainId $DOM -publisher"; then
-  echo "!! publisher survived the group kill — aborting to avoid a contaminated write"
-  pkill -9 -f "rtiddsping -domainId $DOM" 2>/dev/null; kill -9 -- -$SUB 2>/dev/null; exit 1
-fi
-echo "# publisher confirmed dead; ring is idle"
+# FREEZE the publisher (SIGSTOP the group), do NOT kill it. Killing makes RTI's consumer detect the writer's
+# death and UNMATCH it, after which the consumer will not consume anything from that source and its receive
+# thread may stop waiting on the data semaphore — so a killed-publisher ring can never show acceptance. Frozen,
+# the publisher writes nothing (ring static) but stays matched and the consumer keeps listening.
+kill -STOP -- -$PUB 2>/dev/null; sleep 1
+# mutex safety: if the freeze caught the publisher holding the ring mutex (value 0; it holds it ~2us/s so this
+# is very rare) it stays locked while stopped and our write would block — thaw briefly and re-freeze until free.
+MTXKEY=$(printf '%x' $((0xB00000 + PORT)))
+MV=1
+for try in 1 2 3 4 5; do
+  MV=$(./semprobe "$MTXKEY" 2>/dev/null | awk '/\[0\]/{gsub(/[a-z=-]+/,"",$2); print $2}')
+  [ "${MV:-0}" = "1" ] && break
+  echo "# mutex held (=$MV) — thaw+refreeze (try $try)"; kill -CONT -- -$PUB 2>/dev/null; sleep 0.2; kill -STOP -- -$PUB 2>/dev/null; sleep 0.3
+done
+echo "# publisher FROZEN (consumer stays matched); mutex=$MV, ring static"
 
 # build a self-contained writer script and run it through the repo SBCL (registry set)
 cat > /tmp/rt-write.lisp <<LISP
 (asdf:load-system :dds-xport)
 (in-package :cl-user)
-(defun a8 (port)
+(defun blk (port base)
   (let ((key (dds.xport.rti-shmem:rti-shmem-segment-key port)))
     (multiple-value-bind (seg st) (dds.pal:sysv-shm-attach-readonly key 512)
       (if st (list :no-seg st)
           (unwind-protect (loop with sap = (dds.pal:sysv-shm-sap seg)
-                                for i below 8 collect (dds.pal:load-sap-u32 sap (+ #x78 (* 4 i))))
+                                for i below 8 collect (dds.pal:load-sap-u32 sap (+ base (* 4 i))))
             (dds.pal:sysv-shm-detach seg))))))
 (let* ((port $PORT)
        (hex (with-open-file (f "/tmp/rt-record.hex") (read-line f)))
        (toks (remove "" (uiop:split-string hex :separator " ") :test #'string=))
        (rec (make-array (length toks) :element-type '(unsigned-byte 8)
                         :initial-contents (mapcar (lambda (h) (parse-integer h :radix 16)) toks))))
-  (format t "~&<<RT>> BEFORE A@0x78 = ~s~%" (a8 port))
+  (format t "~&<<RT>> BEFORE A@0x78 = ~s~%" (blk port #x78))
+  (format t "<<RT>>        B@0xb0 = ~s~%" (blk port #xb0))
   (multiple-value-bind (ok st) (dds.xport.rti-shmem:rti-shmem-write-record port rec (length rec))
     (format t "<<RT>> WRITE ok=~s status=~s (~d octets)~%" ok st (length rec)))
   (sleep 0.6)
-  (format t "<<RT>> AFTER  A@0x78 = ~s~%" (a8 port))
-  (format t "<<RT>> ACCEPTED iff AFTER consumer counter (idx5) advanced past BEFORE's~%"))
+  (format t "<<RT>> AFTER  A@0x78 = ~s~%" (blk port #x78))
+  (format t "<<RT>>        B@0xb0 = ~s~%" (blk port #xb0))
+  (format t "<<RT>> ACCEPTED iff AFTER a consumer field (A idx1 / idx5) advanced past BEFORE~%"))
 (finish-output)
 LISP
 "$REPO/scripts/with-sbcl.sh" --non-interactive --load /tmp/rt-write.lisp 2>&1 | grep '<<RT>>'

@@ -537,10 +537,18 @@ we must still match.
      `a-cnt - 1` (RTI's counter is 1 on a fresh ring, so `a-cnt >= 1` and this never underflows in practice),
      and the synthetic test initialises the counter to 1 so the first record lands in slot 0. Falsifying it —
      reverting to slot `a-cnt` — turns the test red.
-   - **Still open: acceptance.** With `idx4` right but the slot off by one, the clean run's consumer did not
-     advance (`idx1`/`idx5` unchanged) — it read the descriptor from the empty slot 7. The slot fix is the
-     data-confirmed reason and the next thing to live-retest; whether it is the *last* fix is only knowable
-     by re-running `live-write-retest.sh` and watching the consumer counter advance.
+   - **Still open: acceptance — and the test design was fighting us.** Three clean runs with the writer
+     progressively corrected (idx4, then the slot) never made the consumer advance (`idx1`/`idx5` unchanged
+     every time). Two things surfaced. (i) `idx4` at rest is *not* a fixed offset from `idx0`: one drained
+     run read `idx4 = idx0 + 4`, another `idx4 = idx0` at the same counter — the `+4` model is incomplete.
+     (ii) More fundamentally, the test *kills* the publisher to drain the ring, which makes RTI's consumer
+     detect the writer's death and **unmatch** it; after that the consumer will not consume records from that
+     dead source no matter how correct the write-set is, and its receive thread may no longer be waiting on
+     the data semaphore at all. So none of the three runs was a fair test of acceptance. The fix is to
+     **`SIGSTOP`** the publisher instead — frozen, not dead, so the consumer stays matched and listening while
+     the ring is static — and to re-open the exact `idx4` semantics (it varies at rest, so it encodes
+     something beyond the head). Until a `SIGSTOP`-based run shows the consumer counter advancing, transmit is
+     unproven; the write mechanics and every measured field are correct as far as they go.
 
 ## 7. Consequences and risks
 
