@@ -341,6 +341,23 @@ still unproven (this stack's reader needs none of them), but the descriptor tabl
 lengths, so a live-write writer should maintain it. That is the concrete remaining work for 7b, now named
 down to specific fields rather than "the framing".
 
+**The producer's complete per-record write-set — mapped by stopping the consumer.** With the consumer
+`SIGSTOP`ped so only the producer moves, each control block splits cleanly into producer-written and
+consumer-written `u32`s (both blocks share the same shape):
+
+| field | block A (`0x78`) | block B (`0xb0`) | moves when only the producer runs? |
+|---|---|---|---|
+| position | idx 0, 4 (`0x78`, `0x88`) | idx 0, 4 (`0xb0`, `0xb8`) | **yes — producer** |
+| counter | idx 7 (`0x94`) | idx 7 (`0xbc`) | **yes — producer** |
+| the rest | idx 1,2,3,5,6 | idx 1,2,3,5,6 | no — consumer-owned, frozen |
+
+Block A leads block B by exactly one record throughout (A a head, B a tail; the reason for two is
+unexplained but both are producer-maintained). So per record the producer writes the record, advances
+`A.{0,4}` and `B.{0,4}` to the new positions, bumps `A.7` and `B.7`, and appends `(-D, 0)` to the descriptor
+table at the counter slot. **That is the full set slice 7b's writer must replicate** — slice 7a writes one of
+these seven fields (`0x78`) plus the record. What is still unproven is which subset RTI's *consumer* reads to
+*accept* a record; a live write should replicate all of it and be validated against a throwaway participant.
+
 ⚠️ **A methodological note worth keeping.** An attempt to compare the blocks under one publisher versus four
 found no segment at all in the four-publisher case: the port scan only covered participant indices 0 and 1,
 and five participants occupy 0 through 4. The run failed for a reason that had nothing to do with the
