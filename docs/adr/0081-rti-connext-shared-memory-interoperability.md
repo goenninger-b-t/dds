@@ -525,10 +525,15 @@ we must still match.
      result the live test existed to find. It also localises the fault: in the drained BEFORE state the two
      producer position fields differ — `idx0 = 388`, `idx4 = 392` (a `+4` relationship) — but the writer set
      *both* to the new head, collapsing it; `idx4` was mapped as a duplicate of the head from the
-     consumer-stopped run, where they happened to read equal. That wrong `idx4`, and/or the still-unvalidated
-     descriptor slot index, is the likely reason for rejection. **Remaining work for 7b:** re-measure the
-     exact `idx4` relationship and the descriptor slot, correct `%rti-shmem-publish-record`, and re-run the
-     throwaway-subscriber acceptance test until the consumer counter advances.
+     consumer-stopped run, where they happened to read equal.
+   - (d) **`idx4` corrected from existing data — nine snapshots, no new measurement.** Every running/drained
+     snapshot captured this session has `idx4 = idx0 + 4` (5 of 5), and every consumer-stopped one has
+     `idx4 = idx0` (4 of 4); the resting state a writer must leave behind is `+4`. `%rti-shmem-publish-record`
+     now writes both blocks' index-4 positions as `head + 4` (`+rti-shmem-pos2-delta+`), and the synthetic
+     test asserts it. **Not yet live-retested** — the IPC surface is classifier-gated — and the descriptor
+     slot index (a thinner 2-snapshot read with an initial-counter ambiguity) is left unchanged as the next
+     suspect. The remaining work is a live acceptance re-run against a throwaway subscriber, watching the
+     consumer counter advance; if it still does not, the descriptor slot is next.
 
 ## 7. Consequences and risks
 

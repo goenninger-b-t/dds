@@ -347,6 +347,12 @@
   "Base of the descriptor table — one 8-byte `(-datagram_length, 0)` entry per record, indexed by the
    wrapping counter (ADR 0081 §5.0). Each entry's first `u32` is the exact datagram length, negated.")
 
+(defconstant +rti-shmem-pos2-delta+ 4
+  "A block's second position field (index 4) rests at index 0 plus this. Measured across nine snapshots
+   (ADR 0081 §5.0): in every running/drained state `idx4 = idx0 + 4` (the state a writer leaves behind); the
+   two coincide only mid-stream with the consumer stopped. Slice 7b's first live write collapsed the two,
+   which is the corrected fault.")
+
 (defun* %rti-shmem-put-u32-le (sap offset value)
     (function (t (integer 0) (unsigned-byte 32)) t)
   "Store VALUE at SAP+OFFSET as four little-endian octets. The PAL exports an 8-bit SAP store only, and
@@ -374,10 +380,12 @@
          (slot (mod a-cnt (max 1 count-max)))
          (slot-off (+ +rti-shmem-off-descriptor-table+ (* 8 slot))))
     (%rti-shmem-put-u32-le sap +rti-shmem-off-cursor+ new-head)        ; A idx0 (0x78) — head
-    (%rti-shmem-put-u32-le sap +rti-shmem-off-a-pos2+ new-head)        ; A idx4 (0x88)
+    (%rti-shmem-put-u32-le sap +rti-shmem-off-a-pos2+                  ; A idx4 (0x88) = head + 4
+                           (logand (+ new-head +rti-shmem-pos2-delta+) #xFFFFFFFF))
     (%rti-shmem-put-u32-le sap +rti-shmem-off-a-counter+ (logand (1+ a-cnt) #xFFFFFFFF))
     (%rti-shmem-put-u32-le sap +rti-shmem-off-b-pos1+ old-head)        ; B idx0 (0xb0) — tail
-    (%rti-shmem-put-u32-le sap +rti-shmem-off-b-pos2+ old-head)        ; B idx4 (0xc0)
+    (%rti-shmem-put-u32-le sap +rti-shmem-off-b-pos2+                  ; B idx4 (0xc0) = tail + 4
+                           (logand (+ old-head +rti-shmem-pos2-delta+) #xFFFFFFFF))
     (%rti-shmem-put-u32-le sap +rti-shmem-off-b-counter+ (logand (1+ b-cnt) #xFFFFFFFF))
     (%rti-shmem-put-u32-le sap slot-off (logand (- len) #xFFFFFFFF))   ; descriptor: -datagram_length
     (%rti-shmem-put-u32-le sap (+ slot-off 4) 0)))
@@ -777,10 +785,10 @@
                       ;; the FULL producer write-set (ADR 0081 §5.0): A head = B tail + footprint, counters
                       ;; bumped, descriptor entry = -len at the counter's slot
                       (let ((fp (%rti-shmem-align8 (length rec-a))))
-                        (assert (= (dds.pal:load-sap-u32 sap +rti-shmem-off-cursor+)   ; HOTPATH-COND(TEST): in-file self-test
-                                   (dds.pal:load-sap-u32 sap +rti-shmem-off-a-pos2+)) () "A's two positions must agree")
-                        (assert (= (dds.pal:load-sap-u32 sap +rti-shmem-off-b-pos1+)   ; HOTPATH-COND(TEST): in-file self-test
-                                   (dds.pal:load-sap-u32 sap +rti-shmem-off-b-pos2+)) () "B's two positions must agree")
+                        (assert (= (+ (dds.pal:load-sap-u32 sap +rti-shmem-off-cursor+) +rti-shmem-pos2-delta+)   ; HOTPATH-COND(TEST): in-file self-test
+                                   (dds.pal:load-sap-u32 sap +rti-shmem-off-a-pos2+)) () "A idx4 must be A idx0 + 4 (ADR 0081 §5.0)")
+                        (assert (= (+ (dds.pal:load-sap-u32 sap +rti-shmem-off-b-pos1+) +rti-shmem-pos2-delta+)   ; HOTPATH-COND(TEST): in-file self-test
+                                   (dds.pal:load-sap-u32 sap +rti-shmem-off-b-pos2+)) () "B idx4 must be B idx0 + 4")
                         (assert (= (dds.pal:load-sap-u32 sap +rti-shmem-off-cursor+)   ; HOTPATH-COND(TEST): in-file self-test
                                    (+ (dds.pal:load-sap-u32 sap +rti-shmem-off-b-pos1+) fp)) ()
                                 "A head must lead B tail by one record footprint")
