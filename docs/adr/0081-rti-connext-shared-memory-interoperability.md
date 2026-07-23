@@ -515,8 +515,20 @@ we must still match.
      inverses; falsifying the descriptor sign or the counter bump turns it red. Two facts stay unvalidated
      against a **live** peer — the descriptor slot index (counter mod count_max) and the initial counter
      relationship — and a live write is the one action that corrupts rather than misreads if wrong, so it
-     stays behind a sandboxed experiment against a **throwaway** Connext participant, never a production peer.
-     What that experiment settles: whether RTI's consumer *accepts* a record carrying this write-set.
+     was done against a **throwaway** subscriber, never a production peer.
+   - (c) **live result: the write executes but RTI's consumer does NOT yet accept it.** Against a throwaway
+     `rtiddsping` subscriber (publisher stopped so the ring was drained), the writer wrote a real captured
+     record cleanly — no crash — and advanced the producer fields exactly (head `388 → 452` = +align8(64),
+     the `0x88` field, and the producer counter `6 → 7`). But the consumer did **not** drain it: the consumer
+     position and counter stayed put (`idx1` = 388, consumer counter = 6, against producer counter 7 — one
+     unconsumed record). **So the synthetic round-trip passing was not sufficient for interop**, which is the
+     result the live test existed to find. It also localises the fault: in the drained BEFORE state the two
+     producer position fields differ — `idx0 = 388`, `idx4 = 392` (a `+4` relationship) — but the writer set
+     *both* to the new head, collapsing it; `idx4` was mapped as a duplicate of the head from the
+     consumer-stopped run, where they happened to read equal. That wrong `idx4`, and/or the still-unvalidated
+     descriptor slot index, is the likely reason for rejection. **Remaining work for 7b:** re-measure the
+     exact `idx4` relationship and the descriptor slot, correct `%rti-shmem-publish-record`, and re-run the
+     throwaway-subscriber acceptance test until the consumer counter advances.
 
 ## 7. Consequences and risks
 
