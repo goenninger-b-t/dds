@@ -1,0 +1,18 @@
+// StringLarge for the NeoDDS bounded-string LARGE-form interop probe (log-service Task 1 debt).
+//
+// NeoDDS's (:string N) member with N > 255 emits TI_STRING8_LARGE (0x71) + an LBound UInt32 in the
+// TypeObject, versus TI_STRING8_SMALL (0x70) + an SBound octet for N <= 255. The SMALL form is on
+// the externally-confirmed path (it carries the SBound field, value 0, for an unbounded string);
+// the LARGE form has NEVER been exercised by a live peer. LogEvent bounds `message` at 1024, so it
+// takes the LARGE path — this probe confirms the LARGE TypeObject framing interoperates before
+// Phase B ships LogEvent.
+//
+// A real IDL string<1024> -> TI_STRING8_LARGE on this side, matching NeoDDS's (:string 1024). Same
+// topic name "StringLarge", same registered type name "StringLarge", @key long id, so the bounded
+// LARGE string is the only intended difference.
+
+@final
+struct StringLarge {
+    @key long id;
+    string<1024> text;
+};

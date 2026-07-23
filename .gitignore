@@ -56,3 +56,13 @@ interop/enum-typeobject/EnumBox*.hpp
 interop/enum-typeobject/EnumBox*.cxx
 interop/enum-typeobject/.gen.stamp
 interop/enum-typeobject/enum_pub
+
+# Bounded-string LARGE-form probe: rtiddsgen output + binary (clean-room: never checked in).
+# NOTE exact generated names, not StringLarge*.cxx — macOS is case-insensitive, so that wildcard
+# would also ignore the hand-written stringlarge_pub.cxx.
+interop/string-large/StringLarge.hpp
+interop/string-large/StringLarge.cxx
+interop/string-large/StringLargePlugin.hpp
+interop/string-large/StringLargePlugin.cxx
+interop/string-large/.gen.stamp
+interop/string-large/stringlarge_pub
