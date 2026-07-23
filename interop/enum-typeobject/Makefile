@@ -3,7 +3,7 @@
 #   export NDDSHOME=/Applications/rti_connext_dds-7.3.1
 #   export CONNEXTDDS_ARCH=arm64Darwin20clang12.0     # ls $NDDSHOME/lib
 #   make                                              # -> enum_pub
-APPS   := enum_pub
+APPS   := enum_pub enum_sub
 COMMON := ../connext/common
 IDL    := ./EnumBox.idl
 include $(COMMON)/common.mk

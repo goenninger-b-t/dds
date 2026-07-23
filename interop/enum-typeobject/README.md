@@ -35,20 +35,35 @@ int32-backed, and coercion permits it. This is the meaningful common case.
 > does not reflect this reader's `SUBSCRIPTION_MATCHED` here). To receive reliable user DATA a reader
 > must be matched to the writer, so 32 decoded samples prove the match end to end.
 
-### The boundary — what this does NOT prove
+### The reciprocal — our `TK_INT32` writer → a Connext `TK_ENUM` reader (`enum_sub`)
 
-This is Connext-**writer** → our-**reader**. It proves **our reader tolerates a foreign `TK_ENUM`
-writer**. It does **not** prove the reciprocal: a **strict foreign reader** evaluating **our
-`TK_INT32` writer**. That reciprocal is exactly where enum-vs-int32 enforcement would bite (a
-`TypeConsistencyEnforcement = DISALLOW_TYPE_COERCION` reader), and it is the `LogEvent`-as-writer /
-foreign-strict-subscriber case. It is **untested here because that is direction A** (our writer →
-foreign reader), which is currently blocked by a pre-existing SEDP-publication regression unrelated
-to enums (see the resume note / `interop/appendable` open items). So:
+`enum_sub.cxx` is the Connext reader; a scratch `TK_INT32` writer (offering XCDR1, see below) is our
+side. Connext's verbose log on this run:
 
-- ✅ **We subscribe to a foreign enum publisher** — works, values correct.
-- ⏳ **A strict foreign subscriber reads our enum publisher** — untested (direction-A regression);
-  this is the residual risk for `LogEvent` and the reason the `MinimalEnumeratedType` serializer is
-  still worth landing.
+```
+PRESPsService_assertRemoteEndpointEx:TypeObject succesfully stored (topic: 'EnumBox', type: 'EnumBox')
+```
+
+**Connext stored our writer's TypeObject with no incompatible-QoS warning** — so the enum-vs-int32
+difference does **not** make Connext reject our `TK_INT32` writer on type grounds either. The
+type-matching question is answered **in both directions**: `TK_ENUM ↔ TK_INT32` is coerced, not
+rejected, by default Connext (`ALLOW_TYPE_COERCION`).
+
+Honest caveat: end-to-end *sample delivery* in this reciprocal run was 0, but for a reason unrelated
+to the enum — a DCPS-write-path issue (`COMMENDAnonReaderService: FAILED TO MODIFY READ WRITE AREA |
+commend anon remoteWriter`), i.e. user-data delivery from the scratch DCPS `write-sample` path, not a
+type or QoS rejection. The type acceptance (the Phase B-relevant fact) is established; end-to-end
+delivery via that particular publish path is a separate open item.
+
+### A note on DATA_REPRESENTATION (why the reciprocal writer offers XCDR1)
+
+Our writer's default `DATA_REPRESENTATION` is `[XCDR2]`; a stock Connext `@final` reader requests
+`[XCDR1]`, and XTypes 1.3 §7.6.3.1.1 has a writer serialize with its single representation, so an
+XCDR2 writer does not match an XCDR1 reader (RxO incompatible). This — not any discovery/SEDP defect
+— is what makes an XCDR2 writer fail against a stock foreign reader; offering XCDR1
+(`make-writer-qos :data-representation '(:xcdr1)`) makes the representations compatible so the *type*
+question can be isolated. Our reader already accepts both `(:xcdr2 :xcdr1)`, which is why the forward
+direction needed no such adjustment.
 
 ## Run
 

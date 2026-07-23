@@ -56,6 +56,7 @@ interop/enum-typeobject/EnumBox*.hpp
 interop/enum-typeobject/EnumBox*.cxx
 interop/enum-typeobject/.gen.stamp
 interop/enum-typeobject/enum_pub
+interop/enum-typeobject/enum_sub
 
 # Bounded-string LARGE-form probe: rtiddsgen output + binary (clean-room: never checked in).
 # NOTE exact generated names, not StringLarge*.cxx — macOS is case-insensitive, so that wildcard
@@ -69,3 +70,4 @@ interop/string-large/stringlarge_pub
 
 # Loopback QoS profile copied for the direction-A experiment (duplicate of interop/connext/typeobject-probe/)
 interop/appendable/USER_QOS_PROFILES.xml
+interop/enum-typeobject/USER_QOS_PROFILES.xml
