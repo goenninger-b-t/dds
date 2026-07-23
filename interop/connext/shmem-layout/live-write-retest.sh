@@ -17,8 +17,10 @@ DOM=${DOM:-70}
 PROBE=./shmprobe
 make -s "$PROBE" 2>/dev/null || make -s shmprobe
 
-"$NDDSHOME/bin/rtiddsping" -domainId "$DOM" -subscriber > /tmp/rt-sub.log 2>&1 &  SUB=$!
-"$NDDSHOME/bin/rtiddsping" -domainId "$DOM" -publisher -sendPeriod 1 > /tmp/rt-pub.log 2>&1 & PUB=$!
+# perl setpgrp so each peer is its own process group: rtiddsping's /bin/sh wrapper SPAWNS the real binary
+# as a CHILD, so killing the wrapper pid leaves the real publisher writing. Killing the GROUP gets both.
+perl -e 'setpgrp(0,0); exec @ARGV' "$NDDSHOME/bin/rtiddsping" -domainId "$DOM" -subscriber > /tmp/rt-sub.log 2>&1 &  SUB=$!
+perl -e 'setpgrp(0,0); exec @ARGV' "$NDDSHOME/bin/rtiddsping" -domainId "$DOM" -publisher -sendPeriod 1 > /tmp/rt-pub.log 2>&1 & PUB=$!
 sleep 6
 
 KEY=""; PORT=""
@@ -31,12 +33,14 @@ done; done
 # While the LIVE producer runs, map the descriptor SLOT rule: sample the counter (A idx7 @0x94) and the
 # whole descriptor table (0xe8, 8 slots) twice ~1.2s apart. Which slot gains a fresh -D as the counter
 # increments tells us slot(counter) directly — the second suspect if idx4 alone does not fix acceptance.
-echo "# --- descriptor slot mapping (live producer) ---"
-echo "#   counter(0x94)=$($PROBE "$KEY" u32 0x94 1)  table(0xe8, 8 slots first-u32):"
-$PROBE "$KEY" u32 0xe8 16 | awk '{for(i=1;i<=NF;i+=2){v=$i; printf "    slot%d=%d\n",(i-1)/2,(v>2147483647?v-4294967296:v)}}' | head -8
-sleep 1.2
-echo "#   counter(0x94)=$($PROBE "$KEY" u32 0x94 1)  table again:"
-$PROBE "$KEY" u32 0xe8 16 | awk '{for(i=1;i<=NF;i+=2){v=$i; printf "    slot%d=%d\n",(i-1)/2,(v>2147483647?v-4294967296:v)}}' | head -8
+# dump 32 descriptor slots (the active region is near the counter, not slot 0) alongside the counter,
+# twice, so which slot the live producer fills as the counter increments is visible directly.
+slotdump() {
+  local c; c=$($PROBE "$KEY" u32 0x94 1)
+  echo "#   counter(0x94)=$c  descriptor slots 0..31 (first u32, signed):"
+  $PROBE "$KEY" u32 0xe8 64 | awk '{for(i=1;i<=NF;i+=2){v=$i; s=(i-1)/2; d=(v>2147483647?v-4294967296:v); if(d!=0) printf "    slot%d=%d\n",s,d}}'
+}
+echo "# --- descriptor slot mapping (live producer) ---"; slotdump; sleep 1.5; echo "#   (1.5s later)"; slotdump
 
 # capture one real record + its exact length D (from the -D descriptor)
 O=$($PROBE "$KEY" find 52545053 2>/dev/null | grep '^hit' | sed -n '2p' | awk '{print $4}' | tr -d '()')
@@ -44,8 +48,14 @@ NEGD=$($PROBE "$KEY" u32 0xe8 1); D=$(( (4294967296 - NEGD) % 4294967296 )); [ "
 $PROBE "$KEY" dump "$O" "$D" | sed -n '2,20p' | sed 's/|.*//' | awk '{$1="";print}' | tr -s ' ' | tr -d '\n' | sed 's/^ //' > /tmp/rt-record.hex
 echo "# port $PORT ring 0x$KEY  captured record D=$D bytes at offset $O"
 
-kill -9 $PUB 2>/dev/null            # stop the publisher so the ring drains and the consumer parks
-sleep 2
+# stop the publisher (whole process group, so the real binary dies, not just the /bin/sh wrapper),
+# then VERIFY no publisher survives before writing — a surviving producer contaminates the result.
+kill -9 -- -$PUB 2>/dev/null; sleep 2
+if ps -eo command | grep -q "[r]tiddsping -domainId $DOM -publisher"; then
+  echo "!! publisher survived the group kill — aborting to avoid a contaminated write"
+  pkill -9 -f "rtiddsping -domainId $DOM" 2>/dev/null; kill -9 -- -$SUB 2>/dev/null; exit 1
+fi
+echo "# publisher confirmed dead; ring is idle"
 
 # build a self-contained writer script and run it through the repo SBCL (registry set)
 cat > /tmp/rt-write.lisp <<LISP
@@ -73,8 +83,8 @@ cat > /tmp/rt-write.lisp <<LISP
 LISP
 "$REPO/scripts/with-sbcl.sh" --non-interactive --load /tmp/rt-write.lisp 2>&1 | grep '<<RT>>'
 
-echo "# sub 'issue received' delta: was $(grep -c 'issue received' /tmp/rt-sub.log)"
-kill -9 $SUB 2>/dev/null
+echo "# sub 'issue received' count: $(grep -c 'issue received' /tmp/rt-sub.log)"
+kill -9 -- -$SUB 2>/dev/null
 echo "# teardown: kill any leftover rtiddsping and remove domain-$DOM IPC:"
 echo "#   for id in \$(ipcs -m | awk '\$3 ~ /^0x0040/ && \$3 !~ /1cf/ {print \$2}'); do ipcrm -m \$id; done"
 echo "#   for id in \$(ipcs -s | awk '(\$3~/^0x0080/||\$3~/^0x00b0/) && \$3!~/1cf/ {print \$2}'); do ipcrm -s \$id; done"
