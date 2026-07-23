@@ -12,6 +12,7 @@ if ! command -v "$SBCL_BIN" >/dev/null 2>&1; then
 fi
 
 export CL_SOURCE_REGISTRY="${REPO}//:"
+. "${REPO}/scripts/lisp-cache-env.sh"
 
 exec "$SBCL_BIN" --noinform --no-sysinit --no-userinit --non-interactive \
   --eval "(load (merge-pathnames \"quicklisp/setup.lisp\" (user-homedir-pathname)))" \

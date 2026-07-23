@@ -12,6 +12,7 @@ if [[ ! -x "$CLASP_BIN" ]]; then
 fi
 
 export CL_SOURCE_REGISTRY="${REPO}//:"
+. "${REPO}/scripts/lisp-cache-env.sh"
 
 exec "$CLASP_BIN" --norc --non-interactive \
   --eval "(load (merge-pathnames \"quicklisp/setup.lisp\" (user-homedir-pathname)))" \

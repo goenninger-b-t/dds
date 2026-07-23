@@ -13,7 +13,9 @@
 #      A stale ~/.cache/common-lisp let a genuinely uncompilable tree report 563/563 for two days
 #      (%count-matching: called with 4 args against a 2-arg forward declaim). So this gate builds
 #      from a CLEARED cache — that is the whole point of it, and why it is separate from the
-#      incremental `make build`.
+#      incremental `make build`. What it clears is this project's PRIVATE root
+#      (scripts/lisp-cache-env.sh), never the shared ~/.cache/common-lisp: clearing that would
+#      delete the fasls of any other project's Lisp running at the same time.
 #
 # It also FALSIFIES ITSELF (the make-corpus lesson: a gate never proven to fail proves nothing):
 # it compiles a synthetic system carrying a wrong-arity call and asserts the build machinery
@@ -24,6 +26,9 @@
 set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# The cache root this clears MUST be the one the Lisp then writes to — one definition, sourced by
+# this gate and by both with-*.sh launchers. See scripts/lisp-cache-env.sh.
+. "$REPO/scripts/lisp-cache-env.sh"
 LISP="${1:-$REPO/scripts/with-sbcl.sh}"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -60,7 +65,7 @@ echo "gate-build: falsification OK — a wrong-arity compile IS rejected."
 
 # ---- 2. THE REAL BUILD, from a CLEARED fasl cache. ----
 # Without this the gate can pass on a tree that does not compile (that is how the bug survived).
-CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/common-lisp"
+CACHE="$XDG_CACHE_HOME/common-lisp"
 echo "gate-build: clearing fasl cache ($CACHE) — a cached build proves nothing."
 rm -rf "${CACHE:?}"/* 2>/dev/null || true
 

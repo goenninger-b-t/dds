@@ -77,9 +77,9 @@ identical code.
 ### `make gate-build` — and why `make build` alone is not enough
 
 `build` and `test` are *incremental*: ASDF skips any file whose fasl is newer than its source. That makes
-them fast, but it also means **they can pass on a tree that does not compile** — a stale
-`~/.cache/common-lisp` will happily satisfy a load whose sources no longer build. That is not theoretical:
-it let a wrong-arity call sit in `main` for two days while `make test` reported 563/563.
+them fast, but it also means **they can pass on a tree that does not compile** — a stale fasl cache will
+happily satisfy a load whose sources no longer build. That is not theoretical: it let a wrong-arity call
+sit in `main` for two days while `make test` reported 563/563.
 
 `make gate-build` is the gate that can actually fail. It (1) **clears the fasl cache** and rebuilds from
 scratch, and (2) **falsifies itself** first — it compiles a synthetic system containing a deliberate
@@ -90,6 +90,16 @@ proves nothing, so the gate proves it on every run. Run it on both impls before 
 make gate-build LISP=./scripts/with-clasp.sh
 make gate-build LISP=./scripts/with-sbcl.sh
 ```
+
+**The fasl cache is private to this project.** Every Lisp entry point (`scripts/with-sbcl.sh`,
+`scripts/with-clasp.sh`, `scripts/gate-build.sh`) sources `scripts/lisp-cache-env.sh`, which sets
+`XDG_CACHE_HOME` to `~/.cache/hofvarpnir` unless you have already exported one. This matters because
+ASDF's default puts every project's fasls in one shared `~/.cache/common-lisp` keyed only by
+implementation+version — so `gate-build`'s `rm -rf` would delete the fasls of any *other* project's Lisp
+running at the same time, mid-run, surfacing as a failure in a project you were not even touching. A
+private root also makes the clean-cache guarantee **stronger** than the wipe: nothing else writes there,
+so what the gate clears is all there was. The cache lives outside the repo deliberately — this tree sits
+in a synced folder, and a churning build cache must never be synced.
 
 ### `make gate-hotpath` — CLOS purity *and* allocation purity
 
