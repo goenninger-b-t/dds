@@ -38,6 +38,39 @@
   "Inverse of representation-id-value, or NIL if VALUE is unrecognised."
   (car (rassoc value +representation-ids+)))
 
+(defun* encapsulation-id-for (representation extensibility)
+    (function (symbol symbol) symbol)
+  "The +representation-ids+ LE encapsulation key a TX SerializedPayload carries for a type of
+   EXTENSIBILITY (:final | :appendable | :mutable; NIL = :final) written in REPRESENTATION
+   (:xcdr2 | NIL = the :xcdr2 default | :xcdr1).
+
+   DDS-XTypes 1.3 Table 60 (§7.6.3.1.2) keys the identifier on BOTH the encoding version AND the
+   extensibility — a distinction it is easy to miss, because the version alone looks sufficient:
+
+     encoding version 2:  FINAL -> CDR2_LE 0x0007 · APPENDABLE -> D_CDR2_LE 0x0009 · MUTABLE -> PL_CDR2_LE 0x000b
+     encoding version 1:  FINAL and APPENDABLE -> CDR_LE 0x0001 · MUTABLE -> PL_CDR_LE 0x0003
+
+   APPENDABLE and FINAL coincide under version 1 because rule (29) (§7.4.3.5) serializes an
+   APPENDABLE type AsFinal there — no DHEADER — so there is nothing for a distinct id to announce.
+
+   THE ID MUST AGREE WITH THE FRAMING THE CODEC EMITS. Labelling a delimited body 0x0007 tells a
+   conformant peer there is no DHEADER, and it will read the DHEADER's four octets as the first
+   member. This is the ONE definition of that mapping: it previously existed twice (the DCPS write
+   path and the shapes harness), which is exactly how one copy came to be fixed for appendable
+   while the other silently was not.
+
+   MUTABLE is included because Table 60 defines it; this build's type compiler cannot yet GENERATE
+   a mutable type (it needs per-member EMHEADER framing), so that row is currently reachable only
+   by a hand-built type-support."
+  (ecase representation
+    ((:xcdr2 nil) (ecase extensibility
+                    ((:final nil) :plain-cdr2-le)
+                    (:appendable  :delimited-cdr-le)
+                    (:mutable     :pl-cdr2-le)))
+    (:xcdr1       (ecase extensibility
+                    ((:final nil :appendable) :plain-cdr-le)
+                    (:mutable                 :pl-cdr-le)))))
+
 ;;;; NOT cleared for ship — pending counsel (R6); see ADR 0015.
 (defun* flatdata-rx-rep-plan (id)
     (function ((unsigned-byte 16)) (values (member :native :transcode :reject)

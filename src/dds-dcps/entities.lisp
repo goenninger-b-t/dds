@@ -431,11 +431,8 @@
    0x0007 tells a conformant peer there is NO DHEADER and it would read the DHEADER's four octets as
    the first member. Under XCDR1 rule (29) serializes APPENDABLE exactly as FINAL, so both map to
    PLAIN_CDR_LE and no distinction is needed there."
-  (ecase rep
-    ((:xcdr2 nil) (if (eq ext :appendable)
-                      (values :xcdr2 :delimited-cdr-le)
-                      (values :xcdr2 :plain-cdr2-le)))
-    (:xcdr1       (values :xcdr1 :plain-cdr-le))))
+  (values (ecase rep ((:xcdr2 nil) :xcdr2) (:xcdr1 :xcdr1))
+          (dds.cdr:encapsulation-id-for rep ext)))
 
 (defun* %writer-tx-rep (dw)
     (function (data-writer) symbol)

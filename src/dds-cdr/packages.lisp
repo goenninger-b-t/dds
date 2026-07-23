@@ -13,7 +13,7 @@
   (:export #:+representation-ids+ #:extensibility-kind #:+zc-encapsulation-id+
            #:representation-id #:representation-id-value #:representation-id-name
            #:flatdata-rx-rep-plan
-           #:make-encapsulation-header #:parse-encapsulation-header
+           #:make-encapsulation-header #:parse-encapsulation-header #:encapsulation-id-for
            #:finalize-encapsulation-options
            #:encode-zc-reference #:parse-zc-reference #:+zc-ref-overlay-secured+
            #:cdr-not-implemented

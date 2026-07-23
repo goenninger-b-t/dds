@@ -264,6 +264,20 @@
         (dds.core.buffer:buffer-overflow () (setf refused t)))
       (%check :appendable-dheader-bounds-checked refused
               "a DHEADER claiming more than the buffer holds must be refused, never followed"))
+    ;; 5b. The Table 60 mapping itself, at its ONE definition. This assertion is why the mapping was
+    ;;     hoisted: it previously existed twice (the DCPS write path and the shapes harness) with
+    ;;     nothing checking either, so correcting one copy for APPENDABLE left the other silently
+    ;;     emitting 0x0007 — on exactly the harness a live interop leg would have used.
+    (%check :encap-id-table-60
+            (and (eq :plain-cdr2-le   (dds.cdr:encapsulation-id-for :xcdr2 :final))
+                 (eq :plain-cdr2-le   (dds.cdr:encapsulation-id-for :xcdr2 nil))
+                 (eq :delimited-cdr-le (dds.cdr:encapsulation-id-for :xcdr2 :appendable))
+                 (eq :pl-cdr2-le      (dds.cdr:encapsulation-id-for :xcdr2 :mutable))
+                 ;; Rule (29): APPENDABLE is AsFinal under version 1, so both take CDR_LE.
+                 (eq :plain-cdr-le    (dds.cdr:encapsulation-id-for :xcdr1 :final))
+                 (eq :plain-cdr-le    (dds.cdr:encapsulation-id-for :xcdr1 :appendable))
+                 (eq :pl-cdr-le       (dds.cdr:encapsulation-id-for :xcdr1 :mutable)))
+            "encapsulation-id-for must implement Table 60 keyed on extensibility AND version")
     ;; 6. RX must ACCEPT its own conformant 0x0009 payload — a false-REJECT here is the worst class.
     (multiple-value-bind (q status)
         (dds.dcps::%deserialize-payload

@@ -88,15 +88,17 @@
           do (setf (aref p i) (logand (ash clk (* -8 (- i 3))) #xff)))
     p))
 
-(defun* %rep->encap (rep)
-    (function (symbol) symbol)
-  "Map a writer's offered data-representation keyword to its +representation-ids+ LE encapsulation key (DDS-XTypes 1.3 §7.6.3.1.2 Table 60): :xcdr2 -> :plain-cdr2-le (0x0007, default), :xcdr1 -> :plain-cdr-le (0x0001)."
-  (ecase rep
-    ((:xcdr2 nil) :plain-cdr2-le)
-    (:xcdr1       :plain-cdr-le)))
+(defun* %rep->encap (rep &optional extensibility)
+    (function (symbol &optional symbol) symbol)
+  "The LE encapsulation key for a writer offering REP on a type of EXTENSIBILITY. Delegates to
+   dds.cdr:encapsulation-id-for — the ONE definition of DDS-XTypes 1.3 Table 60. This used to carry
+   its own copy of that mapping, which is how the harness kept labelling a delimited body 0x0007
+   after the DCPS write path had been corrected: a duplicated wire constant gets fixed in one place
+   and not the other."
+  (dds.cdr:encapsulation-id-for rep extensibility))
 
-(defun* %serialize-payload (serialize-fn &optional (capacity 256) (rep :xcdr2))
-    (function (function &optional (integer 1) symbol) (simple-array (unsigned-byte 8) (*)))
+(defun* %serialize-payload (serialize-fn &optional (capacity 256) (rep :xcdr2) extensibility)
+    (function (function &optional (integer 1) symbol symbol) (simple-array (unsigned-byte 8) (*)))
   "Build a SerializedPayload in REP (:xcdr2 -> PLAIN_CDR2_LE 0x0007, default/byte-identical wire;
    :xcdr1 -> PLAIN_CDR_LE 0x0001): a rep-derived encapsulation header + whatever SERIALIZE-FN
    writes (called with the LE cursor) into a CAPACITY-octet scratch buffer (default 256; pass a
@@ -104,7 +106,7 @@
    Works for either shape type (both :final 32-bit/string => XCDR1 and XCDR2 bodies coincide)."
   (let* ((buf (dds.core.buffer:make-octet-buffer capacity))
          (wc (dds.core.buffer:cursor buf :endianness :little))
-         (encap (%rep->encap rep)))
+         (encap (%rep->encap rep extensibility)))
     (dds.cdr:make-encapsulation-header wc encap)
     (funcall serialize-fn wc)
     (dds.cdr:finalize-encapsulation-options wc encap)
