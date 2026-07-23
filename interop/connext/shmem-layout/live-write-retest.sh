@@ -28,6 +28,16 @@ for i in 0 1 2 3; do for d in 11 13; do p=$((7400+250*DOM+d+2*i)); k=$(printf '%
 done; done
 [ -n "$KEY" ] || { echo "no ring found"; kill -9 $SUB $PUB 2>/dev/null; exit 1; }
 
+# While the LIVE producer runs, map the descriptor SLOT rule: sample the counter (A idx7 @0x94) and the
+# whole descriptor table (0xe8, 8 slots) twice ~1.2s apart. Which slot gains a fresh -D as the counter
+# increments tells us slot(counter) directly — the second suspect if idx4 alone does not fix acceptance.
+echo "# --- descriptor slot mapping (live producer) ---"
+echo "#   counter(0x94)=$($PROBE "$KEY" u32 0x94 1)  table(0xe8, 8 slots first-u32):"
+$PROBE "$KEY" u32 0xe8 16 | awk '{for(i=1;i<=NF;i+=2){v=$i; printf "    slot%d=%d\n",(i-1)/2,(v>2147483647?v-4294967296:v)}}' | head -8
+sleep 1.2
+echo "#   counter(0x94)=$($PROBE "$KEY" u32 0x94 1)  table again:"
+$PROBE "$KEY" u32 0xe8 16 | awk '{for(i=1;i<=NF;i+=2){v=$i; printf "    slot%d=%d\n",(i-1)/2,(v>2147483647?v-4294967296:v)}}' | head -8
+
 # capture one real record + its exact length D (from the -D descriptor)
 O=$($PROBE "$KEY" find 52545053 2>/dev/null | grep '^hit' | sed -n '2p' | awk '{print $4}' | tr -d '()')
 NEGD=$($PROBE "$KEY" u32 0xe8 1); D=$(( (4294967296 - NEGD) % 4294967296 )); [ "$D" -gt 100000 ] && D=$(( 4294967296 - NEGD ))
