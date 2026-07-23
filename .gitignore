@@ -37,3 +37,10 @@ interop/perftest/connext/perf_responder
 # Fast DDS non-4-aligned interop leg: generated type support + binary (regenerate with `make gen`)
 interop/fastdds/perfdata/gen/
 interop/fastdds/perfdata/perf_sub
+
+# Appendable interop leg (Leg 1 cross-DDS): rtiddsgen output + binaries (clean-room: never checked in)
+interop/appendable/AppendableShape*.hpp
+interop/appendable/AppendableShape*.cxx
+interop/appendable/.gen.stamp
+interop/appendable/appendable_pub
+interop/appendable/appendable_sub

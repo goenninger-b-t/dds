@@ -1,0 +1,29 @@
+// AppendableShape for the NeoDDS interop/oracle harness (interop Leg 1, cross-DDS half).
+//
+// Defined to match THIS stack's generated `appendable-shape` EXACTLY, so a foreign vendor's
+// TypeObject / wire framing is an apples-to-apples reference for ours:
+//   - @appendable extensibility (our define-dds-type uses :appendable)
+//   - @key on color
+//   - color is an UNBOUNDED string  (our :string member -> TI_STRING8_SMALL bound 0)
+//   - three 32-bit longs
+//   - default @autoid(SEQUENTIAL) -> member ids 0,1,2,3 (matches our decl-index ids)
+//
+// The point of the leg: DDS-XTypes 1.3 Table 60 (§7.6.3.1.2) says APPENDABLE + XCDR2 + LE is
+// D_CDR2_LE 0x0009 (not FINAL's 0x0007), and rule (30) (§7.4.3.5) frames the body with a DHEADER.
+// Our self-leg already confirmed this against tshark's dissector; this IDL lets a REAL Connext /
+// Fast DDS peer be the second, independent implementation on both ends (read ours, write its own).
+//
+// Same topic name "Square" AND the same registered type name "ShapeType" as the @final variant in
+// interop/connext/common/ShapeType.idl — the ONLY intended difference is the extensibility, which
+// is exactly the variable under test. The struct is named ShapeType (not AppendableShape) on
+// purpose: this stack advertises the appendable topic under type name "ShapeType" too, and DDS
+// type-consistency matches on that name, so a differing name would block the match for a reason
+// unrelated to extensibility and muddy the result.
+
+@appendable
+struct ShapeType {
+    @key string color;
+    long x;
+    long y;
+    long shapesize;
+};

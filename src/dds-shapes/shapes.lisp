@@ -20,6 +20,17 @@
   (y :i32)
   (shapesize :i32))
 
+;; The canonical ShapeType fields declared APPENDABLE, so a foreign peer's
+;; @extensibility(APPENDABLE) struct of the same shape matches. Exists to put a DELIMITED_CDR
+;; payload on a real wire: XTypes 1.3 Table 60 says APPENDABLE+XCDR2 is D_CDR2_LE 0x0009, and that
+;; claim currently rests on reading the table rather than on any observed octet. tshark's RTPS
+;; dissector is an independent implementation of the same table, which is what makes it an oracle.
+(dds.gen:define-dds-type appendable-shape (:extensibility :appendable)
+  (color :string :key t)
+  (x :i32)
+  (y :i32)
+  (shapesize :i32))
+
 (dds.gen:define-dds-type tagged-shape (:extensibility :final)
   (color :string :key t)
   (x :i32)
@@ -199,7 +210,7 @@
    SEDP; the writer answers the late reader's NACK with a retransmit of the [firstSN,lastSN] range) and
    forces HISTORY KEEP_ALL so ALL pre-join samples are retained (depth-1 KEEP_LAST would replay only the
    latest per instance). :volatile (the default) is byte-identical to the prior wire — no retention."
-  (check-type type (member :canonical :tagged))
+  (check-type type (member :canonical :tagged :appendable))
   (check-type data-representation (member :xcdr2 :xcdr1))
   (check-type durability (member :volatile :transient-local))
   ;; TRANSIENT_LOCAL must retain ALL pre-join samples for late-joiner replay -> force KEEP_ALL (DDS 1.4 §2.2.3.4).
@@ -264,6 +275,16 @@
                                        (make-shape-type :color color :x x :y y :shapesize shapesize)
                                        wc data-representation))
                          256 data-representation))
+                       ;; The extensibility is passed EXPLICITLY: it selects the encapsulation id
+                       ;; (D_CDR2_LE 0x0009), and a delimited body under an 0x0007 label would tell
+                       ;; a conformant peer there is no DHEADER.
+                       (:appendable
+                        (%serialize-payload
+                         (lambda (wc) (serialize-appendable-shape
+                                       (make-appendable-shape :color color :x x :y y
+                                                              :shapesize shapesize)
+                                       wc data-representation))
+                         256 data-representation :appendable))
                        (:tagged
                         (%serialize-payload
                          (lambda (wc) (serialize-tagged-shape
@@ -419,7 +440,7 @@
    joined, plus all future ones; advertised via PID_DURABILITY in SEDP. :volatile (the default) SKIPS a
    retaining writer's history (advances the WriterProxy past the pre-join range, NACKing only future gaps),
    receiving ONLY post-join samples — byte-identical to the prior wire."
-  (check-type type (member :canonical :tagged))
+  (check-type type (member :canonical :tagged :appendable))
   (check-type durability (member :volatile :transient-local))
   (let ((node (dds.disc:make-disc-node :guid-prefix (%make-prefix #x53) :domain domain
                                        :multicast t :advertise-address advertise-address
@@ -454,6 +475,14 @@
                           (format t "~&[sub] Square ~a x=~d y=~d size=~d~%"
                                   (shape-type-color s) (shape-type-x s)
                                   (shape-type-y s) (shape-type-shapesize s))
+                          (incf seen)))
+                       (:appendable
+                        (let ((s (%deserialize-with (dds.disc:node-sample node sn)
+                                                    #'deserialize-appendable-shape)))
+                          (declare (type appendable-shape s))
+                          (format t "~&[sub] Square(appendable) ~a x=~d y=~d size=~d~%"
+                                  (appendable-shape-color s) (appendable-shape-x s)
+                                  (appendable-shape-y s) (appendable-shape-shapesize s))
                           (incf seen)))
                        (:tagged
                         (let ((s (%deserialize-with (dds.disc:node-sample node sn) #'deserialize-tagged-shape)))
