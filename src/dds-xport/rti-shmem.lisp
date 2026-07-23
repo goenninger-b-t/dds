@@ -377,7 +377,10 @@
    fields themselves were measured directly. RUN-RTI-SHMEM-WRITE-ROUNDTRIP-TEST exercises this whole update."
   (let* ((a-cnt (dds.pal:load-sap-u32 sap +rti-shmem-off-a-counter+))
          (b-cnt (dds.pal:load-sap-u32 sap +rti-shmem-off-b-counter+))
-         (slot (mod a-cnt (max 1 count-max)))
+         ;; The descriptor for the record that takes the counter from C to C+1 goes in slot C-1 (measured:
+         ;; at counter 8 slots 0-6 were filled, so the next record fills slot 7). RTI's counter is 1 at a
+         ;; fresh ring, so a-cnt >= 1 whenever records exist and C-1 never underflows in practice.
+         (slot (mod (1- a-cnt) (max 1 count-max)))
          (slot-off (+ +rti-shmem-off-descriptor-table+ (* 8 slot))))
     (%rti-shmem-put-u32-le sap +rti-shmem-off-cursor+ new-head)        ; A idx0 (0x78) — head
     (%rti-shmem-put-u32-le sap +rti-shmem-off-a-pos2+                  ; A idx4 (0x88) = head + 4
@@ -764,6 +767,9 @@
                  (%rti-shmem-put-u32-le sap +rti-shmem-off-cursor+ 0)
                  (dds.pal:sysv-sem-setval mtx 0 1)   ; mutex rests unlocked
                  (dds.pal:sysv-sem-setval dat 0 0)   ; data flag rests clear
+                 ;; a fresh RTI ring rests with the counter at 1, so the first record fills descriptor slot 0
+                 (%rti-shmem-put-u32-le sap +rti-shmem-off-a-counter+ 1)
+                 (%rti-shmem-put-u32-le sap +rti-shmem-off-b-counter+ 1)
                  (cond
                    ((not (dds.pal:sysv-sem-setval-reliable-p))
                     ;; Clasp/macOS-arm64: the writer must REFUSE, not write.
@@ -792,8 +798,8 @@
                         (assert (= (dds.pal:load-sap-u32 sap +rti-shmem-off-cursor+)   ; HOTPATH-COND(TEST): in-file self-test
                                    (+ (dds.pal:load-sap-u32 sap +rti-shmem-off-b-pos1+) fp)) ()
                                 "A head must lead B tail by one record footprint")
-                        (assert (= 1 (dds.pal:load-sap-u32 sap +rti-shmem-off-a-counter+)) () "A counter must bump to 1")   ; HOTPATH-COND(TEST): in-file self-test
-                        (assert (= 1 (dds.pal:load-sap-u32 sap +rti-shmem-off-b-counter+)) () "B counter must bump to 1")   ; HOTPATH-COND(TEST): in-file self-test
+                        (assert (= 2 (dds.pal:load-sap-u32 sap +rti-shmem-off-a-counter+)) () "A counter must bump 1 -> 2")   ; HOTPATH-COND(TEST): in-file self-test
+                        (assert (= 2 (dds.pal:load-sap-u32 sap +rti-shmem-off-b-counter+)) () "B counter must bump 1 -> 2")   ; HOTPATH-COND(TEST): in-file self-test
                         (assert (= (dds.pal:load-sap-u32 sap +rti-shmem-off-descriptor-table+)   ; HOTPATH-COND(TEST): in-file self-test
                                    (logand (- (length rec-a)) #xFFFFFFFF)) ()
                                 "descriptor[0] must be the negated datagram length"))

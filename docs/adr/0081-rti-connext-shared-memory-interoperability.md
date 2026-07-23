@@ -526,14 +526,21 @@ we must still match.
      producer position fields differ — `idx0 = 388`, `idx4 = 392` (a `+4` relationship) — but the writer set
      *both* to the new head, collapsing it; `idx4` was mapped as a duplicate of the head from the
      consumer-stopped run, where they happened to read equal.
-   - (d) **`idx4` corrected from existing data — nine snapshots, no new measurement.** Every running/drained
-     snapshot captured this session has `idx4 = idx0 + 4` (5 of 5), and every consumer-stopped one has
-     `idx4 = idx0` (4 of 4); the resting state a writer must leave behind is `+4`. `%rti-shmem-publish-record`
-     now writes both blocks' index-4 positions as `head + 4` (`+rti-shmem-pos2-delta+`), and the synthetic
-     test asserts it. **Not yet live-retested** — the IPC surface is classifier-gated — and the descriptor
-     slot index (a thinner 2-snapshot read with an initial-counter ambiguity) is left unchanged as the next
-     suspect. The remaining work is a live acceptance re-run against a throwaway subscriber, watching the
-     consumer counter advance; if it still does not, the descriptor slot is next.
+   - (d) **`idx4` corrected, then confirmed on a clean live run.** `idx4 = idx0 + 4` at rest (nine
+     snapshots; the sole `+8` reading was a contaminated run where the publisher's real binary outlived a
+     wrapper-only kill and kept writing). A clean throwaway-subscriber run — publisher's process group killed
+     and verified dead first — showed the drained BEFORE at `idx0=516, idx4=520` (+4) and the write advancing
+     the head by exactly +64. Fix stands.
+   - (e) **descriptor slot corrected — off by one, measured on that same clean run.** The live producer's
+     table showed counter 6 → slots 0–4 filled, counter 8 → slots 0–6: the record taking the counter from
+     `C` to `C+1` fills slot `C-1`, not `C`. `%rti-shmem-publish-record` wrote slot `a-cnt`; it now writes
+     `a-cnt - 1` (RTI's counter is 1 on a fresh ring, so `a-cnt >= 1` and this never underflows in practice),
+     and the synthetic test initialises the counter to 1 so the first record lands in slot 0. Falsifying it —
+     reverting to slot `a-cnt` — turns the test red.
+   - **Still open: acceptance.** With `idx4` right but the slot off by one, the clean run's consumer did not
+     advance (`idx1`/`idx5` unchanged) — it read the descriptor from the empty slot 7. The slot fix is the
+     data-confirmed reason and the next thing to live-retest; whether it is the *last* fix is only knowable
+     by re-running `live-write-retest.sh` and watching the consumer counter advance.
 
 ## 7. Consequences and risks
 
