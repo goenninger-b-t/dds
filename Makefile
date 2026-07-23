@@ -146,9 +146,12 @@ square-pub:
 	        --eval '(uiop:symbol-call :dds.shapes :run-publisher :domain $(DOMAIN) :color "$(COLOR)" :advertise-address "$(ADVERTISE)" :type :$(TYPE) :count $(COUNT) :peers "$(PEERS)" :port $(PORT) $(LIVELINESS_ARGS) $(PERF_ARGS) $(FAULT_ARGS) $(HISTORY_ARGS) $(REP_ARGS) $(DURABILITY_ARGS))' \
 	        --eval '(uiop:quit 0)'
 
+# SECONDS bounds the run (default 20; SECONDS=0 runs until Ctrl-C, run-subscriber's :seconds 0
+# contract). Previously omitted, so the target silently ran forever and a backgrounded subscriber
+# outlived its capture, holding the DDS sockets and hanging the next suite.
 square-sub:
 	$(SBCL) --eval '(asdf:load-system :dds-shapes)' \
-	        --eval '(uiop:symbol-call :dds.shapes :run-subscriber :domain $(DOMAIN) :advertise-address "$(ADVERTISE)" :type :$(TYPE) :peers "$(PEERS)" :port $(PORT) $(DURABILITY_ARGS))' \
+	        --eval '(uiop:symbol-call :dds.shapes :run-subscriber :domain $(DOMAIN) :seconds $(SECONDS) :advertise-address "$(ADVERTISE)" :type :$(TYPE) :peers "$(PEERS)" :port $(PORT) $(DURABILITY_ARGS))' \
 	        --eval '(uiop:quit 0)'
 
 # Discovery diagnostic: print each discovered participant's locators + resolved dest.

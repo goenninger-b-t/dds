@@ -41,10 +41,14 @@ accepts CDR_LE/BE and CDR2_LE/BE.
 Two terminals, same machine (loopback — the default):
 
 ```bash
-make square-sub                 # terminal 1: prints received Squares
-make square-pub                 # terminal 2: publishes an animated BLUE Square
+make square-sub SECONDS=0        # terminal 1: prints received Squares until Ctrl-C
+make square-pub                  # terminal 2: publishes an animated BLUE Square
 # overrides:  make square-pub DOMAIN=2 COLOR=RED ADVERTISE=192.168.2.148
 ```
+
+`square-sub` runs for `SECONDS` (default **20**) and then exits; pass `SECONDS=0` to watch until
+Ctrl-C, as above. The bound matters when scripting a capture: a backgrounded subscriber that ran
+forever would outlive its capture and hold the DDS sockets, hanging the next run.
 
 **Type toggle (`TYPE=canonical|tagged`, default `tagged`).** `tagged` carries the
 extra `uuid`/`seq` (harness↔harness). `canonical` publishes the **exact** RTI
