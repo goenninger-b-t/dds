@@ -62,9 +62,14 @@ profile. Conformance is decomposed into profiles **P0–P7** (see below).
 ### Explicitly out of scope
 
 The Connext *Professional* **service suite** — Routing Service, Recording/Replay Service,
-Persistence Service (as a separate process), Cloud Discovery Service, Admin Console /
-Monitor GUIs, and similar. Each is its own program; they are **deferred, not designed out** —
-the architecture must not preclude them. See `REQUIREMENTS.md` §13.
+Cloud Discovery Service, Admin Console / Monitor GUIs, and similar. Each is its own program;
+they are **deferred, not designed out** — the architecture must not preclude them.
+See `REQUIREMENTS.md` §13.
+
+**Two services are exceptions, each in scope by explicit directive and each recorded in an ADR:**
+the **durability/persistence service** (ADR 0021 — DDS TRANSIENT/PERSISTENT cannot function without it)
+and the **distributed logging service** (ADR 0082 — `dds.log` plus a collector rendering structured JSON,
+text and aggregator output). The exceptions are enumerated rather than inferred.
 
 ---
 

@@ -27,7 +27,7 @@ Core DDS/DCPS + RTPS + discovery + XTypes/XCDR + the high-value performance diff
 
 ### 1.2 Explicitly out of scope (this program) — see §13
 
-Routing Service, Recording/Replay Service, Cloud Discovery Service, Admin Console / Monitor GUIs, Database/Web Integration, Limited-Bandwidth plugins, Queuing Service, TSS, spreadsheet add-ins. **(The durability/persistence service is now IN scope — owner directive 2026-06-18, ADR 0021 — because DDS TRANSIENT/PERSISTENT durability requires it; the remaining services listed here stay out.)** **Rationale:** these are the bulk of what makes Connext *Professional* "Professional," and each is a project. They are deferred, not designed-out; the architecture MUST NOT preclude them.
+Routing Service, Recording/Replay Service, Cloud Discovery Service, Admin Console / Monitor GUIs, Database/Web Integration, Limited-Bandwidth plugins, Queuing Service, TSS, spreadsheet add-ins. **(Two services are now IN scope, each by explicit owner directive and each recorded in an ADR: the durability/persistence service — 2026-06-18, ADR 0021 — because DDS TRANSIENT/PERSISTENT durability requires it; and the distributed logging service — 2026-07-23, ADR 0082 — §5.14. The remaining services listed here stay out. Exceptions are enumerated rather than inferred: a scope boundary that grows silently is not a boundary.)** **Rationale:** these are the bulk of what makes Connext *Professional* "Professional," and each is a project. They are deferred, not designed-out; the architecture MUST NOT preclude them.
 
 ### 1.3 The non-negotiable constraints (from the brief)
 
@@ -198,6 +198,21 @@ A build is "**Connext-class (core)**" when P0–P5 pass conformance + interop + 
 - **FR-IO-3 (MUST):** Pass an **interop matrix** (each impl × each peer × each profile feature) maintained as living CI artifacts.
 - **FR-IO-4 (MUST):** XCDR byte-exactness validated against peer-generated payloads (FR-CDR-8).
 
+### 5.14 FR-LOG — Distributed logging (service + `dds.log` API; ADR 0082)
+
+In scope by owner directive 2026-07-23 (§1.2). The service is the second carved-out exception to the
+out-of-scope service suite, after durability.
+
+- **FR-LOG-1 (MUST):** A **public, language-neutral log type** `LogEvent`, `@appendable` (XTypes 1.3 §7.2.2), **bounded** in every string, **keyed on source identity** (`host`, `process`). Published from any vendor's binding — C, C++, this stack — so the IDL (`interop/log/DdsLog.idl`) and the `define-dds-type` form are kept in lockstep and the type is validated by XCDR byte-exact corpus vectors (FR-CDR-8) in both endiannesses. Bounds are a **permanent** contract: `@appendable` permits added fields, never a widened bound.
+- **FR-LOG-2 (MUST):** **Severity is the syslog numbering of RFC 5424 §6.2.1** (EMERG 0 … DEBUG 7), extended with **TRACE = 8** below DEBUG. Values are read from the RFC and cited at the definition, never recalled.
+- **FR-LOG-3 (MUST):** A **`dds.log` package** providing one macro per severity plus `with-trace-scope`, and **categories** (`SUP`, `MEM`, …) with an independent per-category threshold. Call sites carry **function, file and line** captured at compile time — function exactly (via `defun*`), file/line best-effort through the PAL, reporting 0 where an implementation cannot supply a line (a documented NFR-PORT gap, never a silent zero).
+- **FR-LOG-4 (MUST):** **A disabled level costs one threshold check and allocates nothing** — one `aref` at a constant index plus a comparison; `with-trace-scope` does not read the clock when TRACE is off. Verified by measurement, not assertion. Enabled emission allocates (it formats); `dds.log` is **not** hot-path-pure and the RTPS data plane MUST NOT call it except behind a level disabled by default.
+- **FR-LOG-5 (MUST):** **The emit path never blocks the caller.** A bounded ring is drained by a worker thread that publishes RELIABLE/KEEP_ALL; backpressure is absorbed by the ring and by the worker, never by the application.
+- **FR-LOG-6 (MUST):** **Overflow sheds by severity and is reported.** TRACE is shed first, then DEBUG, then INFO; EMERG/ALERT/CRIT/ERR are never shed while a slot remains. Drops are counted per severity and **reported through the DDS status machinery** (a vendor status bit clear of the OMG 0–14 range, StatusCondition, listener, `get_*_status` snapshot) — never printed. A per-source monotonic `sequence` makes loss independently observable at the collector.
+- **FR-LOG-7 (MUST):** A **collector service** subscribing on a **configurable domain**, built on the durability service's shape (embedded library entity, multi-service runner, OTP-style supervisor, `log-service-main` CLI/env entrypoint returning a `ReturnCode_t`), with its own queue between reader and sinks so a slow sink cannot stall reception.
+- **FR-LOG-8 (MUST):** **Configurable sinks with replaceable renderers.** Formatters and sinks are structs of closures (the durability store-vtable pattern). Slice 1: the five-field text file and newline-delimited JSON file. Follow-on: RFC 5424 UDP syslog (`PRI = facility*8 + severity`), HTTP bulk. JSON is produced by a **formatter function** that a deployment may replace.
+- **FR-LOG-9 (MUST):** **Text rendering is fixed and golden-tested**: `<ISO 8601 UTC, 6 fractional digits>Z | <severity, left-aligned, 6 columns> | <category> | <function>() - <file>:<line> | <message>`. The 6-column field fixes `WARNING` → **`WARN`**. The owner's two reference lines are byte-exact test vectors.
+
 ---
 
 ## 6. Performance requirements (quantified) — NFR-PERF
@@ -295,7 +310,7 @@ A release is **accepted as "Connext-class (core)"** iff, on **SBCL and AllegroCL
 ## 11. Open issues / decisions needed from owner
 
 1. ~~**FR-LANG-4 carve-out:** condition system allowed, or literally zero CLOS?~~ **RESOLVED:** CLOS is permitted and preferred wherever it shows no performance degradation; the hot path stays CLOS-free and per-sample-allocation-free (FR-LANG-0, NFR-CLOS). Remaining sub-decision: confirm the exact set of packages designated "hot path" for the purity gate (current proposal in NFR-CLOS). `(confirm package list)`
-2. **Scope of "Professional":** core+differentiators **+ the durability/persistence service** — RESOLVED 2026-06-18 (ADR 0021): the durability service is in scope (TRANSIENT/PERSISTENT need it); the remaining Professional services stay out. `(resolved)`
+2. **Scope of "Professional":** core+differentiators **+ the durability/persistence service + the distributed logging service** — RESOLVED 2026-06-18 (ADR 0021): the durability service is in scope (TRANSIENT/PERSISTENT need it); EXTENDED 2026-07-23 (ADR 0082, §5.14): the distributed logging service is in scope. The remaining Professional services stay out. `(resolved)`
 3. **Hard-RT requirement?** If yes, NFR-PERF-3 must be renegotiated or the RT nodes delegated to Connext Micro/Cert. `(decision)`
 4. **VendorId** acquisition path with OMG. `(action)`
 5. **FlatData/Zero-Copy patent clearance** — legal review owner + deadline. `(action, gating P4 ship)`
