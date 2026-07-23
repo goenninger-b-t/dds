@@ -112,7 +112,7 @@ Segment size is a function of the property block and fits
 configurations: (1048576, 65536, 64) → 1115312 exactly, (2048, 2048, 8) → 4456 exactly, and
 (777216, 20480, 37) → 798496 with one 8-byte rounding. Three points and a rounding is a fit, not a proof.
 
-### 5.0 The ring — partially measured (slice 5 in progress, NOT implemented)
+### 5.0 The ring — fully measured (slice 5); read by code (slice 6), writer specced (slice 7)
 
 Observed from a live Connext 7.3.1 `rtiddsping` publisher/subscriber pair exchanging over shared memory, by
 searching the subscriber's user-data segment for the RTPS magic (`52 54 50 53`, RTPS 2.5 §8.3.3.1.1) — a
@@ -271,6 +271,38 @@ message**, consistent with a few cursor updates.
 The same run re-confirms the wakeup latch independently and at 170× the earlier traffic: across 62 million
 samples the data semaphore **never exceeded 1**.
 
+**The producer protocol — the syscall ORDER, traced directly.** State observation gives *what* changed,
+never the *order* of the calls that changed it. That needed syscall tracing, which macOS SIP blocks in the
+`syscall` provider but not in the **`pid`** provider against a third-party process — with the catch that
+`copyin` is disabled there under SIP, so the `sembuf` (op/flag bits) cannot be read, only the scalar register
+arguments (`semid`, `semctl` command and value). Those suffice for the order.
+`interop/connext/shmem-layout/trace-semop.d` traced `rtiddsping` for ~20 identical message cycles. Each
+cycle, the producer does exactly:
+
+1. `semop(mutex 131092, take)` — lock,
+2. write the record and advance the producer cursor under the lock (~2 µs held),
+3. `semop(mutex 131092, release)` — unlock,
+4. `semctl(data-sem 131093, SETVAL, 1)` — raise "data available", ~5 µs **after** the unlock.
+
+Three facts fall out, and they change how a writer must be built:
+
+- **The wake is `semctl(SETVAL, 1)`, not `semop(+1)`.** `SETVAL` is idempotent, which is exactly why the
+  latch never climbs past 1 (§ above): repeated raises while it is already 1 leave it at 1, where `+1` would
+  accumulate. `val=1` was read directly off the register on every cycle, not inferred. A writer of ours must
+  signal the same way — raise the flag with `SETVAL 1`, never `semop`.
+- **The post follows the unlock.** Write under the lock, release, *then* signal — so the woken consumer does
+  not immediately contend on a still-held lock.
+- **The consumer never takes the mutex.** In the whole trace the subscriber touches only the data semaphore;
+  it never appears on `131092`. So the mutex serialises **multiple producers** against each other, not
+  producer against consumer — and the consumer reads locklessly via the cursor, exactly as this stack's own
+  reader (`rti-shmem-read-record`, slice 6b) already does. A writer must take the mutex to coordinate with
+  RTI's own senders; a reader correctly does not.
+
+What SIP kept out of reach is the `sem_flg` bits — specifically whether the mutex take sets `SEM_UNDO`. That
+is not left to inference: a writer of ours will set `SEM_UNDO` on its mutex take regardless, so that a crash
+of our process cannot leave RTI's ring mutex locked forever. Using it is strictly safer whether or not RTI
+does, so the unmeasured bit does not gate correctness.
+
 **`0x44`/`0x48`/`0x4c` = 56, 112, 168 are offsets from `0x40`**, giving `0x78`, `0xb0` and `0xe8`. `0xe8`
 is **not** a third control block: it reads `4294967232 0` repeating — `-64, 0` as signed pairs — an array of
 8-byte entries sitting at a negative sentinel, i.e. an empty table. So the three offsets address two control
@@ -317,9 +349,9 @@ counter throughout, so the per-sender quantity lives *inside* a block while the 
 depend on it at all. Four points, one parameter varied, prediction matching at each — this one is a result,
 not the two-point lead it started as.
 
-**Still NOT established, and not to be guessed at:** the `semop` sequence itself (see above — obtainable,
-just not by me); what the A/B one-record offset MEANS (the shape is clear, the purpose is not); whether the
-within-block delta really scales with sender count (and whether the
+**Still NOT established, and not to be guessed at:** what the A/B one-record offset MEANS (the shape is
+clear — a (next, current) pair — but the purpose is not); the `sem_flg` bits (SIP-blocked; handled by using
+`SEM_UNDO` defensively rather than by observing RTI) (and whether the
 56/112/168 stride implies a third); the meaning of the two position families four bytes apart; whether 688
 is the ring base — it is the value at `0x50`, equals `176 + 8 * received_message_count_max`, and one baseline
 producer position of 708 sits exactly 20 octets above it, but that is suggestive, not proof; wraparound
@@ -398,8 +430,10 @@ we must still match.
    return a properties struct carrying the lie. **Live-validated** against a running Connext 7.3.1
    participant, where all three properties equal RTI's own published defaults (1048576 / 65536 / 64) and the
    segment size matches `ipcs` exactly.
-5. Ring and framing — **partially measured, not implemented.** Geometry and record format are in §5.0;
-   the producer/consumer roles, wraparound and synchronisation are still open. No code reads the ring yet.
+5. Ring, framing and synchronisation — **fully measured** (§5.0): record format, geometry with every
+   coefficient independently varied, the wakeup-latch signalling, and the producer protocol (take mutex →
+   write → release → `semctl(SETVAL,1)`) traced directly. The consumer is lockless; the mutex serialises
+   producers.
 6. **Receive** — (a) landed: the ring address arithmetic as code, tested against the nine measured
    (cursor → offset) pairs rather than against a second copy of the formula. (b) landed:
    `rti-shmem-read-record` copies the record the producer cursor designates out of a live ring, refusing
@@ -410,7 +444,10 @@ we must still match.
    ⚠️ It is an **observer, not a receive path**: it takes no lock. The mutex is measured as real and
    contended, so a delivery path must honour it, and that needs the `semop` ordering (still unmeasured).
    The magic check is what makes the unlocked read safe to use — refusal instead of corruption.
-7. Transmit.
+7. **Transmit** — unblocked. The producer protocol is measured, so a writer can take the ring mutex, write a
+   record at the producer cursor, advance it, release, and raise the data semaphore with `SETVAL 1`. Needs a
+   System V *semaphore* PAL surface (`semget`/`semop`/`semctl`) alongside the shared-memory one, and
+   `SEM_UNDO` on the mutex take.
 
 ## 7. Consequences and risks
 

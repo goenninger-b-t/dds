@@ -1,48 +1,46 @@
 #!/usr/sbin/dtrace -qs
 /*
- * The one remaining unmeasured piece of ADR 0081 SS5.0: the semop sequence.
+ * ADR 0081 SS5.0 — the semop/semctl ORDER, obtained without copyin.
  *
- * Everything else about RTI's shared-memory ring was established by observing state — cursors,
- * semaphore values, segment bytes. The ORDER of operations cannot be seen that way: whether the
- * producer posts the data semaphore before or after releasing the mutex, and by what mechanism it
- * avoids stacking posts, are only visible in the syscalls themselves.
+ * The semop-only trace showed the producer brackets its ring write in a mutex (131092) take/release but
+ * NEVER touches the data semaphore (131093) via semop — yet the consumer's wait on 131093 unblocks,
+ * phase-locked to the producer's write. So the wake goes through a different call. This adds semctl,
+ * whose command number (arg2) is a scalar needing no copyin: SETVAL is 8. If the producer posts by
+ * semctl(131093, 0, SETVAL), it will show here.
  *
- * This needs root, which is why it is a script for the owner to run rather than something the
- * reconstruction could obtain for itself:
+ * RUN (root; REAL rtiddsping binary PIDs, publisher then subscriber):
  *
- *     sudo dtrace -qs interop/connext/shmem-layout/trace-semop.d
+ *     sudo dtrace -qs trace-semop.d <publisher-pid> <subscriber-pid>
  *
- * while a Connext publisher/subscriber pair is exchanging over shared memory — e.g.
- *
- *     rtiddsping -domainId 50 -subscriber &
- *     rtiddsping -domainId 50 -publisher -sendPeriod 0.5 &
- *
- * A `sem_op` of -1 is a take (mutex lock, or a consumer waiting on the data semaphore); +1 is a
- * release or a post. `sem_flg` carries IPC_NOWAIT (0x800 on Darwin) and SEM_UNDO (0x1000), and
- * IPC_NOWAIT on the data-semaphore post would explain the observed "posts once, does not stack"
- * behaviour directly.
- *
- * Correlate the semid values printed here against `ipcs -s`: 0x800000+port is the data semaphore
- * and 0xB00000+port is the mutex (ADR 0081 SS4).
+ * semid 131092 = mutex (0xB04DC7), 131093 = data semaphore (0x804DC7). semctl cmd 8=SETVAL 5=GETVAL.
  */
 
-syscall::semop:entry
-/execname == "rtiddsping" || execname == "shapes_pub" || execname == "shapes_sub"/
+pid$1:libsystem_kernel.dylib:semop:entry,
+pid$2:libsystem_kernel.dylib:semop:entry
+/arg0 == 131092 || arg0 == 131093/
 {
-    self->semid = arg0;
-    self->buf   = arg1;
-    self->nsops = arg2;
+    self->w = arg0 + 1;
+    printf("%-12llu pid=%-6d semop  ENTRY semid=%-7d %s\n",
+           (unsigned long long)(timestamp / 1000), pid, (int)arg0,
+           arg0 == 131092 ? "MUTEX" : "DATASEM");
 }
 
-syscall::semop:return
-/self->buf/
+pid$1:libsystem_kernel.dylib:semop:return,
+pid$2:libsystem_kernel.dylib:semop:return
+/self->w/
 {
-    /* struct sembuf on Darwin: unsigned short sem_num; short sem_op; short sem_flg; */
-    this->num = *(unsigned short *)copyin(self->buf, 2);
-    this->op  = *(short *)copyin(self->buf + 2, 2);
-    this->flg = *(short *)copyin(self->buf + 4, 2);
-    printf("%-14s semid=%-8d nsops=%-2d  sem_num=%-2d sem_op=%-3d sem_flg=0x%04x  rc=%d\n",
-           execname, self->semid, self->nsops, this->num, this->op, this->flg, (int)arg0);
-    self->buf = 0;
-    self->semid = 0;
+    printf("%-12llu pid=%-6d semop  ret   semid=%-7d %-8s rc=%d\n",
+           (unsigned long long)(timestamp / 1000), pid, (int)(self->w - 1),
+           (self->w - 1) == 131092 ? "MUTEX" : "DATASEM", (int)arg1);
+    self->w = 0;
+}
+
+pid$1:libsystem_kernel.dylib:semctl:entry,
+pid$2:libsystem_kernel.dylib:semctl:entry
+/arg0 == 131092 || arg0 == 131093/
+{
+    printf("%-12llu pid=%-6d semctl ENTRY semid=%-7d %-8s cmd=%d%s val=%d\n",
+           (unsigned long long)(timestamp / 1000), pid, (int)arg0,
+           arg0 == 131092 ? "MUTEX" : "DATASEM", (int)arg2,
+           arg2 == 8 ? " (SETVAL)" : (arg2 == 5 ? " (GETVAL)" : ""), (int)arg3);
 }
