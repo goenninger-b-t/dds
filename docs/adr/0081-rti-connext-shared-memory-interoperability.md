@@ -347,8 +347,8 @@ consumer-written `u32`s (both blocks share the same shape):
 
 | field | block A (`0x78`) | block B (`0xb0`) | moves when only the producer runs? |
 |---|---|---|---|
-| position | idx 0, 4 (`0x78`, `0x88`) | idx 0, 4 (`0xb0`, `0xb8`) | **yes — producer** |
-| counter | idx 7 (`0x94`) | idx 7 (`0xbc`) | **yes — producer** |
+| position | idx 0, 4 (`0x78`, `0x88`) | idx 0, 4 (`0xb0`, `0xc0`) | **yes — producer** |
+| counter | idx 7 (`0x94`) | idx 7 (`0xcc`) | **yes — producer** |
 | the rest | idx 1,2,3,5,6 | idx 1,2,3,5,6 | no — consumer-owned, frozen |
 
 Block A leads block B by exactly one record throughout (A a head, B a tail; the reason for two is
@@ -507,16 +507,16 @@ we must still match.
      value mispasses (ADR 0013), so the writer *refuses* with `:setval-unavailable` rather than landing an
      un-signalled record; SBCL (both platforms) and Clasp/Linux are unaffected. 582/582 both impls on macOS,
      582/582 SBCL on Linux where `SEM_UNDO` and `SETVAL` were both confirmed to work.
-   - (b) **NOT done. The framing is now measured** — the cursor advance is `align8(datagram_length)`,
-     confirmed against a live peer across five payloads (§5.0), so slice 7a's `align8(len)` is exactly right.
-     What remains before a **live** write is the rest of the producer's per-record bookkeeping: besides the
-     cursor at `0x78`, the producer also advances a wrapping counter (`0x94`) and there is an 8-byte-per-slot
-     descriptor table at offset 176 whose contents under a write are not characterised. This stack's *reader*
-     locates records with the cursor and the RTPS magic alone and needs neither — so they may be
-     producer-internal — but whether RTI's consumer *accepts* a record written without them is unproven, and
-     a live write is the one action that corrupts rather than misreads if it is wrong. So 7b stays behind
-     either a trace of what the producer writes to `0x94` and offset 176 per record, or a carefully-sandboxed
-     live-write experiment against a throwaway Connext participant.
+   - (b) **code done; live validation deferred.** `rti-shmem-write-record` now writes the *full* producer
+     control state under the lock (`%rti-shmem-publish-record`): block A (head) and block B (tail) positions
+     and counters, and the `(-datagram_length, 0)` descriptor entry — the complete write-set measured in
+     §5.0, not just the cursor. `run-rti-shmem-write-roundtrip-test` verifies every field (A leads B by one
+     footprint, both counters bump, the descriptor is the negated length) and that write/read remain
+     inverses; falsifying the descriptor sign or the counter bump turns it red. Two facts stay unvalidated
+     against a **live** peer — the descriptor slot index (counter mod count_max) and the initial counter
+     relationship — and a live write is the one action that corrupts rather than misreads if wrong, so it
+     stays behind a sandboxed experiment against a **throwaway** Connext participant, never a production peer.
+     What that experiment settles: whether RTI's consumer *accepts* a record carrying this write-set.
 
 ## 7. Consequences and risks
 

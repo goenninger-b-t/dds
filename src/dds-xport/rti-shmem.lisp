@@ -332,6 +332,21 @@
 (defconstant +rti-shmem-datasem-semnum+ 0
   "Index of the semaphore within the data-flag set.")
 
+;;; The producer's per-record write-set, mapped by stopping the consumer (ADR 0081 §5.0). Both control
+;;; blocks split the same way: at each block base, `u32` indices 0 and 4 are producer POSITIONS and index 7
+;;; is the producer COUNTER; the rest are consumer-owned. Block A (`0x78`) is the head, block B (`0xb0`) the
+;;; tail, one record behind. Per record the producer advances A's position to the new head, B's to the old
+;;; head, bumps both counters, and appends a `(-datagram_length, 0)` entry to the descriptor table.
+
+(defconstant +rti-shmem-off-a-pos2+ #x88 "Block A position index 4 (`0x78`+16). ADR 0081 §5.0.")
+(defconstant +rti-shmem-off-a-counter+ #x94 "Block A counter, index 7 (`0x78`+28). ADR 0081 §5.0.")
+(defconstant +rti-shmem-off-b-pos1+ #xb0 "Block B position index 0 (the block-B base). ADR 0081 §5.0.")
+(defconstant +rti-shmem-off-b-pos2+ #xc0 "Block B position index 4 (`0xb0`+16). ADR 0081 §5.0.")
+(defconstant +rti-shmem-off-b-counter+ #xcc "Block B counter, index 7 (`0xb0`+28). ADR 0081 §5.0.")
+(defconstant +rti-shmem-off-descriptor-table+ #xe8
+  "Base of the descriptor table — one 8-byte `(-datagram_length, 0)` entry per record, indexed by the
+   wrapping counter (ADR 0081 §5.0). Each entry's first `u32` is the exact datagram length, negated.")
+
 (defun* %rti-shmem-put-u32-le (sap offset value)
     (function (t (integer 0) (unsigned-byte 32)) t)
   "Store VALUE at SAP+OFFSET as four little-endian octets. The PAL exports an 8-bit SAP store only, and
@@ -343,6 +358,29 @@
     (function ((unsigned-byte 32)) (unsigned-byte 32))
   "N rounded up to a multiple of 8 — records are packed 8-byte aligned (ADR 0081 §5.0)."
   (logand (+ n 7) (lognot 7)))
+
+(defun* %rti-shmem-publish-record (sap old-head new-head len count-max)
+    (function (t (unsigned-byte 32) (unsigned-byte 32) (unsigned-byte 32) (unsigned-byte 32)) t)
+  "Write the producer's full per-record control state for a record just placed at NEW-HEAD, where OLD-HEAD
+   was the cursor before this record (ADR 0081 §5.0 write-set): block A (head) positions → NEW-HEAD, block B
+   (tail) positions → OLD-HEAD, both counters bumped, and a `(-LEN, 0)` descriptor entry at the counter's
+   slot. Called under the ring mutex.
+
+   ⚠️ The descriptor SLOT index (the counter, taken modulo COUNT-MAX) and the initial counter relationship
+   are the two facts still unvalidated against a live peer (ADR 0081 §7 slice 7b); the position and counter
+   fields themselves were measured directly. RUN-RTI-SHMEM-WRITE-ROUNDTRIP-TEST exercises this whole update."
+  (let* ((a-cnt (dds.pal:load-sap-u32 sap +rti-shmem-off-a-counter+))
+         (b-cnt (dds.pal:load-sap-u32 sap +rti-shmem-off-b-counter+))
+         (slot (mod a-cnt (max 1 count-max)))
+         (slot-off (+ +rti-shmem-off-descriptor-table+ (* 8 slot))))
+    (%rti-shmem-put-u32-le sap +rti-shmem-off-cursor+ new-head)        ; A idx0 (0x78) — head
+    (%rti-shmem-put-u32-le sap +rti-shmem-off-a-pos2+ new-head)        ; A idx4 (0x88)
+    (%rti-shmem-put-u32-le sap +rti-shmem-off-a-counter+ (logand (1+ a-cnt) #xFFFFFFFF))
+    (%rti-shmem-put-u32-le sap +rti-shmem-off-b-pos1+ old-head)        ; B idx0 (0xb0) — tail
+    (%rti-shmem-put-u32-le sap +rti-shmem-off-b-pos2+ old-head)        ; B idx4 (0xc0)
+    (%rti-shmem-put-u32-le sap +rti-shmem-off-b-counter+ (logand (1+ b-cnt) #xFFFFFFFF))
+    (%rti-shmem-put-u32-le sap slot-off (logand (- len) #xFFFFFFFF))   ; descriptor: -datagram_length
+    (%rti-shmem-put-u32-le sap (+ slot-off 4) 0)))
 
 (defun* rti-shmem-write-record (port record len)
     (function ((unsigned-byte 16) (simple-array (unsigned-byte 8) (*)) (unsigned-byte 32))
@@ -365,11 +403,16 @@
    leave the mutex locked and deadlock RTI's receiver. The mutex is released on every exit path. LEN is
    bounded by `message_size_max` and the write is bounded by the ring end.
 
-   ⚠️ SCOPE (slice 7a). The cursor is advanced by `align8(LEN)` — the 8-byte-aligned record footprint. That
-   is self-consistent (a record written here is read back by RTI-SHMEM-READ-RECORD at the published cursor)
-   and is what RUN-RTI-SHMEM-WRITE-ROUNDTRIP-TEST proves, but the exact per-record framing RTI uses for a
-   datagram of arbitrary length is NOT yet measured against a live peer — that is slice 7b, and until it is
-   done this must not be pointed at a production Connext ring expecting multi-record correctness."
+   STATE (slice 7b). Besides the record, the full producer control state is written under the lock
+   (`%rti-shmem-publish-record`): block A (head) and block B (tail) positions and counters, and a
+   `(-LEN, 0)` descriptor-table entry — the complete per-record write-set measured in ADR 0081 §5.0. The
+   cursor advance `align8(LEN)` and the descriptor entry `-LEN` are both validated against a live peer.
+
+   ⚠️ NOT cleared for a LIVE Connext ring (slice 7b live). Two facts remain unvalidated against a running
+   peer: the descriptor SLOT index (counter mod count_max) and the initial counter relationship between the
+   two blocks. RUN-RTI-SHMEM-WRITE-ROUNDTRIP-TEST proves the write and read paths are inverses and that every
+   field is written, but a live write must be validated against a THROWAWAY participant first — a wrong field
+   corrupts a running peer rather than misreading it."
   (unless (dds.pal:sysv-sem-setval-reliable-p) (bail :setval-unavailable))
   (multiple-value-bind (props pstatus) (rti-shmem-segment-properties port)
     (when pstatus (bail pstatus))
@@ -390,7 +433,8 @@
                      (fits (<= (+ offset len) size)))
                 (when fits
                   (dotimes (i len) (dds.pal:store-sap-u8 sap (+ offset i) (aref record i)))
-                  (%rti-shmem-put-u32-le sap +rti-shmem-off-cursor+ next))
+                  (%rti-shmem-publish-record sap cursor next len
+                                             (rti-shmem-properties-received-message-count-max props)))
                 (dds.pal:sysv-sem-op mutex +rti-shmem-mutex-semnum+ 1 t)   ; release
                 (dds.pal:sysv-shm-detach seg)
                 (if fits
@@ -730,6 +774,21 @@
                         (assert (and ok (null st)) () "write A must succeed, got ~s/~s" ok st))   ; HOTPATH-COND(TEST): in-file self-test
                       (assert (eql 1 (dds.pal:sysv-sem-getval dat 0)) () "data flag must be raised after write A")   ; HOTPATH-COND(TEST): in-file self-test
                       (assert (eql 1 (dds.pal:sysv-sem-getval mtx 0)) () "mutex must be released after write A")   ; HOTPATH-COND(TEST): in-file self-test
+                      ;; the FULL producer write-set (ADR 0081 §5.0): A head = B tail + footprint, counters
+                      ;; bumped, descriptor entry = -len at the counter's slot
+                      (let ((fp (%rti-shmem-align8 (length rec-a))))
+                        (assert (= (dds.pal:load-sap-u32 sap +rti-shmem-off-cursor+)   ; HOTPATH-COND(TEST): in-file self-test
+                                   (dds.pal:load-sap-u32 sap +rti-shmem-off-a-pos2+)) () "A's two positions must agree")
+                        (assert (= (dds.pal:load-sap-u32 sap +rti-shmem-off-b-pos1+)   ; HOTPATH-COND(TEST): in-file self-test
+                                   (dds.pal:load-sap-u32 sap +rti-shmem-off-b-pos2+)) () "B's two positions must agree")
+                        (assert (= (dds.pal:load-sap-u32 sap +rti-shmem-off-cursor+)   ; HOTPATH-COND(TEST): in-file self-test
+                                   (+ (dds.pal:load-sap-u32 sap +rti-shmem-off-b-pos1+) fp)) ()
+                                "A head must lead B tail by one record footprint")
+                        (assert (= 1 (dds.pal:load-sap-u32 sap +rti-shmem-off-a-counter+)) () "A counter must bump to 1")   ; HOTPATH-COND(TEST): in-file self-test
+                        (assert (= 1 (dds.pal:load-sap-u32 sap +rti-shmem-off-b-counter+)) () "B counter must bump to 1")   ; HOTPATH-COND(TEST): in-file self-test
+                        (assert (= (dds.pal:load-sap-u32 sap +rti-shmem-off-descriptor-table+)   ; HOTPATH-COND(TEST): in-file self-test
+                                   (logand (- (length rec-a)) #xFFFFFFFF)) ()
+                                "descriptor[0] must be the negated datagram length"))
                       (multiple-value-bind (n st) (rti-shmem-read-record port out)
                         (assert (and (plusp n) (null st)) () "record A must read back, got ~s/~s" n st)   ; HOTPATH-COND(TEST): in-file self-test
                         (dotimes (i (length rec-a))
