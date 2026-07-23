@@ -230,6 +230,39 @@ because §3 pinned the severity numbering to RFC 5424 rather than inventing one.
 
 ## 9. Slice ladder
 
+### 9.0 The type cannot be expressed yet — four gaps, closed in the compiler, not worked around
+
+Establishing the plan surfaced that `LogEvent` as specified in §3 is **not expressible** by the type
+compiler as it stands. Four gaps, and the owner's directive of 2026-07-23 is explicit about how they
+are closed: *"Do not model LogEvent around the type compiler deficiencies — extend the type
+compiler!"*
+
+| gap | where | why modelling around it is not an option |
+|---|---|---|
+| `cdr-put-string` is **Latin-1 only** and signals above U+00FF (`primitives.lisp:89`) | `dds.cdr` | A log message containing any non-ASCII text would be refused outright — and IDL/XTypes `string` is UTF-8, so the octets emitted for U+0080..U+00FF are misdecoded by every conformant peer. This is a conformance defect, not merely a limitation. |
+| no **bounded** strings, only `:string` | `dds.gen` | An unbounded string against a peer's `string<N>` is a **different type** that does not match — ADR 0009's defect exactly. |
+| no **enum** member type | `dds.gen` | `Severity` as a bare integer discards the type's meaning, and a foreign peer's generated enum would not match it. |
+| **only `:final`** extensibility (`dsl.lisp:262` rejects the rest) | `dds.gen` | `@appendable` is what makes adding a field later compatible. Shipping `:final` would freeze the type permanently on day one. |
+
+None of these is logging-specific; every one is a hole any future type would fall into. The DHEADER
+primitives (`cdr-put-dheader`/`cdr-get-dheader`) and a working APPENDABLE serialization VM already
+exist in `typeobject-cdr.lisp`, so the extensibility work is wiring a proven mechanism into the
+generated codec path rather than new protocol work. The three compiler gaps are **Phase A of slice
+1** — see `docs/plans/2026-07-23-log-service-slice-1.md`.
+
+**The UTF-8 fix is a separate, separately-reviewed change** (owner decision, 2026-07-23):
+`docs/plans/2026-07-23-utf8-string-codec.md`. It rewrites a hot-path wire codec that every string in
+every type passes through — including topic and type names in SPDP/SEDP — so it is reviewed on its
+own merits rather than as a subordinate step of a logging feature. It must land before the bounded-
+string task, which measures an IDL bound in octets using `dds.cdr:utf8-octet-length` from it.
+
+⚠️ That change is wire-visible and on the hot path: ASCII stays byte-identical (UTF-8 is an ASCII
+superset, so every existing corpus vector must be unchanged, and a moved vector is a regression),
+while U+0080..U+00FF goes from one octet to two — which is the fix. Planning it surfaced two further
+defects it must also close: the generated size estimator (`dsl.lisp:316`) computes a string member's
+size as one octet per character, which **under-sizes the buffer** the moment a multi-byte character
+appears; and `cdr-get-string` sizes its result string by octets rather than decoded characters.
+
 1. **Slice 1 (MVP, vertical):** type + IDL + corpus · `dds.log` with categories, levels and
    `with-trace-scope` · ring, worker, severity shedding, drop statuses · service subscribing on a
    configurable domain · text and JSON file sinks · golden vectors · REQUIREMENTS/wiki/verification entries.
