@@ -322,10 +322,24 @@ is not left to inference: a writer of ours will set `SEM_UNDO` on its mutex take
 of our process cannot leave RTI's ring mutex locked forever. Using it is strictly safer whether or not RTI
 does, so the unmeasured bit does not gate correctness.
 
-**`0x44`/`0x48`/`0x4c` = 56, 112, 168 are offsets from `0x40`**, giving `0x78`, `0xb0` and `0xe8`. `0xe8`
-is **not** a third control block: it reads `4294967232 0` repeating — `-64, 0` as signed pairs — an array of
-8-byte entries sitting at a negative sentinel, i.e. an empty table. So the three offsets address two control
-blocks and one table, not three blocks.
+**`0x44`/`0x48`/`0x4c` = 56, 112, 168 are offsets from `0x40`**, giving `0x78`, `0xb0` and `0xe8`: two
+control blocks (A = producer at `0x78`, B = consumer at `0xb0`, confirmed by A leading B by exactly one
+record) and a **descriptor table** at `0xe8`, not a third block.
+
+**The descriptor table holds one `(-datagram_length, 0)` entry per record, indexed by the wrapping counter.**
+At rest it reads `-64, 0` repeating (the empty/idle value); under traffic it fills one entry per record,
+tracking the counter. Each entry is the **exact** RTPS datagram length, negated — measured `-292` for a
+payload-200 record whose datagram is 292 bytes, while the *cursor* advanced by `align8(292) = 296`. So the
+two are distinct: the ring is packed at the 8-byte-aligned stride, and the table records each record's true
+length for the consumer. rtiddsping hid the distinction because `align8(64) = 64`.
+
+**This makes slice 7a's writer state-incomplete for a live write, though its framing is right.** Per record
+the producer updates, besides writing the record: block A's position fields and its counter, and it appends
+`(-D, 0)` to the descriptor table at the counter's slot. Slice 7a updates only the cursor at `0x78`. Which of
+these RTI's *consumer* actually reads — and therefore which a written record must carry to be accepted — is
+still unproven (this stack's reader needs none of them), but the descriptor table plainly encodes per-record
+lengths, so a live-write writer should maintain it. That is the concrete remaining work for 7b, now named
+down to specific fields rather than "the framing".
 
 ⚠️ **A methodological note worth keeping.** An attempt to compare the blocks under one publisher versus four
 found no segment at all in the four-publisher case: the port scan only covered participant indices 0 and 1,
