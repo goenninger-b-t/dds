@@ -8,9 +8,11 @@ See also: [CDR codec, buffers & the arena](cdr-and-memory.md) for the codecs and
 
 ### Code generation — `dds.gen`
 
-- **`dds.gen:define-dds-type`** — macro; defines a DDS topic type `NAME` from an s-expr spec. `OPTIONS` is a plist (only `:extensibility`, default `:final`, in v1). Each member is `(slot-name member-type &key key)`, where `member-type` is a primitive keyword, `(:sequence element)`, or the name of a previously-defined dds type (nested struct). Emits a `defstruct`, `ftype`-declared `serialize-`/`deserialize-`/`serialized-size-` monomorphic functions (plus an internal `%ssize-` position-threading helper and a `deserialize-into-` in-place variant), a 16-octet key-hash for keyed types, and a registered `type-support`.
+- **`dds.gen:define-dds-type`** — macro; defines a DDS topic type `NAME` from an s-expr spec. `OPTIONS` is a plist (only `:extensibility`, default `:final`, in v1). Each member is `(slot-name member-type &key key)`, where `member-type` is a primitive keyword, `(:string N)` for a bounded string, `(:sequence element)`, or the name of a previously-defined dds type (nested struct). Emits a `defstruct`, `ftype`-declared `serialize-`/`deserialize-`/`serialized-size-` monomorphic functions (plus an internal `%ssize-` position-threading helper and a `deserialize-into-` in-place variant), a 16-octet key-hash for keyed types, and a registered `type-support`. A `(:string N)` member additionally emits the constant `+NAME-SLOT-BOUND+` and the checked setter `set-NAME-SLOT`.
 
 The DSL recognizes these member-type keywords (from `*dds-type-map*`): `:bool`, `:byte` (alias `:octet`), `:u8`, `:u16`, `:u32`, `:u64`, `:i8`, `:i16`, `:i32`, `:i64`, `:string`. `:u8`/`:i8` are the numeric 8-bit integers (`TK_UINT8`/`TK_INT8`); `:byte`/`:octet` is the opaque octet (`TK_BYTE`, IDL `octet`) — all three share the one-octet wire codec but carry distinct XTypes kinds (model an IDL `sequence<octet>` with `:byte`). A `(:sequence element)` member takes one of those keywords as its fixed-size primitive element (variable-size sequence elements, e.g. sequences of strings, are not supported in v1). v1 restricts `:extensibility` to `:final` and `@key` to scalar/string members.
+
+**Bounded strings — `(:string N)`.** `:string` alone is the unbounded IDL `string`; `(:string N)` is IDL `string<N>`. The bound is part of the *type*, not a local check (DDS-XTypes 1.3 §7.3.1.2.1), so a bounded and an unbounded string are structurally different types that do not match — which is why the bound must reach the TypeObject. A `(:string N)` member is emitted as `dds.types:string8-type-identifier` with bound `N` rather than the unbounded `primitive-type-identifier`; that is the identifier a foreign `rtiddsgen`-generated peer compares its own `string<N>` against (ADR 0009 is the defect from getting this wrong). The wire codec is unchanged — a bounded string serializes exactly like an unbounded one — so adding a bound is byte-neutral, and `N` counts **octets, not characters** (ADR 0083: strings are UTF-8, and one character can occupy four octets). The generated `set-NAME-SLOT` measures with `dds.cdr:utf8-octet-length` and returns `(values nil :string-bound-exceeded)` rather than truncating or signalling; the plain `defstruct` accessor remains and is unchecked, so the hot path keeps direct slot access. Bounds are a permanent part of a published type — widening one is a type change, so choose `N` deliberately.
 
 ### The type-support vtable + registry — `dds.types`
 
@@ -135,6 +137,36 @@ Each example below is adapted from a passing test in `src/dds-tests/`. The contr
     (dds.core.arena:pool-release pool b))
   (dds.core.arena:teardown-arena arena))
 ```
+
+### 1.1 Bounded strings — `(:string N)`
+
+A bounded member declares IDL `string<N>`. Two things come out of it, and they do different jobs: the **TypeObject bound**, which is what a foreign peer matches against, and the **checked setter**, which is what stops an over-long value reaching the wire. Neither substitutes for the other (adapted from `run-bounded-string-test` in `src/dds-tests/echo-test.lisp`).
+
+```lisp
+(dds.gen:define-dds-type bounded-str-t (:extensibility :final)
+  (id :i32 :key t)
+  (name (:string 8)))                       ; IDL: string<8> name;
+
+;; 1. The bound is part of the TYPE — it reaches the TypeObject a peer matches against.
+(let* ((ts (dds.types:find-type-support "bounded-str-t"))
+       (m  (second (dds.types:minimal-struct-type-members
+                    (dds.types:type-support-typeobject ts)))))
+  (assert (= 8 (dds.types:type-identifier-bound
+                (dds.types:minimal-struct-member-type-identifier m)))))
+
+;; 2. The checked setter refuses an over-long value instead of truncating or signalling.
+(let ((s (make-bounded-str-t :id 1 :name "12345678")))   ; 8 octets: at the bound, fine
+  (assert (= +bounded-str-t-name-bound+ 8))
+  (multiple-value-bind (ok status) (set-bounded-str-t-name s "123456789")
+    (assert (null ok))
+    (assert (eq status :string-bound-exceeded)))
+  (assert (string= (bounded-str-t-name s) "12345678"))   ; a refused set changes nothing
+  (assert (eq t (set-bounded-str-t-name s "abc")))
+  ;; OCTETS, not characters: eight 2-octet characters are 16 octets and are refused.
+  (assert (null (set-bounded-str-t-name s (make-string 8 :initial-element (code-char #xE4))))))
+```
+
+The last assertion is the whole point of measuring in octets: a bound that counted characters would let a 16-octet value past a bound of 8 and overflow the peer's `char[9]` buffer — the exact overflow the bound exists to prevent.
 
 ### 2. Drive the type purely through the registered `type-support` vtable
 
@@ -371,7 +403,7 @@ A FlatData type's canonical sample buffer is `PLAIN_CDR2_LE` (`0x0007`). Origina
 
 This is mid-M4 (P3 XTypes), built **verifiable-first**: anything checkable offline against the spec's own worked examples is landed and tested; anything that needs a conformant peer to lock the exact wire bytes is built but flagged PROVISIONAL.
 
-- **The generator (v1) is deliberately narrow.** Only `:final` extensibility is accepted by `define-dds-type` (appendable/mutable framing for *generated* types is a later increment — note that the assignability relation already handles all three extensibility kinds for hand-built TypeObjects). `@key` is restricted to scalar/string members. Sequence members must have a fixed-size primitive element; sequences of strings/variable-size elements are rejected. A nested-struct member must reference a previously-defined dds type (define-before-use; the DSL is acyclic).
+- **The generator (v1) is deliberately narrow.** Only `:final` extensibility is accepted by `define-dds-type` (appendable/mutable framing for *generated* types is a later increment — note that the assignability relation already handles all three extensibility kinds for hand-built TypeObjects). `@key` is restricted to scalar/string members. Sequence members must have a fixed-size primitive element; sequences of strings/variable-size elements are rejected. **Bounded strings `(:string N)` are accepted** and emit `TI_STRING8_SMALL` + the SBound octet — the same field the externally-confirmed path already exercises (it carries `0` for an unbounded string), so only the *value* is new, not the framing; a bound **> 255** selects the `TI_STRING8_LARGE` LBound `UInt32` form instead, which **no live peer has yet exercised** — treat a `(:string N)` with `N > 255` as PROVISIONAL until an oracle confirms it. A nested-struct member must reference a previously-defined dds type (define-before-use; the DSL is acyclic).
 
 - **The TypeObject serializer + EquivalenceHash are EXTERNALLY CONFIRMED for the exercised path** (live Fast DDS 3.6.1, an independent conformant peer — Connext never emits the minimal hash, ADR 0009). For the identical ShapeType IDL, Fast DDS's SEDP `PID_TYPE_INFORMATION` announces `EK_MINIMAL` hash `bf e2 a6 2e d8 11 ac 46 3c 40 c9 7d 30 ee` with `typeobject_serialized_size` 87 — byte-identical to ours; that 92-octet parameter value is locked as a regression vector (test `fastdds-type-information-vector`, from `interop/fastdds/captures/s1-forward-lo0.pcap` frames 236/237). MD5 equality pins the **whole** 87-octet MinimalTypeObject serialization, so the three formerly-provisional byte-level choices are confirmed for this path: (1) the hash is over the raw TypeObject XCDR2-LE bytes with **no** 4-byte encapsulation header; (2) `struct_flags` carries the extensibility bit only (minimal-masked); (3) `member_flags` is `TRY_CONSTRUCT=DISCARD` OR'd with `@optional`/`@must_understand`/`@key`. The exercised path is a FINAL struct with `i32` + unbounded `string8` members; PROVISIONAL now narrows to the unexercised serialization-VM edges — unions, MUTABLE structs, the `TK_NONE` base framing under the hash, sequence-member TypeIdentifiers, and nested-dependency hashes.
 

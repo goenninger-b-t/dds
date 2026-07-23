@@ -328,6 +328,46 @@
                           (car probe) estimate actual))))))
   t)
 
+(dds.gen:define-dds-type bounded-str-t (:extensibility :final)
+  (id :i32 :key t)
+  (name (:string 8)))
+
+(defun* run-bounded-string-test ()
+    (function () t)
+  "Test: `(:string N)` declares a BOUNDED string (XTypes 1.3 §7.3.1.2.1 — the bound is part of the
+   type, which is why a bounded and an unbounded string are NOT the same type and do not match).
+
+   Two halves, doing different jobs. The TYPEOBJECT bound is what a foreign rtiddsgen-generated peer
+   compares against for matching — getting it wrong is ADR 0009's defect, where our unbounded `color`
+   against Connext's `string<255>` produced a structurally different type. The CHECKED SETTER is what
+   stops an over-long value reaching the wire at all. Neither substitutes for the other.
+
+   The bound counts OCTETS, not characters (ADR 0083): eight two-octet characters are sixteen octets
+   and must be refused by a bound of eight, or a multi-byte string overflows the peer's buffer —
+   which is the entire reason the bound exists."
+  (%check :bound-constant (= +bounded-str-t-name-bound+ 8) "the bound is exposed as a constant")
+  (let* ((ts (dds.types:find-type-support "bounded-str-t"))
+         (members (dds.types:minimal-struct-type-members (dds.types:type-support-typeobject ts)))
+         (ti (dds.types:minimal-struct-member-type-identifier (second members))))
+    (%check :bounded-typeobject (= 8 (dds.types:type-identifier-bound ti))
+            (format nil "the TypeObject must declare string<8>, got bound ~s"
+                    (dds.types:type-identifier-bound ti))))
+  (let ((s (make-bounded-str-t :id 1 :name "12345678")))
+    (%check :bounded-at-bound (string= (bounded-str-t-name s) "12345678") "a value AT the bound is fine")
+    (multiple-value-bind (ok status) (set-bounded-str-t-name s "123456789")
+      (%check :bounded-refused (and (null ok) (eq status :string-bound-exceeded))
+              (format nil "over the bound must be refused; got ~s ~s" ok status)))
+    (%check :bounded-unchanged (string= (bounded-str-t-name s) "12345678")
+            "a refused set must leave the value alone")
+    (%check :bounded-accepts (eq t (set-bounded-str-t-name s "abc")) "a value within bound is accepted")
+    ;; Eight 2-octet characters = 16 octets: refused, though it is only eight characters.
+    (multiple-value-bind (ok status)
+        (set-bounded-str-t-name s (make-string 8 :initial-element (code-char #xE4)))
+      (declare (ignore status))
+      (%check :bounded-octets-not-characters (null ok)
+              "eight 2-octet characters are 16 octets and must exceed a bound of 8")))
+  t)
+
 (defun* run-byte-exact-test ()
     (function () t)
   "Test: XCDR1 vs XCDR2 byte-exact seed vectors + the 8-byte-alignment divergence (FR-CDR, P0)."
@@ -3825,6 +3865,7 @@
                  ("cdr-utf8-encode"          . run-utf8-encode-test)
                  ("cdr-utf8-decode"          . run-utf8-decode-test)
                  ("cdr-utf8-size-estimate"   . run-utf8-size-estimate-test)
+                 ("gen-bounded-string"       . run-bounded-string-test)
                  ("xcdr-encap-options-pad"   . run-encap-options-pad-test)
                  ("xcdr-generated-type"      . run-generated-type-test)
                  ("xcdr-generated-sequence"  . run-generated-sequence-test)

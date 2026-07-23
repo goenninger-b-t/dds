@@ -60,6 +60,18 @@
            (list :slot slot :kind :scalar :ltype ltype :default default :put put :get get
                  :align align :var (eq size :var) :size (if (eq size :var) 0 size)
                  :dds-type dds-type :key (getf opts :key)))))
+      ;; (:string N) — a BOUNDED string. Same wire codec as :string; the bound is part of the TYPE
+      ;; (XTypes 1.3 §7.3.1.2.1), so it must reach the TypeObject or a peer's `string<N>` and our
+      ;; unbounded string are structurally different types that do not match (ADR 0009).
+      ((and (consp dds-type) (eq (car dds-type) :string))
+       (let ((bound (second dds-type)))
+         (unless (and (integerp bound) (plusp bound))   ; NOCOND(MACRO): macroexpansion-time — compile-time rejection
+           (error "define-dds-type: string bound must be a positive integer, got ~s in ~s" bound spec))
+         (destructuring-bind (ltype default put get align size) (cdr (assoc :string *dds-type-map*))
+           (declare (ignore size))
+           (list :slot slot :kind :scalar :ltype ltype :default default :put put :get get
+                 :align align :var t :size 0
+                 :dds-type :string :bound bound :key (getf opts :key)))))
       ((symbolp dds-type)            ; nested, previously-defined dds type
        (let ((tpkg (or (symbol-package dds-type) *package*)))
          (list :slot slot :kind :nested :ltype dds-type
@@ -279,6 +291,30 @@
          (defstruct (,name (:constructor ,ctor))
            ,@(loop for m in parsed
                    collect `(,(getf m :slot) ,(getf m :default) :type ,(getf m :ltype))))
+         ;; A bounded string member gains its bound as a constant and a CHECKED setter. The plain
+         ;; defstruct accessor stays — existing types are untouched and the hot path keeps direct slot
+         ;; access — so this is purely additive. The bound counts OCTETS (ADR 0083): a character can
+         ;; occupy four, and CL:LENGTH here would let a multi-byte string past a bound it exceeds.
+         ,@(loop for m in parsed
+                 when (getf m :bound)
+                   append (let ((bsym (%sym pkg "+" (string name) "-" (string (getf m :slot)) "-BOUND+"))
+                                (ssym (%sym pkg "SET-" (string name) "-" (string (getf m :slot)))))
+                            `((defconstant ,bsym ,(getf m :bound)
+                                ,(format nil "Declared octet bound of ~(~a~).~(~a~) (IDL string<~d>, ~
+                                              XTypes 1.3 §7.3.1.2.1). Octets, not characters."
+                                         name (getf m :slot) (getf m :bound)))
+                              (declaim (ftype (function (,name string)
+                                                        (values (or null (eql t)) (or null keyword)))
+                                              ,ssym))
+                              (defun ,ssym (sample value)
+                                ,(format nil "Set ~(~a~).~(~a~) to VALUE, or refuse it. Returns ~
+                                              (values T NIL), or (values NIL :STRING-BOUND-EXCEEDED) ~
+                                              when VALUE exceeds the declared ~d-octet bound — measured ~
+                                              in UTF-8 octets (ADR 0083), never characters."
+                                         name (getf m :slot) (getf m :bound))
+                                (if (> (dds.cdr:utf8-octet-length value) ,bsym)
+                                    (values nil :string-bound-exceeded)
+                                    (progn (setf (,(acc m) sample) value) (values t nil)))))))
          (declaim (ftype (function (,name dds.core.buffer:cursor &optional symbol) ,name) ,ser))
          (defun ,ser (sample cursor &optional (mode :xcdr2))
            ,@(loop for m in parsed collect
@@ -634,8 +670,12 @@
                                       ,(string-downcase (string (getf m :slot)))
                                       ,idx
                                       ,(ecase (getf m :kind)
-                                         (:scalar `(dds.types:primitive-type-identifier
-                                                    ,(getf m :dds-type)))
+                                         ;; A bounded string is STRING8 with its bound, not the
+                                         ;; unbounded STRING8 primitive-type-identifier yields.
+                                         (:scalar (if (getf m :bound)
+                                                      `(dds.types:string8-type-identifier ,(getf m :bound))
+                                                      `(dds.types:primitive-type-identifier
+                                                        ,(getf m :dds-type))))
                                          (:sequence `(dds.types:sequence-type-identifier
                                                       (dds.types:primitive-type-identifier
                                                        ,(getf m :elt-type))))
