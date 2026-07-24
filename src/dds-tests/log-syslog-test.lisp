@@ -53,3 +53,44 @@
       (dds.pal:udp-close rx)   ; unblocks a still-waiting recv (status :closed) so the thread exits
       (dds.pal:join thread)))
   t)
+
+(defun* run-log-http-test ()
+    (function () t)
+  "Test (ADR 0082 §7, FR-LOG-8): make-http-bulk-sink batches events and POSTs them as one HTTP/1.1
+   request. A loopback TCP server thread accepts the connection and reads the request until the sink
+   closes (EOF); the received bytes must be a well-formed bulk POST carrying both records."
+  (let* ((listener (dds.pal:tcp-listen "127.0.0.1" 0))
+         (port (dds.pal:tcp-local-port listener))
+         (got nil)
+         (server (dds.pal:spawn
+                  (lambda ()
+                    (multiple-value-bind (conn cstatus) (dds.pal:tcp-accept listener)
+                      (unless cstatus
+                        ;; tcp-recv reads EXACTLY len bytes (length-prefixed framing) — HTTP has no
+                        ;; upfront length, so read one byte at a time until the sink closes (EOF).
+                        (let ((acc (make-array 0 :element-type '(unsigned-byte 8) :adjustable t :fill-pointer 0))
+                              (b (make-array 1 :element-type '(unsigned-byte 8))))
+                          (loop
+                            (multiple-value-bind (size status) (dds.pal:tcp-recv conn b 1)
+                              (when (or status (null size)) (return))   ; EOF / timeout -> request complete
+                              (vector-push-extend (aref b 0) acc)))
+                          (setf got acc)
+                          (dds.pal:tcp-close conn)))))
+                  :name "http-server")))
+    (unwind-protect
+         (let ((sink (dds.log:make-http-bulk-sink "127.0.0.1" port "/ingest" :batch-size 2)))
+           (dds.log:sink-emit sink (dds.log:build-log-event :severity :info :message "http-one"))
+           (dds.log:sink-emit sink (dds.log:build-log-event :severity :info :message "http-two"))  ; batch full -> POST
+           (loop repeat 400 until got do (sleep 0.01))
+           (dds.log:close-sink sink)
+           (%check :http-post
+                   (let ((s (and got (map 'string #'code-char got))))
+                     (and s (eql 0 (search "POST /ingest HTTP/1.1" s))
+                          (search "Content-Type: application/x-ndjson" s)
+                          (search "Content-Length: " s)
+                          (search "http-one" s) (search "http-two" s)))
+                   (format nil "the bulk sink must POST both records; got ~a bytes"
+                           (and got (length got)))))
+      (dds.pal:tcp-close listener)   ; unblock a still-waiting accept so the server thread exits
+      (dds.pal:join server)))
+  t)

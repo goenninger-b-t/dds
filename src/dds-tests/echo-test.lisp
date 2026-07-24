@@ -3875,6 +3875,7 @@
                  ("log-service"              . run-log-service-test)
                  ("log-async"                . run-log-async-test)
                  ("log-syslog"               . run-log-syslog-test)
+                 ("log-http"                 . run-log-http-test)
                  ("log-runner"               . run-log-runner-test)
                  ("xcdr-encap-options-pad"   . run-encap-options-pad-test)
                  ("xcdr-generated-type"      . run-generated-type-test)

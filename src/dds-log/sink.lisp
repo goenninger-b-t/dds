@@ -75,3 +75,52 @@
                              (format-log-event-syslog event :facility facility))))
                 (dds.pal:udp-send-to socket octets (length octets) host port)))
      :close (lambda () (dds.pal:udp-close socket)))))
+
+(defun* %http-bulk-flush (host port path content-type lines)
+    (function (string (integer 0 65535) string string list) t)
+  "POST the accumulated LINES (newest-first) as ONE HTTP/1.1 bulk request to http://HOST:PORT/PATH — the
+   body is the lines newline-delimited in chronological order (the ND-JSON / Elasticsearch _bulk / Loki
+   push shape). Best-effort FIRE-AND-FORGET: sends the request then closes; a failed tcp-connect silently
+   drops the batch (a logging sink must NOT fail the collector), and the HTTP response is not read
+   (mirrors UDP-syslog's best-effort — the reliable leg is the DDS path INTO the collector). Reading the
+   response, a persistent connection, and a reader<->sink queue so a slow endpoint cannot stall reception
+   are follow-ons. No conditions."
+  (when lines
+    (let* ((crlf (coerce (list #\Return #\Newline) 'string))
+           (body (format nil "~{~a~%~}" (reverse lines)))
+           (req (concatenate 'string
+                             "POST " path " HTTP/1.1" crlf
+                             "Host: " host ":" (princ-to-string port) crlf
+                             "Content-Type: " content-type crlf
+                             "Content-Length: " (princ-to-string (dds.cdr:utf8-octet-length body)) crlf
+                             "Connection: close" crlf crlf
+                             body))
+           (octets (dds.cdr:string-to-utf8-octets req)))
+      (multiple-value-bind (socket status) (dds.pal:tcp-connect host port)
+        (unless status
+          (dds.pal:tcp-send socket octets (length octets))
+          (dds.pal:tcp-close socket)))))
+  t)
+
+(defun* make-http-bulk-sink (host port path &key (formatter #'format-log-event-json) (batch-size 32)
+                                             (content-type "application/x-ndjson"))
+    (function (string (integer 0 65535) t &key (:formatter function) (:batch-size (integer 1))
+                      (:content-type string))
+              log-sink)
+  "A sink that POSTs BATCHES of FORMATTER-rendered records to http://HOST:PORT/PATH (ADR 0082 §7,
+   FR-LOG-8). Events accumulate; each BATCH-SIZE events flush as one HTTP/1.1 POST (%http-bulk-flush,
+   newline-delimited body — the ND-JSON / _bulk / Loki-push shape); close-sink flushes the remainder.
+   FORMATTER defaults to the JSON formatter (pass #'format-log-event-text for plain text). CONTENT-TYPE
+   labels the body. Best-effort (see %http-bulk-flush): connects per flush, fire-and-forget. The batch is
+   a single-writer accumulator (one collector drain thread), so it needs no lock."
+  (let ((batch '()) (count 0))
+    (%make-log-sink
+     :write (lambda (event)
+              (push (funcall formatter event) batch)
+              (incf count)
+              (when (>= count batch-size)
+                (%http-bulk-flush host port path content-type batch)
+                (setf batch '() count 0)))
+     :close (lambda ()
+              (%http-bulk-flush host port path content-type batch)
+              (setf batch '() count 0)))))

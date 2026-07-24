@@ -43,7 +43,8 @@
    #:+log-default-ring-capacity+
    ;; sinks (ADR 0082 §7) — replaceable closure pairs
    #:log-sink #:log-sink-p #:sink-emit #:close-sink
-   #:make-file-sink #:make-stream-sink #:make-function-sink #:make-udp-syslog-sink
+   #:make-file-sink #:make-stream-sink #:make-function-sink
+   #:make-udp-syslog-sink #:make-http-bulk-sink
    ;; the collector — receive side (ADR 0082 §6)
    #:log-collector #:log-collector-p #:make-log-collector
    #:collector-drain #:collector-run #:close-log-collector #:log-collector-received
