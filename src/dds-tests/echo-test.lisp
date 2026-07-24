@@ -3871,6 +3871,7 @@
                  ("log-event"                . run-log-event-test)
                  ("log-pipeline"             . run-log-pipeline-test)
                  ("log-macros"               . run-log-macros-test)
+                 ("log-disabled-alloc"       . run-log-disabled-alloc-test)
                  ("log-service"              . run-log-service-test)
                  ("log-async"                . run-log-async-test)
                  ("log-syslog"               . run-log-syslog-test)

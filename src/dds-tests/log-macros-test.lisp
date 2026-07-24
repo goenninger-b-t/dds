@@ -37,6 +37,29 @@
   (loop repeat 300 until (>= (dds.log:log-collector-received collector) n)
         do (dds.log:collector-drain collector) (sleep 0.02)))
 
+(defun* run-log-disabled-alloc-test ()
+    (function () t)
+  "Test (FR-LOG-4): a DISABLED log level allocates NOTHING — MEASURED, not asserted. Measures bytes
+   consed (dds.pal:bytes-consed) across 100000 disabled log-debug calls; the per-call allocation must
+   round to 0. The disabled path is one (aref *log-thresholds* <compile-time-const>) + a compare + a
+   short-circuited WHEN, so the message-building format never runs and the logger (here NIL — never
+   dereferenced when disabled) is never touched. SBCL is the oracle: dds.pal:bytes-consed is 0 on Clasp,
+   so the Clasp run is vacuously consistent while the real measurement is SBCL (the gate-mem oracle)."
+  (dds.log:set-log-threshold :net dds.log:+severity-info+)   ; ensure :net DEBUG is DISABLED (default)
+  ;; a BARE logger struct: no participant, hence no background receiver thread, so dds.pal:bytes-consed
+  ;; (a process-wide counter) measures ONLY the disabled-call path. NIL cannot be used — logger-emit's
+  ;; first arg is logger-typed, so the (unreachable, when-false) call still type-checks at compile time.
+  (let ((logger (dds.log::%make-logger))
+        (n 100000))
+    (dotimes (i 1000) (dds.log:log-debug logger :net "warmup ~d" i))   ; warm up; not measured
+    (let ((before (dds.pal:bytes-consed)))
+      (dotimes (i n) (dds.log:log-debug logger :net "disabled ~d" i))
+      (let ((delta (- (dds.pal:bytes-consed) before)))
+        (%check :log-disabled-zero-alloc (zerop (floor delta n))
+                (format nil "a disabled log-debug must allocate ~~0 bytes/call; measured ~d bytes over ~
+                             ~d calls (~,4f B/call)" delta n (/ delta n 1.0))))))
+  t)
+
 (defun* run-log-macros-test ()
     (function () t)
   "Test: the ergonomic logging macro API (ADR 0082 §5, FR-LOG-3/4) end to end over DDS."
