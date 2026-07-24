@@ -31,6 +31,14 @@
       (string-upcase (symbol-name severity))
       (format nil "SEV~a" severity)))
 
+(defun* %event-kind-name (event-kind)
+    (function (t) string)
+  "The name of EVENT-KIND for rendering: a keyword (:exit -> EXIT) is its name upcased; a raw int32
+   (an undecodable wire value) renders EK<n>."
+  (if (keywordp event-kind)
+      (string-upcase (symbol-name event-kind))
+      (format nil "EK~a" event-kind)))
+
 (defun* format-log-event-text (event)
     (function (log-event) string)
   "Render EVENT to the pinned eight-field text line (ADR 0082 §7):
@@ -51,3 +59,54 @@
           (log-event-file event)
           (log-event-line event)
           (log-event-message event)))
+
+(defun* %json-escape (string)
+    (function (string) string)
+  "Escape STRING for a JSON string literal (RFC 8259 §7): the two mandatory escapes (\\\" and \\\\),
+   the short escapes for the control characters that have them (\\n \\r \\t \\b \\f), and \\u00XX for
+   any other control character below U+0020. Non-ASCII is left as raw UTF-8, which RFC 8259 permits.
+   A log object is a fixed shape, so a hand-written escaper is a few dozen lines against a new runtime
+   dependency + SBOM entry (operating contract §9)."
+  (with-output-to-string (s)
+    (loop for c across string
+          for code = (char-code c)
+          do (cond ((char= c #\") (write-string "\\\"" s))
+                   ((char= c #\\) (write-string "\\\\" s))
+                   ((char= c #\Newline) (write-string "\\n" s))
+                   ((char= c #\Return) (write-string "\\r" s))
+                   ((char= c #\Tab) (write-string "\\t" s))
+                   ((char= c #\Backspace) (write-string "\\b" s))
+                   ((char= c #\Page) (write-string "\\f" s))
+                   ((< code #x20) (format s "\\u~4,'0x" code))
+                   (t (write-char c s))))))
+
+(defun* format-log-event-json (event)
+    (function (log-event) string)
+  "Render EVENT as one JSON object (RFC 8259), the newline-delimited-JSON a collector's JSON sink
+   emits (ADR 0082 §7) — the framing logstash's `json_lines` codec, filebeat, and vector read
+   unchanged. `timestamp` is the ISO 8601 UTC render (µs precision); `severity` and `event_kind` are
+   their lowercase names; `truncated` is a JSON boolean; the counters are JSON numbers. The object
+   carries no trailing newline — the sink adds the record separator. This is the default JSON
+   formatter closure (ADR 0082 §7 — a formatter is a function a config holds and can replace)."
+  (format nil
+          "{\"timestamp\":\"~a\",\"host\":\"~a\",\"process\":~d,\"participant_uuid\":\"~a\",~
+           \"host_ip\":\"~a\",\"app_id\":\"~a\",\"thread\":~d,\"seq\":~d,\"severity\":\"~a\",~
+           \"category\":\"~a\",\"function\":\"~a\",\"file\":\"~a\",\"line\":~d,\"event_kind\":\"~a\",~
+           \"elapsed_ns\":~d,\"truncated\":~:[false~;true~],\"message\":\"~a\"}"
+          (%iso8601-utc (log-event-timestamp event))
+          (%json-escape (log-event-host event))
+          (log-event-process event)
+          (%json-escape (log-event-participant-uuid event))
+          (%json-escape (log-event-host-ip event))
+          (%json-escape (log-event-app-id event))
+          (log-event-thread event)
+          (log-event-seq event)
+          (string-downcase (%severity-name (log-event-severity event)))
+          (%json-escape (log-event-category event))
+          (%json-escape (log-event-function event))
+          (%json-escape (log-event-file event))
+          (log-event-line event)
+          (string-downcase (%event-kind-name (log-event-event-kind event)))
+          (log-event-elapsed-ns event)
+          (log-event-truncated event)
+          (%json-escape (log-event-message event))))

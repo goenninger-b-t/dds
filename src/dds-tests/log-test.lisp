@@ -85,6 +85,23 @@
             "a full IPv6 address must render in the text line untruncated")
     (%check :log-ipv4-roundtrip (string= (dds.log:log-event-host-ip e4) "192.168.2.148")
             "a plain IPv4 address must round-trip"))
+  ;; 4c. the JSON formatter emits one well-formed object per event, and ESCAPES the string fields —
+  ;;     a message with a quote and a newline must not break the JSON (RFC 8259 §7).
+  (let* ((e (dds.log:build-log-event :host "node-1" :process 4242 :app-id "gbttctools"
+                                     :severity :err :event-kind :exit :seq 7 :line 12
+                                     :message (format nil "he said \"hi\"~cand left" #\Newline)))
+         (j (dds.log:format-log-event-json e)))
+    (%check :log-json-shape
+            (and (char= (char j 0) #\{) (char= (char j (1- (length j))) #\})
+                 (search "\"host\":\"node-1\"" j) (search "\"process\":4242" j)
+                 (search "\"app_id\":\"gbttctools\"" j) (search "\"severity\":\"err\"" j)
+                 (search "\"event_kind\":\"exit\"" j) (search "\"seq\":7" j)
+                 (search "\"truncated\":false" j))
+            (format nil "JSON object shape/fields wrong; got ~s" j))
+    (%check :log-json-escaped
+            (and (search "he said \\\"hi\\\"\\nand left" j)   ; quote -> \" and newline -> \n
+                 (not (search (format nil "~c" #\Newline) j)))  ; no RAW newline in the JSON
+            (format nil "JSON string fields must be escaped; got ~s" j)))
   ;; 5. the text formatter reproduces the owner's two golden lines BYTE-FOR-BYTE (ADR 0082 §7/§8).
   ;;    The timestamp is computed from its calendar value so the ISO-8601 render is self-consistent;
   ;;    everything else is the owner's example verbatim (extended with the UUID/IP after the timestamp).

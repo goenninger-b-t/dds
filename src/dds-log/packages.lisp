@@ -32,5 +32,5 @@
    #:+log-event-file-bound+ #:+log-event-message-bound+
    ;; construction + truncation
    #:build-log-event #:truncate-utf8
-   ;; text formatter (ADR 0082 §7) — the default text-rendering closure
-   #:format-log-event-text))
+   ;; formatters (ADR 0082 §7) — the default text- and JSON-rendering closures
+   #:format-log-event-text #:format-log-event-json))

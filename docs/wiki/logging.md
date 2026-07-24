@@ -2,7 +2,7 @@
 
 The logging service (ADR 0082, FR-LOG) is an in-scope exception to the "no Connext service suite" rule: a `LogEvent` wire type plus a collector that renders structured JSON, text, and aggregator output. This page tracks what has landed.
 
-**Status: the wire type is landed (slice 1 / Task 4).** The emit API, formatters, sinks, the service, the multi-service runner, the OTP-style supervisor, and the `log-service-main` CLI are follow-on slices (ADR 0082 §9). This page will grow with them.
+**Status: the wire type and both collector-side formatters (text + JSON) are landed.** The emit API, sinks, the service, the multi-service runner, the OTP-style supervisor, and the `log-service-main` CLI are follow-on slices (ADR 0082 §9). This page will grow with them.
 
 ## The `LogEvent` wire type
 
@@ -46,7 +46,7 @@ Four decisions in the struct are load-bearing (ADR 0082 §3): `timestamp` is a f
 <ISO-8601-UTC.6frac Z> | <participant-uuid> | <host-ip> | <app-id> | <SEVER> | <category> | <function>() - <file>:<line> | <message>
 ```
 
-Severity is left-aligned in 6 columns (so `WARNING` renders `WARN`, the longest name that fits being `NOTICE`); the timestamp is the event's `timestamp` field (POSIX-epoch nanoseconds) rendered ISO 8601 UTC with six fractional digits and a `Z`; the function field holds the bare name and the `()` is added by the formatter. The `participant-uuid`, `host-ip` (IPv4 or IPv6) and `app-id` come from the event fields, so the line reflects the originating logger even when a collector renders a remote source. It is the default text formatter *closure* (ADR 0082 §7 — a formatter is a function a config holds and can replace). It is asserted **byte-for-byte against the owner's two golden example lines** (ADR 0082 §8) in `run-log-event-test`. The JSON formatter and the file/UDP-syslog sinks are follow-on slices.
+Severity is left-aligned in 6 columns (so `WARNING` renders `WARN`, the longest name that fits being `NOTICE`); the timestamp is the event's `timestamp` field (POSIX-epoch nanoseconds) rendered ISO 8601 UTC with six fractional digits and a `Z`; the function field holds the bare name and the `()` is added by the formatter. The `participant-uuid`, `host-ip` (IPv4 or IPv6) and `app-id` come from the event fields, so the line reflects the originating logger even when a collector renders a remote source. It is the default text formatter *closure* (ADR 0082 §7 — a formatter is a function a config holds and can replace). It is asserted **byte-for-byte against the owner's two golden example lines** (ADR 0082 §8) in `run-log-event-test`.
 
 ```lisp
 (dds.log:format-log-event-text
@@ -54,6 +54,20 @@ Severity is left-aligned in 6 columns (so `WARNING` renders `WARN`, the longest 
                           :severity :crit :category "MEM" :function "gbt_tc_core_mem_init"
                           :file "gbttctools/src/src.c" :line 1234 :message "Segmentation Fault encountered"))
 ;; => "…Z | … | 192.168.2.148 | gbttctools | CRIT   | MEM | gbt_tc_core_mem_init() - gbttctools/src/src.c:1234 | Segmentation Fault encountered"
+```
+
+### JSON format — `dds.log:format-log-event-json`
+
+**`dds.log:format-log-event-json`** renders a `log-event` as one JSON object (RFC 8259) — the *newline-delimited JSON* (`json_lines`) a collector's JSON sink emits, which logstash, filebeat and vector read unchanged. `timestamp` is the ISO 8601 UTC render; `severity` and `event_kind` are their lowercase names; `truncated` is a JSON boolean; the counters (`process`, `thread`, `seq`, `line`, `elapsed_ns`) are JSON numbers. The object carries **no trailing newline** — the sink adds the record separator. Every string field is escaped with a hand-written escaper (`%json-escape`, RFC 8259 §7: `\"` `\\` `\n` `\r` `\t` `\b` `\f`, `\u00XX` for any other control character; non-ASCII stays raw UTF-8), so a message containing a quote or a newline can never break the framing — a hand-written escaper against a fixed shape avoids a new runtime dependency and SBOM entry (operating contract §9). It is the default JSON formatter *closure* (ADR 0082 §7).
+
+```lisp
+(dds.log:format-log-event-json
+ (dds.log:build-log-event :host "node-1" :process 4242 :app-id "gbttctools"
+                          :severity :err :event-kind :exit :seq 7 :message "he said \"hi\""))
+;; => {"timestamp":"…Z","host":"node-1","process":4242,"participant_uuid":"…","host_ip":"…",
+;;     "app_id":"gbttctools","thread":0,"seq":7,"severity":"err","category":"…","function":"…",
+;;     "file":"…","line":0,"event_kind":"exit","elapsed_ns":0,"truncated":false,
+;;     "message":"he said \"hi\""}
 ```
 
 ### Interop status (inherited TypeObject notes)
