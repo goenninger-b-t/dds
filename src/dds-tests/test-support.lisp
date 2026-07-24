@@ -158,3 +158,6 @@
 (defconstant +td-dynamic-topic-discovery+ 42
   "durability dynamic-topic-add DISCOVERY-DRIVEN auto-serve isolation offset (WP-DURABILITY-DYNAMIC-TOPIC-DISCOVERY,
    ADR 0026 Phase-2b); distinct from +td-dynamic-topic+ (the API-driven variant) so the two never cross-discover.")
+(defconstant +td-log-pipeline+ 43
+  "logging-service end-to-end pipeline isolation offset (ADR 0082 §5/§6): make-logger -> DDS -> make-log-collector
+   -> file sink, an in-process LogEvent round-trip on its own domain so it never cross-discovers another test.")

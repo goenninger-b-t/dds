@@ -185,6 +185,14 @@
         (+ (* (cffi:mem-ref tp :int64 0) 1000000000) (cffi:mem-ref tp :int64 8))
         (* (- (get-universal-time) 2208988800) 1000000000))))
 
+(defun* process-id ()
+    (function () (unsigned-byte 32))
+  "This process's OS process id (POSIX getpid(2), IEEE Std 1003.1). A CFFI foreign call to the POSIX
+   symbol, so it is implementation-agnostic and needs no reader conditional (getpid never fails and
+   takes no argument). Masked to 32 bits for the LogEvent `process` key (ADR 0082 §3), so logged
+   samples key per originating process; a pid_t is well within 32 bits on the supported targets."
+  (logand (cffi:foreign-funcall "getpid" :int) #xffffffff))
+
 ;;; ---- thread introspection (control-plane; lifecycle assertions, never the hot path) ----
 
 (defun* live-threads ()

@@ -860,6 +860,21 @@
   "Number of remote endpoints matched against P's local endpoints."
   (dds.disc:disc-node-matched-count (dp-node p)))
 
+(defun* participant-guid-prefix (p)
+    (function (domain-participant) (simple-array (unsigned-byte 8) (12)))
+  "P's 12-octet RTPS GUID prefix (DDSI-RTPS 2.5 §8.2.4.2) — the network-unique participant identity
+   that every endpoint GUID on P carries as its high 12 octets. Exposed as public DCPS surface for
+   identity-stamping (e.g. the logging service's participant_uuid, ADR 0082 §3) so a consumer reads
+   the participant's identity without reaching into the discovery node."
+  (dds.disc:disc-node-guid-prefix (dp-node p)))
+
+(defun* participant-advertise-address (p)
+    (function (domain-participant) string)
+  "The address P advertises its unicast locators at — its create-participant :advertise-address
+   (default 127.0.0.1), IPv4 or IPv6 — i.e. where remote peers reach P on the DDS network. Exposed as
+   public DCPS surface for identity-stamping (e.g. the logging service's host_ip, ADR 0082 §3)."
+  (dds.disc:disc-node-advertise-address (dp-node p)))
+
 (defun* %spin-once (p)
     (function (domain-participant) (eql t))
   "One discovery announce + sweep cycle for P (the spin body): SPDP announce (announce-participant) + SEDP

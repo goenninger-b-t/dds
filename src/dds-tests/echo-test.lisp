@@ -3869,6 +3869,7 @@
                  ("gen-enum"                 . run-gen-enum-test)
                  ("gen-appendable"           . run-gen-appendable-test)
                  ("log-event"                . run-log-event-test)
+                 ("log-pipeline"             . run-log-pipeline-test)
                  ("xcdr-encap-options-pad"   . run-encap-options-pad-test)
                  ("xcdr-generated-type"      . run-generated-type-test)
                  ("xcdr-generated-sequence"  . run-generated-sequence-test)

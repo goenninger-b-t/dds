@@ -33,4 +33,15 @@
    ;; construction + truncation
    #:build-log-event #:truncate-utf8
    ;; formatters (ADR 0082 §7) — the default text- and JSON-rendering closures
-   #:format-log-event-text #:format-log-event-json))
+   #:format-log-event-text #:format-log-event-json
+   ;; wire-name defaults (topic + registered type; pinned to the interop leg)
+   #:*log-topic-name* #:*log-type-name*
+   ;; the logger — emit side (ADR 0082 §5)
+   #:logger #:logger-p #:make-logger #:logger-emit #:logger-spin #:close-logger
+   #:logger-host #:logger-participant-uuid #:logger-host-ip #:logger-app-id
+   #:logger-process #:logger-seq
+   ;; sinks (ADR 0082 §7) — replaceable closure pairs
+   #:log-sink #:log-sink-p #:sink-emit #:close-sink #:make-file-sink #:make-function-sink
+   ;; the collector — receive side (ADR 0082 §6)
+   #:log-collector #:log-collector-p #:make-log-collector
+   #:collector-drain #:collector-run #:close-log-collector #:log-collector-received))

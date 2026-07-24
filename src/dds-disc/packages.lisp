@@ -14,7 +14,7 @@
     participant sends SPDPdiscoveredParticipantData to the configured unicast
     peers; inbound SPDP records the remote participant keyed by GUID prefix.")
   (:export #:disc-node #:disc-node-p #:make-disc-node
-           #:disc-node-guid-prefix #:disc-node-peers #:disc-node-port
+           #:disc-node-guid-prefix #:disc-node-advertise-address #:disc-node-peers #:disc-node-port
            #:disc-node-discovered-count #:disc-node-discovered-prefixes
            #:disc-node-matched-count #:disc-node-matched-topics #:disc-node-matched-endpoints-for
            #:disc-node-on-match #:disc-node-on-unmatch

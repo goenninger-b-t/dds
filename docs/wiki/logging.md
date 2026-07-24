@@ -2,7 +2,7 @@
 
 The logging service (ADR 0082, FR-LOG) is an in-scope exception to the "no Connext service suite" rule: a `LogEvent` wire type plus a collector that renders structured JSON, text, and aggregator output. This page tracks what has landed.
 
-**Status: the wire type and both collector-side formatters (text + JSON) are landed.** The emit API, sinks, the service, the multi-service runner, the OTP-style supervisor, and the `log-service-main` CLI are follow-on slices (ADR 0082 §9). This page will grow with them.
+**Status: the thin end-to-end pipeline is landed** — the `LogEvent` wire type, both collector-side formatters (text + JSON), and the emit path (a logger), a file sink, and a collector: `make-logger` → DDS → `make-log-collector` → sink, verified in-process on both SBCL and Clasp (`run-log-pipeline-test`). `logger-emit` is the underlying emit *primitive* (an explicit call taking severity/category/message and the source fields as arguments); the ergonomic **per-severity macros with compile-time function/file/line capture and per-category thresholds (FR-LOG-3/4)**, the **non-blocking ring + severity-graded shedding (FR-LOG-5/6)**, the RFC 5424 UDP-syslog and HTTP-bulk sinks, the multi-service runner, the OTP-style supervisor, and the `log-service-main` CLI are follow-on slices (ADR 0082 §9). This page grows with them.
 
 ## The `LogEvent` wire type
 
@@ -69,6 +69,31 @@ Severity is left-aligned in 6 columns (so `WARNING` renders `WARN`, the longest 
 ;;     "file":"…","line":0,"event_kind":"exit","elapsed_ns":0,"truncated":false,
 ;;     "message":"he said \"hi\""}
 ```
+
+### The end-to-end pipeline — logger → DDS → collector → sink
+
+The emit slice wires the wire type and formatters into a working pipeline (ADR 0082 §5/§6): a **logger** publishes `LogEvent` samples; a **collector** subscribes, drains them, and pushes each through its **sinks**.
+
+**`dds.log:make-logger`** creates a producer and **detects the per-source identity once, now** (owner directives 2026-07-23/24): `host` = the given value or the machine name; `participant_uuid` = the participant's 12-octet RTPS GUID prefix (DDSI-RTPS 2.5 §8.2.4.2) rendered as 24 lowercase hex chars; `host_ip` = the given value or the participant's advertised address (IPv4 **or** IPv6 — the address at which DDS reaches this participant); `process` = the OS pid (`getpid`); `app_id` = the given application identity. It **borrows** a participant you pass (the embedded-library case) or **creates and owns** one on a domain/advertise-address. **`dds.log:logger-emit`** stamps that identity + the next per-logger `seq` + a realtime-nanosecond timestamp onto a `build-log-event` and publishes it; it returns the write status (`:ok` / `:timeout` / …), never a signalled condition — a logging call must not fail. **`dds.log:logger-spin`** drives one discovery/delivery cycle when the logger owns its participant; **`dds.log:close-logger`** deletes an owned participant.
+
+**`dds.log:make-log-collector`** creates a consumer subscribed to the same topic/type, holding a list of sinks. **`dds.log:collector-drain`** takes all available samples and pushes each valid one through every sink (returns the count drained — the unit a test drives directly); **`dds.log:collector-run`** is the bounded drain loop; **`dds.log:close-log-collector`** closes the sinks and deletes an owned participant.
+
+Both the writer and the reader use **`KEEP_ALL` history, not the `KEEP_LAST`-1 default**: every record for one `(host, process)` source is a *distinct* event, and `KEEP_LAST`-1 would coalesce same-key samples and silently drop all but the latest — a log must never lose records.
+
+A **sink** is a replaceable closure pair (ADR 0082 §7): `dds.log:make-file-sink` appends each event to a file as one formatter-rendered record per line (pass `:formatter #'format-log-event-json` for JSON-lines); `dds.log:make-function-sink` wraps any per-event handler (an in-memory collector, a metrics counter, a custom emitter). Swapping a sink or its formatter is a configuration change, never a collector change.
+
+```lisp
+(let* ((sink      (dds.log:make-file-sink "/var/log/app.jsonl" :formatter #'dds.log:format-log-event-json))
+       (collector (dds.log:make-log-collector :domain 7 :sinks (list sink)))
+       (logger    (dds.log:make-logger :domain 7 :app-id "gbttctools")))   ; host/uuid/ip/pid auto-detected
+  (dds.log:logger-emit logger :severity :notice :category "SUP" :function "gbt_sup_log"
+                              :message "supervisor up with 2 children")
+  (dds.log:collector-run collector :seconds 1)       ; drains the published events into the sink
+  (dds.log:close-logger logger)
+  (dds.log:close-log-collector collector))
+```
+
+The producer's participant exposes its identity through two public DCPS accessors added for this slice — `dds.dcps:participant-guid-prefix` (the 12-octet GUID prefix) and `dds.dcps:participant-advertise-address` (the advertised IPv4/IPv6 address) — and the pid comes from `dds.pal:process-id` (POSIX `getpid`, impl-agnostic).
 
 ### Interop status (inherited TypeObject notes)
 

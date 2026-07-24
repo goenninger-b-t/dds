@@ -1,10 +1,15 @@
-;;;; Distributed logging service (ADR 0082, FR-LOG). This slice: the LogEvent wire type.
+;;;; Distributed logging service (ADR 0082, FR-LOG). Slices landed: the LogEvent wire type, the text +
+;;;; JSON formatters, and the emit path (logger) + file sink + collector (the thin end-to-end pipeline).
 (defsystem "dds-log"
-  :description "DDS.LOG — the distributed logging service (ADR 0082). Slice: the LogEvent wire type."
+  :description "DDS.LOG — the distributed logging service (ADR 0082): LogEvent wire type, formatters, and
+                the logger -> DDS -> collector -> sink pipeline."
   :depends-on ("dds-core" "dds-pal" "dds-qos" "dds-types" "dds-gen" "dds-disc" "dds-dcps")
   :pathname "src/dds-log"
   :serial t
   :components ((:file "packages")
                (:file "event")
-               (:file "formatter"))
+               (:file "formatter")
+               (:file "emit")
+               (:file "sink")
+               (:file "collector"))
   :in-order-to ((test-op (test-op "dds-tests"))))

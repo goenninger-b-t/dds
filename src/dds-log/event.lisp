@@ -31,7 +31,9 @@
   (process :u32 :key t)
   ;; Per-source identity detected once at logger creation and stamped on every event, so a collector
   ;; renders the ORIGINATING logger's identity even for a remote source (owner directive 2026-07-23).
-  ;; participant-uuid: the DDS participant's UUID (a 36-char canonical UUID; 40 = + margin).
+  ;; participant-uuid: the DDS participant's network-unique identity. make-logger stamps the 12-octet
+  ;; RTPS GUID prefix (DDSI-RTPS 2.5 §8.2.4.2) as 24 lowercase hex chars; the bound is 40 so a
+  ;; 36-char RFC 4122 UUID from another producer also fits (both are accepted values of this field).
   ;; host-ip: the host machine IP address, IPv4 OR IPv6 — a string bounded at 46, which is
   ;; INET6_ADDRSTRLEN: it holds IPv4 (max "255.255.255.255", 15) and the longest textual IPv6 (the
   ;; IPv4-mapped "ffff:ffff:ffff:ffff:ffff:ffff:255.255.255.255", 45). A scoped/zone address

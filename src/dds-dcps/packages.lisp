@@ -24,6 +24,8 @@
            #:participant-factory-autoenable-p #:set-participant-factory-autoenable
            ;; WP-DCPS-API-COMPLETION S2.T2: parent->children containment registry (DDS 1.4 §2.2.2)
            #:participant-publishers #:participant-subscribers #:participant-topics
+           ;; participant identity accessors (public surface for identity-stamping, ADR 0082 §3)
+           #:participant-guid-prefix #:participant-advertise-address
            #:publisher-datawriters #:subscriber-datareaders
            ;; WP-DCPS-API-COMPLETION S2.T3: enable() + disabled-entity semantics (DDS 1.4 §2.2.2.1.1.7)
            #:enable #:entity-autoenable-created-entities
