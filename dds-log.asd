@@ -12,5 +12,6 @@
                (:file "emit")
                (:file "sink")
                (:file "collector")
-               (:file "macros"))
+               (:file "macros")
+               (:file "service"))
   :in-order-to ((test-op (test-op "dds-tests"))))

@@ -41,7 +41,8 @@
    #:logger-host #:logger-participant-uuid #:logger-host-ip #:logger-app-id
    #:logger-process #:logger-seq
    ;; sinks (ADR 0082 §7) — replaceable closure pairs
-   #:log-sink #:log-sink-p #:sink-emit #:close-sink #:make-file-sink #:make-function-sink
+   #:log-sink #:log-sink-p #:sink-emit #:close-sink
+   #:make-file-sink #:make-stream-sink #:make-function-sink
    ;; the collector — receive side (ADR 0082 §6)
    #:log-collector #:log-collector-p #:make-log-collector
    #:collector-drain #:collector-run #:close-log-collector #:log-collector-received
@@ -49,4 +50,9 @@
    #:log-emerg #:log-alert #:log-crit #:log-err #:log-warn #:log-notice #:log-info
    #:log-debug #:log-trace #:with-trace-scope
    ;; categories + per-category thresholds
-   #:*log-category-list* #:*log-thresholds* #:set-log-threshold #:get-log-threshold))
+   #:*log-category-list* #:*log-thresholds* #:set-log-threshold #:get-log-threshold
+   ;; the runnable service (ADR 0082 §6/§7, FR-LOG-7) — CLI/env entrypoint
+   #:log-service-main #:parse-log-service-config #:make-service-collector #:log-service-usage
+   #:log-service-config #:log-service-config-p #:log-service-config-domain
+   #:log-service-config-file #:log-service-config-format
+   #:*log-service-shutdown-requested*))

@@ -164,3 +164,6 @@
 (defconstant +td-log-macros+ 44
   "logging-service macro-API isolation offset (ADR 0082 §5, FR-LOG-3/4): the per-severity macros + with-trace-scope
    over a logger->collector round-trip (threshold gating, compile-time function capture), on its own domain.")
+(defconstant +td-log-service+ 45
+  "logging-service runnable-service isolation offset (ADR 0082 §6/§7, FR-LOG-7): log-service-main (block nil) builds
+   a collector whose file sink drains a logger's LogEvents, on its own domain so it never cross-discovers a test.")

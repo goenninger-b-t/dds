@@ -2,7 +2,7 @@
 
 The logging service (ADR 0082, FR-LOG) is an in-scope exception to the "no Connext service suite" rule: a `LogEvent` wire type plus a collector that renders structured JSON, text, and aggregator output. This page tracks what has landed.
 
-**Status: the thin end-to-end pipeline and the ergonomic macro API are landed** — the `LogEvent` wire type, both collector-side formatters (text + JSON), the emit path (a logger), a file sink, and a collector (`make-logger` → DDS → `make-log-collector` → sink), plus the per-severity macros + `with-trace-scope` over per-category thresholds (FR-LOG-3/4) — all verified in-process on both SBCL and Clasp (`run-log-pipeline-test`, `run-log-macros-test`). `logger-emit` is the underlying emit *primitive*; the ergonomic **per-severity macros with compile-time function capture and per-category thresholds (FR-LOG-3/4)** are landed too (see below). The **non-blocking ring + severity-graded shedding (FR-LOG-5/6)**, the RFC 5424 UDP-syslog and HTTP-bulk sinks, the multi-service runner, the OTP-style supervisor, and the `log-service-main` CLI are follow-on slices (ADR 0082 §9). This page grows with them.
+**Status: the pipeline, the ergonomic macro API, and a runnable service entrypoint are landed** — the `LogEvent` wire type, both collector-side formatters (text + JSON), the emit path (a logger), file/stream/function sinks, and a collector (`make-logger` → DDS → `make-log-collector` → sink); the per-severity macros + `with-trace-scope` over per-category thresholds (FR-LOG-3/4); and `log-service-main`, the CLI/env entrypoint that runs the collector as a service (FR-LOG-7, single-service) — all verified in-process on both SBCL and Clasp (`run-log-pipeline-test`, `run-log-macros-test`, `run-log-service-test`). `logger-emit` is the underlying emit *primitive*; the ergonomic **per-severity macros with compile-time function capture and per-category thresholds (FR-LOG-3/4)** and the **`log-service-main` CLI/env entrypoint (FR-LOG-7, single-service)** are landed too (see below). The **non-blocking ring + severity-graded shedding (FR-LOG-5/6)**, the RFC 5424 UDP-syslog and HTTP-bulk sinks, and the multi-service runner + OTP-style supervisor (the rest of FR-LOG-7) are follow-on slices (ADR 0082 §9). This page grows with them.
 
 ## The `LogEvent` wire type
 
@@ -115,6 +115,30 @@ Every call site belongs to a **category** (a registered keyword: `:gen :sup :mem
 
 (dds.log:set-log-threshold :sup dds.log:+severity-debug+)   ; now :sup DEBUG (and above) emit
 ```
+
+### Running it as a service — `log-service-main`
+
+**`dds.log:log-service-main`** is the CLI/env entrypoint that runs the collector as a service (FR-LOG-7). It parses config, builds a collector with one sink, and drains received `LogEvent`s until `SIGTERM`/`SIGINT`, then tears down and exits — the exit code is the `ReturnCode_t`. Config (CLI overrides env overrides default):
+
+| option | env | default |
+|---|---|---|
+| `--domain N` | `DDS_LOG_DOMAIN` | `0` |
+| `--file PATH` | `DDS_LOG_FILE` | *(none → console/stdout sink)* |
+| `--format text\|json` | `DDS_LOG_FORMAT` | `text` |
+
+`--help`/`-h` prints usage. A bad option (non-numeric domain, unknown format) is a **returned status** — `parse-log-service-config` returns `(values nil :bad-parameter)`, and `log-service-main` prints usage to standard error and exits non-zero; nothing signals (ADR 0064). Keyword arguments make it testable in-process: `:block nil` returns `(values collector status)` (or `:help`) instead of installing a signal handler and looping, and `:seconds N` bounds a `:block t` run.
+
+```lisp
+;; from a shell:  log-service-main --domain 7 --file /var/log/app.jsonl --format json
+;; in-process (tests): build the collector without daemonizing, drive it yourself
+(multiple-value-bind (collector status)
+    (dds.log:log-service-main :block nil :argv '("--domain" "7" "--format" "json"))
+  (unless status
+    (dds.log:collector-run collector :seconds 5)
+    (dds.log:close-log-collector collector)))
+```
+
+The sink is chosen from `--file`: a `make-file-sink` (owns the file) when a path is given, else a `make-stream-sink` over `*standard-output*` (the console sink — a new sink that *borrows* a stream, flushing but not closing it). The **multi-service runner + OTP-style supervisor** that would run several collectors under one process (the durability-service shape) are the remaining part of FR-LOG-7.
 
 ### Interop status (inherited TypeObject notes)
 

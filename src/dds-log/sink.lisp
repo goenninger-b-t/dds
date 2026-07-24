@@ -31,19 +31,30 @@
   "Release SINK via its close closure."
   (funcall (log-sink-close sink)))
 
+(defun* make-stream-sink (stream &key (formatter #'format-log-event-text))
+    (function (t &key (:formatter function)) log-sink)
+  "A sink that writes each event to the character STREAM as one FORMATTER-rendered record per line
+   (newline-delimited), force-output after each so nothing lingers unflushed. The stream is BORROWED —
+   close-sink finish-outputs but does NOT close it (unlike make-file-sink, which owns its file). Use for
+   *standard-output*/*error-output* or any already-open stream (the log service's default console sink)."
+  (%make-log-sink
+   :write (lambda (event)
+            (write-string (funcall formatter event) stream)
+            (write-char #\Newline stream)
+            (force-output stream))
+   :close (lambda () (finish-output stream))))
+
 (defun* make-file-sink (path &key (formatter #'format-log-event-text) (if-exists :append))
     (function (t &key (:formatter function) (:if-exists keyword)) log-sink)
   "A sink that appends each event to the file at PATH as one FORMATTER-rendered record per line
    (newline-delimited — the framing a text log or a json_lines consumer reads). FORMATTER defaults to
    the text formatter; pass #'format-log-event-json for a JSON-lines file. IF-EXISTS governs an
    existing file (:append the default, :supersede to truncate). The file is opened once here (UTF-8, the
-   LogEvent string encoding) and closed by close-sink; each record is written then force-output, so a
-   crash loses at most the in-flight line."
-  (let ((stream (open path :direction :output :if-exists if-exists :if-does-not-exist :create
-                           :element-type 'character :external-format :utf-8)))
-    (%make-log-sink
-     :write (lambda (event)
-              (write-string (funcall formatter event) stream)
-              (write-char #\Newline stream)
-              (force-output stream))
-     :close (lambda () (close stream)))))
+   LogEvent string encoding); the per-record write is make-stream-sink's (shared, DRY), but close-sink
+   CLOSES the file (this sink OWNS it). Each record is written then force-output, so a crash loses at
+   most the in-flight line."
+  (let* ((stream (open path :direction :output :if-exists if-exists :if-does-not-exist :create
+                            :element-type 'character :external-format :utf-8))
+         (inner (make-stream-sink stream :formatter formatter)))
+    (%make-log-sink :write (log-sink-write inner)
+                    :close (lambda () (close stream)))))
