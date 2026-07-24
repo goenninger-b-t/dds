@@ -2,7 +2,7 @@
 
 The logging service (ADR 0082, FR-LOG) is an in-scope exception to the "no Connext service suite" rule: a `LogEvent` wire type plus a collector that renders structured JSON, text, and aggregator output. This page tracks what has landed.
 
-**Status: the thin end-to-end pipeline is landed** — the `LogEvent` wire type, both collector-side formatters (text + JSON), and the emit path (a logger), a file sink, and a collector: `make-logger` → DDS → `make-log-collector` → sink, verified in-process on both SBCL and Clasp (`run-log-pipeline-test`). `logger-emit` is the underlying emit *primitive* (an explicit call taking severity/category/message and the source fields as arguments); the ergonomic **per-severity macros with compile-time function/file/line capture and per-category thresholds (FR-LOG-3/4)**, the **non-blocking ring + severity-graded shedding (FR-LOG-5/6)**, the RFC 5424 UDP-syslog and HTTP-bulk sinks, the multi-service runner, the OTP-style supervisor, and the `log-service-main` CLI are follow-on slices (ADR 0082 §9). This page grows with them.
+**Status: the thin end-to-end pipeline and the ergonomic macro API are landed** — the `LogEvent` wire type, both collector-side formatters (text + JSON), the emit path (a logger), a file sink, and a collector (`make-logger` → DDS → `make-log-collector` → sink), plus the per-severity macros + `with-trace-scope` over per-category thresholds (FR-LOG-3/4) — all verified in-process on both SBCL and Clasp (`run-log-pipeline-test`, `run-log-macros-test`). `logger-emit` is the underlying emit *primitive*; the ergonomic **per-severity macros with compile-time function capture and per-category thresholds (FR-LOG-3/4)** are landed too (see below). The **non-blocking ring + severity-graded shedding (FR-LOG-5/6)**, the RFC 5424 UDP-syslog and HTTP-bulk sinks, the multi-service runner, the OTP-style supervisor, and the `log-service-main` CLI are follow-on slices (ADR 0082 §9). This page grows with them.
 
 ## The `LogEvent` wire type
 
@@ -94,6 +94,27 @@ A **sink** is a replaceable closure pair (ADR 0082 §7): `dds.log:make-file-sink
 ```
 
 The producer's participant exposes its identity through two public DCPS accessors added for this slice — `dds.dcps:participant-guid-prefix` (the 12-octet GUID prefix) and `dds.dcps:participant-advertise-address` (the advertised IPv4/IPv6 address) — and the pid comes from `dds.pal:process-id` (POSIX `getpid`, impl-agnostic).
+
+### The ergonomic macro API — per-severity macros, categories, `with-trace-scope`
+
+`logger-emit` is the primitive; the everyday API is **one macro per severity** (FR-LOG-3): `log-emerg`, `log-alert`, `log-crit`, `log-err`, `log-warn`, `log-notice`, `log-info`, `log-debug`, `log-trace`. Each is `(log-<sev> logger category control &rest format-args)` — `control` is a `format` control string (with no args it is the literal message, no `format` call). The **function name is captured at compile time** from the enclosing `defun*` (via `dds.lang:current-function-name`, a local `macrolet` the `defun*` establishes), the **file** best-effort from `*compile-file-truename*`; the **line is 0** — a documented NFR-PORT gap (per-impl source-line capture is a follow-on), never a silent zero.
+
+Every call site belongs to a **category** (a registered keyword: `:gen :sup :mem :net :disc :sec :qos :xport :app`) with an **independent threshold** (FR-LOG-4). A message at severity *L* in category *C* is emitted iff *L* ≤ the category's threshold. Defaults are `+severity-info+` — **`EMERG`…`INFO` emit; `DEBUG` and `TRACE` are off by default**. `set-log-threshold` / `get-log-threshold` tune a category at runtime. Because the category is a literal keyword, its index and name are resolved at macroexpansion, so a **disabled level costs one `aref` at a constant index plus a comparison and allocates nothing** — the `format` that builds the message sits inside the threshold gate. The RTPS data plane may therefore hold `log-debug`/`log-trace` calls behind their default-off levels at negligible cost.
+
+**`with-trace-scope`** brackets a body with `TRACE` `:entry`/`:exit` events (the exit carrying elapsed nanoseconds) **only when `TRACE` is enabled for the category** — when it is off (the default), the body runs and **the clock is never read** (FR-LOG-4). It always returns the body's value.
+
+```lisp
+(defun* gbt-sup-start (logger)          ; the function name "gbt-sup-start" is captured at compile time
+    (function (dds.log:logger) t)
+  "..."
+  (dds.log:log-notice logger :sup "supervisor up with ~d children" 2)   ; emitted (INFO threshold)
+  (dds.log:log-debug  logger :sup "child pids ~a" (list 41 42))          ; NOT emitted (DEBUG off) — no format runs
+  (dds.log:with-trace-scope (logger :sup)                               ; silent unless :sup TRACE is on
+    (do-startup-work))
+  t)
+
+(dds.log:set-log-threshold :sup dds.log:+severity-debug+)   ; now :sup DEBUG (and above) emit
+```
 
 ### Interop status (inherited TypeObject notes)
 

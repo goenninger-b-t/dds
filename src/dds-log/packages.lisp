@@ -44,4 +44,9 @@
    #:log-sink #:log-sink-p #:sink-emit #:close-sink #:make-file-sink #:make-function-sink
    ;; the collector — receive side (ADR 0082 §6)
    #:log-collector #:log-collector-p #:make-log-collector
-   #:collector-drain #:collector-run #:close-log-collector #:log-collector-received))
+   #:collector-drain #:collector-run #:close-log-collector #:log-collector-received
+   ;; the ergonomic macro API (ADR 0082 §5, FR-LOG-3/4) — per-severity macros + trace scope
+   #:log-emerg #:log-alert #:log-crit #:log-err #:log-warn #:log-notice #:log-info
+   #:log-debug #:log-trace #:with-trace-scope
+   ;; categories + per-category thresholds
+   #:*log-category-list* #:*log-thresholds* #:set-log-threshold #:get-log-threshold))

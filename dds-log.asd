@@ -11,5 +11,6 @@
                (:file "formatter")
                (:file "emit")
                (:file "sink")
-               (:file "collector"))
+               (:file "collector")
+               (:file "macros"))
   :in-order-to ((test-op (test-op "dds-tests"))))

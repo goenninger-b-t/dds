@@ -161,3 +161,6 @@
 (defconstant +td-log-pipeline+ 43
   "logging-service end-to-end pipeline isolation offset (ADR 0082 §5/§6): make-logger -> DDS -> make-log-collector
    -> file sink, an in-process LogEvent round-trip on its own domain so it never cross-discovers another test.")
+(defconstant +td-log-macros+ 44
+  "logging-service macro-API isolation offset (ADR 0082 §5, FR-LOG-3/4): the per-severity macros + with-trace-scope
+   over a logger->collector round-trip (threshold gating, compile-time function capture), on its own domain.")

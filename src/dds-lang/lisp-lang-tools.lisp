@@ -13,7 +13,8 @@
     contract (FR-LANG-8) and the mandatory docstring (§5.1) structural rather than a
     convention checked after the fact. Used to define every function and struct in the stack.")
   (:export #:defun* #:defstruct* #:plusp-length #:try #:bail
-           #:contract-violation #:contract-violation-detail))
+           #:contract-violation #:contract-violation-detail
+           #:current-function-name))
 
 (in-package #:net.goenninger.dds.lang)
 
@@ -29,6 +30,16 @@
     Owner-blessed (2026-07-15) as an intentional, exempt category (gate: NOCOND(CONTRACT)) — a proper
     typed condition class for these poison defaults rather than a bare `(error \"string\")`. DETAIL names
     the specific slot/argument for the backtrace if a bug ever trips it."))
+
+(defmacro current-function-name ()
+  "Expand to the name (a lowercase string) of the lexically-enclosing DEFUN* function, or \"\" when used
+   outside one. This global definition is the FALLBACK; every DEFUN* shadows it inside its body with a
+   local MACROLET whose expansion is that function's own name (added to the existing TRY/BAIL macrolet).
+   It is the compile-time function-name capture behind the logging service's `function` field
+   (FR-LOG-3, ADR 0082 §5): a log call inside `(defun* gbt-init ...)` records \"gbt-init\" with no
+   runtime cost — the name is a literal baked in at macroexpansion. Purely lexical, so it needs no
+   &environment and no per-implementation support."
+  "")
 
 (declaim (ftype (function (t) t) plusp-length))
 (defun plusp-length (x)
@@ -100,7 +111,11 @@ required parameter(s) — they must match (a mismatch silently mis-types paramet
                           (list 'when s (list 'return-from ',name (list 'values nil s)))
                           v)))
                 (bail (status)
-                  (list 'return-from ',name (list 'values nil status))))
+                  (list 'return-from ',name (list 'values nil status)))
+                ;; Shadow the global CURRENT-FUNCTION-NAME with THIS function's own name, so a log call
+                ;; in the body captures the enclosing function at compile time (FR-LOG-3, ADR 0082 §5).
+                ;; Compile-time only — the name is a literal, no runtime cost, no per-impl support.
+                (current-function-name () ,(string-downcase (symbol-name name))))
              ,@forms))))))
 
 (defmacro defstruct* (name-and-options docstring &body slots)
