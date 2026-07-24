@@ -3877,6 +3877,7 @@
                  ("log-syslog"               . run-log-syslog-test)
                  ("log-http"                 . run-log-http-test)
                  ("log-runner"               . run-log-runner-test)
+                 ("log-supervisor"           . run-log-supervisor-test)
                  ("xcdr-encap-options-pad"   . run-encap-options-pad-test)
                  ("xcdr-generated-type"      . run-generated-type-test)
                  ("xcdr-generated-sequence"  . run-generated-sequence-test)

@@ -174,3 +174,7 @@
   "logging-service multi-service-runner isolation offset (ADR 0082 §6/§7, FR-LOG-7): the runner runs TWO collectors,
    one on this domain and one on this+1 (offset 48, unused elsewhere), each fed by its own logger — proving
    concurrent multi-collector operation + per-domain isolation on their own domains.")
+(defconstant +td-log-supervisor+ 49
+  "logging-service OTP-supervisor isolation offset (ADR 0082 §6/§7, FR-LOG-7): one collector whose drain thread is
+   killed via the *log-runner-fault* hook, so the supervisor's restart + restart-intensity-shed paths are exercised
+   on its own domain (48 is taken by the runner test's second collector).")

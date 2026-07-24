@@ -60,4 +60,7 @@
    #:*log-service-shutdown-requested*
    ;; the multi-service runner (ADR 0082 §6/§7, FR-LOG-7) — N collectors, one process
    #:log-service-runner #:log-service-runner-p #:make-log-service-runner
-   #:log-runner-start #:log-runner-stop))
+   #:log-runner-start #:log-runner-stop
+   ;; the OTP-style supervisor (ADR 0082 §6/§7, FR-LOG-7) — restart dead drain threads
+   #:log-supervisor #:log-supervisor-p #:make-log-supervisor
+   #:log-supervisor-start #:log-supervisor-stop))
