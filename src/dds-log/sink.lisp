@@ -58,3 +58,20 @@
          (inner (make-stream-sink stream :formatter formatter)))
     (%make-log-sink :write (log-sink-write inner)
                     :close (lambda () (close stream)))))
+
+(defun* make-udp-syslog-sink (host port &key (facility 1))
+    (function (string (integer 0 65535) &key (:facility (integer 0 23))) log-sink)
+  "A sink that sends each event to an RFC 5424 syslog collector at HOST:PORT over UDP — one datagram per
+   event, the line rendered by format-log-event-syslog with FACILITY (default 1, user-level). Opens a UDP
+   socket here (closed by close-sink); the datagram is the raw UTF-8 octets of the syslog line
+   (dds.cdr:string-to-utf8-octets), which rsyslog/syslog-ng ingest directly. UDP syslog (RFC 5426) is
+   fire-and-forget — a lost datagram is not retransmitted; the reliable leg is the DDS path INTO the
+   collector, and the collector->syslog hop is best-effort by syslog's own design (ADR 0082 §7, FR-LOG-8)."
+  (multiple-value-bind (socket status) (dds.pal:udp-open)
+    (declare (ignore status))
+    (%make-log-sink
+     :write (lambda (event)
+              (let ((octets (dds.cdr:string-to-utf8-octets
+                             (format-log-event-syslog event :facility facility))))
+                (dds.pal:udp-send-to socket octets (length octets) host port)))
+     :close (lambda () (dds.pal:udp-close socket)))))

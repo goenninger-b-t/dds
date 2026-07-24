@@ -108,24 +108,38 @@
                       ((< cp #x10000) 3)     ;              1110xxxx 10xxxxxx 10xxxxxx
                       (t 4)))))))            ;              11110xxx 10xxxxxx 10xxxxxx 10xxxxxx
 
+(defmacro %do-utf8-octets ((byte-var cp-form) &body emit)
+  "Encode code point CP-FORM to its one-to-four UTF-8 octets (RFC 3629 §3, the table quoted in
+   UTF8-OCTET-LENGTH — each continuation octet carries six payload bits under the 10xxxxxx tag) and run
+   EMIT once per octet with BYTE-VAR bound to it. THE SINGLE definition of the UTF-8 encode byte patterns
+   (DRY): %cdr-put-utf8-char emits to a cursor, string-to-utf8-octets to a heap vector. A macro, not a
+   function, so it INLINES with no per-octet funcall — the hot-path codec pays nothing for the sharing,
+   and %cdr-put-utf8-char's generated code is unchanged (verified byte-exact by the corpus)."
+  (let ((cp (gensym "CP")))
+    (flet ((octet (bexpr) `(let ((,byte-var ,bexpr)) ,@emit)))
+      `(let ((,cp ,cp-form))
+         (declare (type (integer 0) ,cp))
+         (cond ((< ,cp #x80) ,(octet cp))
+               ((< ,cp #x800)
+                ,(octet `(logior #xC0 (ash ,cp -6)))
+                ,(octet `(logior #x80 (logand ,cp #x3F))))
+               ((< ,cp #x10000)
+                ,(octet `(logior #xE0 (ash ,cp -12)))
+                ,(octet `(logior #x80 (logand (ash ,cp -6) #x3F)))
+                ,(octet `(logior #x80 (logand ,cp #x3F))))
+               (t
+                ,(octet `(logior #xF0 (ash ,cp -18)))
+                ,(octet `(logior #x80 (logand (ash ,cp -12) #x3F)))
+                ,(octet `(logior #x80 (logand (ash ,cp -6) #x3F)))
+                ,(octet `(logior #x80 (logand ,cp #x3F)))))))))
+
 (defun* %cdr-put-utf8-char (c cp)
     (function (dds.core.buffer:cursor (integer 0)) t)
   "Write code point CP to cursor C as one to four UTF-8 octets (RFC 3629 §3, the table quoted in
-   UTF8-OCTET-LENGTH). Each continuation octet carries six payload bits under the 10xxxxxx tag."
-  (cond ((< cp #x80)
-         (dds.core.buffer:put-u8 c cp))
-        ((< cp #x800)
-         (dds.core.buffer:put-u8 c (logior #xC0 (ash cp -6)))
-         (dds.core.buffer:put-u8 c (logior #x80 (logand cp #x3F))))
-        ((< cp #x10000)
-         (dds.core.buffer:put-u8 c (logior #xE0 (ash cp -12)))
-         (dds.core.buffer:put-u8 c (logior #x80 (logand (ash cp -6) #x3F)))
-         (dds.core.buffer:put-u8 c (logior #x80 (logand cp #x3F))))
-        (t
-         (dds.core.buffer:put-u8 c (logior #xF0 (ash cp -18)))
-         (dds.core.buffer:put-u8 c (logior #x80 (logand (ash cp -12) #x3F)))
-         (dds.core.buffer:put-u8 c (logior #x80 (logand (ash cp -6) #x3F)))
-         (dds.core.buffer:put-u8 c (logior #x80 (logand cp #x3F))))))
+   UTF8-OCTET-LENGTH). Each continuation octet carries six payload bits under the 10xxxxxx tag. The
+   encode byte patterns are %do-utf8-octets (shared with string-to-utf8-octets), inlined here so the
+   generated code is unchanged from the hand-written cond it replaced."
+  (%do-utf8-octets (b cp) (dds.core.buffer:put-u8 c b)))
 
 (defun* cdr-put-string (c s mode)
     (function (dds.core.buffer:cursor string cdr-mode) string)
@@ -146,6 +160,24 @@
     (%cdr-put-utf8-char c (char-code (char s i))))
   (dds.core.buffer:put-u8 c 0)
   s)
+
+(defun* string-to-utf8-octets (s)
+    (function (string) (simple-array (unsigned-byte 8) (*)))
+  "Encode string S to a FRESH heap octet vector of its UTF-8 bytes (RFC 3629 §3) — NO 4-octet length
+   prefix and NO NUL terminator, unlike CDR-PUT-STRING which frames a CDR string. The standalone
+   encoder for callers that need raw UTF-8 octets to hand to a byte sink, e.g. an RFC 5424 syslog UDP
+   datagram (ADR 0082 §7, FR-LOG-8). Shares the encode byte patterns with the CDR codec via
+   %do-utf8-octets (DRY). Off the measured hot path (a logging sink allocates when it emits)."
+  ;; a logging-sink utility (RFC 5424 syslog datagram, FR-LOG-8), never on the RTPS per-sample path —
+  ;; the codec uses %cdr-put-utf8-char into a cursor, not this.
+  (let ((out (make-array (utf8-octet-length s) :element-type '(unsigned-byte 8)))   ; HOTPATH-ALLOC(COLD): logging-sink util, off the per-sample path
+        (i 0))
+    (declare (type (integer 0) i) (type (simple-array (unsigned-byte 8) (*)) out))
+    (dotimes (k (length s))
+      (%do-utf8-octets (b (char-code (char s k)))
+        (setf (aref out i) b)
+        (incf i)))
+    out))
 (defun* %utf8-lead-length (b0)
     (function ((unsigned-byte 8)) (integer 0 4))
   "Octets in the UTF-8 sequence introduced by lead octet B0, or 0 when B0 cannot lead one

@@ -3,7 +3,7 @@
 (defsystem "dds-log"
   :description "DDS.LOG — the distributed logging service (ADR 0082): LogEvent wire type, formatters, and
                 the logger -> DDS -> collector -> sink pipeline."
-  :depends-on ("dds-core" "dds-pal" "dds-qos" "dds-types" "dds-gen" "dds-disc" "dds-dcps")
+  :depends-on ("dds-core" "dds-pal" "dds-cdr" "dds-qos" "dds-types" "dds-gen" "dds-disc" "dds-dcps")
   :pathname "src/dds-log"
   :serial t
   :components ((:file "packages")

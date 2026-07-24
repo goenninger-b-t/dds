@@ -110,3 +110,33 @@
           (log-event-elapsed-ns event)
           (log-event-truncated event)
           (%json-escape (log-event-message event))))
+
+(defun* %syslog-nilable (s)
+    (function (string) string)
+  "RFC 5424 §6.2 NILVALUE mapping: an empty HEADER field renders as '-' (the NILVALUE), else S. The
+   fields it guards — HOSTNAME, APP-NAME, PROCID, MSGID — are space-free by construction, so no further
+   escaping is needed for the SP-delimited header."
+  (if (zerop (length s)) "-" s))
+
+(defun* format-log-event-syslog (event &key (facility 1))
+    (function (log-event &key (:facility (integer 0 23))) string)
+  "Render EVENT as an RFC 5424 §6 syslog message:
+     <PRI>1 TIMESTAMP HOSTNAME APP-NAME PROCID MSGID STRUCTURED-DATA MSG
+   PRI = FACILITY*8 + severity (§6.2.1); our severity IS the RFC 5424 numbering, clamped to 0..7 for the
+   PRI (TRACE=8 -> 7=debug, since the wire PRI defines no value 8). VERSION is 1. TIMESTAMP is the RFC
+   3339 UTC render (%iso8601-utc). HOSTNAME/APP-NAME/PROCID/MSGID come from host/app_id/process/category,
+   NILVALUE '-' when empty (§6.2). STRUCTURED-DATA is '-' (none). MSG carries the source location and the
+   message. FACILITY defaults to 1 (user-level messages, §6.2.1 Table 1). This is the formatter the
+   UDP-syslog sink emits (ADR 0082 §7, FR-LOG-8)."
+  (let ((pri (+ (* facility 8) (min 7 (severity-to-i32 (log-event-severity event))))))
+    (format nil "<~d>1 ~a ~a ~a ~d ~a - ~a() - ~a:~d ~a"
+            pri
+            (%iso8601-utc (log-event-timestamp event))
+            (%syslog-nilable (log-event-host event))
+            (%syslog-nilable (log-event-app-id event))
+            (log-event-process event)
+            (%syslog-nilable (log-event-category event))
+            (%syslog-nilable (log-event-function event))
+            (%syslog-nilable (log-event-file event))
+            (log-event-line event)
+            (log-event-message event))))

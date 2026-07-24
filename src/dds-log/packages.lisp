@@ -32,8 +32,8 @@
    #:+log-event-file-bound+ #:+log-event-message-bound+
    ;; construction + truncation
    #:build-log-event #:truncate-utf8
-   ;; formatters (ADR 0082 §7) — the default text- and JSON-rendering closures
-   #:format-log-event-text #:format-log-event-json
+   ;; formatters (ADR 0082 §7) — the default text-, JSON- and RFC 5424 syslog-rendering closures
+   #:format-log-event-text #:format-log-event-json #:format-log-event-syslog
    ;; wire-name defaults (topic + registered type; pinned to the interop leg)
    #:*log-topic-name* #:*log-type-name*
    ;; the logger — emit side (ADR 0082 §5); the async non-blocking ring (FR-LOG-5/6)
@@ -43,7 +43,7 @@
    #:+log-default-ring-capacity+
    ;; sinks (ADR 0082 §7) — replaceable closure pairs
    #:log-sink #:log-sink-p #:sink-emit #:close-sink
-   #:make-file-sink #:make-stream-sink #:make-function-sink
+   #:make-file-sink #:make-stream-sink #:make-function-sink #:make-udp-syslog-sink
    ;; the collector — receive side (ADR 0082 §6)
    #:log-collector #:log-collector-p #:make-log-collector
    #:collector-drain #:collector-run #:close-log-collector #:log-collector-received
