@@ -340,15 +340,19 @@ Still provisional: the unexercised serialization-VM edges (unions, MUTABLE struc
   caveat: the foreign→us *user-data* path is not visible to tshark on this host's lo0 (a macOS
   loopback-capture quirk, not a delivery gap — proven by the decoded sample counts); the forward-leg
   `0x0001`/`0x0007` TX encapsulation is dissected directly (`captures/our-xcdr{1,2}-to-{connext,fastdds}.pcap`,
-  `captures/{connext,fastdds}-pub-to-our-sub.pcap`). Those live legs used a reader that advertised
-  `[XCDR1]` **explicitly** (PID present on the wire). A stock `@final` reader created with pure default
-  QoS instead **elides** the default-valued `PID_DATA_REPRESENTATION`; parsing that *absent* PID as our
-  `make-*-qos` local default `[XCDR2, XCDR1]` — rather than the DDS-XTypes 1.3 §7.6.3.1.1 `[XCDR1]` wire
-  default — made our `[XCDR2]` writer *falsely* match it and send into a reader that had rejected the
-  match on its own side: the silent no-`OFFERED_INCOMPATIBLE_QOS`, no-ACKNACK direction-A failure.
-  `parse-endpoint-data` now seeds an absent PID to `[XCDR1]`, closing that path deterministically
-  (`rtps-data-representation-absent-default`) — our `[XCDR2]` writer reports the incompatibility, and a
-  `REP=xcdr1` writer matches and delivers exactly as the live legs above show.
+  `captures/{connext,fastdds}-pub-to-our-sub.pcap`). **Absent-PID RxO (direction-A), fixed `e3f1803`
+  and live-confirmed 2026-07-24 (`interop/data-representation/dirA-absent-pid/`).** The two peers
+  advertise `[XCDR1]` *differently* on the wire (re-dissected, correcting an earlier "both elide"
+  note): **Connext INCLUDES `PID_DATA_REPRESENTATION` explicitly** = `[XCDR1]` (SEDP frame 56, vendor
+  `0x0101`), **Fast DDS OMITS it** (0 frames carry 0x0073). An *absent* PID must default to the
+  DDS-XTypes 1.3 §7.6.3.1.1 wire default `[XCDR1]`, not our `make-*-qos` local default `[XCDR2, XCDR1]`;
+  seeding the local default made our `[XCDR2]` writer *falsely match* a stock Fast DDS reader (RTPS
+  writers publish regardless of match, so it *sent* into a reader that had rejected it — the silent
+  no-`OFFERED_INCOMPATIBLE_QOS` direction-A failure). Live A/B vs the **same** stock @final Fast DDS
+  reader (`match=` = `disc-node-matched-count` = the RxO verdict): **pre-fix `REP=xcdr2` → `match=YES`
+  (false), post-fix → `match=NO` (correct); `REP=xcdr1` → `match=YES`, Fast DDS received 49.** Connext
+  (explicit `[XCDR1]`) gives the correct no-match with or without the fix — unaffected. Closed
+  deterministically by `rtps-data-representation-absent-default`.
 
 - **TRANSIENT_LOCAL durability + late-joiner cross-DDS interop (WP-DURABILITY-TRANSIENT-LOCAL, M6/P5,
   DDS 1.4 §2.2.3.4; [`interop/durability-transient-local/`](../../interop/durability-transient-local/))**

@@ -98,12 +98,22 @@ set `[XCDR2, XCDR1]` = shorts `[2, 0]` (XCDR2's id is 2, XCDR1's id is **0**).
 
 ### Matching outcomes (no new false-rejects)
 
-Both peers' `ShapeType` is a fixed-size `@final` type. **Both Connext's and Fast DDS's *reader*
-for this type accept `[XCDR1]`-only** (they elide the default-valued PID — 0 matches of 0x0073
-from either peer in every capture), so our default `[XCDR2]` writer is a **true RxO incompatibility**
-with their reader (`first-of-offered XCDR2 ∉ accepted {XCDR1}`, DDS 1.4 §2.2.3 / our
-`qos-rxo-compatible`). This is the designed behaviour Step 2 resolves; it is **not** a false-reject
-— it is the *correct* reject of an unsatisfiable representation request. Our **reader** accepts
+Both peers' `ShapeType` is a fixed-size `@final` type, and **both readers request `[XCDR1]`**, so our
+default `[XCDR2]` writer is a **true RxO incompatibility** with their reader (`first-of-offered XCDR2 ∉
+accepted {XCDR1}`, DDS 1.4 §2.2.3 / our `qos-rxo-compatible`). This is the designed behaviour Step 2
+resolves; it is **not** a false-reject — it is the *correct* reject of an unsatisfiable representation
+request.
+
+> **Correction (re-dissected 2026-07-24, `dirA-absent-pid/`): the two peers advertise `[XCDR1]`
+> differently on the wire.** An earlier revision of this note claimed "both readers elide the
+> default-valued PID — 0 matches of 0x0073 from either peer"; the wire falsifies that for Connext.
+> **RTI Connext INCLUDES `PID_DATA_REPRESENTATION` explicitly** = `[XCDR1]` (`captures/connext-sedp-lo0.pcap`
+> frame 56, vendor `0x0101`, `Data Representation Sequence[1] → [0]: XCDR_DATA_REPRESENTATION`). **Fast
+> DDS OMITS it** (`captures/fastdds-sedp-lo0.pcap`: 0 frames carry 0x0073). This matters for RxO parse:
+> an *absent* PID must default to the §7.6.3.1.1 wire default `[XCDR1]`, not our `make-*-qos` local
+> default `[XCDR2, XCDR1]` — seeding the local default made our `[XCDR2]` writer *falsely match* a
+> stock Fast DDS reader. Fixed in `e3f1803` and confirmed live against Fast DDS — see
+> [`dirA-absent-pid/NOTES.md`](dirA-absent-pid/NOTES.md). Our **reader** accepts
 `[XCDR2, XCDR1]`, so it matches each peer's `[XCDR1]`-offering writer.
 
 | Match leg | Result |
