@@ -18,6 +18,7 @@
            #:qos-reliability #:qos-durability #:qos-deadline #:qos-latency-budget
            #:qos-ownership #:qos-ownership-strength #:qos-transport-priority
            #:qos-liveliness #:qos-liveliness-lease #:liveliness-rank
+           #:destination-order-rank #:presentation-rank
            #:qos-destination-order #:qos-presentation-scope
            #:qos-presentation-coherent #:qos-presentation-ordered
            #:qos-data-representation #:qos-partition

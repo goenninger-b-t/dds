@@ -819,6 +819,20 @@
   "PID_OWNERSHIP -> OwnershipQosPolicy {OwnershipQosPolicyKind kind} (RTPS 2.5 Table 9.18
    §9.6.2.2; DDS 1.4 dds_rtf2_dcps.idl §2.2.3.9). kind u32: SHARED_OWNERSHIP_QOS=0,
    EXCLUSIVE_OWNERSHIP_QOS=1.")
+(defconstant +pid-presentation+               #x0021
+  "PID_PRESENTATION -> PresentationQosPolicy {PresentationQosPolicyAccessScopeKind access_scope;
+   boolean coherent_access; boolean ordered_access} (RTPS 2.5 Table 9.14 §9.6.2.2; DDS 1.4 PSM
+   §2.2.3.6). access_scope u32: INSTANCE=0, TOPIC=1, GROUP=2; the two booleans are 1 octet each.")
+(defconstant +pid-deadline+                   #x0023
+  "PID_DEADLINE -> DeadlineQosPolicy {Duration_t period} = 8 octets (RTPS 2.5 Table 9.14 §9.6.2.2;
+   DDS 1.4 PSM §2.2.3.7). Duration_t is the RTPS-wire {seconds; fraction} (§9.3.2).")
+(defconstant +pid-destination-order+          #x0025
+  "PID_DESTINATION_ORDER -> DestinationOrderQosPolicy {DestinationOrderQosPolicyKind kind} = 4 octets
+   (RTPS 2.5 Table 9.14 §9.6.2.2; DDS 1.4 PSM §2.2.3.16). kind u32: BY_RECEPTION_TIMESTAMP=0,
+   BY_SOURCE_TIMESTAMP=1.")
+(defconstant +pid-latency-budget+             #x0027
+  "PID_LATENCY_BUDGET -> LatencyBudgetQosPolicy {Duration_t duration} = 8 octets (RTPS 2.5 Table 9.14
+   §9.6.2.2; DDS 1.4 PSM §2.2.3.8). Duration_t is the RTPS-wire {seconds; fraction} (§9.3.2).")
 (defconstant +pid-default-unicast-locator+    #x0031
   "PID_DEFAULT_UNICAST_LOCATOR (RTPS 2.5 §9.6.2.2 table).")
 (defconstant +pid-metatraffic-unicast-locator+ #x0032

@@ -646,6 +646,14 @@
 (defun* %wire-ownership (n)
     (function ((unsigned-byte 32)) symbol)
   "Map a PID_OWNERSHIP wire code to an OWNERSHIP kind keyword (1=EXCLUSIVE, else the default :shared); an unknown code never rejects (FR-QOS-2)." (if (= n 1) :exclusive :shared))
+(defun* %wire-destination-order (n)
+    (function ((unsigned-byte 32)) symbol)
+  "Map a PID_DESTINATION_ORDER wire code to a DESTINATION_ORDER keyword (DDS 1.4 PSM
+   DestinationOrderQosPolicyKind: 0=BY_RECEPTION_TIMESTAMP, 1=BY_SOURCE_TIMESTAMP); an unknown code keeps the default :by-reception-timestamp, never rejecting (FR-QOS-2)." (if (= n 1) :by-source-timestamp :by-reception-timestamp))
+(defun* %wire-presentation-scope (n)
+    (function ((unsigned-byte 32)) symbol)
+  "Map a PID_PRESENTATION access_scope wire code to a PRESENTATION scope keyword (DDS 1.4 PSM
+   PresentationQosPolicyAccessScopeKind: 0=INSTANCE, 1=TOPIC, 2=GROUP); an unknown code keeps the default :instance, never rejecting (FR-QOS-2)." (case n (1 :topic) (2 :group) (t :instance)))
 (defun* %data-rep-wire (k)
     (function (symbol) (unsigned-byte 16))
   "Map a DATA_REPRESENTATION keyword to its DataRepresentationId_t short (DDS-XTypes 1.3 §7.6.3.1.1:
@@ -742,6 +750,38 @@
       (dds.core.buffer:put-u32 c n)
       (dolist (r reps) (dds.core.buffer:put-u16 c (%data-rep-wire r)))
       (dds.rtps.message:write-parameter cursor dds.rtps.message:+pid-data-representation+ vec 0 val-len)))
+  ;; PID_DEADLINE (0x0023): DeadlineQosPolicy{Duration_t period} = 8 octets (RTPS 2.5 Table 9.14 §9.6.2.2;
+  ;; DDS 1.4 §2.2.3.7). Duration_t is the RTPS-wire {seconds; fraction} (§9.3.2) — DCPS nanosec -> wire
+  ;; fraction (mirrors the liveliness lease, so INFINITE emits 0x7fffffff/0xffffffff). RxO gates on it
+  ;; (offered period <= requested), so a non-default deadline MUST be on the wire, else it mis-matches.
+  (let ((dl (dds.qos:qos-deadline (endpoint-data-qos data))))
+    (multiple-value-bind (c vec) (%make-scratch 8)
+      (dds.core.buffer:put-u32 c (dds.qos:qos-duration-sec dl))
+      (dds.core.buffer:put-u32 c (dds.qos:duration-nanosec->wire-fraction (dds.qos:qos-duration-nanosec dl)))
+      (dds.rtps.message:write-parameter cursor dds.rtps.message:+pid-deadline+ vec 0 8)))
+  ;; PID_LATENCY_BUDGET (0x0027): LatencyBudgetQosPolicy{Duration_t duration} = 8 octets (RTPS 2.5 Table
+  ;; 9.14; DDS 1.4 §2.2.3.8). Same {sec;fraction} Duration_t as deadline; RxO gates on it (offered <= requested).
+  (let ((lb (dds.qos:qos-latency-budget (endpoint-data-qos data))))
+    (multiple-value-bind (c vec) (%make-scratch 8)
+      (dds.core.buffer:put-u32 c (dds.qos:qos-duration-sec lb))
+      (dds.core.buffer:put-u32 c (dds.qos:duration-nanosec->wire-fraction (dds.qos:qos-duration-nanosec lb)))
+      (dds.rtps.message:write-parameter cursor dds.rtps.message:+pid-latency-budget+ vec 0 8)))
+  ;; PID_DESTINATION_ORDER (0x0025): {DestinationOrderQosPolicyKind kind} = 4 octets (RTPS 2.5 Table 9.14;
+  ;; DDS 1.4 §2.2.3.16). kind u32 = the OMG ordinal (destination-order-rank: BY_RECEPTION=0, BY_SOURCE=1).
+  (multiple-value-bind (c vec) (%make-scratch 4)
+    (dds.core.buffer:put-u32 c (dds.qos:destination-order-rank
+                                (dds.qos:qos-destination-order (endpoint-data-qos data))))
+    (dds.rtps.message:write-parameter cursor dds.rtps.message:+pid-destination-order+ vec 0 4))
+  ;; PID_PRESENTATION (0x0021): {AccessScopeKind access_scope; boolean coherent; boolean ordered} = 4+1+1
+  ;; padded to 8 (RTPS 2.5 Table 9.14; DDS 1.4 §2.2.3.6). scope u32 = the OMG ordinal (presentation-rank:
+  ;; INSTANCE=0,TOPIC=1,GROUP=2); each boolean 1 octet (1=true/0=false); 2 trailing pad to 4-alignment.
+  (let ((q (endpoint-data-qos data)))
+    (multiple-value-bind (c vec) (%make-scratch 8)
+      (dds.core.buffer:put-u32 c (dds.qos:presentation-rank (dds.qos:qos-presentation-scope q)))
+      (dds.core.buffer:put-u8 c (if (dds.qos:qos-presentation-coherent q) 1 0))
+      (dds.core.buffer:put-u8 c (if (dds.qos:qos-presentation-ordered q) 1 0))
+      (dds.core.buffer:put-u8 c 0) (dds.core.buffer:put-u8 c 0)
+      (dds.rtps.message:write-parameter cursor dds.rtps.message:+pid-presentation+ vec 0 8)))
   ;; PID_OWNERSHIP (0x001f): {OwnershipQosPolicyKind kind;} = 4 octets (RTPS 2.5 Table 9.18
   ;; §9.6.2.2; dds_rtf2_dcps.idl §2.2.3.9: SHARED=0, EXCLUSIVE=1). Always emitted (both roles).
   (let ((q (endpoint-data-qos data)))
@@ -831,6 +871,35 @@
                  (when kw (push kw reps))))
              (when reps
                (setf (dds.qos:qos-data-representation (endpoint-data-qos data)) (nreverse reps))))))))
+    ((= pid dds.rtps.message:+pid-deadline+)
+     ;; DeadlineQosPolicy{Duration_t period} (RTPS 2.5 Table 9.14). Read only when the length is exactly 8
+     ;; (NFR-SEC-POSTURE); an absent/malformed PID leaves the seeded default (DDS 1.4 §2.2.3.7: INFINITE).
+     (when (= len 8)
+       (let ((sec (dds.core.buffer:get-u32 cursor))
+             (fraction (dds.core.buffer:get-u32 cursor)))
+         (setf (dds.qos:qos-deadline (endpoint-data-qos data))
+               (dds.qos:make-qos-duration sec (dds.qos:wire-fraction->duration-nanosec fraction))))))
+    ((= pid dds.rtps.message:+pid-latency-budget+)
+     (when (= len 8)
+       (let ((sec (dds.core.buffer:get-u32 cursor))
+             (fraction (dds.core.buffer:get-u32 cursor)))
+         (setf (dds.qos:qos-latency-budget (endpoint-data-qos data))
+               (dds.qos:make-qos-duration sec (dds.qos:wire-fraction->duration-nanosec fraction))))))
+    ((= pid dds.rtps.message:+pid-destination-order+)
+     (when (= len 4)
+       (setf (dds.qos:qos-destination-order (endpoint-data-qos data))
+             (%wire-destination-order (dds.core.buffer:get-u32 cursor)))))
+    ((= pid dds.rtps.message:+pid-presentation+)
+     ;; {access_scope u32; boolean coherent; boolean ordered}; read the 6 meaningful octets when present
+     ;; (>= 6; the parameter is padded to 8, and parse-parameter-list snaps past the pad). NFR-SEC-POSTURE.
+     (when (>= len 6)
+       (let ((q (endpoint-data-qos data))
+             (scope (%wire-presentation-scope (dds.core.buffer:get-u32 cursor)))
+             (coherent (/= 0 (dds.core.buffer:get-u8 cursor)))
+             (ordered (/= 0 (dds.core.buffer:get-u8 cursor))))
+         (setf (dds.qos:qos-presentation-scope q) scope
+               (dds.qos:qos-presentation-coherent q) coherent
+               (dds.qos:qos-presentation-ordered q) ordered))))
     ((= pid dds.rtps.message:+pid-ownership+)
      (when (= len 4)
        (setf (dds.qos:qos-ownership (endpoint-data-qos data))
@@ -1081,4 +1150,50 @@
                                     :qos (dds.qos:make-writer-qos :data-representation '(:xcdr1)))))
         (assert (endpoint-match-p w1 reader-ep) ()
                 "an XCDR1-configured writer MUST match an absent-PID (XCDR1) @final reader (direction-A delivery)"))))
+  t)
+
+(defun* run-sedp-qos-completeness-test ()
+    (function () t)
+  "The four RxO policies now carried in SEDP — DEADLINE (0x0023), LATENCY_BUDGET (0x0027),
+   DESTINATION_ORDER (0x0025), PRESENTATION (0x0021) (RTPS 2.5 Table 9.14 §9.6.2.2) — round-trip
+   through serialize->parse, AND their RxO verdict is now decided by the WIRE value, not our
+   make-*-qos local default. Before this slice qos-rxo-compatible gated on all four but
+   parse-endpoint-data never read them, so a peer's non-default value was invisible — a false-match,
+   or (the worst class) a false-reject. Proven: non-default values round-trip; each incompatibility is
+   DETECTED through the wire; the default writer/reader pair still matches (no new false-reject)."
+  (labels ((wire-ep (qos role)
+             (let* ((ob (dds.core.buffer:make-octet-buffer 512))
+                    (wc (dds.core.buffer:cursor ob :endianness :little)))
+               (serialize-endpoint-data wc (make-endpoint-data :role role :topic-name "T" :type-name "Y" :qos qos))
+               (parse-endpoint-data (dds.core.buffer:cursor ob :endianness :little) role)))
+           (bad (wqos rqos) (nth-value 1 (endpoint-match-p (wire-ep wqos :writer) (wire-ep rqos :reader)))))
+    (let ((w (endpoint-data-qos
+              (wire-ep (dds.qos:make-writer-qos :deadline (dds.qos:make-qos-duration 2 500000000)
+                                                :latency-budget (dds.qos:make-qos-duration 0 250000000)
+                                                :destination-order :by-source-timestamp
+                                                :presentation-scope :group :presentation-coherent t
+                                                :presentation-ordered t)
+                       :writer))))
+      (assert (and (= 2 (dds.qos:qos-duration-sec (dds.qos:qos-deadline w)))
+                   (= 500000000 (dds.qos:qos-duration-nanosec (dds.qos:qos-deadline w)))) ()
+              "DEADLINE must round-trip through the wire, got ~a.~a"
+              (dds.qos:qos-duration-sec (dds.qos:qos-deadline w)) (dds.qos:qos-duration-nanosec (dds.qos:qos-deadline w)))
+      (assert (= 250000000 (dds.qos:qos-duration-nanosec (dds.qos:qos-latency-budget w))) () "LATENCY_BUDGET must round-trip")
+      (assert (eq :by-source-timestamp (dds.qos:qos-destination-order w)) () "DESTINATION_ORDER must round-trip")
+      (assert (and (eq :group (dds.qos:qos-presentation-scope w)) (dds.qos:qos-presentation-coherent w)
+                   (dds.qos:qos-presentation-ordered w)) () "PRESENTATION {scope,coherent,ordered} must round-trip"))
+    (assert (member :deadline (bad (dds.qos:make-writer-qos :deadline (dds.qos:make-qos-duration 3 0))
+                                   (dds.qos:make-reader-qos :deadline (dds.qos:make-qos-duration 1 0)))) ()
+            "DEADLINE RxO (offered 3s > requested 1s) must be decided on the wire value, not a default")
+    (assert (member :destination-order (bad (dds.qos:make-writer-qos :destination-order :by-reception-timestamp)
+                                            (dds.qos:make-reader-qos :destination-order :by-source-timestamp))) ()
+            "DESTINATION_ORDER RxO must be decided on the wire value")
+    (assert (member :presentation (bad (dds.qos:make-writer-qos :presentation-scope :instance)
+                                       (dds.qos:make-reader-qos :presentation-scope :group))) ()
+            "PRESENTATION RxO must be decided on the wire value")
+    (assert (member :latency-budget (bad (dds.qos:make-writer-qos :latency-budget (dds.qos:make-qos-duration 0 30000000))
+                                         (dds.qos:make-reader-qos :latency-budget (dds.qos:make-qos-duration 0 20000000)))) ()
+            "LATENCY_BUDGET RxO must be decided on the wire value")
+    (assert (null (bad (dds.qos:make-writer-qos) (dds.qos:make-reader-qos))) ()
+            "the DEFAULT writer/reader pair must still match through the wire (no new false-reject)"))
   t)

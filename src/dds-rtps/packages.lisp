@@ -76,6 +76,7 @@
            #:+pid-topic-name+ #:+pid-type-name+ #:+pid-protocol-version+
            #:+pid-vendorid+ #:+pid-reliability+ #:+pid-durability+ #:+pid-liveliness+
            #:+pid-ownership+ #:+pid-ownership-strength+
+           #:+pid-presentation+ #:+pid-deadline+ #:+pid-destination-order+ #:+pid-latency-budget+
            #:+pid-default-unicast-locator+
            #:+pid-metatraffic-unicast-locator+ #:+pid-participant-guid+
            #:+pid-builtin-endpoint-set+ #:+pid-endpoint-guid+ #:+pid-key-hash+
@@ -187,4 +188,5 @@
            #:+pid-entity-virtual-guid+ #:+pid-service-kind+ #:+service-kind-persistence+
            #:run-sedp-test #:run-data-representation-wire-test
            #:run-data-representation-malformed-test
-           #:run-data-representation-absent-default-test))
+           #:run-data-representation-absent-default-test
+           #:run-sedp-qos-completeness-test))
