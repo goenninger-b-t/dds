@@ -45,10 +45,13 @@
   (running nil :type boolean)
   (drop-counts nil :type (or null (simple-array (unsigned-byte 64) (9))))
   (watermarks nil :type (or null (simple-array (unsigned-byte 32) (9))))
-  ;; shed reporting (FR-LOG-6): a status-changed flag (the vendor status bit +log-shed-status+) + an
-  ;; optional listener fired on each shed. The per-severity counts are drop-counts (logger-shed-counts).
+  ;; shed reporting (FR-LOG-6): a status-changed flag (the vendor status bit +log-shed-status+), an
+  ;; optional listener fired on each shed, and a WaitSet-attachable GuardCondition triggered on each shed
+  ;; (the logger is not a DCPS entity, so a GuardCondition, not a StatusCondition proper). The
+  ;; per-severity counts are drop-counts (logger-shed-counts).
   (shed-status-changed nil :type boolean)
-  (shed-listener nil :type (or null function)))
+  (shed-listener nil :type (or null function))
+  (shed-condition nil :type t))
 
 (defun* %guid-prefix->uuid (prefix)
     (function ((simple-array (unsigned-byte 8) (12))) string)
@@ -178,10 +181,12 @@
 
 (defun* logger-reset-shed-status (logger)
     (function (logger) (eql t))
-  "Clear LOGGER's shed status-changed flag (the get_*_status read-then-reset semantics, DDS 1.4
-   §2.2.4.1). The per-severity counts (logger-shed-counts) are cumulative and are NOT reset."
+  "Clear LOGGER's shed status-changed flag AND its WaitSet condition trigger (the get_*_status
+   read-then-reset semantics, DDS 1.4 §2.2.4.1). The per-severity counts (logger-shed-counts) are
+   cumulative and are NOT reset."
   (dds.pal:with-lock ((logger-lock logger))
     (setf (logger-shed-status-changed logger) nil))
+  (dds.dcps:set-trigger-value (logger-shed-condition logger) nil)   ; outside the lock (it takes the WaitSet lock)
   t)
 
 (defun* logger-set-shed-listener (logger fn)
@@ -232,6 +237,7 @@
                    :app-id app-id
                    :process (dds.pal:process-id)
                    :lock (dds.pal:make-lock "dds-logger")
+                   :shed-condition (dds.dcps:make-guard-condition)   ; WaitSet-attachable shed signal (FR-LOG-6)
                    :async-p async
                    :capacity (if async ring-capacity 0)
                    :ring (when async (make-array ring-capacity :initial-element nil))
@@ -290,10 +296,13 @@
                     (incf (logger-count logger))
                     (dds.pal:condvar-signal (logger-condvar logger))
                     (setf result :ok)))))
-          ;; fire the shed listener OUTSIDE the lock (never call app code holding the lock) — the push
-          ;; of FR-LOG-6's overflow reporting; the counts are also queryable via logger-shed-counts.
-          (when (and shed-sev (logger-shed-listener logger))
-            (funcall (logger-shed-listener logger) shed-sev shed-count))
+          ;; report the shed OUTSIDE the lock (never call app code / take another lock holding the logger
+          ;; lock): trigger the WaitSet condition and fire the listener — the push half of FR-LOG-6's
+          ;; overflow reporting; the counts are also queryable via logger-shed-counts.
+          (when shed-sev
+            (dds.dcps:set-trigger-value (logger-shed-condition logger) t)
+            (when (logger-shed-listener logger)
+              (funcall (logger-shed-listener logger) shed-sev shed-count)))
           result)
         (dds.pal:with-lock ((logger-lock logger))
           (let ((seq (logger-seq logger)))

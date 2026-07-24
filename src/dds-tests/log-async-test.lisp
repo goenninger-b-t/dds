@@ -55,9 +55,19 @@
                    (format nil "the shed listener must fire per shed with (severity . count); got ~s" shed-events))
            (%check :async-shed-changed (dds.log:logger-shed-status-changed-p logger)
                    "the shed status-changed flag must be set after a shed")
+           ;; the shed GuardCondition is triggered, so a WaitSet on it returns it immediately (FR-LOG-6
+           ;; push: a consumer can WaitSet-wait for shed events, not only poll the snapshot / take a callback).
+           (let ((ws (dds.dcps:make-wait-set)))
+             (dds.dcps:attach-condition ws (dds.log:logger-shed-condition logger))
+             (%check :async-shed-waitset
+                     (member (dds.log:logger-shed-condition logger) (dds.dcps:wait-set-wait ws 1.0))
+                     "a WaitSet on the logger's shed-condition must return it (triggered by the sheds)"))
            (dds.log:logger-reset-shed-status logger)
            (%check :async-shed-reset (not (dds.log:logger-shed-status-changed-p logger))
-                   "logger-reset-shed-status must clear the changed flag"))
+                   "logger-reset-shed-status must clear the changed flag")
+           (%check :async-shed-condition-reset
+                   (not (dds.dcps:condition-trigger-value (dds.log:logger-shed-condition logger)))
+                   "logger-reset-shed-status must clear the shed-condition trigger too"))
       (dds.log:close-logger logger)))
   ;; ---- (c) async delivery end to end (worker running) ----
   (let* ((domain (test-domain +td-log-async+))
