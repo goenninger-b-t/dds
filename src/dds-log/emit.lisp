@@ -290,11 +290,14 @@
                           shed-sev sev
                           shed-count (aref (logger-drop-counts logger) sev)
                           result :shed))
-                  (progn                                                 ; enqueue
+                  (let ((was-empty (zerop (logger-count logger))))     ; enqueue
                     (setf (svref (logger-ring logger) (logger-tail logger)) (%build seq)
                           (logger-tail logger) (mod (1+ (logger-tail logger)) (logger-capacity logger)))
                     (incf (logger-count logger))
-                    (dds.pal:condvar-signal (logger-condvar logger))
+                    ;; signal ONLY on the empty->non-empty transition: the worker condvar-waits solely
+                    ;; when the ring is empty, so a signal on every enqueue while it is already draining is
+                    ;; a wasted syscall (measured ~0.4 us/enqueue). The 0.05s wait timeout is the backstop.
+                    (when was-empty (dds.pal:condvar-signal (logger-condvar logger)))
                     (setf result :ok)))))
           ;; report the shed OUTSIDE the lock (never call app code / take another lock holding the logger
           ;; lock): trigger the WaitSet condition and fire the listener — the push half of FR-LOG-6's

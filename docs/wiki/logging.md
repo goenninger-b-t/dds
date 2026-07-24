@@ -133,7 +133,7 @@ Drops are **reported, never printed** (FR-LOG-6), through the logger-scoped stat
   (dds.log:close-logger logger))             ; stops + joins the worker, then tears down
 ```
 
-The lock-based ring is the correct-and-simple first cut, with a lock-free variant a measured optimization later.
+The ring is **lock-based** — and stays that way: a micro-bench (`bench/report/2026-07-24-log-async-ring-signal.md`) measured enqueue at ~0.48 us/op single-thread (~2 M/s), far faster than any real logging workload, so a lock-free MPSC ring's platform-specific memory-ordering risk is not justified by the gain. The measurement *did* warrant one optimization: the enqueue now `condvar-signal`s the worker **only on the empty→non-empty transition** (the worker waits only while the ring is empty), which cut single-thread enqueue 27 % (0.667 → 0.484 us/op) — verified correct by `run-log-async-test`.
 
 ### Running it as a service — `log-service-main`
 
