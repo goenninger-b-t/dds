@@ -5,5 +5,6 @@
   :pathname "src/dds-log"
   :serial t
   :components ((:file "packages")
-               (:file "event"))
+               (:file "event")
+               (:file "formatter"))
   :in-order-to ((test-op (test-op "dds-tests"))))

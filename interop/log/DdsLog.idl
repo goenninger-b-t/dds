@@ -23,7 +23,8 @@ module log {
     @key string<64> host;             // node identity
     @key uint32     process;          // OS process id
     string<40>      participant_uuid; // DDS participant UUID; detected once at logger creation
-    string<46>      host_ip;          // host machine IP address; detected once at logger creation
+    string<46>      host_ip;          // host machine IP (IPv4 or IPv6; 46 = INET6_ADDRSTRLEN); detected at logger creation
+    string<128>     app_id;           // application identity; given once at logger creation
     uint32          thread;           // informational
     uint64          seq;              // per-source monotonic; gaps are visible loss
     int64           timestamp;   // UTC nanoseconds since the POSIX epoch

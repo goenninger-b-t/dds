@@ -6,13 +6,16 @@ with `DdsLog.idl`) interoperates with **RTI Connext 7.3.1**: a Connext `@appenda
 
 ## Result
 
-**INTEROPERATES (Connext writer → our reader).** Our reader decoded 33 samples, every field correct
-across the vendor boundary:
+**INTEROPERATES (Connext writer → our reader).** Our reader decoded every field correct across the
+vendor boundary — including the source-identity fields and an **IPv6** `host_ip`:
 
 ```
-host="connext-node" pid=4242 uuid="8b619879-4ffe-4fca-ad01-05b39d987dbc" ip="192.168.2.148"
-seq=47 sev=CRIT cat="MEM" ek=EXIT msg="segfault at frame 47"
+host="connext-node" pid=4242 uuid="8b619879-4ffe-4fca-ad01-05b39d987dbc" ip="fe80::ffff:ffff:ffff:1"
+appid="gbttctools" seq=4 sev=CRIT cat="MEM" ek=EXIT msg="segfault at frame 4"
 ```
+
+`app_id` and an IPv6 `host_ip` both survive the round trip; `host_ip` (`string<46>` =
+`INET6_ADDRSTRLEN`) carries IPv4 and IPv6 alike.
 
 Connext's verbose log stored our reader's type with no incompatibility:
 `assertRemoteEndpointEx:TypeObject succesfully stored (topic: 'DdsLog', type: 'dds::log::LogEvent')`.

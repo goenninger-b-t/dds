@@ -39,7 +39,8 @@ int main(int argc, char **argv)
     sample.host("connext-node");
     sample.process(4242);
     sample.participant_uuid("8b619879-4ffe-4fca-ad01-05b39d987dbc");
-    sample.host_ip("192.168.2.148");
+    sample.host_ip("fe80::ffff:ffff:ffff:1");   // an IPv6 host_ip, to exercise both families on the wire
+    sample.app_id("gbttctools");
     sample.thread(7);
     sample.timestamp(1700000000000000000LL);
     sample.severity(dds::log::Severity::SEV_CRIT);

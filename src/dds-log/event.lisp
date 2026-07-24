@@ -32,9 +32,16 @@
   ;; Per-source identity detected once at logger creation and stamped on every event, so a collector
   ;; renders the ORIGINATING logger's identity even for a remote source (owner directive 2026-07-23).
   ;; participant-uuid: the DDS participant's UUID (a 36-char canonical UUID; 40 = + margin).
-  ;; host-ip: the host machine IP address (INET6_ADDRSTRLEN = 46 covers IPv6).
+  ;; host-ip: the host machine IP address, IPv4 OR IPv6 — a string bounded at 46, which is
+  ;; INET6_ADDRSTRLEN: it holds IPv4 (max "255.255.255.255", 15) and the longest textual IPv6 (the
+  ;; IPv4-mapped "ffff:ffff:ffff:ffff:ffff:ffff:255.255.255.255", 45). A scoped/zone address
+  ;; (fe80::1%eth0) is a routing detail a host-identity field does not carry; use a routable address.
   (participant-uuid (:string 40))
   (host-ip (:string 46))
+  ;; app-id: the application identity string, given at logger creation (owner directive 2026-07-24).
+  ;; A wire field for the same reason as participant-uuid/host-ip — a collector renders the
+  ;; ORIGINATING application even for a remote source.
+  (app-id (:string 128))
   (thread :u32)
   ;; `seq`, not `sequence`: `sequence` is an IDL reserved word (the collection type), so a foreign
   ;; publisher cannot be generated from an IDL with a member named `sequence` (rtiddsgen rejects it).
@@ -69,12 +76,12 @@
             (setf end (1+ i))))
         (values (subseq string 0 end) t))))
 
-(defun* build-log-event (&key (host "") (process 0) (participant-uuid "") (host-ip "")
+(defun* build-log-event (&key (host "") (process 0) (participant-uuid "") (host-ip "") (app-id "")
                               (thread 0) (seq 0) (timestamp 0)
                               (severity :info) (category "") (function "") (file "") (line 0)
                               (event-kind :message) (elapsed-ns 0) (message ""))
     (function (&key (:host string) (:process (unsigned-byte 32)) (:participant-uuid string)
-                    (:host-ip string) (:thread (unsigned-byte 32))
+                    (:host-ip string) (:app-id string) (:thread (unsigned-byte 32))
                     (:seq (unsigned-byte 64)) (:timestamp (signed-byte 64)) (:severity keyword)
                     (:category string) (:function string) (:file string) (:line (unsigned-byte 32))
                     (:event-kind keyword) (:elapsed-ns (unsigned-byte 64)) (:message string))
@@ -82,15 +89,17 @@
   "Construct a LOG-EVENT, TRUNCATING each bounded string to its octet bound rather than refusing it —
    a logging call must never fail because a value is long. `truncated` is set T iff MESSAGE was
    truncated (the IDL semantics: 'message exceeded its bound'); the other bounded fields (host,
-   participant-uuid, host-ip, category, function, file) truncate silently. All truncation is on a
-   UTF-8 codepoint boundary (truncate-utf8). PARTICIPANT-UUID and HOST-IP are the per-source identity
-   the logger detects once at creation and passes on every call (owner directive 2026-07-23)."
+   participant-uuid, host-ip, app-id, category, function, file) truncate silently. All truncation is
+   on a UTF-8 codepoint boundary (truncate-utf8). PARTICIPANT-UUID, HOST-IP and APP-ID are the
+   per-source identity the logger detects/receives once at creation and passes on every call (owner
+   directives 2026-07-23/24)."
   (multiple-value-bind (msg msg-truncated) (truncate-utf8 message +log-event-message-bound+)
     (make-log-event
      :host (values (truncate-utf8 host +log-event-host-bound+))
      :process process
      :participant-uuid (values (truncate-utf8 participant-uuid +log-event-participant-uuid-bound+))
      :host-ip (values (truncate-utf8 host-ip +log-event-host-ip-bound+))
+     :app-id (values (truncate-utf8 app-id +log-event-app-id-bound+))
      :thread thread :seq seq :timestamp timestamp
      :severity severity
      :category (values (truncate-utf8 category +log-event-category-bound+))

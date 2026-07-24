@@ -12,7 +12,7 @@ Four decisions in the struct are load-bearing (ADR 0082 §3): `timestamp` is a f
 
 ### API reference — `dds.log`
 
-- **`dds.log:log-event`** / **`dds.log:make-log-event`** / **`dds.log:log-event-p`** — the generated struct, its raw constructor, and its predicate. Accessors `log-event-{host,process,participant-uuid,host-ip,thread,seq,timestamp,severity,category,function,file,line,event-kind,elapsed-ns,truncated,message}`. `participant-uuid` (the DDS participant UUID) and `host-ip` (the host machine IP) are per-source identity detected once at logger creation and stamped on every event, so a collector renders the *originating* logger's identity even for a remote source (owner directive 2026-07-23); in the text format they render directly after the timestamp. `severity` and `event-kind` accessors take/return a **keyword** (`:crit`, `:exit`); an undecodable wire value reads back as the raw `int32` (never an invented keyword). `serialize-log-event` / `deserialize-log-event` / `serialized-size-log-event` are the generated `@appendable` codecs (XCDR2 = `D_CDR2_LE 0x0009` + a DHEADER; XCDR1 = no DHEADER, rule 29).
+- **`dds.log:log-event`** / **`dds.log:make-log-event`** / **`dds.log:log-event-p`** — the generated struct, its raw constructor, and its predicate. Accessors `log-event-{host,process,participant-uuid,host-ip,app-id,thread,seq,timestamp,severity,category,function,file,line,event-kind,elapsed-ns,truncated,message}`. `participant-uuid` (the DDS participant UUID), `host-ip` (the host machine IP — **IPv4 or IPv6**; the field is `string<46>` = `INET6_ADDRSTRLEN`, holding IPv4's max 15 chars and IPv6's max 45), and `app-id` (the application identity, supplied by the application) are per-source identity fixed once at logger creation and stamped on every event, so a collector renders the *originating* logger's identity even for a remote source (owner directives 2026-07-23 / 2026-07-24); in the text format they render directly after the timestamp. `severity` and `event-kind` accessors take/return a **keyword** (`:crit`, `:exit`); an undecodable wire value reads back as the raw `int32` (never an invented keyword). `serialize-log-event` / `deserialize-log-event` / `serialized-size-log-event` are the generated `@appendable` codecs (XCDR2 = `D_CDR2_LE 0x0009` + a DHEADER; XCDR1 = no DHEADER, rule 29).
 - **`dds.log:build-log-event`** — the constructor a logging call should use. It **truncates** each bounded string to its octet bound rather than refusing it — a logging call must never fail because a value is long — and sets `truncated` **T** iff the *message* was truncated (the IDL semantics: "message exceeded its bound"). `host`/`category`/`function`/`file` truncate silently. All truncation is on a UTF-8 codepoint boundary.
 - **`dds.log:truncate-utf8`** — `(string max-octets) → (values result truncated-p)`. Truncates to at most `max-octets` UTF-8 octets on a codepoint boundary (never mid-character, RFC 3629 §3). The per-character octet width is derived from the code point.
 - **`dds.log:+severity-emerg+` … `+severity-trace+`** — the RFC 5424 §6.2.1 Table 2 syslog severity values (`emerg=0` … `debug=7`), plus `+severity-trace+ = 8`, this stack's extension below `DEBUG`. Pinning the numbering to RFC 5424 makes the UDP-syslog `PRI = facility*8 + severity` mapping the identity. **These are read from the RFC and cited at the definition, never recalled** — a severity table is exactly the shape of thing that feels too familiar to check.
@@ -38,15 +38,23 @@ Four decisions in the struct are load-bearing (ADR 0082 §3): `timestamp` is a f
   (assert (= 1024 (length (dds.log:log-event-message e)))))
 ```
 
-### Text format (spec — rendered by the formatter slice)
+### Text format — `dds.log:format-log-event-text`
 
-The collector's text renderer emits seven ` | `-separated fields (ADR 0082 §7), extended per the owner directive of 2026-07-23 to carry the source identity directly after the timestamp:
+**`dds.log:format-log-event-text`** renders a `log-event` to the pinned eight ` | `-separated fields (ADR 0082 §7), extended per the owner directives of 2026-07-23 (UUID/IP) and 2026-07-24 (app id) to carry the source identity directly after the timestamp:
 
 ```
-<ISO-8601-UTC.6frac Z> | <participant-uuid> | <host-ip> | <SEVER> | <category> | <function>() - <file>:<line> | <message>
+<ISO-8601-UTC.6frac Z> | <participant-uuid> | <host-ip> | <app-id> | <SEVER> | <category> | <function>() - <file>:<line> | <message>
 ```
 
-Severity is left-aligned in 6 columns (so `WARNING` renders `WARN`, the longest name that fits being `NOTICE`). The `participant-uuid` and `host-ip` come from the event fields, so the line reflects the originating logger even when a collector renders a remote source. The formatter itself (text + JSON, as replaceable closures) is a follow-on slice; this defines the format it produces.
+Severity is left-aligned in 6 columns (so `WARNING` renders `WARN`, the longest name that fits being `NOTICE`); the timestamp is the event's `timestamp` field (POSIX-epoch nanoseconds) rendered ISO 8601 UTC with six fractional digits and a `Z`; the function field holds the bare name and the `()` is added by the formatter. The `participant-uuid`, `host-ip` (IPv4 or IPv6) and `app-id` come from the event fields, so the line reflects the originating logger even when a collector renders a remote source. It is the default text formatter *closure* (ADR 0082 §7 — a formatter is a function a config holds and can replace). It is asserted **byte-for-byte against the owner's two golden example lines** (ADR 0082 §8) in `run-log-event-test`. The JSON formatter and the file/UDP-syslog sinks are follow-on slices.
+
+```lisp
+(dds.log:format-log-event-text
+ (dds.log:build-log-event :timestamp <posix-ns> :participant-uuid "…" :host-ip "192.168.2.148"
+                          :severity :crit :category "MEM" :function "gbt_tc_core_mem_init"
+                          :file "gbttctools/src/src.c" :line 1234 :message "Segmentation Fault encountered"))
+;; => "…Z | … | 192.168.2.148 | gbttctools | CRIT   | MEM | gbt_tc_core_mem_init() - gbttctools/src/src.c:1234 | Segmentation Fault encountered"
+```
 
 ### Interop status (inherited TypeObject notes)
 

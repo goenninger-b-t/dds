@@ -16,7 +16,7 @@
    ;; the type + generated surface (dds.gen:define-dds-type)
    #:log-event #:make-log-event #:log-event-p
    #:log-event-host #:log-event-process #:log-event-participant-uuid #:log-event-host-ip
-   #:log-event-thread #:log-event-seq
+   #:log-event-app-id #:log-event-thread #:log-event-seq
    #:log-event-timestamp #:log-event-severity #:log-event-category #:log-event-function
    #:log-event-file #:log-event-line #:log-event-event-kind #:log-event-elapsed-ns
    #:log-event-truncated #:log-event-message
@@ -28,7 +28,9 @@
    #:+severity-warn+ #:+severity-notice+ #:+severity-info+ #:+severity-debug+ #:+severity-trace+
    ;; bounds
    #:+log-event-host-bound+ #:+log-event-participant-uuid-bound+ #:+log-event-host-ip-bound+
-   #:+log-event-category-bound+ #:+log-event-function-bound+
+   #:+log-event-app-id-bound+ #:+log-event-category-bound+ #:+log-event-function-bound+
    #:+log-event-file-bound+ #:+log-event-message-bound+
    ;; construction + truncation
-   #:build-log-event #:truncate-utf8))
+   #:build-log-event #:truncate-utf8
+   ;; text formatter (ADR 0082 §7) — the default text-rendering closure
+   #:format-log-event-text))
