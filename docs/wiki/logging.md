@@ -2,7 +2,7 @@
 
 The logging service (ADR 0082, FR-LOG) is an in-scope exception to the "no Connext service suite" rule: a `LogEvent` wire type plus a collector that renders structured JSON, text, and aggregator output. This page tracks what has landed.
 
-**Status: the pipeline, the ergonomic macro API, and a runnable service entrypoint are landed** — the `LogEvent` wire type, both collector-side formatters (text + JSON), the emit path (a logger), file/stream/function sinks, and a collector (`make-logger` → DDS → `make-log-collector` → sink); the per-severity macros + `with-trace-scope` over per-category thresholds (FR-LOG-3/4); and `log-service-main`, the CLI/env entrypoint that runs the collector as a service (FR-LOG-7, single-service) — all verified in-process on both SBCL and Clasp (`run-log-pipeline-test`, `run-log-macros-test`, `run-log-service-test`). `logger-emit` is the underlying emit *primitive*; the ergonomic **per-severity macros with compile-time function capture and per-category thresholds (FR-LOG-3/4)** and the **`log-service-main` CLI/env entrypoint (FR-LOG-7, single-service)** are landed too (see below). The **non-blocking ring + severity-graded shedding (FR-LOG-5/6)**, the RFC 5424 UDP-syslog and HTTP-bulk sinks, and the multi-service runner + OTP-style supervisor (the rest of FR-LOG-7) are follow-on slices (ADR 0082 §9). This page grows with them.
+**Status: the pipeline, the macro API, the non-blocking async ring, and a runnable service entrypoint are landed** — the `LogEvent` wire type, both collector-side formatters (text + JSON), the emit path (a logger), file/stream/function sinks, and a collector (`make-logger` → DDS → `make-log-collector` → sink); the per-severity macros + `with-trace-scope` over per-category thresholds (FR-LOG-3/4); the non-blocking async ring + worker + severity-graded shedding (FR-LOG-5/6); and `log-service-main`, the CLI/env entrypoint that runs the collector as a service (FR-LOG-7, single-service) — all verified in-process on both SBCL and Clasp (`run-log-pipeline-test`, `run-log-macros-test`, `run-log-async-test`, `run-log-service-test`). `logger-emit` is the underlying emit *primitive*; the ergonomic **per-severity macros with compile-time function capture and per-category thresholds (FR-LOG-3/4)**, the **non-blocking async ring + worker + severity-graded shedding (FR-LOG-5/6)**, and the **`log-service-main` CLI/env entrypoint (FR-LOG-7, single-service)** are landed too (see below). The RFC 5424 UDP-syslog and HTTP-bulk sinks, the multi-service runner + OTP-style supervisor (the rest of FR-LOG-7), and the DDS-status-condition push for shed counts (the rest of FR-LOG-6) are follow-on slices (ADR 0082 §9). This page grows with them.
 
 ## The `LogEvent` wire type
 
@@ -115,6 +115,23 @@ Every call site belongs to a **category** (a registered keyword: `:gen :sup :mem
 
 (dds.log:set-log-threshold :sup dds.log:+severity-debug+)   ; now :sup DEBUG (and above) emit
 ```
+
+### Non-blocking emit — the async ring (`make-logger :async t`)
+
+By default the logger is synchronous: `logger-emit` writes on the caller's thread and the app pumps `logger-spin`. Passing **`:async t`** switches on the FR-LOG-5/6 path: `logger-emit` **enqueues** on a bounded ring (default `+log-default-ring-capacity+` = 1024) and returns immediately — **it never waits for the DDS write**. A **worker thread** owns the participant: it spins it (discovery + reliable delivery) and drains the ring, writing each queued event. Because only the worker touches the participant, there is no write/spin race, and `logger-spin` becomes a harmless no-op.
+
+On overflow the ring **sheds by severity** (FR-LOG-6): each severity has an occupancy **watermark**, and an event is dropped when the ring is at or above its watermark. `EMERG`/`ALERT`/`CRIT`/`ERR` have watermark = capacity, so they are **never shed while a slot remains**; the lower severities shed earlier — `TRACE` at 25 % full, `DEBUG` at 50 %, `INFO` at 70 % — keeping the upper slots for high-severity records. A shed event still **advances the seq**, so the loss shows up as a gap the collector can detect. Drops are counted per severity and exposed as a snapshot via **`logger-shed-counts`** (a `get_*_status`-style query, indexed by RFC 5424 severity number — reported, never printed). `close-logger` stops and joins the worker (draining the ring's remainder) before deleting the participant.
+
+```lisp
+(let ((logger (dds.log:make-logger :domain 7 :app-id "gbttctools" :async t)))
+  (dds.log:log-info logger :sup "started")   ; enqueue; the worker writes it — the caller never blocks
+  ;; ... run ...
+  (let ((sheds (dds.log:logger-shed-counts logger)))   ; per-severity drop snapshot (all zero if none)
+    (declare (ignore sheds)))
+  (dds.log:close-logger logger))             ; stops + joins the worker, then tears down
+```
+
+The remaining part of FR-LOG-6 — pushing the shed counts through a DDS `StatusCondition` + listener (a vendor status bit) rather than only the snapshot — is a follow-on; and the lock-based ring is the correct-and-simple first cut, with a lock-free variant a measured optimization later.
 
 ### Running it as a service — `log-service-main`
 

@@ -3872,6 +3872,7 @@
                  ("log-pipeline"             . run-log-pipeline-test)
                  ("log-macros"               . run-log-macros-test)
                  ("log-service"              . run-log-service-test)
+                 ("log-async"                . run-log-async-test)
                  ("xcdr-encap-options-pad"   . run-encap-options-pad-test)
                  ("xcdr-generated-type"      . run-generated-type-test)
                  ("xcdr-generated-sequence"  . run-generated-sequence-test)

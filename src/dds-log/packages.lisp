@@ -36,10 +36,11 @@
    #:format-log-event-text #:format-log-event-json
    ;; wire-name defaults (topic + registered type; pinned to the interop leg)
    #:*log-topic-name* #:*log-type-name*
-   ;; the logger — emit side (ADR 0082 §5)
+   ;; the logger — emit side (ADR 0082 §5); the async non-blocking ring (FR-LOG-5/6)
    #:logger #:logger-p #:make-logger #:logger-emit #:logger-spin #:close-logger
    #:logger-host #:logger-participant-uuid #:logger-host-ip #:logger-app-id
-   #:logger-process #:logger-seq
+   #:logger-process #:logger-seq #:logger-async-p #:logger-shed-counts
+   #:+log-default-ring-capacity+
    ;; sinks (ADR 0082 §7) — replaceable closure pairs
    #:log-sink #:log-sink-p #:sink-emit #:close-sink
    #:make-file-sink #:make-stream-sink #:make-function-sink

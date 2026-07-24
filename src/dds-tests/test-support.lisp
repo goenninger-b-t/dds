@@ -167,3 +167,6 @@
 (defconstant +td-log-service+ 45
   "logging-service runnable-service isolation offset (ADR 0082 §6/§7, FR-LOG-7): log-service-main (block nil) builds
    a collector whose file sink drains a logger's LogEvents, on its own domain so it never cross-discovers a test.")
+(defconstant +td-log-async+ 46
+  "logging-service async-ring isolation offset (ADR 0082 §5/§6, FR-LOG-5/6): an async (:async t) logger's worker
+   thread drains the bounded ring into a collector, on its own domain so it never cross-discovers a test.")
