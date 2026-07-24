@@ -80,3 +80,9 @@ interop/log/DdsLogPlugin.cxx
 interop/log/.gen.stamp
 interop/log/log_pub
 interop/log/USER_QOS_PROFILES.xml
+
+# Fast DDS LogEvent leg (FR-IO-2, ADR 0082): fastddsgen output + binary + copied shared files (clean-room)
+interop/fastdds/log/gen/
+interop/fastdds/log/log_pub
+interop/fastdds/log/participant_guard.hpp
+interop/fastdds/log/profiles.xml

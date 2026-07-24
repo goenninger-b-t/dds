@@ -132,3 +132,31 @@
                        "2026-07-23T11:20:13.501947Z | 8b619879-4ffe-4fca-ad01-05b39d987dbc | 192.168.2.148 | gbttctools | CRIT   | MEM | gbt_tc_core_mem_init() - gbttctools/src/src.c:1234 | Segmentation Fault encountered")
               (format nil "golden CRIT line mismatch; got ~s" (dds.log:format-log-event-text e2)))))
   t)
+
+(defun* run-log-corpus-test ()
+    (function () t)
+  "Test (FR-CDR-8 byte-exact ENCODER oracle for @appendable LogEvent): our codec must reproduce, byte for
+   byte, a real Connext LogEvent SerializedPayload captured OFF THE WIRE (interop/log/log_capture.lisp).
+   Reads the committed vector, deserializes it as a LogEvent, RE-SERIALIZES in the wire's representation,
+   and asserts the bytes are IDENTICAL. This is the ENCODER check the runtime decoder-legs (foreign writer
+   -> our reader) cannot give — and the FIRST @appendable byte-exact vector (the perfdata corpus is
+   @final, no DHEADER). Connext sends our @appendable LogEvent as XCDR1 (0x0001, no DHEADER, rule 29)
+   because our reader accepts XCDR1, so the vector is XCDR1. Verified here (not `make corpus`, which is
+   perfdata-only) because the byte-exact corpus machinery is in dds-bench, which does not load dds-log."
+  (let ((path (asdf:system-relative-pathname :dds "corpus/xcdr2/logevent-connext.bin")))
+    (if (not (probe-file path))
+        (%check :log-corpus-present nil
+                (format nil "LogEvent corpus vector missing (~a) — recapture with interop/log/log_capture.lisp" path))
+        (let* ((ts (dds.types:find-type-support "log-event"))
+               (wire (with-open-file (in path :element-type '(unsigned-byte 8))
+                       (let ((v (make-array (file-length in) :element-type '(unsigned-byte 8))))
+                         (read-sequence v in) v)))
+               (encap (logior (ash (aref wire 0) 8) (aref wire 1)))
+               (rep (if (<= encap 1) :xcdr1 :xcdr2))
+               (e (dds.dcps::%deserialize-sample ts wire))
+               (got (dds.dcps::%serialize-sample ts e rep)))
+          (%check :log-corpus-byte-exact
+                  (and (= (length got) (length wire)) (every #'= got wire))
+                  (format nil "our ~a re-serialization of the Connext @appendable LogEvent must be byte-identical (wire ~d, ours ~d)"
+                          rep (length wire) (length got))))))
+  t)

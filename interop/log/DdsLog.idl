@@ -12,9 +12,12 @@
 module dds {
 module log {
 
-  enum Severity { SEV_EMERG = 0, SEV_ALERT = 1, SEV_CRIT  = 2, SEV_ERR   = 3,
-                  SEV_WARN  = 4, SEV_NOTICE= 5, SEV_INFO  = 6, SEV_DEBUG = 7,
-                  SEV_TRACE = 8 };
+  // Values are the RFC 5424 §6.2.1 numbering (0=EMERG .. 7=DEBUG) + TRACE=8, carried by the implicit
+  // SEQUENTIAL declaration order — a plain OMG-IDL enum. fastddsgen REJECTS explicit `SEV_x = N` values
+  // (rtiddsgen accepts them, but a single cross-vendor IDL cannot), so the order here IS the value.
+  // KEEP THIS ORDER: a reorder silently changes the wire values.
+  enum Severity { SEV_EMERG, SEV_ALERT, SEV_CRIT, SEV_ERR,
+                  SEV_WARN, SEV_NOTICE, SEV_INFO, SEV_DEBUG, SEV_TRACE };
 
   enum EventKind { EV_MESSAGE, EV_ENTRY, EV_EXIT };
 

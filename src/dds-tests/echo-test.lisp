@@ -3869,6 +3869,7 @@
                  ("gen-enum"                 . run-gen-enum-test)
                  ("gen-appendable"           . run-gen-appendable-test)
                  ("log-event"                . run-log-event-test)
+                 ("log-corpus"               . run-log-corpus-test)
                  ("log-pipeline"             . run-log-pipeline-test)
                  ("log-macros"               . run-log-macros-test)
                  ("log-disabled-alloc"       . run-log-disabled-alloc-test)

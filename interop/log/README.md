@@ -58,9 +58,25 @@ Connext's default transport (do **not** force the loopback-only QoS profile — 
 deliver same-host user data in this harness; Connext's default SHMEM/UDP mix does). rtiddsgen output,
 the binary, and any copied QoS profile are git-ignored (clean-room).
 
+## Both cross-DDS legs + the byte-exact corpus vector — DONE
+
+**Fast DDS leg (`interop/fastdds/log/`).** A Fast DDS 3.6.1 `@appendable dds::log::LogEvent` publisher
+(`log_pub.cpp`, fastddsgen from this same canonical `DdsLog.idl`) → our reader (`log_sub.lisp`):
+**INTEROPERATES**, 192 samples, every field decoded (host, pid, uuid, IPv6 `host_ip`, app_id, seq,
+CRIT, MEM, EXIT). A loopback-pinned Fast DDS peer is reached by unicast SPDP to `127.0.0.1:7410..`.
+This leg caught a **third IDL defect** the Connext leg could not: **fastddsgen rejects explicit enum
+values** (`SEV_EMERG = 0`) that rtiddsgen accepts — the `Severity` enum is now plain sequential values
+(identical wire, both vendors generate). The Connext leg was re-confirmed from the same unified IDL.
+
+**Byte-exact corpus vector (`corpus/xcdr2/logevent-connext.bin`).** Captured OFF THE WIRE from the
+Connext writer (`log_capture.lisp`) and round-tripped through our codec — deserialize → re-serialize →
+**BYTE-EXACT** (260 octets). This is the ENCODER oracle the decoder-legs cannot give, and the first
+`@appendable` byte-exact vector (the perfdata corpus is `@final`). A stock `@appendable` writer sends
+our `LogEvent` as **XCDR1 (`0x0001`, no DHEADER, rule 29)** because our reader accepts XCDR1, so the
+vector is XCDR1. Verified in the test suite by `run-log-corpus-test` (`make corpus` is perfdata-only).
+
 ## Still open
 
-Byte-exact `LogEvent` corpus vectors (both endiannesses, captured from this Connext writer) and the
-**Fast DDS** publisher leg. The reciprocal (our LogEvent writer → a Connext reader) rides the
-DATA_REPRESENTATION note in `../enum-typeobject/README.md`: our writer would offer XCDR1 for a stock
-`@final` reader, but `LogEvent` is `@appendable`, so the reader's requested representation governs.
+The reciprocal (our LogEvent writer → a foreign reader). It rides the DATA_REPRESENTATION note in
+`../enum-typeobject/README.md`: our writer offers XCDR1 for a stock `@final` reader; `LogEvent` is
+`@appendable`, so the reader's requested representation governs.
