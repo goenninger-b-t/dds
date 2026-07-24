@@ -4060,6 +4060,7 @@
                  ("rtps-discovery-sedp"      . dds.rtps.discovery:run-sedp-test)
                  ("rtps-data-representation-wire" . dds.rtps.discovery:run-data-representation-wire-test)
                  ("rtps-data-representation-malformed" . dds.rtps.discovery:run-data-representation-malformed-test)
+                 ("rtps-data-representation-absent-default" . dds.rtps.discovery:run-data-representation-absent-default-test)
                  ("shmem-locator-wire"       . run-shmem-locator-wire-test)
                  ("udp-transport"           . dds.xport.udp:run-udp-transport-test)
                  ("udp-receiver-thread"      . dds.xport.udp:run-udp-receiver-test)

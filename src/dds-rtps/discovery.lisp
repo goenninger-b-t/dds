@@ -872,11 +872,16 @@
    The required ROLE seeds the QoS defaults an ABSENT parameter must assume (RTPS 2.5 §9.4.2.11.2):
    a DCPSPublication (:writer) defaults RELIABILITY to RELIABLE, a DCPSSubscription
    (:reader) to BEST_EFFORT (DDS 1.4 §2.2.3 RELIABILITY) — RTI Connext elides
-   default-valued PIDs, so a reliable Connext writer carries NO PID_RELIABILITY."
+   default-valued PIDs, so a reliable Connext writer carries NO PID_RELIABILITY.
+   DATA_REPRESENTATION is overridden to the WIRE default [XCDR1] (DDS-XTypes 1.3 §7.6.3.1.1), NOT our
+   make-*-qos LOCAL accept/offer default: a stock @final peer ELIDES its default-valued PID exactly as it
+   does PID_RELIABILITY, so an absent PID means XCDR1. Seeding our LOCAL default [XCDR2,XCDR1] here made
+   our XCDR2 writer FALSELY match an XCDR1-only reader (it sent, the peer dropped, no OFFERED_INCOMPATIBLE_
+   QOS ever fired — a silent direction-A no-match); [XCDR1] restores the correct RxO verdict + status."
   (let ((data (make-endpoint-data :role role
                                   :qos (if (eq role :writer)
-                                           (dds.qos:make-writer-qos)
-                                           (dds.qos:make-reader-qos)))))
+                                           (dds.qos:make-writer-qos :data-representation '(:xcdr1))
+                                           (dds.qos:make-reader-qos :data-representation '(:xcdr1))))))
     (if (dds.rtps.message:parse-parameter-list
          cursor (lambda (pid c len) (%fill-endpoint-param data pid c len)))
         data
@@ -1011,9 +1016,9 @@
    skipped cleanly — the data-representation stays at the role default and a trailing legit
    PID (topic-name 'OK') still parses — with NO OOB even at (safety 0). Both the production
    parse and the (safety 0) twin must agree (reject == reject)."
-  (let ((reader-default (dds.qos:qos-data-representation (dds.qos:make-reader-qos))))
+  (let ((reader-default '(:xcdr1)))   ; DDS-XTypes 1.3 §7.6.3.1.1 WIRE default: parse seeds an ABSENT/skipped PID to [XCDR1]
    (flet ((default-rep-p (ep)
-            ;; a skipped/malformed PID must leave the seeded reader-role default untouched (not corrupt it).
+            ;; a skipped/malformed PID must leave the seeded XCDR1 wire default untouched (not corrupt it).
             (equal (dds.qos:qos-data-representation (endpoint-data-qos ep)) reader-default))
           (parsed-ok (ep)
             (and ep (string= (endpoint-data-topic-name ep) "OK"))))
@@ -1031,4 +1036,49 @@
           (assert (parsed-ok s0) () "[~a] (safety 0) parse must skip the bad PID and still read PID_TOPIC_NAME (no OOB)" label)
           (assert (default-rep-p s0) () "[~a] (safety 0) parse must leave the role default" label)
           (assert (equal (parsed-ok prod) (parsed-ok s0)) () "[~a] production and (safety 0) parse must agree" label))))))
+  t)
+
+(defun* %forge-endpoint-without-data-rep (topic type)
+    (function (string string) dds.core.buffer:octet-buffer)
+  "Hand-build a minimal SEDP ParameterList carrying only PID_TOPIC_NAME + PID_TYPE_NAME + the sentinel,
+   DELIBERATELY omitting PID_DATA_REPRESENTATION — exactly as a stock @final peer does when its
+   representation is the elided DDS-XTypes 1.3 §7.6.3.1.1 default (XCDR1). Used to prove parse defaults an
+   ABSENT PID to [XCDR1], not our make-*-qos local accept/offer default."
+  (let* ((dst (dds.core.buffer:make-octet-buffer 256))
+         (out (dds.core.buffer:cursor dst :endianness :little)))
+    (flet ((str-param (pid s)
+             (multiple-value-bind (c vec) (%make-scratch (+ 8 (length s)))
+               (dds.cdr:cdr-put-string c s :xcdr1)
+               (dds.rtps.message:write-parameter out pid vec 0 (dds.core.buffer:cursor-position c)))))
+      (str-param dds.rtps.message:+pid-topic-name+ topic)
+      (str-param dds.rtps.message:+pid-type-name+ type))
+    (dds.rtps.message:write-parameter-sentinel out)
+    dst))
+
+(defun* run-data-representation-absent-default-test ()
+    (function () t)
+  "Regression (direction-A false-match, DDS-XTypes 1.3 §7.6.3.1.1): a SEDP endpoint that OMITS
+   PID_DATA_REPRESENTATION must parse to the WIRE default [XCDR1] for BOTH roles — a stock @final peer
+   elides its default-valued PID (as it does PID_RELIABILITY), so an absent PID means XCDR1, NOT our
+   make-*-qos local default [XCDR2,XCDR1]. Proven here: (1) our default [XCDR2] writer does NOT match
+   such a reader and reports :data-representation incompatible (previously it FALSELY matched, sent
+   XCDR2, the peer silently dropped, and no OFFERED_INCOMPATIBLE_QOS ever fired); (2) an [XCDR1]-
+   configured writer DOES match it — the configuration that lets direction-A actually deliver to a
+   stock @final reader."
+  (let ((buf (%forge-endpoint-without-data-rep "Square" "ShapeType")))
+    (dolist (role '(:reader :writer))
+      (let ((ep (parse-endpoint-data (dds.core.buffer:cursor buf :endianness :little) role)))
+        (assert (equal (dds.qos:qos-data-representation (endpoint-data-qos ep)) '(:xcdr1)) ()
+                "absent PID_DATA_REPRESENTATION must default to (:xcdr1) for role ~a, got ~s"
+                role (dds.qos:qos-data-representation (endpoint-data-qos ep)))))
+    (let ((reader-ep (parse-endpoint-data (dds.core.buffer:cursor buf :endianness :little) :reader)))
+      (let ((w2 (make-endpoint-data :role :writer :topic-name "Square" :type-name "ShapeType"
+                                    :qos (dds.qos:make-writer-qos))))
+        (multiple-value-bind (ok bad) (endpoint-match-p w2 reader-ep)
+          (assert (not ok) () "an XCDR2 writer must NOT match an absent-PID (XCDR1) reader (no silent false-match)")
+          (assert (member :data-representation bad) () ":data-representation must be reported incompatible, got ~s" bad)))
+      (let ((w1 (make-endpoint-data :role :writer :topic-name "Square" :type-name "ShapeType"
+                                    :qos (dds.qos:make-writer-qos :data-representation '(:xcdr1)))))
+        (assert (endpoint-match-p w1 reader-ep) ()
+                "an XCDR1-configured writer MUST match an absent-PID (XCDR1) @final reader (direction-A delivery)"))))
   t)

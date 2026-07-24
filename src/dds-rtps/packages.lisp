@@ -186,4 +186,5 @@
            #:serialize-endpoint-data #:parse-endpoint-data #:endpoint-match-p
            #:+pid-entity-virtual-guid+ #:+pid-service-kind+ #:+service-kind-persistence+
            #:run-sedp-test #:run-data-representation-wire-test
-           #:run-data-representation-malformed-test))
+           #:run-data-representation-malformed-test
+           #:run-data-representation-absent-default-test))
