@@ -44,7 +44,11 @@
   (worker nil :type t)
   (running nil :type boolean)
   (drop-counts nil :type (or null (simple-array (unsigned-byte 64) (9))))
-  (watermarks nil :type (or null (simple-array (unsigned-byte 32) (9)))))
+  (watermarks nil :type (or null (simple-array (unsigned-byte 32) (9))))
+  ;; shed reporting (FR-LOG-6): a status-changed flag (the vendor status bit +log-shed-status+) + an
+  ;; optional listener fired on each shed. The per-severity counts are drop-counts (logger-shed-counts).
+  (shed-status-changed nil :type boolean)
+  (shed-listener nil :type (or null function)))
 
 (defun* %guid-prefix->uuid (prefix)
     (function ((simple-array (unsigned-byte 8) (12))) string)
@@ -66,6 +70,14 @@
   "Default bounded-ring capacity for an async logger (make-logger :async t, FR-LOG-5): the number of
    LogEvents the ring holds between the emit call and the worker thread. Overflow sheds by severity
    (FR-LOG-6), so this bounds the buffering — not a hard limit on throughput.")
+
+(defconstant +log-shed-status+ #x01000000
+  "The vendor status bit for logging-service OVERFLOW SHED (FR-LOG-6) — bit 24, deliberately clear of
+   the OMG communication-status range (DDS 1.4 §2.3.2 defines statuses at bits 0..14). Set in the
+   logger's status-changed flag whenever an event is shed on ring overflow; the per-severity counts are
+   the logger-shed-counts snapshot, and a shed-listener is the push notification. This is the
+   logger-scoped status machinery (the logger is not a DCPS entity); a WaitSet-attachable DDS
+   StatusCondition on the logger's writer is a follow-on.")
 
 (defparameter *log-severity-order*
   #(:emerg :alert :crit :err :warn :notice :info :debug :trace)
@@ -157,6 +169,29 @@
         (dotimes (i 9) (setf (aref snap i) (aref (logger-drop-counts logger) i)))))
     snap))
 
+(defun* logger-shed-status-changed-p (logger)
+    (function (logger) boolean)
+  "T iff the logging-service SHED status (+log-shed-status+, FR-LOG-6) has changed — i.e. an event has
+   been shed on ring overflow since the last logger-reset-shed-status. The changed-bit half of the DDS
+   status shape (query the per-severity counts with logger-shed-counts)."
+  (logger-shed-status-changed logger))
+
+(defun* logger-reset-shed-status (logger)
+    (function (logger) (eql t))
+  "Clear LOGGER's shed status-changed flag (the get_*_status read-then-reset semantics, DDS 1.4
+   §2.2.4.1). The per-severity counts (logger-shed-counts) are cumulative and are NOT reset."
+  (dds.pal:with-lock ((logger-lock logger))
+    (setf (logger-shed-status-changed logger) nil))
+  t)
+
+(defun* logger-set-shed-listener (logger fn)
+    (function (logger (or null function)) t)
+  "Install FN as LOGGER's shed listener (FR-LOG-6 push), or NIL to remove it. FN is called (OUTSIDE the
+   logger lock) as (funcall FN severity-number cumulative-count) on each shed — severity-number is the
+   RFC 5424 number (0=EMERG..8=TRACE) of the shed event, cumulative-count its running per-severity drop
+   total. Keep FN lightweight: it runs on the emitting thread's shed path. Reported, never printed."
+  (setf (logger-shed-listener logger) fn))
+
 (defun* make-logger (&key participant (domain 0) (advertise-address "127.0.0.1") (app-id "")
                           host host-ip (topic-name *log-topic-name*) (type-name *log-type-name*)
                           (reliability :reliable) (async nil) (ring-capacity +log-default-ring-capacity+))
@@ -237,18 +272,29 @@
             :severity severity :category category :function function :file file :line line
             :event-kind event-kind :elapsed-ns elapsed-ns :message message)))
     (if (logger-async-p logger)
-        (dds.pal:with-lock ((logger-lock logger))
-          (let ((seq (logger-seq logger))
-                (sev (%log-severity-number severity)))
-            (incf (logger-seq logger))                                   ; seq advances even on shed
-            (if (>= (logger-count logger) (aref (logger-watermarks logger) sev))
-                (progn (incf (aref (logger-drop-counts logger) sev)) :shed)
-                (progn
-                  (setf (svref (logger-ring logger) (logger-tail logger)) (%build seq)
-                        (logger-tail logger) (mod (1+ (logger-tail logger)) (logger-capacity logger)))
-                  (incf (logger-count logger))
-                  (dds.pal:condvar-signal (logger-condvar logger))
-                  :ok))))
+        (let ((shed-sev nil) (shed-count 0) (result nil))
+          (dds.pal:with-lock ((logger-lock logger))
+            (let ((seq (logger-seq logger))
+                  (sev (%log-severity-number severity)))
+              (incf (logger-seq logger))                                 ; seq advances even on shed
+              (if (>= (logger-count logger) (aref (logger-watermarks logger) sev))
+                  (progn                                                 ; SHED (FR-LOG-6)
+                    (incf (aref (logger-drop-counts logger) sev))
+                    (setf (logger-shed-status-changed logger) t          ; the +log-shed-status+ bit
+                          shed-sev sev
+                          shed-count (aref (logger-drop-counts logger) sev)
+                          result :shed))
+                  (progn                                                 ; enqueue
+                    (setf (svref (logger-ring logger) (logger-tail logger)) (%build seq)
+                          (logger-tail logger) (mod (1+ (logger-tail logger)) (logger-capacity logger)))
+                    (incf (logger-count logger))
+                    (dds.pal:condvar-signal (logger-condvar logger))
+                    (setf result :ok)))))
+          ;; fire the shed listener OUTSIDE the lock (never call app code holding the lock) — the push
+          ;; of FR-LOG-6's overflow reporting; the counts are also queryable via logger-shed-counts.
+          (when (and shed-sev (logger-shed-listener logger))
+            (funcall (logger-shed-listener logger) shed-sev shed-count))
+          result)
         (dds.pal:with-lock ((logger-lock logger))
           (let ((seq (logger-seq logger)))
             (incf (logger-seq logger))

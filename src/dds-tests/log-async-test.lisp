@@ -20,10 +20,13 @@
             "TRACE < DEBUG < INFO < NOTICE < WARN <= capacity (low severities shed first)"))
   ;; ---- (b) shedding, deterministic with the worker STOPPED ----
   (let ((logger (dds.log:make-logger :domain (test-domain +td-log-async+) :app-id "gbttctools"
-                                     :async t :ring-capacity 8)))   ; TRACE wm = floor(8*25/100)=2
+                                     :async t :ring-capacity 8))   ; TRACE wm = floor(8*25/100)=2
+        (shed-events '()))
     (unwind-protect
          (progn
            (dds.log::%logger-stop-worker logger)   ; freeze the ring so enqueue/shed is deterministic
+           ;; FR-LOG-6 push: capture each shed as (severity-number . cumulative-count).
+           (dds.log:logger-set-shed-listener logger (lambda (sev count) (push (cons sev count) shed-events)))
            ;; three TRACE: wm=2 -> #1,#2 enqueue (count 0,1 < 2), #3 sheds (count 2 >= 2).
            (dotimes (i 3) (dds.log:logger-emit logger :severity :trace :category "NET" :message "t"))
            (let ((shed (dds.log:logger-shed-counts logger)))
@@ -43,7 +46,18 @@
            (%check :async-crit-shed-when-full
                    (and (= (dds.log::logger-count logger) 8) (= (aref (dds.log:logger-shed-counts logger) 2) 1))
                    (format nil "a CRIT sheds only once the ring is FULL (count ~d, crit-drops ~d)"
-                           (dds.log::logger-count logger) (aref (dds.log:logger-shed-counts logger) 2))))
+                           (dds.log::logger-count logger) (aref (dds.log:logger-shed-counts logger) 2)))
+           ;; FR-LOG-6 reporting: the listener fired per shed (TRACE=8, CRIT=2), the status changed-bit
+           ;; is set, and reset clears it (the DDS status read-then-reset shape).
+           (%check :async-shed-listener
+                   (and (member '(8 . 1) shed-events :test #'equal)
+                        (member '(2 . 1) shed-events :test #'equal))
+                   (format nil "the shed listener must fire per shed with (severity . count); got ~s" shed-events))
+           (%check :async-shed-changed (dds.log:logger-shed-status-changed-p logger)
+                   "the shed status-changed flag must be set after a shed")
+           (dds.log:logger-reset-shed-status logger)
+           (%check :async-shed-reset (not (dds.log:logger-shed-status-changed-p logger))
+                   "logger-reset-shed-status must clear the changed flag"))
       (dds.log:close-logger logger)))
   ;; ---- (c) async delivery end to end (worker running) ----
   (let* ((domain (test-domain +td-log-async+))
