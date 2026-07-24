@@ -56,4 +56,7 @@
    #:log-service-main #:parse-log-service-config #:make-service-collector #:log-service-usage
    #:log-service-config #:log-service-config-p #:log-service-config-domain
    #:log-service-config-file #:log-service-config-format
-   #:*log-service-shutdown-requested*))
+   #:*log-service-shutdown-requested*
+   ;; the multi-service runner (ADR 0082 §6/§7, FR-LOG-7) — N collectors, one process
+   #:log-service-runner #:log-service-runner-p #:make-log-service-runner
+   #:log-runner-start #:log-runner-stop))

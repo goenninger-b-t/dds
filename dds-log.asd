@@ -13,5 +13,6 @@
                (:file "sink")
                (:file "collector")
                (:file "macros")
-               (:file "service"))
+               (:file "service")
+               (:file "runner"))
   :in-order-to ((test-op (test-op "dds-tests"))))

@@ -2,7 +2,7 @@
 
 The logging service (ADR 0082, FR-LOG) is an in-scope exception to the "no Connext service suite" rule: a `LogEvent` wire type plus a collector that renders structured JSON, text, and aggregator output. This page tracks what has landed.
 
-**Status: the pipeline, the macro API, the non-blocking async ring, and a runnable service entrypoint are landed** — the `LogEvent` wire type, both collector-side formatters (text + JSON), the emit path (a logger), file/stream/function/**RFC 5424 UDP-syslog** sinks, and a collector (`make-logger` → DDS → `make-log-collector` → sink); the per-severity macros + `with-trace-scope` over per-category thresholds (FR-LOG-3/4); the non-blocking async ring + worker + severity-graded shedding (FR-LOG-5/6); and `log-service-main`, the CLI/env entrypoint that runs the collector as a service (FR-LOG-7, single-service) — all verified in-process on both SBCL and Clasp (`run-log-pipeline-test`, `run-log-macros-test`, `run-log-async-test`, `run-log-service-test`, `run-log-syslog-test`). `logger-emit` is the underlying emit *primitive*; the ergonomic **per-severity macros with compile-time function capture and per-category thresholds (FR-LOG-3/4)**, the **non-blocking async ring + worker + severity-graded shedding (FR-LOG-5/6)**, and the **`log-service-main` CLI/env entrypoint (FR-LOG-7, single-service)** are landed too (see below). The **RFC 5424 UDP-syslog sink (FR-LOG-8)** is landed too (see the sinks below); the HTTP-bulk sink, the multi-service runner + OTP-style supervisor (the rest of FR-LOG-7), and the DDS-status-condition push for shed counts (the rest of FR-LOG-6) are follow-on slices (ADR 0082 §9). This page grows with them.
+**Status: the pipeline, the macro API, the non-blocking async ring, and a runnable service entrypoint are landed** — the `LogEvent` wire type, both collector-side formatters (text + JSON), the emit path (a logger), file/stream/function/**RFC 5424 UDP-syslog** sinks, and a collector (`make-logger` → DDS → `make-log-collector` → sink); the per-severity macros + `with-trace-scope` over per-category thresholds (FR-LOG-3/4); the non-blocking async ring + worker + severity-graded shedding (FR-LOG-5/6); `log-service-main`, the CLI/env entrypoint that runs the collector as a service; and `make-log-service-runner`, which runs several collectors concurrently under one process (FR-LOG-7) — all verified in-process on both SBCL and Clasp (`run-log-pipeline-test`, `run-log-macros-test`, `run-log-async-test`, `run-log-service-test`, `run-log-syslog-test`, `run-log-runner-test`). `logger-emit` is the underlying emit *primitive*; the ergonomic **per-severity macros with compile-time function capture and per-category thresholds (FR-LOG-3/4)**, the **non-blocking async ring + worker + severity-graded shedding (FR-LOG-5/6)**, and the **`log-service-main` CLI/env entrypoint (FR-LOG-7, single-service)** are landed too (see below). The **RFC 5424 UDP-syslog sink (FR-LOG-8)** and the **multi-service runner (FR-LOG-7)** are landed too (see below); the HTTP-bulk sink, the OTP-style supervisor (the rest of FR-LOG-7), and the DDS-status-condition push for shed counts (the rest of FR-LOG-6) are follow-on slices (ADR 0082 §9). This page grows with them.
 
 ## The `LogEvent` wire type
 
@@ -155,7 +155,20 @@ The remaining part of FR-LOG-6 — pushing the shed counts through a DDS `Status
     (dds.log:close-log-collector collector)))
 ```
 
-The sink is chosen from `--file`: a `make-file-sink` (owns the file) when a path is given, else a `make-stream-sink` over `*standard-output*` (the console sink — a new sink that *borrows* a stream, flushing but not closing it). The **multi-service runner + OTP-style supervisor** that would run several collectors under one process (the durability-service shape) are the remaining part of FR-LOG-7.
+The sink is chosen from `--file`: a `make-file-sink` (owns the file) when a path is given, else a `make-stream-sink` over `*standard-output*` (the console sink — a new sink that *borrows* a stream, flushing but not closing it).
+
+For running **several collectors under one process**, `dds.log:make-log-service-runner` takes a list of collectors it will own; `log-runner-start` spawns one drain thread per collector, and `log-runner-stop` joins them all and closes every collector. Each collector's participant is touched only by its own drain thread, so N collectors run without cross-thread races.
+
+```lisp
+(let ((runner (dds.log:make-log-service-runner
+               (list (dds.log:make-log-collector :domain 7 :sinks (list sink-a))
+                     (dds.log:make-log-collector :domain 8 :sinks (list sink-b))))))
+  (dds.log:log-runner-start runner)   ; a drain thread per collector
+  ;; ... run ...
+  (dds.log:log-runner-stop runner))   ; joins the threads, closes the collectors
+```
+
+The **OTP-style supervisor** — restart a drain thread that unexpectedly dies, bounded by a restart-intensity cap (mirroring `dds.durability`'s supervisor) — is the remaining part of FR-LOG-7.
 
 ### Interop status (inherited TypeObject notes)
 

@@ -170,3 +170,7 @@
 (defconstant +td-log-async+ 46
   "logging-service async-ring isolation offset (ADR 0082 §5/§6, FR-LOG-5/6): an async (:async t) logger's worker
    thread drains the bounded ring into a collector, on its own domain so it never cross-discovers a test.")
+(defconstant +td-log-runner+ 47
+  "logging-service multi-service-runner isolation offset (ADR 0082 §6/§7, FR-LOG-7): the runner runs TWO collectors,
+   one on this domain and one on this+1 (offset 48, unused elsewhere), each fed by its own logger — proving
+   concurrent multi-collector operation + per-domain isolation on their own domains.")
