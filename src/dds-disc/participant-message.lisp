@@ -194,7 +194,20 @@
   (let* ((qos (dds.rtps.discovery:endpoint-data-qos remote))
          (kind (%liveliness-kind-for (dds.qos:qos-liveliness qos))))
     (if (null kind)
-        t   ; MANUAL_BY_TOPIC: not gated by the PM protocol -> alive
+        ;; MANUAL_BY_TOPIC: the PM protocol does not carry it, but the writer DOES assert by writing
+        ;; (§8.4.13), and %deliver-user-sample stamps each inbound sample. Age that stamp against the
+        ;; offered lease exactly as the PM path does. Previously this returned T unconditionally, which
+        ;; made such a writer immortal: it could never be reported not-alive, so LIVELINESS_CHANGED was
+        ;; inert for the one kind whose liveliness a reader can actually observe directly.
+        (let ((lease (%lease-seconds (dds.qos:qos-liveliness-lease qos)))
+              (stamp (gethash (dds.rtps.discovery:endpoint-data-guid remote)
+                              (disc-node-writer-data-stamp node))))
+          (cond ((>= lease #x7fffffff) t)   ; infinite lease -> always alive, as for the PM kinds
+                ;; No sample yet: a freshly matched writer has not had a chance to assert, and calling
+                ;; it not-alive here would fire a spurious NOT_ALIVE on every match. Alive until it
+                ;; has actually been given the chance and missed it.
+                ((null stamp) t)
+                (t (not (%lease-stale-p stamp lease now)))))
         (let ((lease (%lease-seconds (dds.qos:qos-liveliness-lease qos)))
               (prefix (subseq (dds.rtps.discovery:endpoint-data-guid remote) 0 12))
               (stamp nil))
@@ -235,7 +248,13 @@
                      (declare (ignore v))
                      (unless (member guid seen :test #'equalp) (push guid stale)))
                    (disc-node-liveliness-state node))
-          (dolist (guid stale) (remhash guid (disc-node-liveliness-state node))))))
+          (dolist (guid stale)
+            (remhash guid (disc-node-liveliness-state node))
+            ;; Drop the MANUAL_BY_TOPIC data stamp with it, for the same reason and one more: a
+            ;; re-matched writer must not inherit a stale assertion and be judged alive on evidence
+            ;; from its previous incarnation, and without this the table grows without bound against a
+            ;; peer that churns endpoints.
+            (remhash guid (disc-node-writer-data-stamp node))))))
     (dolist (tr transitions) (%fire-liveliness-changed node (car tr) (cdr tr)))
     t))
 

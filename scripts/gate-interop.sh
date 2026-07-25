@@ -311,11 +311,12 @@ fi
 # ASSERTS BOTH HALVES: samples prove the match was real, peak-alive>=1 proves the status was set.
 # A reader that receives data while reporting zero live writers is the exact defect.
 #
-# NOT asserted here, and deliberately: the ALIVE -> NOT_ALIVE transition against Connext. Our peer
-# stops asserting and our own writer's lease expiry IS observed (ours<->ours goes 1 -> 0 with
-# not_alive=1), but against Connext the writer stays alive past its offered lease — a separate open
-# question about which assertion kinds %matched-writer-alive-p accepts for a MANUAL_BY_TOPIC writer
-# (RTPS 2.5 §8.4.13 matches on KIND). Asserting it here would gate an unresolved question.
+# It also asserts the FULL TRANSITION: alive must reach 1 and then fall back with not_alive>=1 once
+# the writer stops asserting. That half needed a second fix — MANUAL_BY_TOPIC liveliness is asserted
+# by the writer WRITING (§8.4.13), not by the ParticipantMessage protocol (§8.7.2.2.3 carries only
+# AUTOMATIC and MANUAL_BY_PARTICIPANT), and %matched-writer-alive-p used to answer "alive" for that
+# kind unconditionally, making such a writer immortal. Inbound DATA is now stamped and aged against
+# the offered lease, so the one liveliness kind a reader can observe DIRECTLY finally expires.
 if [[ "$have_connext" -eq 1 && -x interop/connext/liveliness-peer/liveliness_pub ]]; then
   export NDDSHOME
   export DYLD_LIBRARY_PATH="$NDDSHOME/lib/arm64Darwin20clang12.0:$PWD/interop/connext/liveliness-peer:${DYLD_LIBRARY_PATH:-}"
@@ -330,10 +331,11 @@ if [[ "$have_connext" -eq 1 && -x interop/connext/liveliness-peer/liveliness_pub
   stop_peer "$g"
   n="$(grep -oE 'samples=[0-9]+' "$log.ours" | tail -1 | grep -oE '[0-9]+' || echo 0)"
   peak="$(grep -oE 'peak-alive=[0-9]+' "$log.ours" | tail -1 | grep -oE '[0-9]+' || echo 0)"
-  if [[ "$n" -ge 3 && "$peak" -ge 1 ]]; then
-    note "ok" "Connext LIVELINESS -> us: $n sample(s), alive_count reached $peak (0 before the match-time fix)"
+  na="$(grep -oE 'final-not-alive=[0-9]+' "$log.ours" | tail -1 | grep -oE '[0-9]+' || echo 0)"
+  if [[ "$n" -ge 3 && "$peak" -ge 1 && "$na" -ge 1 ]]; then
+    note "ok" "Connext LIVELINESS -> us: $n sample(s), alive reached $peak then went NOT_ALIVE ($na) on lease expiry"
   else
-    note "FAIL" "Connext LIVELINESS -> us: samples=$n peak-alive=$peak (need >=3 and >=1) (log: $log.ours)"; fails=1; fi
+    note "FAIL" "Connext LIVELINESS -> us: samples=$n peak-alive=$peak not-alive=$na (need >=3, >=1, >=1) (log: $log.ours)"; fails=1; fi
 fi
 
 # ---- Leg 24: TRANSIENT_LOCAL DURABILITY — a LATE JOINER must be replayed the history. ----
@@ -712,10 +714,8 @@ echo "              reason worth stating: BOTH vendors send @mutable as PL_CDR (
 echo "              the parameter-list framing only — the PL_CDR2 (XCDR2) framing has NO live peer behind"
 echo "              it from either vendor, so its length-code choice stays externally unpinned."
 echo "              NO_KEY is gated BOTH directions vs Connext. Per-feature legs still NOT gated:"
-echo "              LIVELINESS alive_count is gated (leg 25); the ALIVE -> NOT_ALIVE transition against"
-echo "              Connext is NOT — our peer stops asserting and ours<->ours observes the expiry, but"
-echo "              Connext stays alive past its offered lease (open: which assertion KINDS"
-echo "              %matched-writer-alive-p accepts for MANUAL_BY_TOPIC, RTPS 2.5 §8.4.13)."
+echo "              LIVELINESS is gated BOTH halves (leg 25): alive_count reaching 1 on match AND the"
+echo "              ALIVE -> NOT_ALIVE expiry of a MANUAL_BY_TOPIC writer that stops asserting."
 echo "              under scripts/ and interop/, but nothing runs them. (enum TK_ENUM and string8-LARGE"
 echo "              are legs 15/16; keyed FlatData 17/18; TypeLookup CLIENT 19 — the TypeLookup"
 echo "              SERVER side is still ungated: a stock Fast DDS client needs a non-stock patch"

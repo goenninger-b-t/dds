@@ -378,6 +378,11 @@
   (pm-writer-sn 1 :type integer) ; BuiltinParticipantMessageWriter per-writer SN (1-based)
   (remote-liveliness (make-hash-table :test 'equalp) :type hash-table) ; (12-octet prefix . kind) -> %lease-now stamp
   (liveliness-state (make-hash-table :test 'equalp) :type hash-table) ; matched remote-writer 16-octet GUID -> alive-p (reader-side LIVELINESS_CHANGED transition flag)
+  ;; MANUAL_BY_TOPIC liveliness is asserted by the WRITER WRITING (RTPS 2.5 §8.4.13), not by the
+  ;; ParticipantMessage protocol — which carries only AUTOMATIC and MANUAL_BY_PARTICIPANT (§8.7.2.2.3).
+  ;; So the only assertion a reader ever sees for such a writer is its DATA, and without stamping it
+  ;; %matched-writer-alive-p has no evidence and must call every MANUAL_BY_TOPIC writer alive forever.
+  (writer-data-stamp (make-hash-table :test 'equalp) :type hash-table) ; remote writer 16-octet GUID -> internal-real-time of its last DATA (MANUAL_BY_TOPIC liveliness assertion)
 
   ;; DDS-Security 1.1 §7.4.3.2 IdentityToken octets for SPDP; NIL = security OFF, byte-identical.
   (identity-token-octets nil :type (or null (simple-array (unsigned-byte 8) (*))))

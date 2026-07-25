@@ -3298,6 +3298,12 @@
     ;; WP-SECURITY-ZC-SHMEM-OVERLAY (ADR 0051): a ZC overlay sample is a data_protection SecuredPayload even when
     ;; the reader's own data_protection governance is NONE — OVERLAY-SECURED forces the decode (the KM resolves as
     ;; the remote-writer EntityCrypto key exactly as the normal data_protection decode; fail-closed reuse below).
+    ;; MANUAL_BY_TOPIC LIVELINESS ASSERTION (RTPS 2.5 §8.4.13). For that kind the writer asserts by
+    ;; WRITING — the ParticipantMessage protocol carries only AUTOMATIC and MANUAL_BY_PARTICIPANT
+    ;; (§8.7.2.2.3) — so this DATA is the only evidence a reader will ever get, and %liveliness-sweep
+    ;; has nothing else to age against. One PUTHASH of a fixnum per sample, keyed by the EFFECTIVE
+    ;; writer GUID (the logical origin, so a relayed sample credits the ORIGINAL writer, not the relay).
+    (setf (gethash effective-guid (disc-node-writer-data-stamp node)) (%lease-now))
     (let ((ct (and (or overlay-secured (not (eq rkind :none))) (disc-node-crypto-transform node))))
       ;; ADR 0078: the RX store pool is drawn only for a node with NO crypto-transform, but the transform can be
       ;; installed by a live DDS-Security handshake between that test (on the receiver thread, before this call)
