@@ -260,6 +260,32 @@ if [[ "$have_connext" -eq 1 ]]; then
     note "FAIL" "Connext -> us LARGE: only $n verified sample(s), need >= $MIN_SAMPLES (log: $log)"; fails=1; fi
 fi
 
+# ---- Leg 19: TypeLookup CLIENT — our getTypes query against a live Fast DDS server. ----
+# The one protocol in this stack with NO Connext oracle at all: RTI does not implement the TypeLookup
+# service (ADR 0010), so every byte of it was self-pinned regression vectors plus a tshark decode
+# until Fast DDS provided a real server. This leg keeps that peer confirmation running instead of
+# leaving it as a one-off manual result recorded in a README.
+#
+# It asserts the ROUND TRIP, not merely a reply: the probe takes the EK_MINIMAL hash from the peer's
+# SEDP PID_TYPE_INFORMATION, issues getTypes, parses the returned TypeObject and RE-HASHES it, and
+# passes only if the hash it computes equals the hash it asked for. A reply that parsed but hashed
+# differently would be a silent corruption of exactly the identity the type gate matches on.
+if [[ "$have_fastdds" -eq 1 && -x interop/fastdds/shapes/shapes_pub ]]; then
+  TLDOM=$DOMAIN   # Fast DDS's profile pins the builtin port for this domain; its peers live here
+  log="$(mktemp)"
+  g="$(start_peer "$log" ./scripts/with-fastdds.sh bash -c "cd interop/fastdds/shapes && exec ./shapes_pub GREEN 0")"
+  sleep 6
+  tmout $((SECONDS_RUN + 25)) ./scripts/with-sbcl.sh \
+    --eval "(asdf:load-system :dds-shapes)" \
+    --eval "(uiop:symbol-call :dds.shapes :run-typelookup-probe :domain $TLDOM :seconds $SECONDS_RUN :advertise-address \"127.0.0.1\" :peers \"127.0.0.1:7410\")" \
+    --eval '(uiop:quit 0)' > "$log.ours" 2>&1
+  stop_peer "$g"
+  if grep -q 'tl-probe\] PASS' "$log.ours"; then
+    note "ok" "TypeLookup getTypes vs Fast DDS: $(grep -oE 'TypeObject [0-9]+ octets' "$log.ours" | head -1) re-hashes to the queried hash"
+  else
+    note "FAIL" "TypeLookup getTypes vs Fast DDS: $(grep -oE '\[tl-probe\] FAIL.*' "$log.ours" | head -1) (log: $log.ours)"; fails=1; fi
+fi
+
 # ---- Legs 17/18: KEYED FLATDATA, both directions vs Connext (FR-PF-4, ADR 0015/0017; R6). ----
 # The crux is not that samples arrive: it is that a keyed FlatData instance's IDENTITY agrees across
 # vendors. Our keyhash for a FlatData sample is computed by reading the fields back out of the
@@ -555,7 +581,9 @@ echo "              reason worth stating: BOTH vendors send @mutable as PL_CDR (
 echo "              the parameter-list framing only — the PL_CDR2 (XCDR2) framing has NO live peer behind"
 echo "              it from either vendor, so its length-code choice stays externally unpinned."
 echo "              NO_KEY is gated BOTH directions vs Connext. Per-feature legs still NOT gated:"
-echo "              TypeLookup, liveliness, deadline, durability, security — drivers exist"
+echo "              liveliness, deadline, durability, security — drivers exist"
 echo "              under scripts/ and interop/, but nothing runs them. (enum TK_ENUM and string8-LARGE"
-echo "              are legs 15/16; keyed FlatData is legs 17/18.)"
+echo "              are legs 15/16; keyed FlatData 17/18; TypeLookup CLIENT 19 — the TypeLookup"
+echo "              SERVER side is still ungated: a stock Fast DDS client needs a non-stock patch"
+echo "              to query us (FR-IO-2 S4 leg B), so only the client direction is gateable.)"
 echo "              Say so rather than let a green line read as 'interop is covered'."

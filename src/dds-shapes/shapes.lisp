@@ -1167,8 +1167,9 @@
         (format t "~&[corpus] stopped; no PID_TYPE_OBJECT_LB captured.~%"))
       nil)))
 
-(defun* run-typelookup-probe (&key (domain 0) (seconds 15) (advertise-address "127.0.0.1"))
-    (function (&key (:domain (integer 0)) (:seconds (integer 1)) (:advertise-address string)) t)
+(defun* run-typelookup-probe (&key (domain 0) (seconds 15) (advertise-address "127.0.0.1") peers)
+    (function (&key (:domain (integer 0)) (:seconds (integer 1)) (:advertise-address string)
+                    (:peers (or null string))) t)
   "FR-IO-2 S4 probe: discover one remote participant on DOMAIN, take the
    EquivalenceHash from its SEDP PID_TYPE_INFORMATION (0x0075), issue a
    TypeLookup getTypes toward it (XTypes 1.3 §7.6.3.3), and report whether the
@@ -1176,7 +1177,11 @@
    (equivalence-hash) to the queried hash. Prints PASS/FAIL lines; returns T on
    PASS. SECONDS bounds discovery + reply wait."
   (let ((node (dds.disc:make-disc-node :guid-prefix (%make-prefix #x54) :domain domain
-                                       :multicast t :advertise-address advertise-address)))
+                                       :multicast t :advertise-address advertise-address
+                                       ;; Fast DDS's profile whitelists 127.0.0.1 and never sees LAN
+                                       ;; multicast SPDP, so reaching its TypeLookup server needs a
+                                       ;; unicast peer at its builtin metatraffic port.
+                                       :peers (%parse-peers peers))))
     ;; a Square reader makes the peer SEDP-announce its Square writer (+ 0x0075) at us
     (dds.disc:add-local-reader node :topic "Square" :type "ShapeType"
                                :reliability dds.rtps.discovery:+reliability-reliable+
