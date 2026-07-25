@@ -47,6 +47,9 @@
    This is how the corpus is REGENERATED; `make corpus` only VERIFIES against the committed .bin files, so
    the gate does not need Connext installed."
   (ensure-directories-exist *corpus-dir*)
+  ;; Same reason, and the same SETF-not-LET reason, as mutable-corpus-capture: with the RX store pool on
+  ;; VEC is a pooled SLOT rather than the payload, and every vector would carry kilobytes of trailing slack.
+  (setf dds.disc::*rx-store-pool-enabled* nil)
   (let ((seen (make-hash-table :test #'equal))
         (ts (dds.types:find-type-support "perf-data")))
     (let ((orig (symbol-function 'dds.disc::%deliver-user-sample)))
@@ -87,6 +90,118 @@
       (dds.dcps:delete-participant p)))
   t)
 
+;;;; ---- The MUTABLE reference vector (ADR 0086) ----
+;;;;
+;;;; MUTABLE is the extensibility kind with the most room for two conformant writers to disagree: the
+;;;; LENGTH CODE for a variable-width member is a WRITER'S CHOICE the spec does not fix (XTypes 1.3
+;;;; §7.4.3.4.2 — codes 5-7 "save 4 bytes" but are never required). This stack emits LC 0-4; RTI Connext
+;;;; may emit LC 5/6 for `label` and `vals`, reusing NEXTINT as the member's own leading length. Only a
+;;;; captured vector can say which, and the vector wins.
+
+(dds.gen:define-dds-type mutable-data (:extensibility :mutable)
+  (a :i32 :id 0 :key t)
+  (b :i16 :id 1)
+  (label :string :id 2)
+  (t-ns :i64 :id 3)
+  (vals (:sequence :i32) :id 4))
+
+(defparameter +mutable-corpus-file+ "mutabledata-connext.bin"
+  "File name of the MUTABLE reference vector: the SerializedPayload RTI Connext transmits for the ONE fixed
+   MutableData sample defined by %corpus-mutable-sample. Captured from the live peer in
+   interop/connext/mutable/ (mutable_pub), whose IDL declares the same members with the same @ids.
+
+   IT IS PL_CDR, NOT PL_CDR2. Connext 7.3.1 stamps an @mutable type 0x0003 (PL_CDR_LE, encoding version 1)
+   by default, not the 0x000b (PL_CDR2_LE) this stack sends — so the XCDR1 parameter-list framing of rules
+   (23)-(25) is the one that actually carries MUTABLE to Connext, and the length-code question of rules
+   (21)-(22) does not even arise on this wire. That is worth stating plainly, because ADR 0086 expected
+   the vector to settle the LC choice and instead it settled something more basic.")
+
+(defun* %corpus-mutable-sample ()
+    (function () mutable-data)
+  "THE fixed MutableData sample the vector encodes — a=1, b=2, label=\"hello\", t_ns=3, vals=[7,8,9].
+   Defined by RULE, exactly as %corpus-payload is, so the vector holds the reference ENCODING while this
+   holds the sample. It must stay identical to the literal in interop/connext/mutable/mutable_pub.cxx."
+  (make-mutable-data :a 1 :b 2 :label "hello" :t-ns 3
+                     :vals (make-array 3 :element-type '(signed-byte 32)
+                                         :initial-contents '(7 8 9))))
+
+(defun* mutable-corpus-capture (&key (domain 0) (advertise-address "192.168.2.148") (seconds 60))
+    (function (&key (:domain (integer 0)) (:advertise-address string) (:seconds (integer 1))) t)
+  "CAPTURE MODE for the MUTABLE vector: subscribe the MutableCorpus topic and write the FIRST payload
+   RTI Connext transmits to *CORPUS-DIR*/+mutable-corpus-file+, verbatim.
+
+   Off our own receive path, for the reason the file header gives: Connext's rti::topic::to_cdr_buffer is
+   not the wire. Drive it with interop/connext/mutable/mutable_pub."
+  (ensure-directories-exist *corpus-dir*)
+  ;; THE RX STORE POOL MUST BE OFF WHILE CAPTURING. With it on, the copy out of the receive buffer lands
+  ;; in a POOLED slot and %deliver-user-sample is handed that slot's WHOLE vector — 16 KB of it for a
+  ;; 72-octet sample — with the true extent (plen) known only to the caller. A vector captured that way
+  ;; is the payload followed by kilobytes of pool slack, and nothing about it looks wrong. Off, the copy
+  ;; is (make-array plen): exactly the octets Connext transmitted.
+  ;;
+  ;; SETF, NOT LET. The receive path runs on the RECEIVER THREAD, and a dynamic binding is thread-local —
+  ;; a LET here rebinds the special in the capturing thread only and the receiver keeps seeing the global
+  ;; value, so the pool stays on and the capture is silently 16 KB long again.
+  (setf dds.disc::*rx-store-pool-enabled* nil)
+  (let ((ts (dds.types:find-type-support "mutable-data"))
+        (done nil))
+    (let ((orig (symbol-function 'dds.disc::%deliver-user-sample)))
+      (setf (fdefinition 'dds.disc::%deliver-user-sample)
+            (lambda (node writer-id sn vec &rest r)
+              (when (and (not done)
+                         (typep vec '(array (unsigned-byte 8) (*)))
+                         (>= (length vec) 8))
+                (setf done t)
+                (let ((path (merge-pathnames +mutable-corpus-file+ *corpus-dir*)))
+                  (with-open-file (out path :direction :output :element-type '(unsigned-byte 8)
+                                            :if-exists :supersede :if-does-not-exist :create)
+                    (write-sequence vec out))
+                  (format t "~&[corpus] captured ~a: ~d octets, encap=~2,'0x~2,'0x options=~2,'0x~2,'0x~%~
+                               [corpus] body: ~a~%"
+                          +mutable-corpus-file+ (length vec) (aref vec 0) (aref vec 1)
+                          (aref vec 2) (aref vec 3) (%hex vec))
+                  (finish-output)))
+              (apply orig node writer-id sn vec r))))
+    (let* ((p (%perf-participant domain advertise-address nil))
+           (tp (dds.dcps:create-topic p "MutableCorpus" "MutableData" ts))
+           (sub (dds.dcps:create-subscriber p)))
+      (dds.dcps:create-datareader
+       sub tp :qos (dds.qos:make-reader-qos :reliability :reliable :history-kind :keep-all))
+      (format t "~&[corpus] capturing Connext's MUTABLE wire payload into ~a for ~d s~%"
+              *corpus-dir* seconds)
+      (finish-output)
+      (sleep seconds)
+      (dds.dcps:delete-participant p)))
+  t)
+
+(defun* %corpus-verify-mutable (path)
+    (function (t) (integer 0))
+  "Verify the MUTABLE vector at PATH against our own encoder for the same fixed sample; returns the
+   mismatch count (0 or 1) and prints a byte-level diff on failure.
+
+   A mismatch here is NOT automatically our bug. The length code for a variable-width member is the one
+   part of this encoding the spec leaves to the writer, so a diff confined to `label`'s and `vals`'
+   member headers means Connext chose LC 5/6 where we chose LC 4 — both conformant, and the fix is to
+   change dds.gen::%mutable-lc to match the vector, never to change the vector (ADR 0086 §A2)."
+  (let ((expect (with-open-file (in path :element-type '(unsigned-byte 8))
+                  (let ((v (make-array (file-length in) :element-type '(unsigned-byte 8))))
+                    (read-sequence v in) v)))
+        ;; :XCDR1 — the representation Connext actually used for this @mutable type (see
+        ;; +mutable-corpus-file+). Comparing our XCDR2 output against a PL_CDR vector would compare two
+        ;; different encodings and fail for a reason that says nothing about either.
+        (got (dds.dcps::%serialize-sample
+              (dds.types:find-type-support "mutable-data") (%corpus-mutable-sample) :xcdr1)))
+    (cond
+      ((and (= (length expect) (length got)) (every #'= expect got))
+       (format t "~&  ok   ~a (~d octets, PL_CDR/XCDR1)~%" +mutable-corpus-file+ (length expect))
+       0)
+      (t
+       (format t "~&  FAIL ~a: expected ~d octets, got ~d~%    connext: ~a~%    ours:    ~a~%~
+                    NOTE: a diff in a VARIABLE member's header is a length-code choice, not a defect —~%~
+                    the spec does not fix it. Match the vector via dds.gen::%mutable-lc (ADR 0086 §A2).~%"
+               +mutable-corpus-file+ (length expect) (length got) (%hex expect) (%hex got))
+       1))))
+
 (defun* corpus-verify ()
     (function () (integer 0))
   "THE GATE (`make corpus`): for every committed reference vector, serialize the SAME sample with OUR codec
@@ -111,14 +226,20 @@
         ;; the shape of a gate that cannot fail. Now it is verified here, named in
         ;; *corpus-verified-elsewhere*, or it is a FAILURE.
         (when (null id-len)
-          (if (member name *corpus-verified-elsewhere* :test #'string=)
-              (format t "~&  --   ~a (verified elsewhere — see *corpus-verified-elsewhere*)~%" name)
-              (progn
-                (incf bad)
-                (format t "~&  FAIL ~a: unrecognised corpus vector — this gate verifies nothing for it.~%~
-                             Name it perfdata-id<ID>-len<LEN>.bin so it is checked here, or add it to~%~
-                             *corpus-verified-elsewhere* naming the gate that does.~%"
-                        name))))
+          (cond
+            ;; The MUTABLE vector (ADR 0086) is a different TYPE, not another (id, len) case of
+            ;; perf-data, so it gets its own arm rather than a name this loop could parse.
+            ((string= name +mutable-corpus-file+)
+             (incf n)
+             (incf bad (%corpus-verify-mutable f)))
+            ((member name *corpus-verified-elsewhere* :test #'string=)
+             (format t "~&  --   ~a (verified elsewhere — see *corpus-verified-elsewhere*)~%" name))
+            (t
+             (incf bad)
+             (format t "~&  FAIL ~a: unrecognised corpus vector — this gate verifies nothing for it.~%~
+                          Name it perfdata-id<ID>-len<LEN>.bin so it is checked here, or add it to~%~
+                          *corpus-verified-elsewhere* naming the gate that does.~%"
+                     name))))
         (when id-len
           (destructuring-bind (id . len) id-len
             (incf n)

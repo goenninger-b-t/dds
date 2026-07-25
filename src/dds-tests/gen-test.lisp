@@ -726,3 +726,242 @@
     (dds.pal:free-static (dds.core.buffer:octet-buffer-vec out))
     (dds.pal:free-static (dds.core.buffer:octet-buffer-vec ptout))
     t))
+
+;;;; ---- MUTABLE extensibility (ADR 0086; XTypes 1.3 §7.4.3.4.2, rules (21)-(25)) ----
+;;;; mut-v1 and mut-v2 are the same type at two revisions: v2 adds a member AND reorders the
+;;;; declaration, which is exactly what MUTABLE is for and what neither FINAL nor APPENDABLE
+;;;; survives. The ids, not the positions, are the contract — note v2 declares them out of order on
+;;;; purpose, so a positional decode cannot pass.
+
+(dds.gen:define-dds-type mut-v1 (:extensibility :mutable)
+  (a :i32 :key t)                       ; id 0
+  (b :u16)                              ; id 1  <- the id that collides with the RTPS sentinel
+  (label :string)                       ; id 2
+  (t-ns :i64))                          ; id 3
+
+(dds.gen:define-dds-type mut-v2 (:extensibility :mutable)
+  (t-ns :i64 :id 3)
+  (label :string :id 2)
+  (a :i32 :id 0 :key t)
+  (extra :i32 :id 7)
+  (b :u16 :id 1))
+
+;; A member a peer is not allowed to ignore (@must_understand, §7.4.1.2.1).
+(dds.gen:define-dds-type mut-mu (:extensibility :mutable)
+  (a :i32 :id 0)
+  (critical :i32 :id 9 :must-understand t))
+
+(defun* %mut-ser (s ser mode endianness)
+    (function (t function symbol (member :little :big)) (simple-array (unsigned-byte 8) (*)))
+  "Serialize S with SER into a fresh vector — a test fixture, not a data path."
+  (let* ((buf (dds.core.buffer:make-octet-buffer 512))
+         (wc (dds.core.buffer:cursor buf :endianness endianness)))
+    (funcall ser s wc mode)
+    (let* ((len (dds.core.buffer:cursor-position wc))
+           (out (make-array len :element-type '(unsigned-byte 8))))
+      (replace out (dds.core.buffer:octet-buffer-vec buf) :end1 len)
+      (dds.pal:free-static (dds.core.buffer:octet-buffer-vec buf))
+      out)))
+
+(defun* %mut-cursor (bytes endianness)
+    (function ((simple-array (unsigned-byte 8) (*)) (member :little :big)) dds.core.buffer:cursor)
+  "A read cursor over BYTES whose buffer capacity is exactly (LENGTH BYTES) — the XCDR1 parameter
+   walk uses the buffer extent as its bound, so a slack capacity would weaken the test."
+  (dds.core.buffer:cursor (dds.core.buffer:octet-buffer-over bytes) :endianness endianness))
+
+(defun* run-gen-mutable-test ()
+    (function () t)
+  "Test: `:mutable` extensibility (ADR 0086; DDS-XTypes 1.3 §7.4.3.4.2 EMHEADER1/LC/NEXTINT,
+   §7.4.1.2.1 parameter ids, §7.4.3.5 rules (21)-(25)).
+
+   MUTABLE is the only kind whose decode is DRIVEN BY WIRE DATA — a member is located by an id and
+   sized by a length the peer chose — so this covers the framing bytes, the compatibility property in
+   both directions, the must-understand discard, and the hostile-length rejections."
+  ;; 1. THE FRAMING BYTES, XCDR2 (rules (21)-(22)). Derived from the clause, not from our output:
+  ;;    DHEADER=48 excluding itself; then per member EMHEADER1 = (M_FLAG<<31)+(LC<<28)+id, LE.
+  ;;    a  : LC=2 (4 octets) id=0 -> 0x20000000 ; then the i32.
+  ;;    b  : LC=1 (2 octets) id=1 -> 0x10000001 ; then the u16, then 2 pad to the next header.
+  ;;    lbl: LC=4 id=2 -> 0x40000002 + NEXTINT=10 (4 length + "hello\0"); then the string.
+  ;;    t  : LC=3 (8 octets) id=3 -> 0x30000003 ; then the i64 (4-aligned, XCDR2 caps at 4).
+  (let* ((s (make-mut-v1 :a 1 :b 2 :label "hello" :t-ns 3))
+         (x2 (%mut-ser s #'serialize-mut-v1 :xcdr2 :little)))
+    (%check :mutable-xcdr2-bytes
+            (equalp x2 (octets #x30 #x00 #x00 #x00
+                               #x00 #x00 #x00 #x20  #x01 #x00 #x00 #x00
+                               #x01 #x00 #x00 #x10  #x02 #x00  #x00 #x00
+                               #x02 #x00 #x00 #x40  #x0a #x00 #x00 #x00
+                               #x06 #x00 #x00 #x00  #x68 #x65 #x6c #x6c #x6f #x00  #x00 #x00
+                               #x03 #x00 #x00 #x30  #x03 #x00 #x00 #x00 #x00 #x00 #x00 #x00))
+            (format nil "PL_CDR2 framing must match §7.4.3.4.2; got ~{~2,'0x ~}" (coerce x2 'list)))
+    ;; 2. THE FRAMING BYTES, XCDR1 (rules (23)-(25)). A parameter list: per member ALIGN(4), a 16-bit
+    ;;    id, a 16-bit length, then the member with its origin reset; closed by PID_LIST_END + 0.
+    ;;    Member b's id is 1 — the value the RTPS sentinel uses. It must appear as a MEMBER here.
+    ;;
+    ;;    THREE OF THESE FIELDS WERE WRONG UNTIL A LIVE CONNEXT VECTOR SAID SO
+    ;;    (corpus/xcdr2/mutabledata-connext.bin, `make corpus`), and all three were hand-derived from the
+    ;;    clause and looked right:
+    ;;      - the DECLARED LENGTH is rounded up to a multiple of 4 (b, a 2-octet short, declares 4; the
+    ;;        10-octet string declares 12) — a PL_CDR list is the RTPS ParameterList structure;
+    ;;      - the terminator is 0x7F02, PID_LIST_END with FLAG_MUST_UNDERSTAND, which Table 34 requires
+    ;;        and rule (23)'s bare "PID_SENTINEL" does not mention;
+    ;;      - and Connext sends @mutable as PL_CDR (XCDR1) in the first place, which is why this leg,
+    ;;        not the XCDR2 one above, is the framing that actually reaches it.
+    (let ((x1 (%mut-ser s #'serialize-mut-v1 :xcdr1 :little)))
+      (%check :mutable-xcdr1-bytes
+              (equalp x1 (octets #x00 #x00 #x04 #x00  #x01 #x00 #x00 #x00
+                                 #x01 #x00 #x04 #x00  #x02 #x00  #x00 #x00
+                                 #x02 #x00 #x0c #x00  #x06 #x00 #x00 #x00
+                                 #x68 #x65 #x6c #x6c #x6f #x00  #x00 #x00
+                                 #x03 #x00 #x08 #x00  #x03 #x00 #x00 #x00 #x00 #x00 #x00 #x00
+                                 #x02 #x7f #x00 #x00))
+              (format nil "PL_CDR framing must match rules (23)-(25); got ~{~2,'0x ~}"
+                      (coerce x1 'list)))
+      ;; 2b. PARAMETER ID 1 IS A MEMBER, NOT A TERMINATOR. Table 34 confines the id-1 terminator to
+      ;;     Simple Discovery types, which give up member id 1 to buy it. Accepting it for a user
+      ;;     type ends the list at the SECOND member of a default-numbered struct and silently
+      ;;     delivers defaults for everything after — a wrong sample reported as a good one.
+      (multiple-value-bind (q st) (deserialize-mut-v1 (%mut-cursor x1 :little) :xcdr1)
+        (%check :mutable-xcdr1-id1-is-a-member
+                (and (null st) q (= 2 (mut-v1-b q)) (= 3 (mut-v1-t-ns q))
+                     (string= "hello" (mut-v1-label q)))
+                (format nil "member id 1 must decode as a member; status ~s sample ~s" st q))))
+    ;; 3. Round-trip both encodings x both endiannesses, and serialized-size EXACT for each. The
+    ;;    size sizes the payload buffer (%serialize-sample), and MUTABLE puts a header on EVERY
+    ;;    member, so an omission here is a buffer overflow rather than a cosmetic mismatch.
+    (dolist (mode '(:xcdr2 :xcdr1))
+      (dolist (endian '(:little :big))
+        (let* ((bytes (%mut-ser s #'serialize-mut-v1 mode endian))
+               (ssz (serialized-size-mut-v1 s mode)))
+          (%check :mutable-serialized-size-exact
+                  (= ssz (length bytes))
+                  (format nil "~a/~a: serialized-size ~d != bytes written ~d"
+                          mode endian ssz (length bytes)))
+          (multiple-value-bind (q st) (deserialize-mut-v1 (%mut-cursor bytes endian) mode)
+            (%check :mutable-roundtrip
+                    (and (null st) q (= 1 (mut-v1-a q)) (= 2 (mut-v1-b q))
+                         (string= "hello" (mut-v1-label q)) (= 3 (mut-v1-t-ns q)))
+                    (format nil "~a/~a round-trip: status ~s sample ~s" mode endian st q)))
+          ;; deserialize-into fills a POOLED sample and must agree member for member.
+          (let ((target (make-mut-v1 :a 99 :b 99 :label "stale" :t-ns 99)))
+            (multiple-value-bind (q st) (deserialize-into-mut-v1 target (%mut-cursor bytes endian) mode)
+              (%check :mutable-deserialize-into
+                      (and (null st) q (= 1 (mut-v1-a q)) (= 2 (mut-v1-b q))
+                           (string= "hello" (mut-v1-label q)) (= 3 (mut-v1-t-ns q)))
+                      (format nil "~a/~a deserialize-into: status ~s sample ~s" mode endian st q)))))))
+    ;; 4. THE COMPATIBILITY PROPERTY, forward: a v2 sample (extra member, members reordered on the
+    ;;    wire) read by a v1 reader. The shared members decode BY ID and the unknown id 7 is skipped
+    ;;    using the header's own length — never the member's type, which a v1 reader does not have.
+    (dolist (mode '(:xcdr2 :xcdr1))
+      (let* ((s2 (make-mut-v2 :a 5 :b 6 :label "wire" :t-ns 7 :extra 12345))
+             (bytes (%mut-ser s2 #'serialize-mut-v2 mode :little)))
+        (multiple-value-bind (q st) (deserialize-mut-v1 (%mut-cursor bytes :little) mode)
+          (%check :mutable-v2-as-v1
+                  (and (null st) q (= 5 (mut-v1-a q)) (= 6 (mut-v1-b q))
+                       (string= "wire" (mut-v1-label q)) (= 7 (mut-v1-t-ns q)))
+                  (format nil "~a: an unknown non-must-understand member must be SKIPPED; status ~s sample ~s"
+                          mode st q)))
+        ;; 5. And the reverse: a v1 sample read by a v2 reader. `extra` was never sent, so it must
+        ;;    keep its DEFAULT — a member's absence is normal in MUTABLE, not an error.
+        (let ((bytes1 (%mut-ser s #'serialize-mut-v1 mode :little)))
+          (multiple-value-bind (q st) (deserialize-mut-v2 (%mut-cursor bytes1 :little) mode)
+            (%check :mutable-v1-as-v2
+                    (and (null st) q (= 1 (mut-v2-a q)) (= 2 (mut-v2-b q))
+                         (string= "hello" (mut-v2-label q)) (= 3 (mut-v2-t-ns q))
+                         (= 0 (mut-v2-extra q)))
+                    (format nil "~a: an absent member must stay at its default; status ~s sample ~s"
+                            mode st q))))))
+    ;; 6. MUST_UNDERSTAND: the same skip becomes a DISCARD. §7.4.1.2.1 says the bit decides whether an
+    ;;    unrecognised member "may be simply ignored or whether it causes the entire data sample to be
+    ;;    discarded". Reported as a STATUS, never signalled (ADR 0064). mut-mu's id 9 is unknown to
+    ;;    mut-v1, and the M_FLAG is what makes the difference between test 4 and this one.
+    (dolist (mode '(:xcdr2 :xcdr1))
+      (let* ((smu (make-mut-mu :a 1 :critical 42))
+             (bytes (%mut-ser smu #'serialize-mut-mu mode :little)))
+        (multiple-value-bind (q st) (deserialize-mut-v1 (%mut-cursor bytes :little) mode)
+          (%check :mutable-must-understand-discards
+                  (and (null q) (eq st :unknown-must-understand-member))
+                  (format nil "~a: an unrecognised must-understand member must DISCARD the sample; got ~s / ~s"
+                          mode q st)))))
+    ;; 7. THE ENGINE PATH. Table 60 labels a MUTABLE payload PL_CDR2_LE 0x000b (v2) / PL_CDR_LE 0x0003
+    ;;    (v1), and the RX side must ACCEPT it. Until MUTABLE shipped, %encap->codec had no arm for
+    ;;    either id and signalled — so the stack would have refused its OWN writer's samples.
+    (let* ((ts (dds.types:find-type-support "mut-v1"))
+           (x2 (dds.dcps::%serialize-sample ts s :xcdr2))
+           (x1 (dds.dcps::%serialize-sample ts s :xcdr1)))
+      (%check :mutable-encap-xcdr2 (and (= 0 (aref x2 0)) (= #x0b (aref x2 1)))
+              (format nil "MUTABLE+XCDR2 must be PL_CDR2_LE 0x000b (Table 60); got ~2,'0x~2,'0x"
+                      (aref x2 0) (aref x2 1)))
+      (%check :mutable-encap-xcdr1 (and (= 0 (aref x1 0)) (= #x03 (aref x1 1)))
+              (format nil "MUTABLE+XCDR1 must be PL_CDR_LE 0x0003 (Table 60); got ~2,'0x~2,'0x"
+                      (aref x1 0) (aref x1 1)))
+      (dolist (payload (list x2 x1))
+        (multiple-value-bind (q st)
+            (dds.dcps::%deserialize-payload ts (dds.core.buffer:octet-buffer-over payload))
+          (%check :mutable-rx-accepts-pl-cdr
+                  (and (null st) q (= 1 (mut-v1-a q)) (string= "hello" (mut-v1-label q)))
+                  (format nil "RX must accept its own PL_CDR(2) payload; status ~s" st)))))
+    ;; 8. LC 0-7 DECODE. We emit only 0-4, so 5-7 have no encoder to check them against and are the
+    ;;    codes a foreign writer is most likely to use for a length-prefixed member. Rule (22) rewinds
+    ;;    4 octets for LC>=5 so NEXTINT doubles as the member's own leading length; the extent from
+    ;;    that rewind point is therefore 4 + width*NEXTINT, where LC 5/6/7 give width 1/4/8. Reading
+    ;;    "serialized member length is also NEXTINT" as the extent from the rewind point instead is 4
+    ;;    octets short and desynchronises every following member — which is what this pins.
+    (%check :mutable-lc-extent-table
+            (and (= 1 (dds.cdr:lc-member-extent 0 0)) (= 2 (dds.cdr:lc-member-extent 1 0))
+                 (= 4 (dds.cdr:lc-member-extent 2 0)) (= 8 (dds.cdr:lc-member-extent 3 0))
+                 (= 12 (dds.cdr:lc-member-extent 4 12))
+                 (= 16 (dds.cdr:lc-member-extent 5 12))       ; 4 + 1*12
+                 (= 52 (dds.cdr:lc-member-extent 6 12))       ; 4 + 4*12
+                 (= 100 (dds.cdr:lc-member-extent 7 12)))     ; 4 + 8*12
+            "LC 4-7 extents must follow §7.4.3.4.2 with NEXTINT reused for 5-7")
+    ;; A hand-built PL_CDR2 payload whose string member uses LC=5: EMHEADER1 = (5<<28)|2, then the
+    ;; string's own 4-octet length IS the NEXTINT. If the decoder took the extent as NEXTINT rather
+    ;; than 4+NEXTINT it would land 4 octets early and read the next EMHEADER1 out of the string.
+    (let* ((lc5 (octets #x18 #x00 #x00 #x00                       ; DHEADER = 24
+                        #x02 #x00 #x00 #x50                       ; EMHEADER1 LC=5 id=2
+                        #x06 #x00 #x00 #x00                       ; NEXTINT = 6 = the string length
+                        #x68 #x65 #x6c #x6c #x6f #x00 #x00 #x00   ; "hello\0" + 2 pad
+                        #x00 #x00 #x00 #x20 #x63 #x00 #x00 #x00)) ; EMHEADER1 LC=2 id=0, i32 = 99
+           (q (deserialize-mut-v1 (%mut-cursor lc5 :little) :xcdr2)))
+      (%check :mutable-decodes-lc5
+              (and q (string= "hello" (mut-v1-label q)) (= 99 (mut-v1-a q)))
+              (format nil "a peer's LC=5 member must decode and leave the stream aligned; got ~s" q)))
+    ;; 9. WIRE DATA IS HOSTILE (NFR-SEC-POSTURE). A member length that overruns the DHEADER extent is
+    ;;    refused as a status; a DHEADER that overruns the buffer is refused at the boundary.
+    ;; The DHEADER here is HONEST (8 octets follow it, and 8 are present) so the buffer-level check
+    ;; passes and the forged NEXTINT is what must be caught — otherwise this would only re-test the
+    ;; DHEADER guard below and the member-extent check would be unexercised.
+    (let* ((overrun (octets #x08 #x00 #x00 #x00                    ; DHEADER = 8
+                            #x02 #x00 #x00 #x40                    ; EMHEADER1 LC=4 id=2
+                            #xff #xff #xff #x7f))                  ; NEXTINT = 2^31-1
+           (st (nth-value 1 (deserialize-mut-v1 (%mut-cursor overrun :little) :xcdr2))))
+      (%check :mutable-member-extent-checked
+              (eq st :malformed-member-extent)
+              (format nil "a member claiming more than the DHEADER extent must be refused; got ~s" st)))
+    (let ((huge (octets #xff #xff #xff #x7f #x00 #x00 #x00 #x00))
+          (refused nil))
+      (handler-case (deserialize-mut-v1 (%mut-cursor huge :little) :xcdr2)
+        (dds.core.buffer:buffer-overflow () (setf refused t)))
+      (%check :mutable-dheader-bounds-checked refused
+              "a DHEADER claiming more than the buffer holds must be refused, never followed"))
+    ;; An XCDR1 parameter list that never terminates must be refused rather than treated as ending
+    ;; where the payload happens to end.
+    (let ((unterminated (octets #x00 #x00 #x04 #x00 #x01 #x00 #x00 #x00))
+          )
+      (%check :mutable-xcdr1-requires-list-end
+              (eq :missing-parameter-list-end
+                  (nth-value 1 (deserialize-mut-v1 (%mut-cursor unterminated :little) :xcdr1)))
+              "a PL_CDR list with no PID_LIST_END must be refused"))
+    ;; 10. The TypeObject must advertise the DECLARED ids, not member positions — they are what a peer
+    ;;     matches on, and mut-v2 declares them out of order precisely so the two cannot coincide.
+    (let* ((ts2 (dds.types:find-type-support "mut-v2"))
+           (ms (dds.types:minimal-struct-type-members (dds.types:type-support-typeobject ts2))))
+      (%check :mutable-typeobject-ids
+              (equal '(3 2 0 7 1) (mapcar #'dds.types:minimal-struct-member-id ms))
+              (format nil "the TypeObject must carry declared @ids in declaration order; got ~s"
+                      (mapcar #'dds.types:minimal-struct-member-id ms)))
+      (%check :mutable-typeobject-extensibility
+              (eq :mutable (dds.types:minimal-struct-type-extensibility
+                            (dds.types:type-support-typeobject ts2)))
+              "the TypeObject must record :mutable extensibility")))
+  t)

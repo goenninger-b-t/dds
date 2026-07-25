@@ -385,3 +385,130 @@
   "Length code for an N-byte member when N in {1,2,4,8}; else NIL (needs NEXTINT,
    LC 4-7) (§7.4.3.4.2)."
   (case n (1 +lc-1-byte+) (2 +lc-2-bytes+) (4 +lc-4-bytes+) (8 +lc-8-bytes+) (t nil)))
+
+(defun* lc-member-extent (lc nextint)
+    (function ((integer 0 7) (unsigned-byte 32)) (integer 0))
+  "Octets a MUTABLE member occupies, given its length code LC and NEXTINT (§7.4.3.4.2, rule (22)).
+
+   Measured from where the member's serialization STARTS, which differs by code and is the whole
+   subtlety here:
+
+     LC 0-3  — no NEXTINT; the member starts after the 4-octet EMHEADER1 and is 1/2/4/8 octets.
+     LC 4    — the member starts after NEXTINT and is NEXTINT octets.
+     LC 5-7  — rule (22) rewinds the stream 4 octets, so the member starts AT the NEXTINT word and
+               that word IS the member's own leading length. The spec's phrase 'serialized member
+               length is also NEXTINT' therefore counts the octets AFTER the shared word, and the
+               multipliers give the game away: LC 6 = '4*NEXTINT' and LC 7 = '8*NEXTINT' only make
+               sense if NEXTINT is an ELEMENT COUNT and the multiplier is the element width (1/4/8).
+               So the extent from the rewind point is 4 + width*NEXTINT.
+
+   Reading the phrase literally instead — extent = NEXTINT from the rewind point — is self-
+   contradictory: for a string of L octets the member is 4+L octets long while its own leading word
+   holds L, so the NEXTINT the writer wrote is overwritten by a DIFFERENT value and no reader could
+   recover the length. Four octets short per member, which desynchronises every member after it."
+  (ecase lc
+    (0 1) (1 2) (2 4) (3 8)
+    (4 nextint)
+    (5 (+ 4 nextint))
+    (6 (+ 4 (* 4 nextint)))
+    (7 (+ 4 (* 8 nextint)))))
+
+;;;; XCDR1 MUTABLE (PL_CDR) parameter-list framing: XTypes 1.3 §7.4.1.2.1 + Table 34, rules
+;;;; (23)-(25) of §7.4.3.5. Values are read from the clause, never recalled.
+
+(defconstant +flag-impl-extension+ #x8000
+  "FLAG_IMPL_EXTENSION — the most significant bit of a 16-bit PL_CDR parameter ID, marking an
+   implementation-specific interpretation (DDS-XTypes 1.3 §7.4.1.2.1). It SHALL be zero for
+   user-defined data types: the clause states that implementations of user-defined types 'will never
+   set the FLAG_IMPL_EXTENSION bit', which is currently used only for RTPS discovery-defined types.
+   Exported so the decoder can recognise — and refuse to mistake for a member id — a PID that sets it.")
+
+(defconstant +flag-must-understand+ #x4000
+  "FLAG_MUST_UNDERSTAND — the second most significant bit of a 16-bit PL_CDR parameter ID
+   (DDS-XTypes 1.3 §7.4.1.2.1). Set 'if and only if the must_understand property of the member being
+   encapsulated is set to true'. When a consumer does not recognise the parameter id, this bit is what
+   decides between ignoring the member and discarding the entire data sample.")
+
+(defconstant +pid-extended+ #x3f01
+  "PID_EXTENDED — the reserved parameter id introducing the LONG PL_CDR member header, used when a
+   member id or length does not fit the short form (DDS-XTypes 1.3 Table 34, §7.4.1.2.1). Table 34
+   marks it FLAG_MUST_UNDERSTAND=Yes, so on the wire it appears as +pid-extended-mu+ = 0x7F01.")
+
+(defconstant +pid-extended-mu+ #x7f01
+  "PID_EXTENDED with the must-understand flag set = 0x4000 + 0x3F01, stated verbatim in
+   DDS-XTypes 1.3 §7.4.1.2.1. This is the 16-bit value a long-form member header carries; the member's
+   OWN must-understand flag lives in the following eMemberHeader's FLAG_2, not here.")
+
+(defconstant +pid-list-end+ #x3f02
+  "PID_LIST_END = 0x3F02 — 'Indicates the end of the parameter list data structure' (DDS-XTypes 1.3
+   Table 34). This is the sentinel a USER-DEFINED mutable type terminates its parameter list with.
+
+   Parameter id 1 (+pid-sentinel-rtps+) is NOT the general terminator: Table 34 confines that to
+   Simple Discovery types, which 'shall be subject to a special limitation: member ID 1 shall not be
+   used and parameter ID 1 shall terminate the parameter list to provide backwards compatibility'.
+   The same entry requires implementations to 'be robust to receiving parameter ID 0x3F02 to indicate
+   the end of a list as well', so a decoder accepts both and an encoder of a user type writes this one.")
+
+(defconstant +pid-list-end-mu+ #x7f02
+  "PID_LIST_END with FLAG_MUST_UNDERSTAND set = 0x4000 + 0x3F02 — the value actually written to terminate
+   a parameter list. DDS-XTypes 1.3 Table 34 marks PID_LIST_END 'FLAG_MUST_UNDERSTAND set? Yes', and the
+   clause requires an implementation to 'set the FLAG_MUST_UNDERSTAND bit as described in Table 34'. It is
+   easy to write the bare 0x3F02 instead, because rule (23) names only 'PID_SENTINEL' and the flag lives
+   in a different clause; the live RTI Connext vector (corpus/xcdr2/mutabledata-connext.bin) terminates
+   with 0x7F02, which is what caught it here. A decoder masks the flags off before comparing, so both
+   forms are RECOGNISED — this is about what we EMIT.")
+
+(defconstant +pid-ignore+ #x3f03
+  "PID_IGNORE = 0x3F03 — 'All consumers of this Data Representation shall ignore parameters with this
+   ID' (DDS-XTypes 1.3 Table 34). Distinct from an unknown id: it is skipped unconditionally, and its
+   must-understand bit never causes a sample to be discarded.")
+
+(defconstant +pid-sentinel-rtps+ #x0001
+  "The RTPS parameter-list terminator, parameter id 1 (PID_SENTINEL), which DDS-XTypes 1.3 Table 34
+   retains for SIMPLE DISCOVERY types ONLY. It is defined here to document why a user-defined type's
+   decoder must NOT treat it as a terminator — see pl-end-of-list-p. Discovery's own ParameterList
+   codec is a separate thing and keeps using it.")
+
+(defconstant +emheader-mu-flag+ #x40000000
+  "FLAG_2 of the long-form eMemberHeader = 0x40000000, which carries the MEMBER's must-understand
+   flag (DDS-XTypes 1.3 §7.4.1.2.1: 'FLAG_2 encodes the must understand flag'). The remaining bits are
+   FLAG_1 = 0x80000000 (implementation extension, zero for user types) and FLAG_3/FLAG_4 =
+   0x20000000/0x10000000, both 'left for future extensions'; the low 28 bits are the member id.")
+
+(declaim (inline pl-pid-encode))
+(defun* pl-pid-encode (must-understand member-id)
+    (function (t (integer 0)) (unsigned-byte 16))
+  "The 16-bit short-form PL_CDR parameter id for MEMBER-ID (rule (24): FLAG_I + FLAG_M + M.id).
+   FLAG_IMPL_EXTENSION is always zero — this emits user-defined types (§7.4.1.2.1)."
+  (logior (if must-understand +flag-must-understand+ 0)
+          (logand member-id #x3fff)))
+
+(defun* pl-pid-decode (u16)
+    (function ((unsigned-byte 16)) (values t fixnum t))
+  "Inverse of pl-pid-encode: (values must-understand member-id impl-extension-p) for a 16-bit
+   short-form PL_CDR parameter id (§7.4.1.2.1). The id is the low 14 bits; the two flag bits are
+   returned separately rather than masked away, because must-understand decides whether an
+   unrecognised member is skipped or discards the sample."
+  (values (logtest u16 +flag-must-understand+)
+          (logand u16 #x3fff)
+          (logtest u16 +flag-impl-extension+)))
+
+(declaim (inline pl-end-of-list-p))
+(defun* pl-end-of-list-p (member-id)
+    (function (integer) t)
+  "T iff a decoded short-form PL_CDR member id terminates a USER-DEFINED type's parameter list.
+   PID_LIST_END (0x3F02) and nothing else.
+
+   It is tempting to also accept the RTPS PID_SENTINEL (parameter id 1) here, on the reasoning that a
+   peer might emit it and refusing one would be a false-REJECT. THAT IS BACKWARDS, and it silently
+   truncates samples. Member ids default to declaration order, so id 1 is the SECOND MEMBER of a
+   typical type; treating parameter id 1 as a terminator ends the parameter list at that member and
+   every later member decodes as its default — a wrong sample delivered as a good one, which is worse
+   than any reject.
+
+   DDS-XTypes 1.3 Table 34 is explicit that the id-1 terminator is not general: Simple Discovery types
+   'shall be subject to a special limitation: member ID 1 shall not be used and parameter ID 1 shall
+   terminate the parameter list to provide backwards compatibility.' The limitation buys back id 1 as
+   a terminator precisely BY giving up id 1 as a member — and it is scoped to the built-in topic
+   types, not to user-defined ones. So a user type uses PID_LIST_END and keeps member id 1."
+  (= member-id +pid-list-end+))

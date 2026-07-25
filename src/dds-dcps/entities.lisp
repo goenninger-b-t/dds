@@ -415,7 +415,12 @@
 
 (defun* %rep->codec (rep &optional ext)
     (function (symbol &optional symbol)
-              (values dds.cdr:cdr-mode (member :plain-cdr2-le :plain-cdr-le :delimited-cdr-le)))
+              ;; The MUTABLE ids belong in this list: encapsulation-id-for maps (:xcdr2 :mutable) to
+              ;; PL_CDR2_LE and (:xcdr1 :mutable) to PL_CDR_LE, so omitting them made the declared
+              ;; return type a statement the function contradicts — and callers compile at (safety 0),
+              ;; where the declaration is believed rather than checked.
+              (values dds.cdr:cdr-mode
+                      (member :plain-cdr2-le :plain-cdr-le :delimited-cdr-le :pl-cdr2-le :pl-cdr-le)))
   "Map a writer's OFFERED data-representation keyword (DDS-XTypes 1.3 §7.6.3.1.1) to the
    (values CODEC-MODE ENCAP-REP) the TX SerializedPayload uses: :xcdr2 -> (:xcdr2 :plain-cdr2-le),
    :xcdr1 -> (:xcdr1 :plain-cdr-le). CODEC-MODE drives the generated serializer's alignment cap
@@ -511,11 +516,12 @@
    reads whichever representation a peer wrote (WP-DATA-REPRESENTATION; the 8-vs-4 alignment + endianness
    come from the wire, not a hardcoded :xcdr2). DELIMITED_CDR_LE/BE (0x0009/0x0008) is an APPENDABLE
    type under encoding version 2 (Table 60) and maps to the same XCDR2 mode — its leading DHEADER is
-   consumed by the generated deserializer, not here. A NIL (absent) encap maps to the XCDR2-LE default
-   (back-compat); a known-but-unmapped encap (PL_CDR / XML) is unexpected for a PLAIN- or
-   DELIMITED-encapsulated non-mutable type and SIGNALS via the ecase — the correct conservative reject
-   (such a body is not decodable here; truly-unknown ids are already rejected upstream by
-   parse-encapsulation-header)."
+   consumed by the generated deserializer, not here. PL_CDR2_LE/BE (0x000b/0x000a) and PL_CDR_LE/BE
+   (0x0003/0x0002) are a MUTABLE type under encoding version 2 and 1 respectively and map to those
+   codec modes; their per-member headers are likewise consumed by the generated deserializer. A NIL
+   (absent) encap maps to the XCDR2-LE default (back-compat); a known-but-unmapped encap (XML) SIGNALS
+   via the ecase — the correct conservative reject, since such a body is not decodable here
+   (truly-unknown ids are already rejected upstream by parse-encapsulation-header)."
   (ecase encap
     (:plain-cdr-le   (values :xcdr1 :little))
     (:plain-cdr-be   (values :xcdr1 :big))
@@ -525,7 +531,16 @@
     ;; mode; the leading DHEADER is consumed by the generated deserializer, not here. Rejecting it
     ;; would be a false-REJECT of a conformant peer's appendable sample.
     (:delimited-cdr-le (values :xcdr2 :little))
-    (:delimited-cdr-be (values :xcdr2 :big))))
+    (:delimited-cdr-be (values :xcdr2 :big))
+    ;; PL_CDR2 / PL_CDR = a MUTABLE type (Table 60), encoding version 2 and 1. While MUTABLE was
+    ;; unimplemented these fell through the ecase and SIGNALLED, and this docstring called that "the
+    ;; correct conservative reject" — which it was, for exactly as long as no mutable type could
+    ;; exist. It is now a false-REJECT of every conformant mutable peer, and of our OWN writer's
+    ;; samples: encapsulation-id-for stamps a mutable payload with precisely the id refused here.
+    (:pl-cdr2-le (values :xcdr2 :little))
+    (:pl-cdr2-be (values :xcdr2 :big))
+    (:pl-cdr-le  (values :xcdr1 :little))
+    (:pl-cdr-be  (values :xcdr1 :big))))
 
 (defun* %deserialize-payload (ts ob)
     (function (t dds.core.buffer:octet-buffer) (values t (or null keyword)))

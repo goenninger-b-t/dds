@@ -8,11 +8,11 @@ See also: [CDR codec, buffers & the arena](cdr-and-memory.md) for the codecs and
 
 ### Code generation — `dds.gen`
 
-- **`dds.gen:define-dds-type`** — macro; defines a DDS topic type `NAME` from an s-expr spec. `OPTIONS` is a plist (`:extensibility`, default `:final`, now also `:appendable`). Each member is `(slot-name member-type &key key)`, where `member-type` is a primitive keyword, `(:string N)` for a bounded string, `(:enum NAME)` for a previously-defined enum, `(:sequence element)`, or the name of a previously-defined dds type (nested struct). Emits a `defstruct`, `ftype`-declared `serialize-`/`deserialize-`/`serialized-size-` monomorphic functions (plus an internal `%ssize-` position-threading helper and a `deserialize-into-` in-place variant), a 16-octet key-hash for keyed types, and a registered `type-support`. A `(:string N)` member additionally emits the constant `+NAME-SLOT-BOUND+` and the checked setter `set-NAME-SLOT`.
+- **`dds.gen:define-dds-type`** — macro; defines a DDS topic type `NAME` from an s-expr spec. `OPTIONS` is a plist (`:extensibility`, default `:final`, also `:appendable` and `:mutable`). Each member is `(slot-name member-type &key key id must-understand)`, where `member-type` is a primitive keyword, `(:string N)` for a bounded string, `(:enum NAME)` for a previously-defined enum, `(:sequence element)`, or the name of a previously-defined dds type (nested struct). Emits a `defstruct`, `ftype`-declared `serialize-`/`deserialize-`/`serialized-size-` monomorphic functions (plus an internal `%ssize-` position-threading helper and a `deserialize-into-` in-place variant), a 16-octet key-hash for keyed types, and a registered `type-support`. A `(:string N)` member additionally emits the constant `+NAME-SLOT-BOUND+` and the checked setter `set-NAME-SLOT`.
 
 - **`dds.gen:define-dds-enum`** — macro; defines the DDS enumerated type `NAME` from literals `(keyword value)`. Emits `NAME-TO-I32` and `NAME-FROM-I32`, each returning `(values result status)` with status `:unknown-enum-value` for an input this build does not declare, plus the codec pair `(:enum NAME)` members are wired to. Rejects at macroexpansion: no literals, a malformed literal, a duplicate keyword, and a duplicate *value* (two literals sharing a value would make the wire ambiguous — the receiver could not say which was meant).
 
-The DSL recognizes these member-type keywords (from `*dds-type-map*`): `:bool`, `:byte` (alias `:octet`), `:u8`, `:u16`, `:u32`, `:u64`, `:i8`, `:i16`, `:i32`, `:i64`, `:string`. `:u8`/`:i8` are the numeric 8-bit integers (`TK_UINT8`/`TK_INT8`); `:byte`/`:octet` is the opaque octet (`TK_BYTE`, IDL `octet`) — all three share the one-octet wire codec but carry distinct XTypes kinds (model an IDL `sequence<octet>` with `:byte`). A `(:sequence element)` member takes one of those keywords as its fixed-size primitive element (variable-size sequence elements, e.g. sequences of strings, are not supported in v1). `:extensibility` accepts `:final` and `:appendable` (`:mutable` needs EMHEADER framing and is a later increment); `@key` is restricted to scalar/string members.
+The DSL recognizes these member-type keywords (from `*dds-type-map*`): `:bool`, `:byte` (alias `:octet`), `:u8`, `:u16`, `:u32`, `:u64`, `:i8`, `:i16`, `:i32`, `:i64`, `:string`. `:u8`/`:i8` are the numeric 8-bit integers (`TK_UINT8`/`TK_INT8`); `:byte`/`:octet` is the opaque octet (`TK_BYTE`, IDL `octet`) — all three share the one-octet wire codec but carry distinct XTypes kinds (model an IDL `sequence<octet>` with `:byte`). A `(:sequence element)` member takes one of those keywords as its fixed-size primitive element (variable-size sequence elements, e.g. sequences of strings, are not supported in v1). `:extensibility` accepts `:final`, `:appendable` and `:mutable`; `@key` is restricted to scalar/string members. `:id` (`@id`) and `:must-understand` (`@must_understand`) are per-member wire properties that matter for `:mutable` — see §1.4.
 
 **Bounded strings — `(:string N)`.** `:string` alone is the unbounded IDL `string`; `(:string N)` is IDL `string<N>`. The bound is part of the *type*, not a local check (DDS-XTypes 1.3 §7.3.1.2.1), so a bounded and an unbounded string are structurally different types that do not match — which is why the bound must reach the TypeObject. A `(:string N)` member is emitted as `dds.types:string8-type-identifier` with bound `N` rather than the unbounded `primitive-type-identifier`; that is the identifier a foreign `rtiddsgen`-generated peer compares its own `string<N>` against (ADR 0009 is the defect from getting this wrong). The wire codec is unchanged — a bounded string serializes exactly like an unbounded one — so adding a bound is byte-neutral, and `N` counts **octets, not characters** (ADR 0083: strings are UTF-8, and one character can occupy four octets). The generated `set-NAME-SLOT` measures with `dds.cdr:utf8-octet-length` and returns `(values nil :string-bound-exceeded)` rather than truncating or signalling; the plain `defstruct` accessor remains and is unchecked, so the hot path keeps direct slot access. Bounds are a permanent part of a published type — widening one is a type change, so choose `N` deliberately.
 
@@ -218,6 +218,67 @@ DDS-XTypes 1.3 §7.4.3.5 rule **(30)**: under XCDR2 an APPENDABLE type is `DHEAD
 The DHEADER is wire data and is bounds-checked against the buffer extent before it is trusted. That check is defense in depth rather than the sole guard — every member read is independently bounds-checked — so it earns its place by failing *fast*, before any attacker-controlled member is parsed against a bogus extent.
 
 `:final` types are untouched by all of this and stay **byte-identical** (`make corpus` is the guard).
+
+### 1.4 `:mutable` — adding, removing *and* reordering members
+
+APPENDABLE only lets a type grow at the end. MUTABLE gives every member its own header carrying a
+**member id**, so a peer can add, remove or reorder members and both sides still match up — members are
+located by id, never by position. It costs a header per member on the wire and an id dispatch per member
+on decode; that is inherent to the kind and is a per-type choice, not a default (ADR 0086).
+
+```lisp
+(dds.gen:define-dds-type mut-v1 (:extensibility :mutable)
+  (a :i32 :key t)                      ; id 0 — ids default to declaration order
+  (b :u16)                             ; id 1
+  (label :string)                      ; id 2
+  (t-ns :i64))                         ; id 3
+
+(dds.gen:define-dds-type mut-v2 (:extensibility :mutable)
+  (t-ns :i64 :id 3)                    ; declared in a DIFFERENT order, same ids
+  (label :string :id 2)
+  (a :i32 :id 0 :key t)
+  (extra :i32 :id 7)                   ; new member, unknown to a v1 reader
+  (b :u16 :id 1))
+
+;; A v1 reader reads a v2 sample: the shared members decode BY ID whatever order they
+;; arrive in, and unknown id 7 is SKIPPED using its header's own length — never its type,
+;; which a v1 reader does not have.
+;; A v2 reader reads a v1 sample: `extra` was never sent, so it keeps its default.
+;; An absent member is normal in MUTABLE, not an error.
+```
+
+**`:id` is the wire contract.** It defaults to declaration order and goes into the TypeObject, so
+*reordering* members of a mutable type is safe but *renumbering* them is not. Duplicates are rejected at
+macroexpansion — two members sharing an id would have the second silently overwrite the first on decode.
+
+**`:must-understand t`** (`@must_understand`) marks a member a peer may not quietly ignore. If it does not
+recognise the id, it must discard the **entire sample** rather than deliver a partial one
+(§7.4.1.2.1) — reported as the status `:unknown-must-understand-member`, never signalled (ADR 0064).
+Without the flag the same unknown member is simply skipped. That single bit is the whole difference.
+
+**Two framings, chosen at runtime by the representation.** Under XCDR2 (rules (21)–(22)) it is a DHEADER
+over members each prefixed by `EMHEADER1`; under XCDR1 (rules (23)–(25)) it is a PL_CDR parameter list,
+each member 4-aligned with its alignment origin reset (`PUSH(ORIGIN=0)`), closed by `PID_LIST_END`. Both
+are emitted, because a stock foreign reader may request either — and emitting XCDR2 framing under an
+XCDR1 encapsulation id would be silently wrong bytes rather than a visible failure. Table 60 labels them
+`PL_CDR2_LE` **0x000b** and `PL_CDR_LE` **0x0003**, and RX accepts both.
+
+**RTI Connext sends `@mutable` as PL_CDR (XCDR1), not PL_CDR2.** The committed vector
+`corpus/xcdr2/mutabledata-connext.bin` — a live Connext 7.3.1 payload, gated byte-exact by `make corpus`
+— is stamped `0x0003`. So the XCDR1 leg is the one that actually carries MUTABLE to Connext, which is why
+both encodings are emitted rather than XCDR2 alone; a type that refused XCDR1 would interoperate with
+nothing while every local test still passed.
+
+Traps worth knowing, all pinned by `run-gen-mutable-test` and `make corpus` (ADR 0086 §A1/§A3/§A5):
+
+- Length codes 5–7 make NEXTINT double as the member's own leading length, so a member's extent is
+  `4 + width×NEXTINT`, not `NEXTINT`.
+- **Parameter id 1 is a member, not a list terminator** for a user-defined type — the id-1 terminator
+  belongs to Simple Discovery types, which give up member id 1 to buy it.
+- Under XCDR1 a parameter's **declared length is rounded up to a multiple of 4** (a 2-octet `short`
+  declares 4), and the list terminator is **`0x7F02`** — PID_LIST_END with must-understand — not the bare
+  `0x3F02` that rule (23)'s "PID_SENTINEL" suggests. Neither is visible to a round-trip test; both were
+  found by the external vector.
 
 ### 2. Drive the type purely through the registered `type-support` vtable
 

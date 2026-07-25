@@ -1,0 +1,29 @@
+// MutableData — the @mutable reference type for the byte-exact XCDR corpus (FR-CDR-8, ADR 0086).
+//
+// MUTABLE is the one extensibility kind whose framing this stack has never checked against an external
+// encoder, and it is the one with the most room to differ: every member carries its own header, and the
+// LENGTH CODE a writer picks for a variable-width member is a WRITER'S CHOICE the spec does not fix
+// (XTypes 1.3 §7.4.3.4.2 — length codes 5-7 "save 4 bytes" but are never required). Two conformant
+// writers can therefore emit different bytes for the same sample, so only a captured vector can say what
+// RTI Connext actually does.
+//
+// The members are chosen to cover exactly the cases where writers may diverge:
+//   a  (long)   -> a 4-octet member, length code 2, no NEXTINT
+//   b  (short)  -> a 2-octet member, length code 1  (member id 1: the id that collides with the RTPS
+//                  PID_SENTINEL under PL_CDR, which Table 34 reserves for Simple Discovery types only)
+//   label       -> a string: its serialization begins with a UInt32 length, so this is where a writer
+//                  may choose LC=5 (NEXTINT reused as the string's own length) over LC=4
+//   t_ns (long long) -> an 8-octet member, length code 3, and the XCDR2 4-byte alignment cap
+//   vals        -> a sequence of long: begins with a UInt32 COUNT, so a writer may choose LC=6
+//                  (extent = 4 * NEXTINT) over LC=4
+//
+// Ids are declared explicitly rather than left to declaration order: an id is what MUTABLE matches on,
+// and pinning them here is what lets our type and this one be compared member for member.
+@mutable
+struct MutableData {
+    @id(0) @key long a;
+    @id(1) short b;
+    @id(2) string label;
+    @id(3) long long t_ns;
+    @id(4) sequence<long> vals;
+};

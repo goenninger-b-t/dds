@@ -90,6 +90,10 @@ DELIMITED / MUTABLE serialization (XTypes 1.3 §7.4.3.4).
 | `dds.cdr:cdr-put-dheader` / `cdr-get-dheader` | DHEADER = UInt32 serialized size of the object that follows, 4-byte aligned (XTypes 1.3 §7.4.3.4.1). |
 | `dds.cdr:emheader1-encode` | EMHEADER1 = `(M_FLAG<<31) | (LC<<28) | (MemberId & 0x0fffffff)` (§7.4.3.4.2). Args: `must-understand`, `lc`, `member-id`. |
 | `dds.cdr:emheader1-decode` | Inverse of `emheader1-encode`: returns `(values must-understand lc member-id)`. |
+| `dds.cdr:lc-member-extent` *(lc nextint)* | Octets a mutable member occupies, measured from where its serialization **starts** — which differs by length code, and is the whole subtlety of §7.4.3.4.2. LC 0–3: 1/2/4/8, starting after the 4-octet EMHEADER1. LC 4: `NEXTINT`, starting after NEXTINT. LC 5–7: rule (22) rewinds 4 octets so the member starts **at** the NEXTINT word and that word *is* the member's own leading length, so the extent is `4 + width×NEXTINT` with width 1/4/8. Reading the spec's "serialized member length is also NEXTINT" as the extent from the rewind point instead is **4 octets short per member** — it does not fail loudly, it desynchronises the walk so the next EMHEADER1 is read out of the middle of the previous member. See ADR 0086 §A1. |
+| `dds.cdr:pl-pid-encode` / `pl-pid-decode` | The 16-bit short-form PL_CDR parameter id of rule (24): `FLAG_I + FLAG_M + M.id`. `FLAG_IMPL_EXTENSION` (bit 15) is always zero for user-defined types (§7.4.1.2.1); `FLAG_MUST_UNDERSTAND` is bit 14. Decode returns `(values must-understand member-id impl-extension-p)`. |
+| `dds.cdr:pl-end-of-list-p` | T iff a decoded short-form parameter id terminates a **user-defined** type's parameter list — `PID_LIST_END` (0x3F02) and nothing else. **Parameter id 1 is not a terminator here.** Table 34 confines the id-1 terminator to Simple Discovery types, which buy it by giving up member id 1; member ids default to declaration order, so accepting it would end the list at the *second member* of a typical struct and deliver defaults for everything after — a wrong sample reported as a good one. See ADR 0086 §A3. |
+| `dds.cdr:+pid-list-end+` `+pid-extended+` `+pid-extended-mu+` `+pid-ignore+` `+pid-sentinel-rtps+` `+flag-must-understand+` `+flag-impl-extension+` `+emheader-mu-flag+` | The XCDR1 PL_CDR parameter constants, pinned to XTypes 1.3 Table 34 / §7.4.1.2.1: `PID_LIST_END` 0x3F02, `PID_EXTENDED` 0x3F01 (0x7F01 with must-understand, the long-form introducer), `PID_IGNORE` 0x3F03 (skipped unconditionally, never a discard), the RTPS sentinel 1 (documented so its *non*-use is explicit), the two PID flag bits, and `FLAG_2` = 0x40000000 of the long form's `eMemberHeader`. |
 | `dds.cdr:lc-for-length` | Length code (0/1/2/3) for a member of N bytes when N ∈ {1,2,4,8}; else `NIL` (the case that needs NEXTINT, LC 4–7) (§7.4.3.4.2). |
 
 ### Arena & pools (`dds.core.arena`)
@@ -347,16 +351,16 @@ NameHash example: `MD5("color")[0:4]` = `70 dd a5 df`. (From `run-md5-test`.)
   exhausting the heap, NFR-SEC-POSTURE). The pooled, zero-alloc deserialize path is a
   tracked M1-perf follow-up (FR-LANG-5 / NFR-DET); the *serialize* side and pool
   acquire/release are already allocation-free.
-- **MUTABLE is DESIGNED but not yet shipped (ADR 0086).** `define-dds-type` accepts `:final` and
-  `:appendable`; `:mutable` is rejected at macroexpansion. The design — EMHEADER framing, length-code
-  selection, unknown-member skipping, `must_understand` discard — is settled in ADR 0086 with every
-  constant pinned to XTypes 1.3 §7.4.3.4.2 and rules (21)-(25). FR-TYPE-1 names all three kinds, so this
-  is an open MUST, and it is what blocks FR-CDR-8's "all extensibility kinds".
-- **DELIMITED / MUTABLE struct serialization is incremental.** `cdr-put-dheader`,
-  `emheader1-encode`, and `lc-for-length` are the pinned, byte-exact framing primitives;
-  the full DELIMITED/MUTABLE struct walk that composes them is a later increment. The
-  generated `serialize-T` functions that drive them live in
-  [Type system & code generation](type-system.md).
+- **MUTABLE emits length codes 0–4 and decodes 0–7.** LC 5–7 rewind the stream so NEXTINT
+  doubles as the member's own leading length — a 4-octet saving the spec *offers*, never
+  requires. The encoder takes the unambiguous option (LC 0–3 for a fixed-width member,
+  LC 4 otherwise), so our bytes are a function of the declared member widths alone; the
+  decoder handles all eight, because a peer may well emit them. `dds.gen::%mutable-lc` is
+  the single function to change if a captured Connext vector shows it emits 5–7 — the
+  vector wins, not the rule (ADR 0086 §A2). **This is the one part of the MUTABLE encoding
+  the spec leaves to the writer, so two conformant writers can differ byte-for-byte.** The
+  question does not arise against RTI Connext, which sends `@mutable` as PL_CDR (XCDR1),
+  where there are no length codes at all — see `corpus/xcdr2/mutabledata-connext.bin`.
 - **`enum` is fixed 32-bit.** `bit_bound` refinement of enum width is deferred.
 - **MD5 is not a security primitive.** It is a content/identity hash for XTypes hashes
   and the >16-byte keyhash only. The DDS-Security profile (FR-SEC-2) mandates vetted

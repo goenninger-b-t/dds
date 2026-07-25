@@ -206,6 +206,368 @@
       `(dds.cdr:cdr-get-octet-sequence cursor mode)
       `(dds.cdr:cdr-get-sequence-typed cursor (function ,(getf m :elt-get)) mode ',(getf m :elt-ltype))))
 
+;;;; ---- MUTABLE extensibility framing (ADR 0086) ----
+;;;; XCDR2 = PL_CDR2: DHEADER + one EMHEADER1-framed member each (XTypes 1.3 §7.4.3.5 rules
+;;;; (21)-(22), header layout §7.4.3.4.2). XCDR1 = PL_CDR: a parameter list terminated by
+;;;; PID_LIST_END, each member 4-aligned with its alignment origin reset (rules (23)-(25),
+;;;; parameter-id bitmask §7.4.1.2.1). Both are emitted; MODE selects at runtime, because the same
+;;;; generated function serves a writer offering either representation.
+
+(defun* %mutable-lc (m)
+    (function (list) (or null (integer 0 3)))
+  "The EMHEADER1 length code for member M when its width is STATICALLY KNOWN, else NIL meaning
+   \"LC=4 with a backpatched NEXTINT\" (XTypes 1.3 §7.4.3.4.2; ADR 0086).
+
+   LC 0/1/2/3 encode a serialized member length of 1/2/4/8 octets directly in the 4-octet header, so a
+   fixed-width scalar carries no length field at all. A string, sequence or nested struct has no
+   compile-time width and takes LC=4, whose NEXTINT is backpatched once the member has been written.
+
+   DELIBERATELY DOES NOT RETURN 5-7, and that is an open empirical question, not a settled one.
+   Those codes rewind the stream so NEXTINT doubles as the member's own leading length — a 4-octet
+   saving the spec OFFERS (\"the use of length codes 5 to 7 saves 4 bytes\"), never requires. LC=4 is
+   unambiguously conformant for every member, and emitting only 0-4 keeps our bytes a function of the
+   declared member widths alone. We nevertheless DECODE 0-7 (lc-member-extent), because a peer may
+   well emit them.
+
+   ADR 0086 Decision 4 adopts the opposite rule (smallest correct LC, i.e. 5-7 for length-prefixed
+   members) and says in the same breath that the choice \"must be confirmed against a captured Connext
+   payload before it is called byte-exact; if Connext differs, the vector wins and this rule changes\".
+   Until that vector exists, the unambiguous encoding is the honest default: flipping this one function
+   is the whole change if the capture says otherwise."
+  (if (getf m :var)
+      nil
+      (case (getf m :size) (1 0) (2 1) (4 2) (8 3) (t nil))))
+
+(defun* %member-size-step-forms (m value-form pos mode)
+    (function (list t symbol symbol) list)
+  "Macro-time: forms advancing the size accumulator POS by the serialized size of member M holding
+   VALUE-FORM, under codec mode MODE.
+
+   Extracted from serialized-size-<name> so the XCDR1 MUTABLE encoder can reuse it: rules (24)/(25)
+   need M.value.ssize BEFORE the member is written, to choose the short or the long parameter form.
+   One definition of a member's serialized size, not two — a second copy is how an encoder and its
+   size function drift until a buffer is undersized."
+  (ecase (getf m :kind)
+    (:scalar
+     (if (getf m :var)
+         ;; 4 (length prefix) + the UTF-8 OCTETS + 1 (NUL) — never (LENGTH s): a character occupies
+         ;; up to four octets (RFC 3629 §3), and this number sizes the buffer, so under-estimating
+         ;; it is a buffer overflow.
+         `((setf ,pos (dds.cdr:cdr-size-align ,pos 4 ,mode))
+           (incf ,pos (+ 5 (dds.cdr:utf8-octet-length ,value-form))))
+         `((setf ,pos (dds.cdr:cdr-size-align ,pos ,(getf m :align) ,mode))
+           (incf ,pos ,(getf m :size)))))
+    (:sequence
+     ;; Closed form, not a per-element loop: every supported element type has
+     ;; (size MOD effective-align) = 0, so once the first element is aligned every later one starts
+     ;; aligned. Align once, then add n*size.
+     `((setf ,pos (dds.cdr:cdr-size-align ,pos 4 ,mode))
+       (incf ,pos 4)
+       (let ((n (length ,value-form)))
+         (when (plusp n)
+           (setf ,pos (dds.cdr:cdr-size-align ,pos ,(getf m :elt-align) ,mode))
+           (incf ,pos (* n ,(getf m :elt-size)))))))
+    (:nested
+     `((setf ,pos (,(getf m :ssize) ,value-form ,pos ,mode))))))
+
+(defun* %member-ssize-form (m value-form mode)
+    (function (list t symbol) t)
+  "Macro-time: a form evaluating to member M's serialized size measured from a FRESH origin — what
+   rules (24)/(25) call M.value.ssize. XCDR1 MUTABLE resets the alignment origin per member
+   (PUSH(ORIGIN=0)), so a member's size does not depend on where in the stream it lands and can be
+   computed before it is written."
+  (let ((p (gensym "MPOS")))
+    `(let ((,p 0))
+       (declare (type (integer 0) ,p))
+       ,@(%member-size-step-forms m value-form p mode)
+       ,p)))
+
+(defun* %mutable-xcdr2-member-forms (m put-form)
+    (function (list t) list)
+  "Macro-time: rule (22) — one EMHEADER1-framed member under PL_CDR2.
+
+   A fixed-width member needs only the 4-octet header (its LC states the length). A variable member
+   takes LC=4 and an 8-octet header whose NEXTINT is written as a placeholder and backpatched with the
+   octets the member actually occupied — the same mechanism the APPENDABLE DHEADER uses."
+  (let ((id (getf m :id))
+        (mu (getf m :must-understand))
+        (lc (%mutable-lc m)))
+    (if lc
+        `((dds.cdr:cdr-align cursor 4 mode)
+          (dds.core.buffer:put-u32 cursor (dds.cdr:emheader1-encode ,mu ,lc ,id))
+          ,put-form)
+        (let ((np (gensym "NEXTINT")) (ms (gensym "MSTART")) (me (gensym "MEND")))
+          `((dds.cdr:cdr-align cursor 4 mode)
+            (dds.core.buffer:put-u32 cursor (dds.cdr:emheader1-encode ,mu 4 ,id))
+            (let ((,np (dds.core.buffer:cursor-position cursor)))
+              (dds.core.buffer:put-u32 cursor 0)
+              (let ((,ms (dds.core.buffer:cursor-position cursor)))
+                ,put-form
+                (let ((,me (dds.core.buffer:cursor-position cursor)))
+                  (dds.core.buffer:cursor-set-position cursor ,np)
+                  (dds.core.buffer:put-u32 cursor (- ,me ,ms))
+                  (dds.core.buffer:cursor-set-position cursor ,me)))))))))
+
+(defun* %mutable-xcdr1-member-forms (m put-form value-form)
+    (function (list t t) list)
+  "Macro-time: rules (24)/(25) — one PL_CDR parameter under XCDR1.
+
+   The short form (24) carries a 16-bit parameter id and a 16-bit length; it applies when both fit,
+   and the LONG form (25) is used otherwise. The id bound is taken as < PID_EXTENDED (0x3F01) rather
+   than the rule's literal 2^14, because DDS-XTypes 1.3 Table 34 reserves 0x3F01-0x3FFF for the OMG:
+   a member id in that window would be read back as a reserved parameter, not as the member.
+
+   PUSH(ORIGIN=0) is the per-member alignment reset both rules specify — a member's internal
+   alignment is relative to its own start, not to the stream origin. It is pushed and popped around
+   the member so the parameter list itself keeps aligning against the stream origin.
+
+   THE DECLARED LENGTH IS ROUNDED UP TO A MULTIPLE OF 4, and the pad octets are emitted. Rules (24)/(25)
+   say `M.value.ssize`, which reads as the exact size — but a PL_CDR parameter list IS the RTPS
+   ParameterList structure (RTPS 2.5 §9.4.2.11), where every parameter carries a 4-multiple length; this
+   repo's own dds.rtps.message:write-parameter has always done exactly this for discovery. Confirmed
+   against the live RTI Connext vector, which declares length 4 for a 2-octet short and length 12 for a
+   10-octet string (corpus/xcdr2/mutabledata-connext.bin)."
+  (let ((id (getf m :id))
+        (mu (getf m :must-understand))
+        (sz (gensym "SSIZE")) (pad (gensym "PADDED")) (o (gensym "ORIGIN")))
+    `((dds.cdr:cdr-align cursor 4 mode)
+      (let* ((,sz ,(%member-ssize-form m value-form 'mode))
+             (,pad (* 4 (ceiling ,sz 4))))
+        (if (and ,(< id #x3f01) (<= ,pad #xffff))
+            (progn                                   ; rule (24), short form
+              (dds.core.buffer:put-u16 cursor (dds.cdr:pl-pid-encode ,mu ,id))
+              (dds.core.buffer:put-u16 cursor ,pad))
+            (progn                                   ; rule (25), long form
+              (dds.core.buffer:put-u16 cursor dds.cdr:+pid-extended-mu+)
+              (dds.core.buffer:put-u16 cursor 8)
+              (dds.core.buffer:put-u32 cursor (logior ,(if mu 'dds.cdr:+emheader-mu-flag+ 0) ,id))
+              (dds.core.buffer:put-u32 cursor ,pad)))
+        (let ((,o (dds.core.buffer:cursor-origin cursor)))
+          (dds.core.buffer:cursor-set-origin cursor)   ; PUSH(ORIGIN=0)
+          ,put-form
+          (dotimes (i (- ,pad ,sz)) (dds.core.buffer:put-u8 cursor 0))
+          (setf (dds.core.buffer:cursor-origin cursor) ,o))))))
+
+(defun* %mutable-ser-form (parsed put-forms value-forms)
+    (function (list list list) t)
+  "Macro-time: the whole MUTABLE serialize body — rules (21)-(22) under XCDR2, rules (23)-(25) under
+   XCDR1, selected at runtime by MODE because one generated function serves both offered
+   representations. PUT-FORMS and VALUE-FORMS run parallel to PARSED."
+  (let ((dh (gensym "DH")) (e (gensym "END")))
+    `(if (eq mode :xcdr2)
+         ;; (21): DHEADER over the member sequence. Backpatched — the size is not known yet.
+         (let ((,dh (progn (dds.cdr:cdr-align cursor 4 mode)
+                           (let ((p (dds.core.buffer:cursor-position cursor)))
+                             (dds.core.buffer:put-u32 cursor 0)
+                             p))))
+           ,@(loop for m in parsed for f in put-forms
+                   append (%mutable-xcdr2-member-forms m f))
+           (let ((,e (dds.core.buffer:cursor-position cursor)))
+             (dds.core.buffer:cursor-set-position cursor ,dh)
+             ;; §7.4.3.4.1: the size EXCLUDES the DHEADER itself.
+             (dds.core.buffer:put-u32 cursor (- ,e ,dh 4))
+             (dds.core.buffer:cursor-set-position cursor ,e)))
+         ;; (23): no DHEADER — a parameter list closed by PID_LIST_END with a zero length.
+         (progn
+           ,@(loop for m in parsed for f in put-forms for v in value-forms
+                   append (%mutable-xcdr1-member-forms m f v))
+           (dds.cdr:cdr-align cursor 4 mode)
+           ;; Table 34 marks PID_LIST_END must-understand, so the terminator on the wire is 0x7F02.
+           (dds.core.buffer:put-u16 cursor dds.cdr:+pid-list-end-mu+)
+           (dds.core.buffer:put-u16 cursor 0)))))
+
+(defun* %mutable-ssize-forms (parsed value-forms)
+    (function (list list) list)
+  "Macro-time: forms advancing POS by the serialized size of a MUTABLE struct's framing AND members.
+
+   THE FRAMING IS PART OF THE SIZE. %serialize-sample sizes the payload buffer from this number, so
+   omitting the DHEADER or a member header is a buffer overflow, not a cosmetic mismatch — which is
+   exactly what a MUTABLE type would have hit, since every member here carries its own header.
+
+   Both encodings are EXACT, and they get there differently because the two rules differ in one
+   respect that matters here: whether a member's internal alignment is measured from the stream or
+   from the member.
+
+   XCDR2 (rules (21)-(22)) has NO origin reset, so a member's padding depends on where in the stream
+   it lands and the size accumulator must thread through it exactly as the encoder does: 4 (DHEADER)
+   + per member 4 (EMHEADER1), plus 4 more for a variable-width member (LC=4's NEXTINT), each
+   4-aligned, then the member's own stepped size.
+
+   XCDR1 (rules (24)/(25)) resets the origin per member (PUSH(ORIGIN=0)), which makes a member's size
+   independent of its position — so it is computed once from a fresh origin and simply ADDED. That is
+   both exact and simpler than threading the accumulator, which would measure the member's internal
+   padding from the wrong base and could undersize the buffer for, say, a sequence of 8-byte elements
+   landing at the wrong stream parity. The header is 4 octets short-form or 12 long-form, chosen by
+   the same test the encoder uses so the two cannot disagree, plus 4 for the terminating sentinel."
+  `((if (eq mode :xcdr2)
+        (progn
+          (setf pos (dds.cdr:cdr-size-align pos 4 mode))
+          (incf pos 4)
+          ,@(loop for m in parsed for v in value-forms
+                  append `((setf pos (dds.cdr:cdr-size-align pos 4 mode))
+                           (incf pos ,(if (%mutable-lc m) 4 8))
+                           ,@(%member-size-step-forms m v 'pos 'mode))))
+        (progn
+          ,@(loop for m in parsed for v in value-forms
+                  append (let ((sz (gensym "SZ")))
+                           `((setf pos (dds.cdr:cdr-size-align pos 4 mode))
+                             (let* ((,sz ,(%member-ssize-form m v 'mode))
+                                    (,sz (* 4 (ceiling ,sz 4))))   ; the DECLARED length is 4-padded
+                               ;; Same short-vs-long test as %mutable-xcdr1-member-forms.
+                               (incf pos (if (and ,(< (getf m :id) #x3f01) (<= ,sz #xffff)) 4 12))
+                               (incf pos ,sz)))))
+          ;; Rule (23): the list is closed by PID_LIST_END + a zero length.
+          (setf pos (dds.cdr:cdr-size-align pos 4 mode))
+          (incf pos 4)))))
+
+(defun* %mutable-assign-form (m get-form dest-form bad)
+    (function (list t t symbol) t)
+  "Macro-time: assign one decoded MUTABLE member to DEST-FORM.
+
+   A NESTED member is the reason this is not simply a SETF: a nested MUTABLE type's deserializer
+   returns (values sample status), and dropping that status would deliver a sample whose nested
+   member silently failed to decode. A FINAL or APPENDABLE nested type returns a single value, so its
+   status reads as NIL and the same shape covers both."
+  (if (eq (getf m :kind) :nested)
+      (let ((v (gensym "V")) (st (gensym "ST")))
+        `(multiple-value-bind (,v ,st) ,get-form
+           (if ,st (setf ,bad ,st) (setf ,dest-form ,v))))
+      `(setf ,dest-form ,get-form)))
+
+(defun* %mutable-decode-loop-form (parsed assign-forms bad)
+    (function (list list symbol) t)
+  "Macro-time: the MUTABLE decode walk, shared by deserialize-<name> and deserialize-into-<name>.
+   ASSIGN-FORMS runs parallel to PARSED; BAD is the caller's status variable, and a non-NIL BAD stops
+   the walk and makes the caller return (values NIL BAD).
+
+   Members arrive BY ID, in any order, and a peer may send ids we do not know — that is what the kind
+   is FOR. So the caller starts every slot at its default, this walks the extent header by header,
+   dispatches on the id, and SKIPS anything unrecognised using the header's own length, never the
+   member's type (which we do not have).
+
+   UNLESS the must-understand flag is set. §7.4.1.2.1: that bit decides whether an unrecognised
+   member \"may be simply ignored or whether it causes the entire data sample to be discarded\". A
+   discard is reported as a STATUS, never signalled (ADR 0064).
+
+   WIRE DATA (NFR-SEC-POSTURE): every length here is peer-controlled. Each member's end is checked
+   against the enclosing extent, which is itself checked against the buffer, so a forged length can
+   neither walk us past the payload nor loop forever — every iteration consumes at least the 4 octets
+   of a member header, so the walk always makes progress. The position is FORCED to each member's
+   declared end, which also means a member a peer sized differently from us costs exactly that member
+   instead of desynchronising the rest of the sample."
+  (let ((n (gensym "N")) (end (gensym "END")) (emh (gensym "EMH")) (mu (gensym "MU"))
+        (lc (gensym "LC")) (mid (gensym "ID")) (nx (gensym "NX")) (mlen (gensym "LEN"))
+        (ms (gensym "MSTART")) (o (gensym "ORIGIN")) (done (gensym "DONE"))
+        (pid (gensym "PID")) (slen (gensym "SLEN")) (m0 (gensym "MU0")) (id0 (gensym "ID0"))
+        (stop (gensym "STOP")) (hp (gensym "HDRPOS")))
+    (flet ((next-header-form (end-var)
+             ;; Advance to where the next member header would start, and stop if it does not fit in
+             ;; END. The alignment is computed and ASSIGNED rather than done with cdr-align, for two
+             ;; reasons. It must not run before the bound is known: a struct whose extent ends on an
+             ;; unaligned octet — the common case, since the last member need not be 4-wide — would
+             ;; have cdr-align try to pad past the end of the payload and raise buffer-overflow on a
+             ;; PERFECTLY VALID sample. And cdr-align ZERO-FILLS the padding it skips, which is right
+             ;; when writing and wrong here: this is a receive buffer, and a decoder has no business
+             ;; writing into the octets a peer sent.
+             `(let ((,hp (+ (dds.core.buffer:cursor-origin cursor)
+                            (dds.cdr:cdr-size-align
+                             (- (dds.core.buffer:cursor-position cursor)
+                                (dds.core.buffer:cursor-origin cursor))
+                             4 mode))))
+                (when (> (+ ,hp 4) ,end-var) (return))
+                (dds.core.buffer:cursor-set-position cursor ,hp)))
+           (dispatch (mid-var mu-var extra)
+             ;; Shared id dispatch: a known id decodes, PID_IGNORE is dropped unconditionally
+             ;; (Table 34: "All consumers ... shall ignore parameters with this ID"), and anything
+             ;; else is skipped unless it is flagged must-understand.
+             `(case ,mid-var
+                ,@(loop for m in parsed for a in assign-forms
+                        collect `((,(getf m :id)) ,a))
+                (t (cond ,@extra
+                         ((= ,mid-var dds.cdr:+pid-ignore+) nil)
+                         (,mu-var (setf ,bad :unknown-must-understand-member)))))))
+      `(if (eq mode :xcdr2)
+           ;; ---- rules (21)-(22): DHEADER extent, EMHEADER1 per member ----
+           (let* ((,n (dds.cdr:cdr-get-dheader cursor mode))
+                  (,end (progn
+                          ;; A DHEADER claiming more than the buffer holds is refused, never
+                          ;; followed (NFR-SEC-POSTURE).
+                          (dds.core.buffer:check-room cursor ,n)
+                          (+ (dds.core.buffer:cursor-position cursor) ,n))))
+             (loop while (null ,bad)
+                   ;; Fewer than 4 octets left in the extent is trailing padding, not a member.
+                   do ,(next-header-form end)
+                      (let ((,emh (dds.core.buffer:get-u32 cursor)))
+                        (multiple-value-bind (,mu ,lc ,mid) (dds.cdr:emheader1-decode ,emh)
+                          (if (and (>= ,lc 4)
+                                   (> (+ (dds.core.buffer:cursor-position cursor) 4) ,end))
+                              (setf ,bad :truncated-member-header)
+                              (let* ((,nx (if (>= ,lc 4) (dds.core.buffer:get-u32 cursor) 0))
+                                     (,mlen (dds.cdr:lc-member-extent ,lc ,nx)))
+                                ;; LC 5-7 reuse NEXTINT as the member's own leading length: rewind so
+                                ;; the member starts AT it (rule (22): XCDR.offset = XCDR.offset-4).
+                                (when (>= ,lc 5)
+                                  (dds.core.buffer:cursor-set-position
+                                   cursor (- (dds.core.buffer:cursor-position cursor) 4)))
+                                (let ((,ms (dds.core.buffer:cursor-position cursor)))
+                                  (if (> (+ ,ms ,mlen) ,end)
+                                      (setf ,bad :malformed-member-extent)
+                                      (progn
+                                        ,(dispatch mid mu '())
+                                        (when (null ,bad)
+                                          (dds.core.buffer:cursor-set-position
+                                           cursor (+ ,ms ,mlen)))))))))))
+             ;; Consume the declared extent whatever the members did with it, so the caller's
+             ;; cursor is left where the next object starts.
+             (when (null ,bad) (dds.core.buffer:cursor-set-position cursor ,end)))
+           ;; ---- rules (23)-(25): a parameter list closed by PID_LIST_END ----
+           (let ((,end (dds.core.buffer:octet-buffer-capacity (dds.core.buffer:cursor-buffer cursor)))
+                 (,done nil))
+             (loop while (and (null ,bad) (null ,done))
+                   ;; Same compute-then-check as the XCDR2 walk, but running out here is an ERROR
+                   ;; rather than a clean stop: a parameter list ends at PID_LIST_END, and guessing
+                   ;; that it ended where the payload did would accept a truncated sample.
+                   do (let ((,hp (+ (dds.core.buffer:cursor-origin cursor)
+                                    (dds.cdr:cdr-size-align
+                                     (- (dds.core.buffer:cursor-position cursor)
+                                        (dds.core.buffer:cursor-origin cursor))
+                                     4 mode))))
+                        (if (> (+ ,hp 4) ,end)
+                            (setf ,bad :missing-parameter-list-end)
+                            (progn
+                              (dds.core.buffer:cursor-set-position cursor ,hp)
+                          (let ((,pid (dds.core.buffer:get-u16 cursor))
+                                (,slen (dds.core.buffer:get-u16 cursor))
+                                (,mu nil) (,mid 0) (,mlen 0) (,stop nil))
+                            (multiple-value-bind (,m0 ,id0) (dds.cdr:pl-pid-decode ,pid)
+                              (cond
+                                ((dds.cdr:pl-end-of-list-p ,id0) (setf ,done t ,stop t))
+                                ;; Long form (§7.4.1.2.1): slength is 8, then eMemberHeader (flags +
+                                ;; 28-bit id) and llength, then the member.
+                                ((= ,id0 dds.cdr:+pid-extended+)
+                                 (if (or (/= ,slen 8)
+                                         (> (+ (dds.core.buffer:cursor-position cursor) 8) ,end))
+                                     (setf ,bad :malformed-extended-parameter ,stop t)
+                                     (let ((,emh (dds.core.buffer:get-u32 cursor)))
+                                       (setf ,mlen (dds.core.buffer:get-u32 cursor)
+                                             ,mu (logtest ,emh dds.cdr:+emheader-mu-flag+)
+                                             ,mid (logand ,emh #x0fffffff)))))
+                                (t (setf ,mu ,m0 ,mid ,id0 ,mlen ,slen))))
+                            (unless ,stop
+                              (let ((,ms (dds.core.buffer:cursor-position cursor))
+                                    (,o (dds.core.buffer:cursor-origin cursor)))
+                                (if (> (+ ,ms ,mlen) ,end)
+                                    (setf ,bad :malformed-member-extent)
+                                    (progn
+                                      ;; PUSH(ORIGIN=0): a member's internal alignment is relative to
+                                      ;; its own start (rules (24)/(25)).
+                                      (dds.core.buffer:cursor-set-origin cursor)
+                                      ,(dispatch mid mu '())
+                                      (setf (dds.core.buffer:cursor-origin cursor) ,o)
+                                      (when (null ,bad)
+                                        (dds.core.buffer:cursor-set-position
+                                         cursor (+ ,ms ,mlen)))))))))))))))))
+
 (defun* %key-max-size (keys)
     (function (list) t)
   "Maximum PLAIN_CDR2 (XCDR2, max alignment 4) serialized size of the key holder built
@@ -332,15 +694,46 @@
        ,val)))
 
 (defmacro define-dds-type (name options &body members)
-  "Define a DDS topic type NAME from an s-expr spec. OPTIONS is a plist (only
-   :extensibility, default :final, in v1). Each MEMBER is (slot-name member-type
-   &key key), where member-type is a primitive keyword, (:sequence element), or
-   the name of a previously-defined dds type (nested struct). Emits a defstruct,
-   ftype-declared serialize/deserialize/serialized-size monomorphic functions
-   (plus an internal %ssize position-threading helper), and a type-support."
+  "Define a DDS topic type NAME from an s-expr spec. OPTIONS is a plist; :extensibility is
+   :final (default), :appendable or :mutable, and :flatdata requires :final. Each MEMBER is
+   (slot-name member-type &key key id must-understand), where member-type is a primitive keyword,
+   (:sequence element), (:string bound), (:enum name), or the name of a previously-defined dds type
+   (nested struct). Emits a defstruct, ftype-declared serialize/deserialize/serialized-size
+   monomorphic functions (plus an internal %ssize position-threading helper), and a type-support.
+
+   :ID is the member's wire identity (@id, FR-TYPE-1), defaulting to declaration order from 0. It is
+   what MUTABLE matches on, it goes into the TypeObject, and it must stay stable across revisions of a
+   type — reordering members of a mutable type is safe, renumbering them is not. Duplicates are
+   rejected at macroexpansion.
+
+   :MUST-UNDERSTAND (@must_understand) marks a member a peer may not silently ignore: if it does not
+   recognise the id, it must discard the whole sample rather than deliver a partial one
+   (XTypes 1.3 §7.4.1.2.1). It is a per-member wire flag in both encodings.
+
+   EXTENSIBILITY decides the framing and the encapsulation id together (Table 60, §7.6.3.1.2):
+   :final is plain CDR; :appendable prepends a DHEADER under XCDR2 and is AsFinal under XCDR1
+   (rules 29/30); :mutable frames every member with its own header — EMHEADER1 under XCDR2
+   (rules 21-22) and a PL_CDR parameter list under XCDR1 (rules 23-25) — which is what lets a peer
+   add, remove or reorder members without breaking either side. It costs a header per member on the
+   wire and an id dispatch per member on decode; that is inherent to the kind and is the user's choice
+   per type (ADR 0086)."
   (let* ((pkg (or (symbol-package name) *package*))
          (ext (getf options :extensibility :final))
-         (parsed (mapcar #'%parse-member members))
+         (parsed (let ((i -1))
+                   (mapcar (lambda (spec)
+                             (incf i)
+                             ;; Member id (@id, FR-TYPE-1; ADR 0086 Decision 2, XTypes 1.3 §7.4.3.4.2):
+                             ;; declaration order by default, overridable with :id. Ids are what MUTABLE
+                             ;; MEANS — a member is found by id, not by position — so they are explicit in
+                             ;; the codegen plist rather than positional-by-accident. :must-understand
+                             ;; (@must_understand) rides along: it is a per-member wire flag in both
+                             ;; encodings, and it is what decides whether a peer that does not know this
+                             ;; member may ignore it or must discard the whole sample.
+                             (append (%parse-member spec)
+                                     (list :id (or (getf (cddr spec) :id) i)
+                                           :must-understand
+                                           (and (getf (cddr spec) :must-understand) t))))
+                           members)))
          (ctor (%sym pkg "MAKE-" (string name)))
          (ser  (%sym pkg "SERIALIZE-" (string name)))
          (des  (%sym pkg "DESERIALIZE-" (string name)))
@@ -361,12 +754,13 @@
          (fd-ssz (%sym pkg "SERIALIZED-SIZE-" (string name) "-FD"))
          (fd-tx (%sym pkg "TX-TRANSCODE-" (string name) "-FD"))
          (tname (string-downcase (string name))))
-    (unless (member ext '(:final :appendable))   ; NOCOND(MACRO): macroexpansion-time — compile-time rejection
-      (error "define-dds-type: extensibility must be :final or :appendable (got ~s); :mutable needs EMHEADER framing and is a later increment" ext))
-    ;; FlatData's in-memory layout IS the wire, so a DHEADER in front of it would break the identity
-    ;; block-copy the whole mechanism rests on (ADR 0015).
-    (when (and (getf options :flatdata) (eq ext :appendable))   ; NOCOND(MACRO): macroexpansion-time
-      (error "define-dds-type: :flatdata requires :final extensibility (got :appendable)"))
+    (unless (member ext '(:final :appendable :mutable))   ; NOCOND(MACRO): macroexpansion-time — compile-time rejection
+      (error "define-dds-type: extensibility must be :final, :appendable or :mutable (got ~s)" ext))
+    ;; FlatData's in-memory layout IS the wire (ADR 0015); a DHEADER, or a per-member EMHEADER, in front
+    ;; of it breaks the identity block-copy the whole mechanism rests on.
+    (when (and (getf options :flatdata) (member ext '(:appendable :mutable)))
+      ;; NOCOND(MACRO): macroexpansion-time — compile-time rejection
+      (error "define-dds-type: :flatdata requires :final extensibility (got ~s)" ext))
     ;; FlatData v1 gate: :flatdata t requires every member to be a fixed-size scalar (FR-PF-4, ADR 0015).
     ;; This already constrains @key members to fixed-size scalars (WP-KEYED-FLATDATA): a string/sequence/
     ;; variable-size @key still errors here; the keyhash is read from the buffer via key-hash-<name>-fd below.
@@ -379,6 +773,15 @@
                (find-if (lambda (m) (or (getf m :var) (getf m :enum) (not (eq (getf m :kind) :scalar)))) parsed))))
     (when (some (lambda (m) (not (eq (getf m :kind) :scalar))) keys)   ; NOCOND(MACRO): macroexpansion-time
       (error "define-dds-type: only scalar/string @key members are supported in v1"))
+    ;; Member ids address members on the wire, so a duplicate is not a style problem: two members would
+    ;; share one EMHEADER id and the second would silently overwrite the first on decode. The range is
+    ;; EMHEADER1's 28-bit id field (XTypes 1.3 §7.4.3.4.2); an id at or above PID_EXTENDED simply takes
+    ;; the XCDR1 long parameter form (%mutable-xcdr1-member-forms), so it is permitted, not rejected.
+    (let ((ids (mapcar (lambda (m) (getf m :id)) parsed)))
+      (unless (every (lambda (id) (typep id '(integer 0 #x0fffffff))) ids)   ; NOCOND(MACRO): macroexpansion-time
+        (error "define-dds-type: member :id must be an integer in [0, #x0fffffff]; got ~s" ids))
+      (unless (= (length ids) (length (remove-duplicates ids)))   ; NOCOND(MACRO): macroexpansion-time
+        (error "define-dds-type: duplicate member :id in ~s — an id addresses a member on the wire" name)))
     (multiple-value-bind (fd-offs fd-body) (when flatp (%flatdata-offsets parsed))
       (declare (ignorable fd-offs fd-body))
     (flet ((acc (m) (%sym pkg (string name) "-" (string (getf m :slot))))
@@ -423,6 +826,13 @@
                                   (:sequence (%seq-put-form m `(,(acc m) sample)))
                                   (:nested `(,(getf m :ser) (,(acc m) sample) cursor mode)))))
                    (dh (gensym "DH")) (e (gensym "END")))
+               (if (eq ext :mutable)
+                   ;; MUTABLE: rules (21)-(22) under XCDR2, rules (23)-(25) under XCDR1. Both are
+                   ;; emitted and MODE picks at runtime — a stock foreign reader may request either
+                   ;; representation, and emitting XCDR2 framing under an XCDR1 encapsulation id would
+                   ;; be silently wrong bytes rather than a visible failure (ADR 0086 Decision 1).
+                   (list (%mutable-ser-form parsed forms
+                                            (loop for m in parsed collect `(,(acc m) sample))))
                (if (eq ext :appendable)
                    `((let ((,dh (when (eq mode :xcdr2)
                                   ;; Placeholder, backpatched below — the size is not known yet.
@@ -438,9 +848,18 @@
                            ;; §7.4.3.4.1: the size EXCLUDES the DHEADER itself.
                            (dds.core.buffer:put-u32 cursor (- ,e ,dh 4))
                            (dds.core.buffer:cursor-set-position cursor ,e)))))
-                   forms))
+                   forms)))
            sample)
-         (declaim (ftype (function (dds.core.buffer:cursor &optional symbol) ,name) ,des))
+         ;; A MUTABLE decode can REFUSE a sample — an unrecognised must-understand member, or a forged
+         ;; length — and reports it as (values NIL status) per ADR 0064. That has to be in the declared
+         ;; type: hot-path code compiles at (safety 0), where the compiler simply believes this, and a
+         ;; declaration promising a struct from a function that returns NIL is undefined behaviour, not
+         ;; a lint. FINAL and APPENDABLE cannot fail this way and keep the single-value declaration.
+         (declaim (ftype (function (dds.core.buffer:cursor &optional symbol)
+                                   ,(if (eq ext :mutable)
+                                        `(values (or null ,name) (or null keyword))
+                                        name))
+                         ,des))
          (defun ,des (cursor &optional (mode :xcdr2))
            ;; An APPENDABLE reader must stop at the DHEADER's extent: a peer built from an OLDER
            ;; revision sent fewer members, and reading past the extent would decode the next
@@ -456,7 +875,27 @@
                    (ctor-call `(,ctor ,@(loop for m in parsed
                                               append (list (intern (string (getf m :slot)) :keyword)
                                                            (getf m :slot))))))
-              (if (eq ext :appendable)
+              (if (eq ext :mutable)
+                  ;; MUTABLE decode (ADR 0086). Every slot starts at its DEFAULT because a member may
+                  ;; simply be absent — an older or newer peer sends the ids it has — and the walk
+                  ;; itself lives in %mutable-decode-loop-form, shared with deserialize-into-<name> so
+                  ;; the two cannot drift apart on the one path where wire data drives the control flow.
+                  (let ((bad (gensym "BAD")))
+                    `(let (,@(loop for m in parsed collect `(,(getf m :slot) ,(getf m :default)))
+                           (,bad nil))
+                       ,(%mutable-decode-loop-form
+                         parsed
+                         (loop for m in parsed
+                               collect (%mutable-assign-form
+                                        m
+                                        (ecase (getf m :kind)
+                                          (:scalar `(,(getf m :get) cursor mode))
+                                          (:sequence (%seq-get-form m))
+                                          (:nested `(,(getf m :des) cursor mode)))
+                                        (getf m :slot) bad))
+                         bad)
+                       (if ,bad (values nil ,bad) (values ,ctor-call nil))))
+                  (if (eq ext :appendable)
                   `(let* ((,end (when (eq mode :xcdr2)
                                   (let ((n (dds.cdr:cdr-get-dheader cursor mode)))
                                     ;; WIRE DATA — a DHEADER claiming more than the buffer holds is
@@ -475,8 +914,12 @@
                                                 ,(getf m :default)))))
                      (when ,end (dds.core.buffer:cursor-set-position cursor ,end))
                      ,ctor-call)
-                  `(let ,binds ,ctor-call))))
-         (declaim (ftype (function (,name dds.core.buffer:cursor &optional symbol) ,name) ,dnto))
+                  `(let ,binds ,ctor-call)))))
+         (declaim (ftype (function (,name dds.core.buffer:cursor &optional symbol)
+                                   ,(if (eq ext :mutable)
+                                        `(values (or null ,name) (or null keyword))
+                                        name))
+                         ,dnto))
          (defun ,dnto (sample cursor &optional (mode :xcdr2))
            ;; Same extent rule as ,des. An uncovered member is reset to its DEFAULT rather than
            ;; left alone: this fills a POOLED sample in place, so keeping the previous occupant's
@@ -487,6 +930,30 @@
                                   (:sequence `(setf (,(acc m) sample) ,(%seq-get-form m)))
                                   (:nested `(,(getf m :des-into) (,(acc m) sample) cursor mode)))))
                    (end (gensym "END")))
+               (if (eq ext :mutable)
+                   ;; MUTABLE fills a POOLED sample, so every slot is reset to its default BEFORE the
+                   ;; walk — a member absent from this sample must not keep the previous occupant's
+                   ;; value. Same walk as ,des; only the destinations differ.
+                   (let ((bad (gensym "BAD")))
+                     `((let ((,bad nil))
+                         ,@(loop for m in parsed
+                                 collect `(setf (,(acc m) sample) ,(getf m :default)))
+                         ,(%mutable-decode-loop-form
+                           parsed
+                           (loop for m in parsed
+                                 collect (%mutable-assign-form
+                                          m
+                                          (ecase (getf m :kind)
+                                            (:scalar `(,(getf m :get) cursor mode))
+                                            (:sequence (%seq-get-form m))
+                                            ;; The nested type fills the EXISTING sub-struct in place
+                                            ;; (the pooling point), so it yields the sub-struct itself.
+                                            (:nested `(progn (,(getf m :des-into)
+                                                              (,(acc m) sample) cursor mode)
+                                                             (,(acc m) sample))))
+                                          `(,(acc m) sample) bad))
+                           bad)
+                         (when ,bad (return-from ,dnto (values nil ,bad))))))
                (if (eq ext :appendable)
                    `((let ((,end (when (eq mode :xcdr2)
                                    (let ((n (dds.cdr:cdr-get-dheader cursor mode)))
@@ -498,8 +965,8 @@
                                             ,f
                                             (setf (,(acc m) sample) ,(getf m :default))))
                        (when ,end (dds.core.buffer:cursor-set-position cursor ,end))))
-                   forms))
-           sample)
+                   forms)))
+           ,(if (eq ext :mutable) '(values sample nil) 'sample))
          (declaim (ftype (function (,name (integer 0) &optional symbol) (integer 0)) ,sszi))
          (defun ,sszi (sample pos &optional (mode :xcdr2))
            (declare (type (integer 0) pos) (ignorable sample))
@@ -509,7 +976,11 @@
                `((when (eq mode :xcdr2)
                    (setf pos (dds.cdr:cdr-size-align pos 4 mode))
                    (incf pos 4))))
-           ,@(loop for m in parsed append
+           ,@(if (eq ext :mutable)
+                 ;; MUTABLE carries a header per MEMBER, not one per struct, so the framing dominates
+                 ;; the size rather than decorating it — see %mutable-ssize-forms.
+                 (%mutable-ssize-forms parsed (loop for m in parsed collect `(,(acc m) sample)))
+                 (loop for m in parsed append
                    (ecase (getf m :kind)
                      (:scalar
                       (if (getf m :var)
@@ -537,7 +1008,7 @@
                             (setf pos (dds.cdr:cdr-size-align pos ,(getf m :elt-align) mode))
                             (incf pos (* n ,(getf m :elt-size)))))))
                      (:nested
-                      `((setf pos (,(getf m :ssize) (,(acc m) sample) pos mode))))))
+                      `((setf pos (,(getf m :ssize) (,(acc m) sample) pos mode)))))))
            pos)
          (declaim (ftype (function (,name &optional symbol) (integer 0)) ,ssz))
          (defun ,ssz (sample &optional (mode :xcdr2))
@@ -830,10 +1301,15 @@
              (dds.types:make-minimal-struct-type
               :name ,tname :extensibility ,ext
               :members
-              (list ,@(loop for m in parsed for idx from 0
+              ;; The member id, not the member's POSITION. They coincide for a type that declares no
+              ;; :id, which is why a positional index survived here; for a type that does declare one
+              ;; they diverge, and the TypeObject would then advertise a different member id from the
+              ;; one the codec puts in every EMHEADER — the two things a peer matches on (FR-TYPE-1
+              ;; @id, FR-TYPE-2).
+              (list ,@(loop for m in parsed
                             collect `(dds.types:make-struct-member
                                       ,(string-downcase (string (getf m :slot)))
-                                      ,idx
+                                      ,(getf m :id)
                                       ,(ecase (getf m :kind)
                                          ;; A bounded string is STRING8 with its bound, not the
                                          ;; unbounded STRING8 primitive-type-identifier yields.
@@ -859,5 +1335,7 @@
                                                     (dds.types:type-support-typeobject
                                                      (dds.types:find-type-support
                                                       ,(getf m :type-name))))))
-                                      ,@(when (getf m :key) '(:key-p t)))))))))
+                                      ,@(when (getf m :key) '(:key-p t))
+                                      ,@(when (getf m :must-understand)
+                                          '(:must-understand-p t)))))))))
          ',name)))))

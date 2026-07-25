@@ -3868,6 +3868,7 @@
                  ("gen-bounded-string"       . run-bounded-string-test)
                  ("gen-enum"                 . run-gen-enum-test)
                  ("gen-appendable"           . run-gen-appendable-test)
+                 ("gen-mutable"              . run-gen-mutable-test)
                  ("log-event"                . run-log-event-test)
                  ("log-corpus"               . run-log-corpus-test)
                  ("log-pipeline"             . run-log-pipeline-test)

@@ -3216,3 +3216,29 @@ public GitHub master for understanding only; no code copied into `src/`.
 - **Scope limit.** The layout is valid for shmem protocol `majorVersion` 2, Connext 7.3.1,
   `arm64Darwin20clang12.0`. ADR 0081 §7 requires an implementation to refuse a segment whose `majorVersion`
   it has not been validated against, rather than misparse it.
+
+## M4 — Connext 7.3.1 MUTABLE wire capture (2026-07-25, ADR 0086)
+
+- **Purpose:** FR-CDR-8's last uncovered dimension. The byte-exact corpus covered FINAL and APPENDABLE;
+  MUTABLE — the encoding with a header on every member — had never been checked against an external
+  encoder, so its framing rested entirely on our own reading of DDS-XTypes 1.3 rules (21)–(25).
+- **Sources consulted:** the OMG specifications (`docs/specs/xtypes-1_3.pdf` §7.4.1.2.1, §7.4.3.4.2,
+  §7.4.3.5 rules (21)–(25), Table 34; `docs/specs/rtps-2_5.pdf` §9.4.2.11) and **the octets a live RTI
+  Connext 7.3.1 DataWriter transmitted** on the owner's licensed installation, received by this stack's
+  own subscriber. Nothing else.
+- **Artifacts tracked:** `interop/connext/mutable/MutableData.idl`, the hand-written
+  `mutable_pub.cxx` driver, its `Makefile` and `README.md`, and the captured payload
+  `corpus/xcdr2/mutabledata-connext.bin` (72 octets). **Not tracked:** all `rtiddsgen` output, the
+  `mutable_pub` binary, and the RTI dylib symlinks — git-ignored, produced at build time (NFR-IP).
+- **Why the octets are not RTI's expression of the encoding.** The vector is a SerializedPayload: the
+  OMG-specified byte layout for a sample whose field values are fixed by rule in
+  `dds.bench::%corpus-mutable-sample`. It contains no RTI code, no generated code, and no RTI-authored
+  text; a conformant implementation of the cited clauses must produce the same octets.
+- **NOT done:** no RTI source, headers or `rtiddsgen` output read or copied; no disassembly; no
+  decompilation. `rti::topic::to_cdr_buffer` was deliberately **not** used — it returns a local CDR
+  buffer that is neither padded nor carries the OPTIONS pad bits, and a corpus built from it would once
+  have certified bytes ADR 0061 proved malformed. The oracle is the wire.
+- **What it corrected.** Three details of our XCDR1 encoder, each derived from the clause and each
+  wrong: the parameter length is padded to a multiple of 4; the list terminator carries
+  FLAG_MUST_UNDERSTAND (`0x7F02`); and Connext sends `@mutable` as PL_CDR (XCDR1), not PL_CDR2 — so the
+  parameter-list framing, not the EMHEADER framing, is what interoperates with it. See ADR 0086 §A5.

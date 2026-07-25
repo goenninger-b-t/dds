@@ -46,3 +46,14 @@ tshark.err
 !nokey/captures/
 !nokey/captures/*.pcap
 !nokey/captures/*.log
+
+# mutable corpus peer (ADR 0086) — rtiddsgen output is produced at build time, never committed
+MutableData.hpp
+MutableData.cxx
+MutableDataPlugin.hpp
+MutableDataPlugin.cxx
+mutable/mutable_pub
+
+# RTI dylib symlinks placed next to the binary: the libs are installed with an @loader_path
+# install name, which DYLD_LIBRARY_PATH cannot satisfy (same fix as interop/perftest/connext).
+mutable/*.dylib

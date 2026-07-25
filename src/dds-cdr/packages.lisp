@@ -29,4 +29,8 @@
            #:cdr-put-octet-sequence #:cdr-get-octet-sequence
            ;; XCDR2 framing (FR-CDR-2, XTypes 1.3 §7.4.3.4)
            #:cdr-put-dheader #:cdr-get-dheader
-           #:emheader1-encode #:emheader1-decode #:lc-for-length))
+           #:emheader1-encode #:emheader1-decode #:lc-for-length #:lc-member-extent
+           #:+flag-impl-extension+ #:+flag-must-understand+
+           #:+pid-extended+ #:+pid-extended-mu+ #:+pid-list-end+ #:+pid-list-end-mu+ #:+pid-ignore+
+           #:+pid-sentinel-rtps+ #:+emheader-mu-flag+
+           #:pl-pid-encode #:pl-pid-decode #:pl-end-of-list-p))
