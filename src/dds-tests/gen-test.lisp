@@ -992,3 +992,82 @@
                             (dds.types:type-support-typeobject ts2)))
               "the TypeObject must record :mutable extensibility")))
   t)
+
+;;;; ---- IDL <-> Lisp member-name parity (FR-TOOL-1, FR-IO; ADR 0086 §A6) ----
+
+(defparameter *idl-type-parity*
+  ;; (IDL path . registered type name). Each pair is a type this stack publishes AND a foreign peer
+  ;; generates from the committed IDL, so their member names must agree exactly.
+  '(("interop/log/DdsLog.idl"              . "log-event")
+    ("interop/connext/mutable/MutableData.idl" . "mutable-data")
+    ("interop/connext/common/ShapeType.idl"    . "shape-type")
+    ("interop/perftest/common/PerfData.idl"    . "perf-data"))
+  "IDL file -> registered type, for run-idl-name-parity-test. Add a row whenever a type gains a
+   committed IDL; a row whose IDL or type is missing is SKIPPED with a note, never silently passed.")
+
+(defun* %idl-member-names (path)
+    (function (string) list)
+  "The member names declared by the LAST struct in the IDL at PATH, in declaration order.
+
+   Deliberately crude — it takes the trailing identifier of each `<type> <name>;` line inside the
+   final `struct { ... }` and ignores annotations, comments and nested types. It does not need to be
+   an IDL parser: its only job is to recover the SPELLINGS a peer's code generator will use, and a
+   line it cannot read shows up as a missing name, which fails loudly rather than passing quietly."
+  (let ((names '()) (in-struct nil))
+    (with-open-file (in path :if-does-not-exist nil)
+      (when in
+        (loop for line = (read-line in nil nil) while line
+              do (let* ((c (search "//" line))
+                        (l (string-trim " " (if c (subseq line 0 c) line))))
+                   (cond
+                     ((and (>= (length l) 6) (string= "struct" l :end2 6))
+                      (setf in-struct t names '()))
+                     ((and in-struct (plusp (length l)) (char= #\} (char l 0)))
+                      (setf in-struct nil))
+                     ((and in-struct (find #\; l))
+                      (let* ((decl (string-trim " " (subseq l 0 (position #\; l))))
+                             (sp (position-if (lambda (ch) (member ch '(#\Space #\Tab))) decl
+                                              :from-end t)))
+                        (when sp
+                          (let ((nm (string-trim " *" (subseq decl (1+ sp)))))
+                            (when (and (plusp (length nm)) (alpha-char-p (char nm 0)))
+                              (push nm names)))))))))))
+    (nreverse names)))
+
+(defun* run-idl-name-parity-test ()
+    (function () t)
+  "Test: every member name in a committed IDL exists, spelled identically, in the Lisp type this
+   stack publishes for it.
+
+   THIS IS A FALSE-REJECT GUARD, not tidiness. Type assignability matches members by NameHash
+   (XTypes 1.3 §7.2.4.4.4), so one differing character makes two otherwise identical types
+   INCONSISTENT — and the symptom is not an error but a silent non-match (matched=0). IDL spells
+   identifiers with '_' and Lisp with '-', so the mismatch is the DEFAULT outcome, not an unlucky
+   one: `log-event` shipped with FIVE such members, and the live Connext MUTABLE leg is what finally
+   exposed the class (ADR 0086 §A6). Nothing in a round-trip test, a byte-exact vector, or an
+   inbound interop leg can see it — inbound exercises the PEER's gate, not ours."
+  (let ((checked 0))
+    (dolist (row *idl-type-parity*)
+      (let* ((path (car row))
+             (tyname (cdr row))
+             (ts (dds.types:find-type-support tyname))
+             (idl (%idl-member-names path)))
+        (cond
+          ((null idl) (format t "~&  -- idl-name-parity: ~a unreadable/absent — SKIPPED~%" path))
+          ((null ts)  (format t "~&  -- idl-name-parity: type ~a not registered — SKIPPED~%" tyname))
+          (t
+           (incf checked)
+           (let* ((to (dds.types:type-support-typeobject ts))
+                  (ours (mapcar #'dds.types:minimal-struct-member-name
+                                (dds.types:minimal-struct-type-members to)))
+                  (missing (remove-if (lambda (n) (member n ours :test #'string=)) idl)))
+             (%check :idl-name-parity
+                     (null missing)
+                     (format nil "~a vs ~a: IDL member(s) ~s have no identically-spelled member in ~
+                                  our type ~s. Give the IDL spelling with :name — assignability ~
+                                  matches by NameHash, so this false-REJECTS the peer silently."
+                             path tyname missing ours)))))))
+    (%check :idl-name-parity-checked-something
+            (plusp checked)
+            "no IDL/type pair was actually compared — the guard would pass vacuously")
+    t))

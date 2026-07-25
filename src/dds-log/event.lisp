@@ -26,6 +26,13 @@
 (dds.gen:define-dds-enum event-kind
   (:message 0) (:entry 1) (:exit 2))
 
+;; :name gives the IDL spelling wherever it differs from the Lisp slot. FR-LOG-1 requires this type to
+;; be publishable "from any vendor's binding", and a peer generated from interop/log/DdsLog.idl announces
+;; participant_uuid / host_ip / app_id / event_kind / elapsed_ns. Type assignability matches members by
+;; NameHash, so without these the two types are judged INCONSISTENT and the peer is refused — silently,
+;; as matched=0 with no error (ADR 0086 §A6; the same defect the live MUTABLE leg exposed). The wire
+;; BYTES are unaffected: only the TypeObject's NameHashes change, so the byte-exact corpus vector
+;; logevent-connext.bin still holds.
 (dds.gen:define-dds-type log-event (:extensibility :appendable)
   (host (:string 64) :key t)
   (process :u32 :key t)
@@ -38,12 +45,12 @@
   ;; INET6_ADDRSTRLEN: it holds IPv4 (max "255.255.255.255", 15) and the longest textual IPv6 (the
   ;; IPv4-mapped "ffff:ffff:ffff:ffff:ffff:ffff:255.255.255.255", 45). A scoped/zone address
   ;; (fe80::1%eth0) is a routing detail a host-identity field does not carry; use a routable address.
-  (participant-uuid (:string 40))
-  (host-ip (:string 46))
+  (participant-uuid (:string 40) :name "participant_uuid")
+  (host-ip (:string 46) :name "host_ip")
   ;; app-id: the application identity string, given at logger creation (owner directive 2026-07-24).
   ;; A wire field for the same reason as participant-uuid/host-ip — a collector renders the
   ;; ORIGINATING application even for a remote source.
-  (app-id (:string 128))
+  (app-id (:string 128) :name "app_id")
   (thread :u32)
   ;; `seq`, not `sequence`: `sequence` is an IDL reserved word (the collection type), so a foreign
   ;; publisher cannot be generated from an IDL with a member named `sequence` (rtiddsgen rejects it).
@@ -54,8 +61,8 @@
   (function (:string 128))
   (file (:string 256))
   (line :u32)
-  (event-kind (:enum event-kind))
-  (elapsed-ns :u64)
+  (event-kind (:enum event-kind) :name "event_kind")
+  (elapsed-ns :u64 :name "elapsed_ns")
   (truncated :bool)
   (message (:string 1024)))
 

@@ -3869,6 +3869,7 @@
                  ("gen-enum"                 . run-gen-enum-test)
                  ("gen-appendable"           . run-gen-appendable-test)
                  ("gen-mutable"              . run-gen-mutable-test)
+                 ("idl-name-parity"          . run-idl-name-parity-test)
                  ("log-event"                . run-log-event-test)
                  ("log-corpus"               . run-log-corpus-test)
                  ("log-pipeline"             . run-log-pipeline-test)

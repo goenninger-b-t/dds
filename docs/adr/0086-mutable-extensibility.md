@@ -244,6 +244,19 @@ can see, because inbound testing exercises the peer's gate rather than ours. And
 was too thin to act on: `INCOMPATIBLE` named no failing condition, so it now dumps both models
 (extensibility, ids, kinds) when `*type-compat-log*` is set.
 
+**The class was then swept, and MUTABLE was not the only victim.** `log-event` — shipped, and recorded
+as live-proven against both vendors — declared **five** members whose Lisp slots differ from
+`interop/log/DdsLog.idl`: `participant-uuid`, `host-ip`, `app-id`, `event-kind`, `elapsed-ns` against
+`participant_uuid`, `host_ip`, `app_id`, `event_kind`, `elapsed_ns`. FR-LOG-1 requires that type to be
+publishable "from any vendor's binding", and a peer generated from the committed IDL would have been
+refused on all five. The wire bytes were never wrong, which is exactly why nothing caught it: only the
+TypeObject's NameHashes differ, so the byte-exact vector `logevent-connext.bin` verifies either way.
+
+Closed permanently by a guard rather than five edits: `run-idl-name-parity-test` (`make test`) reads
+each committed IDL and asserts every member name exists, spelled identically, in the Lisp type this
+stack publishes for it. It is falsifiable — removing one `:name` makes it name the exact member — and
+it refuses to pass vacuously if no pair was compared.
+
 The capture tooling had its own defect, worth recording because it would have silently poisoned any
 future vector: `corpus-capture` reads the buffer handed to `%deliver-user-sample`, which since the RX
 store-copy pool landed is a pooled **slot** rather than the payload — a 72-octet sample was captured as
