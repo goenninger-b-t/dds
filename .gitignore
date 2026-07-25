@@ -86,3 +86,10 @@ interop/fastdds/log/gen/
 interop/fastdds/log/log_pub
 interop/fastdds/log/participant_guard.hpp
 interop/fastdds/log/profiles.xml
+
+# RTI dylib symlinks. interop/connext/common/common.mk's `rtilinks` target drops these beside EVERY
+# Connext peer binary, in whatever directory that peer lives — they are absolute paths into a
+# machine-specific Connext install, so they are generated, never committed. A per-directory rule is
+# the wrong shape here and was gotten wrong three times: rtilinks reaches any interop/ subdirectory,
+# including ones that do not exist yet.
+interop/**/*.dylib
