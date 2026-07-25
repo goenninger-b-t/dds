@@ -1,0 +1,9 @@
+# RTI dylib symlinks placed beside the binaries by common.mk's rtilinks target. They are ABSOLUTE
+# paths into a machine-specific Connext install, so they are generated, never committed (the same
+# rule interop/connext/.gitignore applies to its own tree; this directory sits outside it).
+*.dylib
+
+# build artifacts + the built peers
+*.o
+appendable_pub
+appendable_sub
