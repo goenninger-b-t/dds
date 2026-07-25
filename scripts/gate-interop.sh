@@ -21,6 +21,20 @@
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
+# A LEAKED PEER FROM AN EARLIER RUN POISONS THIS ONE, SILENTLY AND UPWARDS. A stray publisher on the
+# same domain and topic inflates sample counts (an aborted run left a shapes_pub alive and the Shapes
+# legs read 741/719 instead of ~250) and starves the legs it collides with — three unrelated legs went
+# red in the same run. Counts only ever go UP, so the result looks HEALTHIER, which is precisely why
+# this must be checked rather than eyeballed. Abort instead of reporting a number nobody can trust.
+STRAYS="$(pgrep -f 'interop/(connext|appendable|fastdds).*/(shapes|nokey|mutable|large|appendable|perf)_(pub|sub)' 2>/dev/null || true)"
+if [[ -n "$STRAYS" ]]; then
+  echo "gate-interop: ABORT — peer process(es) from an earlier run are still alive:" >&2
+  ps -o pid,etime,command -p $STRAYS >&2 || true
+  echo "gate-interop: they will cross-talk on the same domains and corrupt every count below." >&2
+  echo "gate-interop: kill them and re-run (they are this harness's own binaries, not the owner's)." >&2
+  exit 1
+fi
+
 DOMAIN="${DOMAIN:-0}"
 SECONDS_RUN="${SECONDS_RUN:-15}"
 ALLOW="${INTEROP_ALLOW_MISSING:-}"
@@ -246,6 +260,60 @@ if [[ "$have_connext" -eq 1 ]]; then
     note "FAIL" "Connext -> us LARGE: only $n verified sample(s), need >= $MIN_SAMPLES (log: $log)"; fails=1; fi
 fi
 
+# ---- Legs 13/14: APPENDABLE extensibility, both directions vs Connext (XTypes rules 29/30). ----
+# With these, ALL THREE extensibility kinds are exercised live against the strict oracle rather than
+# only against our own decoder: FINAL by the Shapes legs, MUTABLE by legs 8/9, APPENDABLE here.
+# APPENDABLE is the kind whose framing DIFFERS BY ENCODING — a DHEADER under XCDR2 (rule 30), AsFinal
+# with none under XCDR1 (rule 29) — and Table 60 gives it its own encapsulation id, D_CDR2_LE 0x0009.
+# Both peers were built and committed and nothing had ever run them.
+# REP=xcdr1 for the outbound leg, for the reason legs 3 and 11 give: a stock Connext reader advertises
+# XCDR1 only and DATA_REPRESENTATION is an RxO policy. Under XCDR1 rule (29) this exercises the
+# AsFinal path; the XCDR2 DHEADER framing is covered by the inbound leg and by make corpus.
+if [[ "$have_connext" -eq 1 && -x interop/appendable/appendable_sub && -x interop/appendable/appendable_pub ]]; then
+  export NDDSHOME
+  export DYLD_LIBRARY_PATH="$NDDSHOME/lib/arm64Darwin20clang12.0:$PWD/interop/appendable:${DYLD_LIBRARY_PATH:-}"
+  ADV="${ADVERTISE:-$(ipconfig getifaddr en0 2>/dev/null || echo 127.0.0.1)}"
+  # A DEDICATED DOMAIN, and this is not optional. The appendable peers publish "Square"/"ShapeType" —
+  # the SAME topic and type name as the Shapes legs, deliberately, because type-consistency matches on
+  # the name and a different one would muddy the extensibility result (interop/appendable/AppendableShape.idl
+  # says so). On a shared domain that makes them indistinguishable from the Shapes traffic: the first
+  # attempt inflated the Shapes legs to 741/719 samples and knocked three unrelated legs over.
+  APDOMAIN=$((DOMAIN + 3))
+  # LOOPBACK + a unicast peer, not the LAN address. interop/appendable/USER_QOS_PROFILES.xml pins these
+  # peers with EMPTY <initial_peers> and NO multicast_receive_addresses, so they announce to nobody and
+  # hear no multicast: the ONLY way to meet them is to announce unicast at their metatraffic port and
+  # advertise a locator they can answer. The README says as much (ADVERTISE=127.0.0.1 PEERS=...); passing
+  # the LAN address instead is a silent non-discovery, not an error.
+  APPEER="127.0.0.1:$((7400 + 250 * APDOMAIN + 10))"
+  # Leg 13: us -> Connext, APPENDABLE.
+  log="$(mktemp)"
+  g="$(start_peer "$log" bash -c "cd interop/appendable && exec ./appendable_sub $APDOMAIN $((SECONDS_RUN + 8))")"
+  sleep 4
+  tmout $((SECONDS_RUN + 25)) ./scripts/with-sbcl.sh \
+    --eval "(asdf:load-system :dds-shapes)" \
+    --eval "(uiop:symbol-call :dds.shapes :run-publisher :domain $APDOMAIN :type :appendable :data-representation :xcdr1 :advertise-address \"127.0.0.1\" :peers \"$APPEER\" :color \"BLUE\" :count $((SECONDS_RUN * 20)) :rate 20)" \
+    --eval '(uiop:quit 0)' >/dev/null 2>&1
+  wait_peer "$g" $((SECONDS_RUN + 30)); stop_peer "$g"
+  n="$(grep -c '\[connext-sub\] #' "$log" || true)"
+  if [[ "$n" -ge "$MIN_SAMPLES" ]]; then note "ok" "us -> Connext APPENDABLE: $n sample(s) accepted by the STRICT oracle"; else
+    note "FAIL" "us -> Connext APPENDABLE: only $n sample(s), need >= $MIN_SAMPLES (log: $log)"; fails=1; fi
+  # Leg 14: Connext -> us, APPENDABLE.
+  log="$(mktemp)"
+  g="$(start_peer "$log" bash -c "cd interop/appendable && exec ./appendable_pub $APDOMAIN GREEN")"
+  sleep 3
+  tmout $((SECONDS_RUN + 25)) ./scripts/with-sbcl.sh \
+    --eval "(asdf:load-system :dds-shapes)" \
+    --eval "(uiop:symbol-call :dds.shapes :run-subscriber :domain $APDOMAIN :type :appendable :advertise-address \"127.0.0.1\" :peers \"$APPEER\" :seconds $SECONDS_RUN)" \
+    --eval '(uiop:quit 0)' > "$log.ours" 2>&1
+  stop_peer "$g"
+  n="$(grep -c '\[sub\] Square(appendable)' "$log.ours" || true)"
+  if [[ "$n" -ge "$MIN_SAMPLES" ]]; then note "ok" "Connext -> us APPENDABLE: $n sample(s) (DHEADER framing decoded)"; else
+    note "FAIL" "Connext -> us APPENDABLE: only $n sample(s), need >= $MIN_SAMPLES (log: $log.ours)"; fails=1; fi
+elif [[ "$have_connext" -eq 1 ]]; then
+  note "FAIL" "Connext APPENDABLE peers not built — run: cd interop/appendable && make"
+  fails=1
+fi
+
 # ---- Legs 8/9: MUTABLE extensibility, both directions vs Connext (ADR 0086). ----
 # The corpus proves our ENCODER reproduces Connext's octets for a @mutable sample. It cannot prove that
 # Connext's own DataReader ACCEPTS what we write — type gate, encapsulation id, per-member framing and
@@ -404,7 +472,7 @@ echo "gate-interop: PASS — live cross-vendor interop validated (Connext = the 
 echo "gate-interop: COVERAGE — BOTH DIRECTIONS, both vendors: vendor->us and us->vendor (the latter is"
 echo "              the direction that hid ADR 0057, and it is gated here with REP=xcdr1 because a stock"
 echo "              foreign reader advertises XCDR1 only and DATA_REPRESENTATION is RxO)."
-echo "gate-interop: NOT COVERED — Shapes + large-data + MUTABLE only. Large-data runs against BOTH vendors"
+echo "gate-interop: NOT COVERED — Shapes + large-data + all three EXTENSIBILITY kinds + NO_KEY. Large-data runs against BOTH vendors"
 echo "              (Connext both directions; Fast DDS outbound — there is no Fast DDS LargeData publisher,"
 echo "              so DATA_FRAG REASSEMBLY is gated against Connext only). MUTABLE runs against BOTH vendors, for a"
 echo "              reason worth stating: BOTH vendors send @mutable as PL_CDR (XCDR1), so these legs gate"

@@ -61,8 +61,17 @@ GEN_HDRS := $(IDL_BASE).hpp $(IDL_BASE)Plugin.hpp
 GEN_OBJS := $(GEN_SRCS:.cxx=.o)
 OBJS     := $(addsuffix .o,$(APPS)) $(GEN_OBJS)
 
-.PHONY: all clean generate
-all: $(APPS)
+.PHONY: all clean generate rtilinks
+all: rtilinks $(APPS)
+
+# A STANDALONE target, not just a post-link step. An already-built peer never relinks, so a post-link
+# recipe silently skips exactly the binaries that have been sitting around unrunnable — which is the
+# case this exists to fix (interop/appendable and interop/connext/nokey were both built and both died
+# with "Library not loaded"). Making it a prerequisite of `all` means `make` repairs them.
+rtilinks:
+ifeq ($(UNAME_S),Darwin)
+	@for l in $(RTILINKS); do ln -sf "$(LIBDIR)/$$l.dylib" "$$l.dylib"; done
+endif
 
 generate: .gen.stamp
 .gen.stamp: $(IDL)
@@ -83,9 +92,6 @@ $(GEN_SRCS) $(GEN_HDRS): .gen.stamp
 RTILINKS := libnddscpp2 libnddsc libnddscore
 $(APPS): %: %.o $(GEN_OBJS)
 	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
-ifeq ($(UNAME_S),Darwin)
-	@for l in $(RTILINKS); do ln -sf "$(LIBDIR)/$$l.dylib" "$$l.dylib"; done
-endif
 
 clean:
 	rm -f $(APPS) $(OBJS) .gen.stamp $(GEN_SRCS) $(GEN_HDRS) \
