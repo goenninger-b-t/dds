@@ -347,6 +347,11 @@ NameHash example: `MD5("color")[0:4]` = `70 dd a5 df`. (From `run-md5-test`.)
   exhausting the heap, NFR-SEC-POSTURE). The pooled, zero-alloc deserialize path is a
   tracked M1-perf follow-up (FR-LANG-5 / NFR-DET); the *serialize* side and pool
   acquire/release are already allocation-free.
+- **MUTABLE is DESIGNED but not yet shipped (ADR 0086).** `define-dds-type` accepts `:final` and
+  `:appendable`; `:mutable` is rejected at macroexpansion. The design — EMHEADER framing, length-code
+  selection, unknown-member skipping, `must_understand` discard — is settled in ADR 0086 with every
+  constant pinned to XTypes 1.3 §7.4.3.4.2 and rules (21)-(25). FR-TYPE-1 names all three kinds, so this
+  is an open MUST, and it is what blocks FR-CDR-8's "all extensibility kinds".
 - **DELIMITED / MUTABLE struct serialization is incremental.** `cdr-put-dheader`,
   `emheader1-encode`, and `lc-for-length` are the pinned, byte-exact framing primitives;
   the full DELIMITED/MUTABLE struct walk that composes them is a later increment. The
