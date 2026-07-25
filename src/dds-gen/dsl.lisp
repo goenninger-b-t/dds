@@ -712,7 +712,7 @@
 
    :NAME is the member's WIRE name, defaulting to the downcased slot name. It exists because the two
    are not always the same string: IDL spells identifiers with '_' where Lisp uses '-', so a slot
-   named T-NS renders "t-ns" while the IDL member is "t_ns". Type assignability matches members by
+   named T-NS renders \"t-ns\" while the IDL member is \"t_ns\". Type assignability matches members by
    NameHash, so that difference makes an otherwise identical type INCONSISTENT with the peer's — and
    the symptom is not an error but a silent non-match (matched=0), the ADR 0057 failure shape. Give
    the IDL spelling here whenever it differs. Duplicates are rejected at macroexpansion.
