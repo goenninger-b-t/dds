@@ -278,17 +278,54 @@ if [[ "$have_connext" -eq 1 && -x interop/security-connext/hello_secure_pub ]]; 
     note "FAIL" "DDS-Security: RTI's OpenSSL symlinks are absent — see interop/security-connext/run-connext-interop.sh"
     fails=1
   else
-    log="$(mktemp)"
-    tmout $((SECONDS_RUN * 2 + 120)) bash interop/security-connext/run-connext-interop.sh secure "$SECONDS_RUN" \
-      > "$log" 2>&1
-    passes="$(grep -c 'RESULT: PASS' "$log" || true)"
-    keyed="$(grep -c 'ever-keyed=T' "$log" || true)"
-    if [[ "$passes" -ge 2 && "$keyed" -ge 1 ]]; then
-      note "ok" "DDS-Security GOV=secure: both directions PASS, crypto keys exchanged (ever-keyed=T)"
-    else
-      note "FAIL" "DDS-Security GOV=secure: $passes/2 direction(s) PASS, keyed=$keyed (log: $log)"; fails=1
-    fi
+    # ALL THREE protected governance profiles, because they exercise DIFFERENT crypto paths and a
+    # green `secure` says nothing about the other two:
+    #   secure   — all-ENCRYPT: AES-GCM confidentiality on discovery, RTPS, metadata and data.
+    #   sign     — all-SIGN: AES-GMAC authenticated-but-VISIBLE; data itself unprotected. This is the
+    #              path where a receiver must VERIFY a MAC it could otherwise ignore, so a broken
+    #              verifier passes `secure` (which would simply fail to decrypt) and fails here.
+    #   datasign — SIGN including the user payload: the §9.5.3.3.4.3 SecuredPayload MAC, a separate
+    #              code path from submessage protection.
+    for GOV in secure sign datasign; do
+      log="$(mktemp)"
+      tmout $((SECONDS_RUN * 2 + 120)) bash interop/security-connext/run-connext-interop.sh "$GOV" "$SECONDS_RUN" \
+        > "$log" 2>&1
+      passes="$(grep -c 'RESULT: PASS' "$log" || true)"
+      keyed="$(grep -c 'ever-keyed=T' "$log" || true)"
+      if [[ "$passes" -ge 2 && "$keyed" -ge 1 ]]; then
+        note "ok" "DDS-Security GOV=$GOV: both directions PASS, crypto keys exchanged (ever-keyed=T)"
+      else
+        note "FAIL" "DDS-Security GOV=$GOV: $passes/2 direction(s) PASS, keyed=$keyed (log: $log)"; fails=1
+      fi
+    done
   fi
+fi
+
+# ---- Leg 23: DEADLINE — a Connext writer that GOES QUIET, so our status must fire. ----
+# The assertion is an ABSENCE, which is why no other leg covers it: every other leg proves samples
+# arrive. Here the writer publishes, stops on purpose, and stays matched, and our reader's
+# REQUESTED_DEADLINE_MISSED must CLIMB (DDS 1.4 §2.2.3.7). A deadline implementation that never fires
+# passes every sample-counting leg in this gate.
+# offered(1000ms) <= requested(2000ms) is the RxO rule, so they match and our clock decides.
+if [[ "$have_connext" -eq 1 && -x interop/connext/deadline/deadline_pub ]]; then
+  export NDDSHOME
+  export DYLD_LIBRARY_PATH="$NDDSHOME/lib/arm64Darwin20clang12.0:$PWD/interop/connext/deadline:${DYLD_LIBRARY_PATH:-}"
+  DLDOM=$((DOMAIN + 22)); DLPEER="127.0.0.1:$((7400 + 250 * DLDOM + 10))"
+  log="$(mktemp)"
+  g="$(start_peer "$log" bash -c "cd interop/connext/deadline && exec ./deadline_pub $DLDOM 1000 8 $((SECONDS_RUN + 14))")"
+  sleep 3
+  tmout $((SECONDS_RUN + 35)) ./scripts/with-sbcl.sh \
+    --eval "(asdf:load-system :dds-shapes)" \
+    --eval "(uiop:symbol-call :dds.shapes :run-deadline-subscriber :domain $DLDOM :deadline-ms 2000 :advertise-address \"127.0.0.1\" :peers \"$DLPEER\" :seconds $((SECONDS_RUN + 10)))" \
+    --eval '(uiop:quit 0)' > "$log.ours" 2>&1
+  stop_peer "$g"
+  got="$(grep -oE 'received [0-9]+ sample' "$log.ours" | tail -1 | grep -oE '[0-9]+' || echo 0)"
+  miss="$(grep -oE 'REQUESTED_DEADLINE_MISSED total=[0-9]+' "$log.ours" | tail -1 | grep -oE '[0-9]+$' || echo 0)"
+  # BOTH halves are required: samples prove the match was real, misses prove the status fires.
+  if [[ "$got" -ge 5 && "$miss" -ge 3 ]]; then
+    note "ok" "Connext DEADLINE -> us: $got sample(s) then $miss REQUESTED_DEADLINE_MISSED after the writer went quiet"
+  else
+    note "FAIL" "Connext DEADLINE -> us: samples=$got misses=$miss (need >=5 and >=3) (log: $log.ours)"; fails=1; fi
 fi
 
 # ---- Leg 19: TypeLookup CLIENT — our getTypes query against a live Fast DDS server. ----
@@ -612,11 +649,11 @@ echo "              reason worth stating: BOTH vendors send @mutable as PL_CDR (
 echo "              the parameter-list framing only — the PL_CDR2 (XCDR2) framing has NO live peer behind"
 echo "              it from either vendor, so its length-code choice stays externally unpinned."
 echo "              NO_KEY is gated BOTH directions vs Connext. Per-feature legs still NOT gated:"
-echo "              liveliness, deadline, durability — drivers exist"
+echo "              liveliness, durability — drivers exist"
 echo "              under scripts/ and interop/, but nothing runs them. (enum TK_ENUM and string8-LARGE"
 echo "              are legs 15/16; keyed FlatData 17/18; TypeLookup CLIENT 19 — the TypeLookup"
 echo "              SERVER side is still ungated: a stock Fast DDS client needs a non-stock patch"
 echo "              to query us (FR-IO-2 S4 leg B), so only the client direction is gateable.)"
-echo "              DDS-Security is leg 20 at GOV=secure; the sign/datasign governance profiles are"
-echo "              runnable by hand (run-connext-interop.sh) but not gated."
+echo "              DDS-Security is legs 20-22: ALL THREE protected governance profiles (secure /"
+echo "              sign / datasign), each exercising a different crypto path."
 echo "              Say so rather than let a green line read as 'interop is covered'."
