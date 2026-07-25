@@ -301,6 +301,34 @@ if [[ "$have_connext" -eq 1 && -x interop/security-connext/hello_secure_pub ]]; 
   fi
 fi
 
+# ---- Leg 24: TRANSIENT_LOCAL DURABILITY — a LATE JOINER must be replayed the history. ----
+# THE ORDERING IS THE TEST. Every other leg in this gate starts the reader first, so a writer with no
+# history at all would pass them. Here the Connext writer publishes its whole batch BEFORE our reader
+# exists and then writes nothing more: the samples are off the wire by the time we appear, so the only
+# way we can see them is the writer replaying its durable history on match (DDS 1.4 §2.2.3.4). A
+# VOLATILE writer scores zero here, which is exactly the discrimination.
+# The assertion checks the FIRST sample (x=10) specifically, not just a count — receiving only the
+# tail would mean a KEEP_LAST-shaped replay rather than the KEEP_ALL history actually offered.
+if [[ "$have_connext" -eq 1 && -x interop/connext/durability/durable_pub ]]; then
+  export NDDSHOME
+  export DYLD_LIBRARY_PATH="$NDDSHOME/lib/arm64Darwin20clang12.0:$PWD/interop/connext/durability:${DYLD_LIBRARY_PATH:-}"
+  DUDOM=$((DOMAIN + 24)); DUPEER="127.0.0.1:$((7400 + 250 * DUDOM + 10))"
+  log="$(mktemp)"
+  g="$(start_peer "$log" bash -c "cd interop/connext/durability && exec ./durable_pub $DUDOM 10 $((SECONDS_RUN + 12))")"
+  sleep 8   # deliberately LATE: the batch is fully written and gone from the wire before we join
+  tmout $((SECONDS_RUN + 25)) ./scripts/with-sbcl.sh \
+    --eval "(asdf:load-system :dds-shapes)" \
+    --eval "(uiop:symbol-call :dds.shapes :run-subscriber :domain $DUDOM :type :canonical :durability :transient-local :advertise-address \"127.0.0.1\" :peers \"$DUPEER\" :seconds $SECONDS_RUN)" \
+    --eval '(uiop:quit 0)' > "$log.ours" 2>&1
+  stop_peer "$g"
+  n="$(grep -c 'Square BLUE x=' "$log.ours" || true)"
+  first="$(grep -c 'Square BLUE x=10 ' "$log.ours" || true)"
+  if [[ "$n" -ge 8 && "$first" -ge 1 ]]; then
+    note "ok" "Connext TRANSIENT_LOCAL -> us (LATE JOINER): $n replayed sample(s) incl. the first written"
+  else
+    note "FAIL" "Connext TRANSIENT_LOCAL -> us: $n sample(s), first-written seen=$first (need >=8 and >=1) (log: $log.ours)"; fails=1; fi
+fi
+
 # ---- Leg 23: DEADLINE — a Connext writer that GOES QUIET, so our status must fire. ----
 # The assertion is an ABSENCE, which is why no other leg covers it: every other leg proves samples
 # arrive. Here the writer publishes, stops on purpose, and stays matched, and our reader's
@@ -649,7 +677,8 @@ echo "              reason worth stating: BOTH vendors send @mutable as PL_CDR (
 echo "              the parameter-list framing only — the PL_CDR2 (XCDR2) framing has NO live peer behind"
 echo "              it from either vendor, so its length-code choice stays externally unpinned."
 echo "              NO_KEY is gated BOTH directions vs Connext. Per-feature legs still NOT gated:"
-echo "              liveliness, durability — drivers exist"
+echo "              liveliness — a peer must be written (RTI participant liveliness is proprietary"
+echo "              NDDSPING, not standard ParticipantMessageData); writer-liveliness is next."
 echo "              under scripts/ and interop/, but nothing runs them. (enum TK_ENUM and string8-LARGE"
 echo "              are legs 15/16; keyed FlatData 17/18; TypeLookup CLIENT 19 — the TypeLookup"
 echo "              SERVER side is still ungated: a stock Fast DDS client needs a non-stock patch"

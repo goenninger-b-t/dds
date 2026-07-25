@@ -62,3 +62,9 @@ mutable/*.dylib
 # deadline peer (cross-vendor REQUESTED_DEADLINE_MISSED)
 ShapeType.hpp
 deadline/deadline_pub
+
+# durability peer (TRANSIENT_LOCAL late-joiner replay)
+durability/durable_pub
+
+# liveliness peer (writer-liveliness lease expiry)
+liveliness-peer/liveliness_pub

@@ -1050,6 +1050,58 @@
       (dds.dcps:delete-participant p))
     t))
 
+(defun* run-liveliness-subscriber (&key (domain 0) (lease-seconds 3) (seconds 30)
+                                        (advertise-address "127.0.0.1") (peers nil))
+    (function (&key (:domain (integer 0)) (:lease-seconds (integer 1)) (:seconds (integer 1))
+                    (:advertise-address string) (:peers (or null string))) t)
+  "S0/S1 live interop (DDS 1.4 §2.2.3.11 LIVELINESS, §2.2.4.1 LIVELINESS_CHANGED): a DataReader that
+   REQUESTS a finite lease and reports its LIVELINESS_CHANGED counts, so a foreign writer which stops
+   asserting liveliness is observed transitioning ALIVE -> NOT_ALIVE.
+
+   The assertion this exists for is the TRANSITION, not the samples. A reader that merely receives
+   data proves nothing about liveliness: the interesting event is a writer that is still MATCHED and
+   still DISCOVERED going not-alive because its lease expired, which no sample-counting leg can see.
+
+   LEASE-SECONDS is REQUESTED; a foreign writer must OFFER a lease <= it (RxO, §2.2.3.11), so pick it
+   comfortably above the peer's offered lease or they will not match at all."
+  (let* ((ts (dds.types:find-type-support "shape-type"))
+         (p (dds.dcps:create-participant :domain domain :advertise-address advertise-address
+                                         :peers (%parse-peers peers) :autonomous t))
+         (tp (dds.dcps:create-topic p "Square" "ShapeType" ts))
+         (sub (dds.dcps:create-subscriber p))
+         (dr (dds.dcps:create-datareader
+              sub tp :qos (dds.qos:make-reader-qos
+                           :reliability :reliable
+                           :liveliness :automatic
+                           :liveliness-lease (%deadline-duration (* lease-seconds 1000))))))
+    (format t "~&[liveliness-sub] Square/ShapeType domain=~d requested-lease=~ds~%" domain lease-seconds)
+    (finish-output)
+    (unwind-protect
+         (let ((deadline (+ (get-internal-real-time) (* seconds internal-time-units-per-second)))
+               (last-alive -1) (peak-alive 0) (n 0))
+           (loop while (< (get-internal-real-time) deadline)
+                 do (dolist (cs (dds.dcps:take-samples dr))
+                      (when (dds.dcps:sample-info-valid-data (dds.dcps:cached-sample-info cs))
+                        (incf n)))
+                    (let* ((st (dds.dcps:get-liveliness-changed-status dr))
+                           (alive (dds.dcps:liveliness-changed-status-alive-count st))
+                           (not-alive (dds.dcps:liveliness-changed-status-not-alive-count st)))
+                      (setf peak-alive (max peak-alive alive))
+                      (unless (= alive last-alive)
+                        (format t "~&[liveliness-sub] LIVELINESS_CHANGED alive=~d not_alive=~d~%"
+                                alive not-alive)
+                        (finish-output)
+                        (setf last-alive alive)))
+                    (sleep 0.25))
+           (let* ((st (dds.dcps:get-liveliness-changed-status dr))
+                  (alive (dds.dcps:liveliness-changed-status-alive-count st))
+                  (not-alive (dds.dcps:liveliness-changed-status-not-alive-count st)))
+             (format t "~&[liveliness-sub] stopped: samples=~d peak-alive=~d final-alive=~d final-not-alive=~d~%"
+                     n peak-alive alive not-alive)
+             (finish-output)))
+      (dds.dcps:delete-participant p))
+    t))
+
 (defun* run-deadline-subscriber (&key (domain 0) (deadline-ms 2000) (seconds 25)
                                       (advertise-address "127.0.0.1") (peers nil)
                                       (autonomous nil) (announce-ms 1000) (lease-seconds 100))
