@@ -21,9 +21,14 @@
   (id :i32 :key t)
   (kind (:enum probe-kind)))
 
-(defun run-enum-probe (&key (domain 0) (seconds 30) (advertise-address "127.0.0.1"))
+(defun run-enum-probe (&key (domain 0) (seconds 30) (advertise-address "127.0.0.1") peers)
   (let* ((ts (dds.types:find-type-support "enum-box"))
-         (p (dds.dcps:create-participant :domain domain :advertise-address advertise-address)))
+         (p (dds.dcps:create-participant :domain domain :advertise-address advertise-address
+                                        ;; This peer pins itself to 127.0.0.1 with
+                                        ;; <multicast_receive_addresses/> empty (see its
+                                        ;; USER_QOS_PROFILES.xml), so it hears NO multicast:
+                                        ;; a unicast SPDP peer is the only way to meet it.
+                                        :peers (dds.disc:parse-peers peers))))
     (setf dds.dcps:*type-compat-log* *standard-output*)
     (let* ((tp (dds.dcps:create-topic p "EnumBox" "EnumBox" ts))
            (sub (dds.dcps:create-subscriber p))
@@ -49,5 +54,13 @@
         (format t "~&[enum-probe] VERDICT: ~:[NO DATA — our reader did not receive from the Connext TK_ENUM writer~;TOLERATED — Connext's TK_ENUM writer matched our TK_INT32 reader; values decoded correctly~]~%"
                 (plusp seen))))))
 
-(run-enum-probe :seconds 30)
+(let ((env (lambda (k d) (or (uiop:getenv k) d))))
+  ;; Env-driven so `make interop` can give this probe its OWN DOMAIN and the peer's unicast port.
+  ;; A DEDICATED DOMAIN is not optional: several harnesses in this repo publish distinct topics on a
+  ;; shared domain and a leaked or concurrent peer then cross-talks, which inflates counts UPWARDS and
+  ;; makes a poisoned run look healthier than a clean one.
+  (run-enum-probe :domain (parse-integer (funcall env "PROBE_DOMAIN" "0"))
+        :seconds (parse-integer (funcall env "PROBE_SECONDS" "30"))
+        :advertise-address (funcall env "PROBE_ADVERTISE" "127.0.0.1")
+        :peers (uiop:getenv "PROBE_PEERS")))
 (uiop:quit 0)

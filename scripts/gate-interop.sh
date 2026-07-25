@@ -260,6 +260,45 @@ if [[ "$have_connext" -eq 1 ]]; then
     note "FAIL" "Connext -> us LARGE: only $n verified sample(s), need >= $MIN_SAMPLES (log: $log)"; fails=1; fi
 fi
 
+# ---- Legs 15/16: the two TypeObject-shape probes (enum TK_ENUM, string8 LARGE form). ----
+# Both existed as READMEs describing a manual two-terminal run, and neither had ever been gated. They
+# cover the two TypeObject encodings the logging type depends on and that ADR 0009 flags as the
+# defect class: our (:enum ...) member announces TK_INT32 where a foreign IDL declares TK_ENUM, and a
+# (:string 1024) member announces TI_STRING8_LARGE (0x71) + an LBound UInt32 — the LARGE form, which
+# no live peer had ever confirmed. Both peers pin themselves to 127.0.0.1 with an empty
+# <multicast_receive_addresses/>, so each needs a unicast SPDP peer, and each gets its OWN DOMAIN.
+if [[ "$have_connext" -eq 1 && -x interop/enum-typeobject/enum_pub && -x interop/string-large/stringlarge_pub ]]; then
+  export NDDSHOME
+  # Leg 15: TK_ENUM writer -> our TK_INT32 reader.
+  ENUMDOM=$((DOMAIN + 7)); ENUMPEER="127.0.0.1:$((7400 + 250 * ENUMDOM + 10))"
+  export DYLD_LIBRARY_PATH="$NDDSHOME/lib/arm64Darwin20clang12.0:$PWD/interop/enum-typeobject:${DYLD_LIBRARY_PATH:-}"
+  log="$(mktemp)"
+  g="$(start_peer "$log" bash -c "cd interop/enum-typeobject && exec ./enum_pub $ENUMDOM 0")"
+  sleep 4
+  PROBE_DOMAIN=$ENUMDOM PROBE_SECONDS=$SECONDS_RUN PROBE_PEERS="$ENUMPEER" \
+    tmout $((SECONDS_RUN + 25)) ./scripts/with-sbcl.sh --load interop/enum-typeobject/enum_sub.lisp \
+    > "$log.ours" 2>&1
+  stop_peer "$g"
+  if grep -q 'VERDICT: TOLERATED' "$log.ours"; then
+    note "ok" "Connext TK_ENUM -> us: $(grep -c 'enum-probe\] sample #' "$log.ours") sample(s), values decoded (we announce TK_INT32 — ADR 0009 gap TOLERATED, not fixed)"
+  else
+    note "FAIL" "Connext TK_ENUM -> us: no data (log: $log.ours)"; fails=1; fi
+  # Leg 16: string<1024> writer -> our TI_STRING8_LARGE reader.
+  SLDOM=$((DOMAIN + 8)); SLPEER="127.0.0.1:$((7400 + 250 * SLDOM + 10))"
+  export DYLD_LIBRARY_PATH="$NDDSHOME/lib/arm64Darwin20clang12.0:$PWD/interop/string-large:${DYLD_LIBRARY_PATH:-}"
+  log="$(mktemp)"
+  g="$(start_peer "$log" bash -c "cd interop/string-large && exec ./stringlarge_pub $SLDOM 0")"
+  sleep 4
+  PROBE_DOMAIN=$SLDOM PROBE_SECONDS=$SECONDS_RUN PROBE_PEERS="$SLPEER" \
+    tmout $((SECONDS_RUN + 25)) ./scripts/with-sbcl.sh --load interop/string-large/stringlarge_sub.lisp \
+    > "$log.ours" 2>&1
+  stop_peer "$g"
+  if grep -q 'VERDICT: INTEROPERATES' "$log.ours"; then
+    note "ok" "Connext string<1024> -> us: $(grep -c 'strlarge-probe\] sample #' "$log.ours") sample(s), TI_STRING8_LARGE decoded"
+  else
+    note "FAIL" "Connext string<1024> -> us: no data (log: $log.ours)"; fails=1; fi
+fi
+
 # ---- Legs 13/14: APPENDABLE extensibility, both directions vs Connext (XTypes rules 29/30). ----
 # With these, ALL THREE extensibility kinds are exercised live against the strict oracle rather than
 # only against our own decoder: FINAL by the Shapes legs, MUTABLE by legs 8/9, APPENDABLE here.
@@ -480,5 +519,6 @@ echo "              the parameter-list framing only — the PL_CDR2 (XCDR2) fram
 echo "              it from either vendor, so its length-code choice stays externally unpinned."
 echo "              NO_KEY is gated BOTH directions vs Connext. Per-feature legs still NOT gated:"
 echo "              TypeLookup, keyed FlatData, liveliness, deadline, durability, security — drivers exist"
-echo "              under scripts/ and interop/, but nothing runs them."
+echo "              under scripts/ and interop/, but nothing runs them. (enum TK_ENUM and string8-LARGE"
+echo "              are now gated as legs 15/16.)"
 echo "              Say so rather than let a green line read as 'interop is covered'."
