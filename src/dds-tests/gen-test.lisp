@@ -829,6 +829,42 @@
                 (and (null st) q (= 2 (mut-v1-b q)) (= 3 (mut-v1-t-ns q))
                      (string= "hello" (mut-v1-label q)))
                 (format nil "member id 1 must decode as a member; status ~s sample ~s" st q))))
+    ;; 2c. THE SAME TWO FRAMINGS, BIG-ENDIAN, hand-derived from the clause rather than captured.
+    ;;     FR-CDR-8 requires byte-exactness in BOTH endiannesses, and no external BE oracle is
+    ;;     obtainable here: RTI Connext and Fast DDS both run little-endian on this hardware, and a
+    ;;     library buffer is not the wire (the rti::topic::to_cdr_buffer lesson, ADR 0061). So these
+    ;;     octets are derived BY HAND from the alignment and endianness rules: EMHEADER1, the
+    ;;     parameter ids and every length are UInt16/UInt32 in the stream endianness (§7.4.3.4.2), so
+    ;;     each is byte-reversed against the LE vectors above, while the octet STRING "hello" and the
+    ;;     padding are not. That asymmetry is the point — the bug a BE test catches is a codec that
+    ;;     byte-swaps the payload but forgets a header field, or the reverse.
+    ;;     WEAKER THAN A CAPTURE, and recorded as such: derived from the spec, not produced by an
+    ;;     independent implementation.
+    (let ((x2be (%mut-ser s #'serialize-mut-v1 :xcdr2 :big))
+          (x1be (%mut-ser s #'serialize-mut-v1 :xcdr1 :big)))
+      (%check :mutable-xcdr2-bytes-be
+              (equalp x2be (octets #x00 #x00 #x00 #x30
+                                   #x20 #x00 #x00 #x00  #x00 #x00 #x00 #x01
+                                   #x10 #x00 #x00 #x01  #x00 #x02  #x00 #x00
+                                   #x40 #x00 #x00 #x02  #x00 #x00 #x00 #x0a
+                                   #x00 #x00 #x00 #x06  #x68 #x65 #x6c #x6c #x6f #x00  #x00 #x00
+                                   #x30 #x00 #x00 #x03  #x00 #x00 #x00 #x00 #x00 #x00 #x00 #x03))
+              (format nil "PL_CDR2 big-endian framing; got ~{~2,'0x ~}" (coerce x2be 'list)))
+      (%check :mutable-xcdr1-bytes-be
+              (equalp x1be (octets #x00 #x00 #x00 #x04  #x00 #x00 #x00 #x01
+                                   #x00 #x01 #x00 #x04  #x00 #x02  #x00 #x00
+                                   #x00 #x02 #x00 #x0c  #x00 #x00 #x00 #x06
+                                   #x68 #x65 #x6c #x6c #x6f #x00  #x00 #x00
+                                   #x00 #x03 #x00 #x08  #x00 #x00 #x00 #x00 #x00 #x00 #x00 #x03
+                                   #x7f #x02 #x00 #x00))
+              (format nil "PL_CDR big-endian framing; got ~{~2,'0x ~}" (coerce x1be 'list)))
+      ;; BE and LE must be the SAME LENGTH: endianness reorders octets within a field, it never
+      ;; changes how many there are. A length difference is an ALIGNMENT bug, not a byte-order one,
+      ;; and the two are easy to confuse when only one endianness is ever exercised.
+      (%check :mutable-be-le-same-length
+              (and (= (length x2be) (length (%mut-ser s #'serialize-mut-v1 :xcdr2 :little)))
+                   (= (length x1be) (length (%mut-ser s #'serialize-mut-v1 :xcdr1 :little))))
+              "BE and LE encodings must have identical lengths"))
     ;; 3. Round-trip both encodings x both endiannesses, and serialized-size EXACT for each. The
     ;;    size sizes the payload buffer (%serialize-sample), and MUTABLE puts a header on EVERY
     ;;    member, so an omission here is a buffer overflow rather than a cosmetic mismatch.

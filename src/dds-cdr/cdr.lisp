@@ -59,9 +59,10 @@
    path and the shapes harness), which is exactly how one copy came to be fixed for appendable
    while the other silently was not.
 
-   MUTABLE is included because Table 60 defines it; this build's type compiler cannot yet GENERATE
-   a mutable type (it needs per-member EMHEADER framing), so that row is currently reachable only
-   by a hand-built type-support."
+   The MUTABLE rows are live: define-dds-type generates mutable types (ADR 0086), and both ids are
+   confirmed against a peer — PL_CDR_LE 0x0003 by the committed Connext and Fast DDS vectors and by
+   the gated interop legs, PL_CDR2_LE 0x000b by our own round-trip only, because BOTH vendors send
+   @mutable as PL_CDR and neither exercises the version-2 id."
   (ecase representation
     ((:xcdr2 nil) (ecase extensibility
                     ((:final nil) :plain-cdr2-le)
