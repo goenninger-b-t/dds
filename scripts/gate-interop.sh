@@ -260,6 +260,37 @@ if [[ "$have_connext" -eq 1 ]]; then
     note "FAIL" "Connext -> us LARGE: only $n verified sample(s), need >= $MIN_SAMPLES (log: $log)"; fails=1; fi
 fi
 
+# ---- Leg 20: DDS-SECURITY cross-vendor, GOV=secure (all-ENCRYPT). The P6 exit gate. ----
+# GOV=secure, not GOV=none, and the difference is the whole point: `none` exercises authentication and
+# access control with protection NONE, so it proves the §8.7 PKI-DH handshake and the permissions
+# documents but NOT ONE BYTE of crypto. `secure` is all-ENCRYPT — the crypto-token exchange over PVMS,
+# protected SEDP, and AES-GCM on the data — and the script's own summary reports `ever-keyed=T` only
+# when the key exchange actually happened, which is what distinguishes "encrypted" from "matched".
+# The runner drives BOTH directions itself: ours->Connext observed by rtiddsspy, and Connext->ours
+# with a real secured Connext publisher (hello_secure_pub) whose AEAD data our subscriber decodes.
+#
+# PREREQUISITE, and it fails LOUDLY rather than skipping: RTI's security plugin resolves
+# libssl.3/libcrypto.3 via @loader_path and ships no OpenSSL, so they must be symlinked into
+# $NDDSHOME/resource/app/lib/$CONNEXTDDS_ARCH/ (see the runner's header). Without it the plugin cannot
+# load and the leg would otherwise look like a protocol failure.
+if [[ "$have_connext" -eq 1 && -x interop/security-connext/hello_secure_pub ]]; then
+  if [[ ! -e "$NDDSHOME/resource/app/lib/arm64Darwin20clang12.0/libssl.3.dylib" ]]; then
+    note "FAIL" "DDS-Security: RTI's OpenSSL symlinks are absent — see interop/security-connext/run-connext-interop.sh"
+    fails=1
+  else
+    log="$(mktemp)"
+    tmout $((SECONDS_RUN * 2 + 120)) bash interop/security-connext/run-connext-interop.sh secure "$SECONDS_RUN" \
+      > "$log" 2>&1
+    passes="$(grep -c 'RESULT: PASS' "$log" || true)"
+    keyed="$(grep -c 'ever-keyed=T' "$log" || true)"
+    if [[ "$passes" -ge 2 && "$keyed" -ge 1 ]]; then
+      note "ok" "DDS-Security GOV=secure: both directions PASS, crypto keys exchanged (ever-keyed=T)"
+    else
+      note "FAIL" "DDS-Security GOV=secure: $passes/2 direction(s) PASS, keyed=$keyed (log: $log)"; fails=1
+    fi
+  fi
+fi
+
 # ---- Leg 19: TypeLookup CLIENT — our getTypes query against a live Fast DDS server. ----
 # The one protocol in this stack with NO Connext oracle at all: RTI does not implement the TypeLookup
 # service (ADR 0010), so every byte of it was self-pinned regression vectors plus a tshark decode
@@ -581,9 +612,11 @@ echo "              reason worth stating: BOTH vendors send @mutable as PL_CDR (
 echo "              the parameter-list framing only — the PL_CDR2 (XCDR2) framing has NO live peer behind"
 echo "              it from either vendor, so its length-code choice stays externally unpinned."
 echo "              NO_KEY is gated BOTH directions vs Connext. Per-feature legs still NOT gated:"
-echo "              liveliness, deadline, durability, security — drivers exist"
+echo "              liveliness, deadline, durability — drivers exist"
 echo "              under scripts/ and interop/, but nothing runs them. (enum TK_ENUM and string8-LARGE"
 echo "              are legs 15/16; keyed FlatData 17/18; TypeLookup CLIENT 19 — the TypeLookup"
 echo "              SERVER side is still ungated: a stock Fast DDS client needs a non-stock patch"
 echo "              to query us (FR-IO-2 S4 leg B), so only the client direction is gateable.)"
+echo "              DDS-Security is leg 20 at GOV=secure; the sign/datasign governance profiles are"
+echo "              runnable by hand (run-connext-interop.sh) but not gated."
 echo "              Say so rather than let a green line read as 'interop is covered'."
