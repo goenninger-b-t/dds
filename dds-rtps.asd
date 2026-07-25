@@ -1,7 +1,7 @@
 ;;;; L4 — RTPS engine (M0: frozen HistoryCache protocol + CacheChange shape).
 (defsystem "dds-rtps"
   :description "DDS.RTPS — submessage codec + reliable engine + HistoryCache (M0 contracts)."
-  :depends-on ("dds-cdr" "dds-types" "dds-qos")
+  :depends-on ("dds-pal" "dds-cdr" "dds-types" "dds-qos")
   :pathname "src/dds-rtps"
   :serial t
   :components ((:file "packages")

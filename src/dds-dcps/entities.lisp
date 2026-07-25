@@ -2665,7 +2665,7 @@
   (let ((sguid (dds.disc:node-sample-writer-guid node key))
         (sn (dds.disc:node-sample-key-sn key))
         (advance t))                       ; advance the per-writer watermark unless arbitration keeps it pending
-  (let ((bytes (dds.disc:node-sample node key)))
+  (let ((bytes (dds.disc:node-sample-raw node key)))   ; ADR 0078: the VERBATIM entry — node-sample would copy a pooled buffer out, and this is the hot path
     (when (dds.disc:zc-loan-marker-p bytes)            ; WP-FLATDATA-ZC-LOAN (R6, ADR 0017): an UNRESOLVED ZC ref -> acquire a literal-0-copy view, never deserialize
       (%drain-one-loan dr ts key bytes sn sguid)
       (return-from %drain-one-sample t))
@@ -2674,9 +2674,15 @@
       (return-from %drain-one-sample t))
     (when bytes
       (multiple-value-bind (data decode-status)
-          (%deserialize-sample ts bytes                 ; RX-POOLING Phase A (ADR 0073): decode in place through the reused per-reader scratch wrapper -> zero alloc/sample
-                               (or (dr-deser-scratch dr)
-                                   (setf (dr-deser-scratch dr) (dds.core.buffer:octet-buffer-over bytes))))
+          (if (typep bytes 'dds.core.buffer:octet-buffer)
+              ;; ADR 0078: an RX-STORE-POOLED copy — the buffer IS the payload extent (its CAPACITY was set to
+              ;; the exact plen at acquire), so it is decoded IN PLACE with no wrapper at all and under bounds
+              ;; byte-identical to the exact-length vector it replaces (%deserialize-payload validates against
+              ;; capacity). No scratch, no repointing — the reverse of the ADR 0073 wrapper, one step further.
+              (%deserialize-payload ts bytes)
+              (%deserialize-sample ts bytes             ; RX-POOLING Phase A (ADR 0073): decode in place through the reused per-reader scratch wrapper -> zero alloc/sample
+                                   (or (dr-deser-scratch dr)
+                                       (setf (dr-deser-scratch dr) (dds.core.buffer:octet-buffer-over bytes)))))
         ;; A REJECTED payload (FlatData: short body / non-transcodable representation id) is a STATUS now,
         ;; not a signalled condition (ADR 0064). Drop the sample: never hand a NIL DATA to the filter or to
         ;; %instance-handle. It must still fall through to the watermark advance at the tail — an early

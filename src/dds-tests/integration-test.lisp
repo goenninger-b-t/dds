@@ -4088,6 +4088,139 @@
       (dds.dcps:delete-participant p)))
   t)
 
+(defun* run-rx-store-pool-test ()
+    (function () t)
+  "ADR 0078 regression — the receiver thread's per-sample store COPY is drawn from the node's arena-backed RX
+   store-copy pool, it carries its OWN payload extent, and it is RETURNED to the pool exactly once when the
+   store entry is dropped.
+
+   Four independent things have to hold, and each is asserted separately:
+   (1) DELIVERY IS CORRECT ACROSS VARYING PAYLOAD SIZES. The samples deliberately cycle four colour strings of
+   DIFFERENT lengths, so consecutive samples reuse the SAME recycled buffer at different extents and every
+   field must still survive the round trip (:rxp-delivered / :rxp-fields).
+   (2) THE EXTENT IS THE BOUNDS. This is the security property, and it needs its own assertion: a well-formed
+   payload deserializes correctly even with an over-long extent (the decoder simply stops reading), so the
+   field check above CANNOT catch a wrong capacity — verified, by setting the capacity to the carve size and
+   watching :rxp-fields stay green. :rxp-truncation-bounded closes that hole directly: a COMPLETE payload is
+   written into a pooled buffer which is then presented with a TRUNCATED extent, and the decode must be
+   REFUSED at the bounds rather than satisfied by reading the bytes that follow — which is exactly what a
+   recycled buffer holds. If the bounds were the buffer's LENGTH instead of its CAPACITY, this decode would
+   succeed on stale bytes: an over-read and an information disclosure (NFR-SEC-POSTURE).
+   (3) THE BUFFER COMES BACK. After every sample has been drained the pool must have NOTHING checked out, and
+   its high-water must be a handful — the whole point is that a few buffers serve every sample by recycling.
+   (4) THE ACCESSOR CONTRACT. A pooled entry reads back through node-sample as the EXACT-LENGTH vector that
+   accessor has always returned (the durability relay persists and republishes it), while node-sample-raw —
+   what the hot drain uses — sees the buffer verbatim.
+
+   FALSIFIED, seen red, not assumed. Deleting the pool-release from the store-drop choke
+   (%purge-secured-sample) fails :rxp-returned with 'in-use 64, high-water 64' — the pool never recovers a
+   single buffer. Setting the acquired buffer's capacity to the carve size instead of the payload length
+   fails :rxp-normalized. Presenting the full extent instead of a truncated one fails
+   :rxp-truncation-bounded, which is what proves that assertion is not vacuous."
+  ;; The pooled arm is reached on the RECEIVER THREAD, where a LET binding of the switch is invisible (special
+  ;; bindings are per-thread) — so this test cannot force the pool on locally; it reports NOT-APPLICABLE instead.
+  (when (null dds.disc:*rx-store-pool-enabled*)
+    (format t "  [rx-store-pool] SKIP: dds.disc:*rx-store-pool-enabled* is NIL (pool off; the copy path allocates)~%")
+    (return-from run-rx-store-pool-test t))
+  (let* ((ts (dds.types:find-type-support "shape-type"))
+         (p1 (dds.dcps:create-participant :domain (test-domain)))
+         (p2 (dds.dcps:create-participant :domain (test-domain)))
+         (pool-at-teardown nil))   ; captured BEFORE teardown so the post-teardown assertion can still read it
+    (unwind-protect
+         (let* ((tw (dds.dcps:create-topic p1 "RxPool" "shape-type" ts))
+                (tr (dds.dcps:create-topic p2 "RxPool" "shape-type" ts))
+                (dw (dds.dcps:create-datawriter (dds.dcps:create-publisher p1) tw))
+                (dr (dds.dcps:create-datareader (dds.dcps:create-subscriber p2) tr))
+                (node (dds.dcps::dp-node p2))
+                (colors #("RED" "BLUE" "GREEN" "MAGENTA"))   ; DIFFERENT payload extents through the SAME recycled buffers
+                (n 120) (got 0) (bad 0))
+           (loop repeat 150
+                 until (and (plusp (dds.dcps:matched-count p1)) (plusp (dds.dcps:matched-count p2)))
+                 do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+           (%check :rxp-matched (plusp (dds.dcps:matched-count p1))
+                   "DataWriter/DataReader did not match — the test never exercised the receive path")
+           (dotimes (i n)
+             (let ((color (aref colors (mod i (length colors)))))
+               (dds.dcps:write-sample dw (make-shape-type :color color :x i :y (* 2 i) :shapesize 7))
+               (loop repeat 200
+                     until (let ((ss (dds.dcps:take-samples dr)))
+                             (dolist (s ss)
+                               (let ((d (dds.dcps:cached-sample-data s)))
+                                 (incf got)
+                                 (unless (and (string= (shape-type-color d) color)
+                                              (= (shape-type-x d) i)
+                                              (= (shape-type-y d) (* 2 i)))
+                                   (incf bad))))
+                             ss)
+                     do (sleep 0.002))))
+           (%check :rxp-delivered (= got n)
+                   (format nil "~d of ~d samples were delivered" got n))
+           (%check :rxp-fields (zerop bad)
+                   (format nil "~d sample(s) deserialized to the WRONG field values after riding a recycled pooled buffer" bad))
+           (let ((pool (dds.disc::disc-node-rx-store-pool node)))
+             (%check :rxp-pooled (and pool t)
+                     "the RX store-copy pool was never carved — the per-sample copy is still allocating")
+             (when pool
+               (%check :rxp-returned (zerop (dds.core.arena:pool-in-use pool))
+                       (format nil "every drained sample must return its pooled buffer (in-use ~d, high-water ~d)"
+                               (dds.core.arena:pool-in-use pool) (dds.core.arena:pool-high-water pool)))
+               (%check :rxp-recycled (<= 1 (dds.core.arena:pool-high-water pool) 8)
+                       (format nil "a handful of buffers must serve all ~d samples by RECYCLING (high-water ~d)"
+                               n (dds.core.arena:pool-high-water pool)))
+               (let* ((payload (dds.dcps::%serialize-sample
+                                ts (make-shape-type :color "CYAN" :x 9 :y 9 :shapesize 9)))
+                      (guid (make-array 16 :element-type '(unsigned-byte 8) :initial-element 7))
+                      (key (cons guid 4242))
+                      (before (dds.core.arena:pool-in-use pool))
+                      (ob (dds.disc::%rx-store-acquire node (length payload))))
+                 (%check :rxp-acquire (and ob t)
+                         "the pool must hand out a buffer for a payload within its element size")
+                 (when ob
+                   (replace (dds.core.buffer:octet-buffer-vec ob) payload)
+                   (setf (gethash 4242 (dds.disc::%inner-table (dds.disc::disc-node-samples node) guid)) ob)
+                   (%check :rxp-raw (eq ob (dds.disc:node-sample-raw node key))
+                           "node-sample-raw must return the store entry VERBATIM (the hot drain type-dispatches it)")
+                   (%check :rxp-normalized (equalp payload (dds.disc:node-sample node key))
+                           "node-sample must still return the EXACT-LENGTH payload for a pooled entry (the durability relay persists it)")
+                   (dds.disc:node-consume-sample node guid 4242)
+                   (%check :rxp-drop-returns (= before (dds.core.arena:pool-in-use pool))
+                           "dropping a pooled store entry must return its buffer to the pool"))
+                 ;; THE EXTENT IS THE BOUNDS (NFR-SEC-POSTURE). Write a COMPLETE payload into a pooled buffer,
+                 ;; then present it with a TRUNCATED extent: the decode must be refused at the bounds, NOT
+                 ;; satisfied by reading the bytes that follow — which in a recycled buffer are a previous
+                 ;; sample's. Were the bounds the buffer's LENGTH rather than its CAPACITY, this would succeed.
+                 (let ((ob2 (dds.disc::%rx-store-acquire node (length payload))))
+                   (%check :rxp-acquire2 (and ob2 t) "the pool must hand out a second buffer")
+                   (when ob2
+                     (replace (dds.core.buffer:octet-buffer-vec ob2) payload)
+                     (setf (dds.core.buffer:octet-buffer-capacity ob2) (1- (length payload)))
+                     (%check :rxp-truncation-bounded
+                             (handler-case
+                                 (multiple-value-bind (d s) (dds.dcps::%deserialize-payload ts ob2)
+                                   (or (null d) (and s t)))
+                               (dds.core.buffer:buffer-overflow () t))
+                             "a payload presented SHORTER than its buffer must be refused at the extent, never completed by reading the recycled bytes beyond it")
+                     (dds.disc::%rx-store-release node ob2)))
+                 ;; Leave ONE pooled buffer checked out and resident in the store across teardown, and hold on
+                 ;; to the pool so it can be inspected afterwards.
+                 (let ((live (dds.disc::%rx-store-acquire node (length payload))))
+                   (when live
+                     (setf (gethash 99 (dds.disc::%inner-table (dds.disc::disc-node-samples node) guid)) live))
+                   (setf pool-at-teardown pool))))))
+      (progn (dds.dcps:delete-participant p1)
+             (dds.dcps:delete-participant p2)))
+    ;; AFTER teardown. teardown-arena frees a pool by walking its SLOTS, and pool-acquire NILs the slot it
+    ;; hands out — so a buffer still checked out at teardown is NOT freed and its foreign memory leaks.
+    ;; stop-node must therefore return every pooled store-copy buffer FIRST
+    ;; (node-return-all-rx-store-buffers, the twin of node-return-all-loans). Reading the CAPTURED pool works
+    ;; because teardown-arena does not touch the in-use counter and the node's own slot is cleared.
+    ;; FALSIFIED: drop that call from stop-node and this reads 1, not 0.
+    (when pool-at-teardown
+      (%check :rxp-teardown-returns (zerop (dds.core.arena:pool-in-use pool-at-teardown))
+              (format nil "stop-node must return every pooled store-copy buffer to its slot before teardown-arena, or its static memory leaks (~d still checked out)"
+                      (dds.core.arena:pool-in-use pool-at-teardown)))))
+  t)
+
 ;;; Builtin-topic readers (M3 #5, FR-DCPS-6): DCPSParticipant / DCPSPublication /
 ;;; DCPSSubscription / DCPSTopic surface the discovered participants + endpoints.
 

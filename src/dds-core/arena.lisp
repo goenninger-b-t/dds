@@ -101,12 +101,19 @@
 
 (defun* pool-release (pool obj)
     (function (buffer-pool t) (values))
-  "Return OBJ to POOL."
+  "Return OBJ to POOL. A release when the free list is already FULL (top = capacity, i.e. nothing is
+   checked out) would, at (safety 0), write (svref slots capacity) — one past the vector — a wild heap
+   write that a later GC faults on (ADR 0078 §re-landing: this was an unguarded OOB). It is only ever
+   reachable through a caller bug (a double release / a release of a buffer never acquired); the bounds
+   guard degrades that to a NO-OP (a bounded leaked slot — the pool then falls back to allocating),
+   strictly better than corrupting the free list or the heap. Correct callers (top < capacity) are
+   byte-identical to before."
   (let ((top (buffer-pool-top pool)))
-    (setf (svref (buffer-pool-slots pool) top) obj
-          (buffer-pool-top pool) (1+ top))
-    (decf (buffer-pool-in-use pool))
-    (values)))
+    (when (< top (buffer-pool-capacity pool))
+      (setf (svref (buffer-pool-slots pool) top) obj
+            (buffer-pool-top pool) (1+ top))
+      (decf (buffer-pool-in-use pool))))
+  (values))
 
 (defun* arena-report (arena)
     (function (arena) list)

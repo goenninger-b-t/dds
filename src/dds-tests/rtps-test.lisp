@@ -2550,3 +2550,68 @@
                            when (and (= (aref vec2 i) #x03) (= (aref vec2 (1+ i)) #x80)) return t))
                 "PID_SERVICE_KIND must NOT appear in a non-relay endpoint")))
     t))
+
+(defun* run-reader-concurrent-receivers-test ()
+    (function () t)
+  "Regression: ONE rtps-reader driven by SEVERAL threads at once, which is what a live node actually does —
+   start-node runs up to THREE receiver threads (unicast UDP, multicast UDP, SHMEM) and they ALL feed
+   %handle-datagram, which lands in reader-on-data / reader-dedup-accept-p with no enclosing lock. The
+   reader-side docstrings used to assume a 'single receiver thread per proxy' discipline that does not exist.
+
+   Every thread offers the SAME (GUID, SN) set, so the three properties below are exactly the ones the
+   unsynchronized engine broke:
+   (1) EXACTLY-ONCE (RTPS 2.5 §8.3.5.4). reader-dedup-accept-p is a seen-test-then-mark; unlocked, two
+       threads both find an SN unseen and BOTH return T, so the sample is delivered twice. The accept
+       counts summed over all threads must be exactly the number of distinct SNs — not more.
+   (2) NO LOST PROXY. get-writer-proxy is (or (gethash k) (setf (gethash k) ...)); unlocked, two threads
+       both miss and both construct, and one proxy — with every received-SN marker written into it — is
+       silently dropped, so the reader NACKs samples it already holds.
+   (3) NO LOST MARKER. Every SN offered must be present in RECEIVED, and LAST-SN must be the true maximum
+       (it is updated by a read-compare-write that interleaves into a lost update).
+
+   FALSIFIED, seen red, not assumed: with the reader lock removed from %get-writer-proxy and
+   reader-dedup-accept-p this fails :rxrace-dedup-exactly-once (accepts exceed the SN count) and
+   :rxrace-markers (RECEIVED short of the SNs offered)."
+  (let* ((reader (dds.rtps.reliable:make-rtps-reader))
+         (guid (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xC7))
+         (payload (make-array 0 :element-type '(unsigned-byte 8)))
+         (n-threads 4)
+         (n-sns 500)
+         (accepts (make-array n-threads :initial-element 0))
+         (go-flag (list nil)))
+    (let ((threads (loop for i below n-threads
+                         collect (let ((idx i))
+                                   (dds.pal:spawn
+                                    (lambda ()
+                                      (loop until (car go-flag))   ; release them together: skewed starts do not race
+                                      (let ((accepted 0))
+                                        (dotimes (s n-sns)
+                                          (let ((sn (1+ s)))
+                                            (dds.rtps.reliable:reader-on-data reader guid sn payload)
+                                            (when (dds.rtps.reliable:reader-dedup-accept-p reader guid sn)
+                                              (incf accepted))))
+                                        (setf (aref accepts idx) accepted)))
+                                    :name "rx-race")))))
+      (setf (car go-flag) t)
+      (dolist (th threads) (dds.pal:join th)))
+    (let* ((total (reduce #'+ accepts))
+           (proxies (dds.rtps.reliable::rtps-reader-proxies reader))   ; internal: the proxy TABLE is not part of the exported surface
+           (proxy (dds.rtps.reliable:get-writer-proxy reader guid))
+           (received (dds.rtps.reliable:writer-proxy-received proxy)))
+      (%check :rxrace-dedup-exactly-once
+              (= total n-sns)
+              (format nil "~d threads offering the same ~d SNs must yield EXACTLY ~d accepts in total (exactly-once, RTPS 2.5 §8.3.5.4); got ~d"
+                      n-threads n-sns n-sns total))
+      (%check :rxrace-single-proxy
+              (= 1 (hash-table-count proxies))
+              (format nil "one writer GUID must yield exactly ONE WriterProxy however many threads race its creation; got ~d"
+                      (hash-table-count proxies)))
+      (%check :rxrace-markers
+              (= n-sns (hash-table-count received))
+              (format nil "every offered SN must survive in RECEIVED (a dropped proxy loses its markers and the reader re-NACKs); expected ~d, got ~d"
+                      n-sns (hash-table-count received)))
+      (%check :rxrace-last-sn
+              (= n-sns (dds.rtps.reliable:writer-proxy-last-sn proxy))
+              (format nil "LAST-SN is a read-compare-write and must not lose an update; expected ~d, got ~d"
+                      n-sns (dds.rtps.reliable:writer-proxy-last-sn proxy))))
+    t))

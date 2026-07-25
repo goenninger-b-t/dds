@@ -191,7 +191,9 @@ recovery).
 - `dds.disc:node-lifecycle-sns` *(node)* — composite `(GUID . SN)` cons keys of the dispose/unregister lifecycle DATAs received so far (unordered; SNs may not start at 1 against Connext, and two writers sharing an EntityId never alias, §8.3.5.4) — lets the user thread drain newly-classified lifecycle changes the same way `node-sample-sns` drains data samples.
 - `dds.disc:*debug-drop-fragment-numbers*` — debug-only fragment-loss injection (default `NIL` = off): a list of 1-based fragment numbers the send path silently withholds when fragmenting (initial push **and** sample-level ACKNACK retransmits) — the whole packed `DATA_FRAG` submessage is withheld if **any** fragment it contains is named; NACK_FRAG-driven resends are not filtered, so the peer's NACK_FRAG is the only recovery path — the live proof of fragment-level reliability. Never set in production. (`make large-pub DROP=3` sets it via `run-large-publisher :drop-fragments`.)
 - `dds.disc:node-sample-count` *(node)* — number of distinct user samples the subscriber has received.
-- `dds.disc:node-sample` *(node sn)* — the received payload for sequence number `SN`, or `NIL`.
+- `dds.disc:node-sample` *(node key)* — the received payload for composite sample `KEY` (a `(GUID . SN)` cons, see `node-sample-sns`), or `NIL`. Always an **exact-length** octet vector: a sample the receiver copied into a pooled buffer (see `*rx-store-pool-capacity*`) is copied out here, so this accessor's contract is unaffected by pooling. Use `node-sample-by-sn` when you know only the SN.
+- `dds.disc:node-sample-raw` *(node key)* — the **verbatim** store entry for `KEY`, or `NIL`: a plain octet vector, a pooled store-copy `octet-buffer` (whose `capacity` is the exact payload extent), a secured loan handle, or a Zero-Copy loan marker. For the one hot consumer — the DCPS drain, which type-dispatches the entry and decodes it in place — so that it never pays `node-sample`'s normalising copy. Every other caller wants `node-sample`.
+- `dds.disc:*rx-store-pool-capacity*` — number of buffers in a node's **RX store-copy pool** (default 64, ADR 0078): the arena-backed pool the receiver thread draws each received sample's copy from, instead of allocating a fresh vector per sample — the last receive-path allocation that scaled with payload size. Carved lazily on the first copy-path receive and sized from `*plain-payload-max-bytes*`; read once per node, so rebinding it later does not resize an already-carved pool. **Exhaustion is not data loss and not a RESOURCE_LIMITS reject**: the drain copies the sample out again into an independent struct, so a receive that finds the pool empty (or a payload larger than the element size, or a node with DDS-Security data protection, which pools its decode output separately) simply allocates as before — bounded degradation, byte-identical delivery.
 - `dds.disc:node-sample-sns` *(node)* — sequence numbers of the user samples received so far (unordered; SNs may not start at 1 against Connext). **Conses one `(GUID . SN)` key per STORED sample** — fine for a test or a diagnostic, wrong for the receive path; the DCPS drain uses `node-collect-pending-samples` instead.
 - `dds.disc:node-collect-pending-samples` *(node pending-p out)* — push the `(GUID . SN)` key of every stored user sample the caller still considers pending into `OUT` (a caller-owned adjustable vector, **reused across calls**) and return it. `PENDING-P` is called as `(GUID SN)` — the raw hash keys, not a consed key — so the deciding walk allocates **nothing** and a key is consed **only** for a genuinely pending sample. This is what makes the DCPS `%drain` `O(pending)` rather than `O(stored)` in both time and allocation (an empty drain now allocates zero bytes).
 - `dds.disc:node-collect-pending-lifecycle` *(node pending-p out)* — the dispose/unregister twin of the above; replaces `node-lifecycle-sns` + a `SET-DIFFERENCE` on the drain path.
@@ -341,7 +343,7 @@ so the exact payload arrives even over a lossy/reordering link. Adapted from
          ;; publish; the reliable plane delivers it
          (dds.disc:publish-sample node1 payload)
          (loop repeat 150 until (plusp (dds.disc:node-sample-count node2)) do (sleep 0.02))
-         (equalp (dds.disc:node-sample node2 1) payload))      ; => T
+         (equalp (dds.disc:node-sample-by-sn node2 1) payload))   ; => T  (by-SN convenience; node-sample takes a (GUID . SN) key)
     (dds.disc:stop-node node1)
     (dds.disc:stop-node node2)))
 ```
@@ -363,7 +365,7 @@ receive. Adapted from `run-typed-dataplane-test` in `integration-test.lisp`.
 (dds.disc:publish-sample node1 (%serialize-shape (make-shape-type :color "BLUE"
                                                                   :x 100 :y 150 :shapesize 30)))
 (loop repeat 150 until (plusp (dds.disc:node-sample-count node2)) do (sleep 0.02))
-(let ((q (%deserialize-shape (dds.disc:node-sample node2 1))))
+(let ((q (%deserialize-shape (dds.disc:node-sample-by-sn node2 1))))
   (list (shape-type-color q) (shape-type-x q)))   ; => ("BLUE" 100)
 ```
 

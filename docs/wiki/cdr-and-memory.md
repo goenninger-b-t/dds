@@ -105,13 +105,13 @@ carved from it (NFR-MEM).
 | `dds.core.arena:teardown-arena` | Free every pool's static buffers and mark the arena uninitialized. |
 | `dds.core.arena:arena-initialized-p` | True while the arena is live (between `init-arena` and `teardown-arena`). |
 | `dds.core.arena:arena-report` | Plist of byte budget, bytes used, and per-pool reserved sizes / high-water, for startup logging (NFR-OBS). |
-| `dds.core.arena:make-buffer-pool` | `(arena element-bytes capacity)` — carve a fixed-capacity pool of `capacity` octet-buffers of `element-bytes` each, pre-allocated once. Signals `arena-exhausted` if the request exceeds the remaining budget. |
+| `dds.core.arena:make-buffer-pool` | `(arena element-bytes capacity)` — carve a fixed-capacity pool of `capacity` octet-buffers of `element-bytes` each, pre-allocated once. Returns `(values pool NIL)`, or `(values NIL :arena-exhausted)` when the carve does not fit the remaining budget — exhaustion is an ordinary expected **status**, not a condition (ADR 0064). Every caller must test it: the arena is stored only after the carve succeeds, so an unchecked `NIL` orphans it. |
 | `dds.core.arena:pool-acquire` | Pop a buffer from the pool. **Returns `NIL` on exhaustion** — the caller applies RESOURCE_LIMITS, never a GC-heap fallback. |
 | `dds.core.arena:pool-release` | Return a buffer to the pool. |
 | `dds.core.arena:pool-capacity` | Fixed number of buffers the pool was provisioned with. |
 | `dds.core.arena:pool-in-use` | Number of buffers currently checked out. |
 | `dds.core.arena:pool-high-water` | Peak in-use count seen for the pool (budget tracking). |
-| `dds.core.arena:arena-exhausted` | Condition raised at provisioning time when a pool would exceed the budget. |
+| `dds.core.arena:pool-release` (RX store copy) | The receive path draws each sample's store copy from a per-node pool (`dds.disc:*rx-store-pool-capacity*`, ADR 0078) whose element is an `octet-buffer` with `capacity` set to the exact payload extent — so the pooled buffer **is** its own bounds check and a recycled buffer can never be over-read into. See [Discovery](discovery.md). |
 
 ### Buffers & cursors (`dds.core.buffer`)
 
@@ -288,6 +288,25 @@ NameHash example: `MD5("color")[0:4]` = `70 dd a5 df`. (From `run-md5-test`.)
 
 ## Notes / status
 
+- **The raw-pointer rule is now ENFORCED, not just documented (ADR 0085).** NFR-MEM requires that anything
+  addressed by a raw pointer/SAP be foreign/static, never a GC-heap array — a moving collector can
+  invalidate a heap vector's address underneath a syscall, after which the kernel reads or writes whatever
+  now occupies it. `dds.pal:udp-send-to` and `dds.pal:udp-recv` used to state that requirement in prose
+  only; they now take the raw `sendto`/`recvfrom` path **only when `dds.pal:static-vector-p` holds** and
+  otherwise fall back to the GC-safe `sb-bsd-sockets` path — the same predicate `sap-copy-out` has always
+  used to choose memcpy vs element-wise. This was not hypothetical: the RFC 5424 UDP syslog sink was
+  handing each log line's freshly-consed UTF-8 octets straight through, and a test was handing `recvfrom`
+  a 2048-byte heap buffer to **write** into. Cost is one predicate per datagram; the hot dataplane passes
+  PAL-backed buffers and is unchanged. `dds.pal:static-pointer` remains raw and unchecked — callers that
+  may be handed either kind must test first.
+- **`dds.disc:*rx-store-pool-enabled*` is the RX store-copy pool's kill-switch (ADR 0085).** `T` by default;
+  `NIL` makes every copy-path receive allocate its store vector exactly as the pre-pool path did —
+  byte-identical delivery at the pre-pool allocation cost, and no pool is ever carved. Read per receive, so
+  it can be flipped at runtime without a rebuild. It exists because this pool's historical failure mode was
+  a *stability* defect: attributing a corruption to it requires a same-tree A/B with the pool as the only
+  variable, and an operator who hits one needs an off switch that is not a recompile. It does not disturb an
+  already-carved node's outstanding buffers — release and teardown stay correct, they just stop being
+  re-acquired.
 - **Byte-exact corpus is seeded, not complete.** The byte-exact vectors that ship today
   are *spec-sourced* (encapsulation IDs from XTypes 1.3 §7.6 Table 60, EMHEADER1 from
   §7.4.3.4.2, alignment/origin from RTPS 2.5 §10.2) and dissector-confirmed. The **full

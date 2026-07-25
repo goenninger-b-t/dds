@@ -380,14 +380,20 @@
    placeholder locator, a down interface) is DROPPED by the caller, never fatal, and the reliable layer
    recovers via HEARTBEAT/ACKNACK.
 
-   BUFFER MUST be PAL-static (DDS.PAL:ALLOC-STATIC). It is handed to the kernel by raw pointer, and
-   NFR-MEM is explicit that any buffer addressed by a pointer/SAP is foreign/static and never a plain
-   heap array — SBCL's and AllegroCL's GCs MOVE objects, so a heap vector's address can be invalidated
-   underneath a blocking syscall. The one production caller (DDS.XPORT.UDP:MAKE-UDP-TRANSPORT) passes an
-   octet-buffer vec, which is PAL-backed by construction.
+   BUFFER SHOULD be PAL-static (DDS.PAL:ALLOC-STATIC), and the raw path is now TAKEN ONLY IF IT IS —
+   the STATIC-VECTOR-P test above is the enforcement, not a comment. NFR-MEM is explicit that any buffer
+   addressed by a pointer/SAP is foreign/static and never a plain heap array: SBCL's and AllegroCL's GCs
+   MOVE objects, so a heap vector's SAP can be invalidated underneath the syscall and the kernel then
+   reads whatever now occupies that address — wrong bytes on the wire, and heap contents disclosed to a
+   remote peer. That was NOT hypothetical: DDS.LOG:MAKE-UDP-SYSLOG-SINK passed the freshly-consed UTF-8
+   octets of each syslog line straight through here (found by an audit of STATIC-POINTER's callers).
+   A heap BUFFER now takes the SOCKET-SEND path, which is GC-safe, instead. This mirrors SAP-COPY-OUT,
+   which has always chosen memcpy-vs-element-wise on exactly this predicate. The hot dataplane
+   (DDS.XPORT.UDP:MAKE-UDP-TRANSPORT) passes an octet-buffer vec, PAL-backed by construction, so it keeps
+   the raw path with no behaviour change; the cost is one predicate per datagram.
 
-   Set *UDP-RAW-SENDTO* to NIL to fall back to sb-bsd-sockets SOCKET-SEND; the wire bytes are identical."
-  (if *udp-raw-sendto*
+   Set *UDP-RAW-SENDTO* to NIL to force the sb-bsd-sockets SOCKET-SEND path; the wire bytes are identical."
+  (if (and *udp-raw-sendto* (static-vector-p buffer))   ; NFR-MEM: the raw path is taken ONLY for a genuinely static buffer — see below
       (flet ((send (sa)
                (%fill-sockaddr-in sa host port)
                (cffi:foreign-funcall-pointer
@@ -463,9 +469,13 @@
    On the *UDP-RAW-RECVFROM* NIL path a closed socket still SIGNALS (SOCKET-RECEIVE's behaviour), so
    STATUS is always NIL there and the caller's handler is what ends the loop.
 
-   BUFFER MUST be PAL-static (DDS.PAL:ALLOC-STATIC) on the raw path, for the same reason as
-   UDP-SEND-TO's: the kernel writes into it through a raw pointer (NFR-MEM)."
-  (if *udp-raw-recvfrom*
+   BUFFER SHOULD be PAL-static (DDS.PAL:ALLOC-STATIC), and the raw path is TAKEN ONLY IF IT IS — the
+   STATIC-VECTOR-P test above enforces it (see UDP-SEND-TO for the full rationale). This direction is the
+   DANGEROUS one: the kernel WRITES up to LENGTH octets through the raw pointer, so a GC-heap buffer whose
+   address the GC has since invalidated means recvfrom(2) scribbles a whole datagram over unrelated live
+   Lisp objects — heap corruption that surfaces later as a GC fault far from its cause. A heap BUFFER now
+   takes the GC-safe SOCKET-RECEIVE path instead (NFR-MEM)."
+  (if (and *udp-raw-recvfrom* (static-vector-p buffer))   ; NFR-MEM: the raw path is taken ONLY for a genuinely static buffer — see udp-send-to
       (let ((n (cffi:foreign-funcall-pointer
                 *recvfrom-fp* ()
                 :int (sb-bsd-sockets:socket-file-descriptor socket)

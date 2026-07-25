@@ -369,6 +369,26 @@ KEEP_ALL writer never evicts, so `gap-sns` is empty and no GAP is sent.
 
 ## Notes / status
 
+- **The reliable READER is shared by up to three receiver threads, and is locked (ADR 0085).**
+  `start-node` runs a unicast-UDP, a multicast-UDP and a SHMEM receiver, and all three feed
+  `%handle-datagram` — so `reader-on-data`, `reader-dedup-accept-p`, `reader-on-heartbeat`,
+  `reader-on-gap` and friends are entered concurrently for the *same* reader. Every reader entry
+  point therefore takes the reader's own lock, which guards the five tables it shares (`proxies`,
+  `dedup-map`, each proxy's `received` and `reassembly`, each `dedup-origin`'s `above`). One lock buys both
+  missing properties: no two threads are ever inside a table at once (two colliding `PUTHASH`es meeting an
+  internal rehash would otherwise publish a half-built vector that the collector walks — heap corruption),
+  and the *compound* operations become atomic — `get-writer-proxy` is a get-or-create,
+  `reader-dedup-accept-p` is a seen-test-then-mark, `reader-on-data` updates `last-sn` by
+  read-compare-write. Unlocked, those drop a WriterProxy together with every received-SN marker in it,
+  or accept the same `(GUID, SN)` twice — **double delivery**, breaking exactly-once (RTPS 2.5 §8.3.5.4).
+  The lock is a **leaf**: this layer cannot call back into the disc layer, so it never nests inside
+  another lock. `get-writer-proxy` takes it; `%get-writer-proxy` is the unlocked core the other entry
+  points use while already holding it. Earlier docstrings here asserted a "single receiver thread per
+  proxy" discipline — **that discipline never existed** once the second transport landed. Regression:
+  `reader-concurrent-receivers` (four threads, one reader, 500 shared SNs; seen red without the lock at
+  503/519/502 accepts for 500 SNs). Cost is +31 ns/sample; per-impl synchronized tables were measured as an
+  alternative and rejected at 4x the cost for no extra safety
+  (`bench/report/2026-07-24-reliable-reader-lock.md`).
 - **Connext interop is pending a Connext install.** Correctness here is established by
   byte-exact tests against the RTPS 2.5 spec clauses (e.g. the §9.4.5.4 DATA byte image and
   the §9.4.2.6 SequenceNumberSet bytes in `rtps-test.lisp`) and by an offline UDP-loopback

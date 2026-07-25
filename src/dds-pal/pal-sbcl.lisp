@@ -57,7 +57,13 @@
 
 (defun* static-pointer (vec)
     (function ((simple-array (unsigned-byte 8) (*))) t)
-  "Return the raw foreign pointer (SBCL system-area-pointer) to VEC for syscalls."
+  "Return the raw foreign pointer (SBCL system-area-pointer) to VEC for syscalls.
+
+   VEC MUST be ALLOC-STATIC-backed. For a GC-HEAP vector this returns a DYNAMIC-SPACE address that a
+   moving GC can invalidate at any moment, so whatever writes through it (a syscall, libcrypto) can end up
+   scribbling over unrelated live Lisp objects — heap corruption that surfaces later as a GC fault far from
+   its cause. Callers that can be handed either kind must test STATIC-VECTOR-P first and take a GC-safe
+   path otherwise; UDP-SEND-TO / UDP-RECV and SAP-COPY-IN / SAP-COPY-OUT all do (NFR-MEM)."
   (static-vectors:static-vector-pointer vec))
 
 (defun* static-length (vec)

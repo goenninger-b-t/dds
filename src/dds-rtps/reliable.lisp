@@ -599,12 +599,17 @@
    layer sets the flag from durability (%reader-durability-init: T for a VOLATILE reader matched a retaining
    writer); the reliable engine here is policy-agnostic and just applies it. DURABILITY-APPLIED-P latches the
    one-shot application so a later HEARTBEAT never re-skips live samples."
+  ;; ⚠️ EVERY TABLE ON THIS STRUCT IS GUARDED BY THE OWNING RTPS-READER'S LOCK (ADR 0085) and MUST NOT be
+  ;; mutated off-lock. A node runs up to THREE receiver threads — unicast UDP, multicast UDP, SHMEM — that
+  ;; all feed %handle-datagram, so two colliding PUTHASHes meeting an internal rehash would publish a
+  ;; half-built vector that the collector then walks as a live object: heap corruption, not a lost entry.
+  ;; The accessors are exported for single-threaded tests and read-only inspection, NOT for off-lock writes.
   (received (make-hash-table :test 'eql) :type hash-table)   ; SN -> T (received) | :gap (presence only)
   (first-sn 1 :type integer)
   (last-sn 0 :type integer)                ; available range from HEARTBEAT
   (skip-history nil :type boolean)         ; durability gate: VOLATILE skips pre-match history (DDS §2.2.3.4)
   (durability-applied-p nil :type boolean) ; latch: the skip is applied once, on the first HEARTBEAT
-  (reassembly (make-hash-table :test 'eql) :type hash-table)   ; SN -> frag-reassembly
+  (reassembly (make-hash-table :test 'eql) :type hash-table)   ; SN -> frag-reassembly; same reader-lock rule as RECEIVED
   (acknack-bitmap (make-array (ceiling dds.rtps.message:+seqnum-set-max-bits+ 32)
                               :element-type '(unsigned-byte 32) :initial-element 0)
                   :type (simple-array (unsigned-byte 32) (*)))) ; reusable ACKNACK NACK-bitmap scratch (256-bit cap = 8 words, RTPS 2.5 §9.4.2.6), opt-in via reader-acknack REUSE-BITMAP on the lock-free user path — single-mutator, same receiver-thread discipline as RECEIVED (NFR-MEM)
@@ -613,11 +618,28 @@
   "Per-original-GUID dedup state: contiguous low-watermark LO + bounded out-of-order set ABOVE.
    In-order traffic keeps ABOVE EMPTY (LO just advances), O(1)/GUID. NFR-MEM. RTPS 2.5 §8.3.5.4."
   (lo 0 :type integer)
-  (above (make-hash-table :test 'eql) :type hash-table))
+  (above (make-hash-table :test 'eql) :type hash-table))   ; mutated from the receiver threads via reader-dedup-accept-p, under the READER LOCK (ADR 0085)
 
 (defstruct* (rtps-reader (:constructor make-rtps-reader))
   "Stateful reliable RTPS reader (RTPS 2.5 §8.4.10): an opaque-writer-key -> WriterProxy table
    plus an original-GUID dedup map for relay-forwarded samples (§8.3.5.4)."
+  ;; THE READER LOCK (ADR 0085). The "single receiver thread per proxy" discipline the reader-side
+  ;; docstrings used to assume DOES NOT HOLD: a node runs up to THREE receiver threads (unicast UDP,
+  ;; multicast UDP, SHMEM) that all feed %handle-datagram and land here. Every reader entry point below
+  ;; takes this lock, which buys both properties that were missing:
+  ;;   - MEMORY safety. These are plain hash tables; two colliding PUTHASHes meeting an internal rehash
+  ;;     publish a half-built vector that the collector then walks as a live object (heap corruption).
+  ;;   - ATOMICITY of the compound read-modify-writes, which a merely thread-safe table cannot give:
+  ;;     (or (gethash k) (setf (gethash k) ...)) in get-writer-proxy, the seen-then-mark in
+  ;;     reader-dedup-accept-p, the (when (> sn last-sn) (setf last-sn sn)) in reader-on-data. Interleaved,
+  ;;     those lose a proxy (its received-SN markers vanish -> spurious NACKs), lose a dedup-origin, or
+  ;;     accept the same (GUID,SN) twice -> DOUBLE DELIVERY, breaking exactly-once (RTPS 2.5 §8.3.5.4).
+  ;; Per-impl synchronized tables were measured as an alternative for the first property and REJECTED: with
+  ;; every entry point already locked they add a redundant inner lock per operation and cost 4x more
+  ;; (+150 ns/sample vs +31 ns/sample; bench/report/2026-07-24-reliable-reader-lock.md).
+  ;; The lock is a LEAF: this layer (L4) cannot call back into the disc layer, so it can never nest inside
+  ;; another of our locks and has no ordering hazard. Entry points take it; the %-prefixed cores assume it.
+  (lock (dds.pal:make-lock "rtps-reader") :type t)
   (proxies  (make-hash-table :test 'equalp) :type hash-table)   ; writer key (opaque, equalp) -> writer-proxy
   (dedup-map (make-hash-table :test 'equalp) :type hash-table)) ; original-GUID[16] -> dedup-origin
 
@@ -628,8 +650,18 @@
    HEARTBEAT). Does NOT create one, so it is a pure test. Lets the disc layer detect the ADR 0043 residual
    window — a HEARTBEAT for a writer that is already MATCHED but whose baseline is not yet armed — instead of
    silently lazily-creating a proxy with skip-history NIL and pulling a retaining writer's pre-match history
-   into a VOLATILE reader (ADR 0059)."
-  (and (nth-value 1 (gethash writer-id (rtps-reader-proxies reader))) t))
+   into a VOLATILE reader (ADR 0059). Takes the reader lock (a receiver thread may be creating a proxy)."
+  (dds.pal:with-lock ((rtps-reader-lock reader))
+    (and (nth-value 1 (gethash writer-id (rtps-reader-proxies reader))) t)))
+
+(defun* %get-writer-proxy (reader writer-id)
+    (function (rtps-reader t) writer-proxy)
+  "GET-WRITER-PROXY's body. CALLER HOLDS THE READER LOCK — which is what makes the get-or-create ATOMIC.
+   Unlocked, two receiver threads racing the same new writer both miss, both construct, and both SETF: one
+   proxy is silently dropped along with every received-SN marker recorded into it, so the reader NACKs
+   samples it already holds (RTPS 2.5 §8.3.5.4)."
+  (or (gethash writer-id (rtps-reader-proxies reader))
+      (setf (gethash writer-id (rtps-reader-proxies reader)) (make-writer-proxy))))
 
 (defun* get-writer-proxy (reader writer-id)
     (function (rtps-reader t) writer-proxy)
@@ -637,9 +669,11 @@
    first use. The key is treated only as an equalp hash key (the disc layer passes the remote writer's
    full 16-octet GUID; the value-level tests pass an integer): a SequenceNumber is unique only within
    one writer GUID (RTPS 2.5 §8.3.5.4), so two writers sharing EntityId 0x102 on different participants
-   get independent received-SN sets / HEARTBEAT ranges / ACKNACK / GAP / reassembly state."
-  (or (gethash writer-id (rtps-reader-proxies reader))
-      (setf (gethash writer-id (rtps-reader-proxies reader)) (make-writer-proxy))))
+   get independent received-SN sets / HEARTBEAT ranges / ACKNACK / GAP / reassembly state.
+
+   Takes the reader lock. The other reader entry points already hold it and call %GET-WRITER-PROXY."
+  (dds.pal:with-lock ((rtps-reader-lock reader))
+    (%get-writer-proxy reader writer-id)))
 
 (defun* reader-dedup-accept-p (reader original-guid original-sn)
     (function (rtps-reader (or null (simple-array (unsigned-byte 8) (16))) (or null integer)) boolean)
@@ -652,10 +686,16 @@
    keeps ABOVE EMPTY — LO just advances, O(1)/GUID (NFR-MEM). At the *max-gap-range* cap, the
    HIGHEST entry in ABOVE is shed (never LO is advanced past an un-arrived SN) — the only residual
    is a benign duplicate if that high out-of-order SN re-arrives; silent loss cannot occur.
-   INERT when ORIGINAL-GUID is nil."
+   INERT when ORIGINAL-GUID is nil.
+
+   TAKES THE READER LOCK, and the whole seen-test-then-mark must be inside it: this is a check-then-act, so
+   two receiver threads handed the SAME (GUID,SN) — which happens whenever a writer reaches us over two
+   transports — can both find it unseen and both return T, delivering the sample TWICE and breaking the
+   exactly-once guarantee this function exists to provide (§8.3.5.4)."
   (if (null original-guid)
       t                                                   ; no PID -> normal path, always accept
-      (let* ((outer (rtps-reader-dedup-map reader))
+      (dds.pal:with-lock ((rtps-reader-lock reader))
+       (let* ((outer (rtps-reader-dedup-map reader))
              (origin (or (gethash original-guid outer)
                          (let ((o (%make-dedup-origin)))
                            (setf (gethash original-guid outer) o)
@@ -676,19 +716,24 @@
            (loop while (gethash (1+ (dedup-origin-lo origin)) above)
                  do (remhash (1+ (dedup-origin-lo origin)) above)
                     (incf (dedup-origin-lo origin)))
-           t)))))
+           t))))))
 
 (defun* reader-on-data (reader writer-id sn payload)
     (function (rtps-reader t integer (array (unsigned-byte 8) (*))) t)
   "Accept a DATA. Idempotent (duplicate SN re-marks — dedup); tracks the highest SN seen. Records only a
    PRESENCE marker (T), not PAYLOAD — the application is delivered the sample from the wire, and the engine
    only needs SN presence for ACKNACK/complete/gap, so no per-sample payload is retained (the PAYLOAD
-   argument is kept for the call contract but not stored)."
+   argument is kept for the call contract but not stored).
+
+   TAKES THE READER LOCK: the LAST-SN update is a read-compare-write that two receiver threads can
+   interleave into a lost update (the highest SN seen goes backwards), and the get-or-create it rides on
+   must be atomic (see %GET-WRITER-PROXY)."
   (declare (ignore payload))
-  (let ((proxy (get-writer-proxy reader writer-id)))
-    (setf (gethash sn (writer-proxy-received proxy)) t)
-    (when (> sn (writer-proxy-last-sn proxy)) (setf (writer-proxy-last-sn proxy) sn))
-    t))
+  (dds.pal:with-lock ((rtps-reader-lock reader))
+    (let ((proxy (%get-writer-proxy reader writer-id)))
+      (setf (gethash sn (writer-proxy-received proxy)) t)
+      (when (> sn (writer-proxy-last-sn proxy)) (setf (writer-proxy-last-sn proxy) sn))
+      t)))
 
 (defun* reader-on-heartbeat (reader writer-id first-sn last-sn)
     (function (rtps-reader t integer integer) t)
@@ -704,8 +749,10 @@
    advertised pre-match history (it then NACKs only future gaps). The skip is LATCHED (durability-applied-p)
    so it applies exactly once — a later HEARTBEAT (the writer published new samples) never re-skips them.
    With SKIP-HISTORY NIL (the default) this is byte-identical to before: the reader keeps firstSN and
-   requests the full advertised range."
-  (let* ((proxy (get-writer-proxy reader writer-id))
+   requests the full advertised range. Takes the reader lock (the one-shot latch + the firstSN/lastSN
+   advance + the RECEIVED compaction must be one atomic step against a concurrent receiver thread)."
+  (dds.pal:with-lock ((rtps-reader-lock reader))
+   (let* ((proxy (%get-writer-proxy reader writer-id))
          (skip-floor (if (and (writer-proxy-skip-history proxy)
                               (not (writer-proxy-durability-applied-p proxy)))
                          (1+ last-sn)                      ; VOLATILE: skip the pre-match history
@@ -718,7 +765,7 @@
       (let ((received (writer-proxy-received proxy)) (drop '()))
         (maphash (lambda (sn v) (declare (ignore v)) (when (< sn new-first) (push sn drop))) received)
         (dolist (sn drop) (remhash sn received))))
-    t))
+    t)))
 
 (defun* init-writer-proxy-durability (reader writer-id skip-history)
     (function (rtps-reader t boolean) writer-proxy)
@@ -730,11 +777,12 @@
    (reader-on-heartbeat advances firstSN to lastSN+1, NACKing only future gaps); SKIP-HISTORY NIL leaves the
    default full-range request (byte-identical to before this WP). Resets the one-shot latch so a re-match
    re-arms the decision. The proxy is keyed by the writer's GUID (each matched writer's gate is independent,
-   §8.3.5.4)."
-  (let ((proxy (get-writer-proxy reader writer-id)))
-    (setf (writer-proxy-skip-history proxy) skip-history)
-    (setf (writer-proxy-durability-applied-p proxy) nil)   ; re-arm on (re)match
-    proxy))
+   §8.3.5.4). Takes the reader lock."
+  (dds.pal:with-lock ((rtps-reader-lock reader))
+    (let ((proxy (%get-writer-proxy reader writer-id)))
+      (setf (writer-proxy-skip-history proxy) skip-history)
+      (setf (writer-proxy-durability-applied-p proxy) nil)   ; re-arm on (re)match
+      proxy)))
 
 (defun* reader-acknack (reader writer-id &optional reuse-bitmap)
     (function (rtps-reader t &optional t) (values integer (unsigned-byte 32) (simple-array (unsigned-byte 32) (*))))
@@ -749,8 +797,14 @@
    lock-free user HEARTBEAT path (%on-user-heartbeat) does exactly that under the
    single-receiver-thread-per-proxy discipline (the same that lets RECEIVED be a
    lock-free hash). write-sequence-number-set reads exactly ceil(numBits/32) words,
-   so the reused scratch's tail is never serialized."
-  (let* ((proxy (get-writer-proxy reader writer-id))
+   so the reused scratch's tail is never serialized.
+
+   TAKES THE READER LOCK. The single-receiver-thread-per-proxy discipline the paragraph above appeals to
+   DOES NOT HOLD — a node runs up to three receiver threads — so the RECEIVED scan that builds BASE and the
+   bitmap has to be atomic against a concurrent reader-on-data/on-gap or the ACKNACK reports a range that
+   was never simultaneously true."
+  (dds.pal:with-lock ((rtps-reader-lock reader))
+   (let* ((proxy (%get-writer-proxy reader writer-id))
          (first (writer-proxy-first-sn proxy))
          (last (writer-proxy-last-sn proxy))
          (received (writer-proxy-received proxy))
@@ -767,7 +821,7 @@
     (loop for sn from base below (+ base numbits)
           unless (gethash sn received)
             do (dds.rtps.message:seqnum-set-bit bitmap (- sn base)))
-    (values base numbits bitmap)))
+    (values base numbits bitmap))))
 
 (defun* reader-on-gap (reader writer-id gap-start base numbits bitmap)
     (function (rtps-reader t integer integer (unsigned-byte 32) (simple-array (unsigned-byte 32) (*)))
@@ -788,8 +842,11 @@
    re-counted. Because this engine content-filters READER-SIDE (never emits writer-side filter GAPs), every
    inbound GAP is a genuine purge/eviction, so the count is exact; the lower-clamp to first-sn keeps a
    durability-skipped pre-match range (which is intentionally not-wanted, not lost) out of the tally. The
-   disc layer (%on-user-gap) fires SAMPLE_LOST with this count via the on-sample-lost hook."
-  (let* ((proxy (get-writer-proxy reader writer-id))
+   disc layer (%on-user-gap) fires SAMPLE_LOST with this count via the on-sample-lost hook.
+   Takes the reader lock: the read-then-mark in %MARK-GAP is a check-then-act, so a concurrent
+   reader-on-data could otherwise have its T marker clobbered to :gap and the loss double-counted."
+  (dds.pal:with-lock ((rtps-reader-lock reader))
+   (let* ((proxy (%get-writer-proxy reader writer-id))
          (received (writer-proxy-received proxy))
          (lo (max gap-start (writer-proxy-first-sn proxy)))         ; don't mark below the proxy window
          (hi (min base (+ lo *max-gap-range*)))                     ; HARD cap — independent of wire last-sn
@@ -803,7 +860,7 @@
       (dotimes (i numbits)                                          ; bitmap is already bounded (numBits<=256)
         (when (dds.rtps.message:seqnum-set-bit-p bitmap i)
           (%mark-gap (+ base i)))))
-    lost))
+    lost)))
 
 (defun* reader-suppress-sn (reader writer-id sn)
     (function (rtps-reader t integer) t)
@@ -815,18 +872,21 @@
    limitation 1). It NEVER runs while the key material is still absent (the key-exchange race must keep
    self-healing). Marks the ONE named SN and does NOT touch last-sn, so a genuinely-missing LOWER SN still NACKs
    (no head-of-line suppression) and a forged high SN cannot inflate the ACKNACK range. Receiver-thread-only, the
-   same single-mutator discipline as reader-on-data. Idempotent (a re-mark is a no-op)."
-  (let ((proxy (get-writer-proxy reader writer-id)))
-    (setf (gethash sn (writer-proxy-received proxy)) :gap)
-    t))
+   same locking discipline as reader-on-data (the reader lock). Idempotent (a re-mark is a no-op)."
+  (dds.pal:with-lock ((rtps-reader-lock reader))
+    (let ((proxy (%get-writer-proxy reader writer-id)))
+      (setf (gethash sn (writer-proxy-received proxy)) :gap)
+      t)))
 
 (defun* reader-complete-p (reader writer-id)
     (function (rtps-reader t) t)
-  "T iff every SN in the available range [first, last] has been received or GAPped."
-  (let* ((proxy (get-writer-proxy reader writer-id))
-         (received (writer-proxy-received proxy)))
-    (loop for sn from (writer-proxy-first-sn proxy) to (writer-proxy-last-sn proxy)
-          always (gethash sn received))))
+  "T iff every SN in the available range [first, last] has been received or GAPped. Takes the reader lock
+   so the range and the scan over it are one consistent snapshot."
+  (dds.pal:with-lock ((rtps-reader-lock reader))
+    (let* ((proxy (%get-writer-proxy reader writer-id))
+           (received (writer-proxy-received proxy)))
+      (loop for sn from (writer-proxy-first-sn proxy) to (writer-proxy-last-sn proxy)
+            always (gethash sn received)))))
 
 (defun* reader-on-data-frag (reader writer-id sn fragment-starting-num fragments-in-submsg
                                     fragment-size sample-size payload)
@@ -847,7 +907,8 @@
     (when (or (< fragment-starting-num 1) (zerop fragments-in-submsg)
               (> (+ fragment-starting-num fragments-in-submsg -1) total))
       (return-from reader-on-data-frag nil))
-    (let* ((proxy (get-writer-proxy reader writer-id))
+    (dds.pal:with-lock ((rtps-reader-lock reader))   ; the get-or-create of ENTRY and the fragment-count update are check-then-act; two receiver threads would build two reassembly buffers and lose fragments into the dropped one
+     (let* ((proxy (%get-writer-proxy reader writer-id))
            (table (writer-proxy-reassembly proxy))
            (entry (or (gethash sn table)
                       (setf (gethash sn table)
@@ -874,15 +935,18 @@
                 (incf (frag-reassembly-received-count entry))))))
         (when (= (frag-reassembly-received-count entry) total)
           (remhash sn table)
-          buf)))))
+          buf))))))
 
 (defun* reader-frag-acknack (reader writer-id sn)
     (function (rtps-reader t integer) t)
   "Compute a NACK_FRAG fragment set for the in-progress reassembly of (WRITER-ID, SN):
    (values base numBits bitmap) naming the 1-based fragment numbers NOT yet received, or
    NIL if there is no such reassembly (unknown or already complete). The window
-   [base, base+numBits) is capped at 256 fragments per NACK_FRAG (§9.4.2.8). RTPS 2.5 §8.3.7.2."
-  (let* ((proxy (get-writer-proxy reader writer-id))
+   [base, base+numBits) is capped at 256 fragments per NACK_FRAG (§9.4.2.8). RTPS 2.5 §8.3.7.2.
+   Takes the reader lock so the RECEIVED bitset is a consistent snapshot against a concurrent
+   reader-on-data-frag (otherwise the NACK can name fragments that arrived while it was being built)."
+  (dds.pal:with-lock ((rtps-reader-lock reader))
+   (let* ((proxy (%get-writer-proxy reader writer-id))
          (entry (gethash sn (writer-proxy-reassembly proxy))))
     (when (null entry) (return-from reader-frag-acknack nil))
     (let* ((rcv (frag-reassembly-received entry))
@@ -899,7 +963,7 @@
         (loop for f from base below (+ base numbits)
               when (zerop (sbit rcv (1- f)))
                 do (dds.rtps.message:fragnum-set-bit bitmap (- f base)))
-        (values base numbits bitmap)))))
+        (values base numbits bitmap))))))
 
 ;;; ---- Writer-side fragmentation planners (RTPS 2.5 §8.3.8.3) ----
 

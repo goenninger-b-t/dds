@@ -30,7 +30,11 @@
   ;; ---- (b) make-udp-syslog-sink SENDS the datagram (loopback receiver thread) ----
   (let* ((rx (dds.pal:udp-open :port 0))
          (port (dds.pal:udp-local-port rx))
-         (buf (make-array 2048 :element-type '(unsigned-byte 8)))
+         ;; PAL-STATIC, not a GC-heap array (NFR-MEM): udp-recv hands the kernel a raw pointer, so a heap
+         ;; buffer the GC may relocate means recvfrom(2) writes a datagram over unrelated live objects.
+         ;; udp-recv now REFUSES the raw path for a non-static buffer, so a heap array here would silently
+         ;; stop exercising the production recvfrom path as well as being wrong.
+         (buf (dds.pal:alloc-static 2048))
          (got nil)
          (thread (dds.pal:spawn
                   (lambda ()
@@ -51,7 +55,8 @@
                    (format nil "the sink must send the exact RFC 5424 UTF-8 datagram; got ~a bytes"
                            (and got (length got)))))
       (dds.pal:udp-close rx)   ; unblocks a still-waiting recv (status :closed) so the thread exits
-      (dds.pal:join thread)))
+      (dds.pal:join thread)
+      (dds.pal:free-static buf)))   ; after the join — the receiver thread is the only other user
   t)
 
 (defun* run-log-http-test ()
