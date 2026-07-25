@@ -301,6 +301,41 @@ if [[ "$have_connext" -eq 1 && -x interop/security-connext/hello_secure_pub ]]; 
   fi
 fi
 
+# ---- Leg 25: LIVELINESS — a matched Connext writer must COUNT as alive. ----
+# This leg is why the bug it guards was found. LIVELINESS_CHANGED.alive_count was NEVER established
+# when a reader matched a live writer: the discovery sweep fires only on a TRANSITION and already
+# ASSUMES a freshly matched writer is alive, so nothing ever told the DCPS status, the count sat at 0
+# while samples streamed in, and a later not-alive had nothing to decrement. Fixed by recording ALIVE
+# at match (and dropping it at unmatch); this leg is the regression guard, and it FAILS on the old code.
+#
+# ASSERTS BOTH HALVES: samples prove the match was real, peak-alive>=1 proves the status was set.
+# A reader that receives data while reporting zero live writers is the exact defect.
+#
+# NOT asserted here, and deliberately: the ALIVE -> NOT_ALIVE transition against Connext. Our peer
+# stops asserting and our own writer's lease expiry IS observed (ours<->ours goes 1 -> 0 with
+# not_alive=1), but against Connext the writer stays alive past its offered lease — a separate open
+# question about which assertion kinds %matched-writer-alive-p accepts for a MANUAL_BY_TOPIC writer
+# (RTPS 2.5 §8.4.13 matches on KIND). Asserting it here would gate an unresolved question.
+if [[ "$have_connext" -eq 1 && -x interop/connext/liveliness-peer/liveliness_pub ]]; then
+  export NDDSHOME
+  export DYLD_LIBRARY_PATH="$NDDSHOME/lib/arm64Darwin20clang12.0:$PWD/interop/connext/liveliness-peer:${DYLD_LIBRARY_PATH:-}"
+  LVDOM=$((DOMAIN + 26)); LVPEER="127.0.0.1:$((7400 + 250 * LVDOM + 10))"
+  log="$(mktemp)"
+  g="$(start_peer "$log" bash -c "cd interop/connext/liveliness-peer && exec ./liveliness_pub $LVDOM 2000 8 $((SECONDS_RUN + 12))")"
+  sleep 3
+  tmout $((SECONDS_RUN + 30)) ./scripts/with-sbcl.sh \
+    --eval "(asdf:load-system :dds-shapes)" \
+    --eval "(uiop:symbol-call :dds.shapes :run-liveliness-subscriber :domain $LVDOM :lease-seconds 5 :advertise-address \"127.0.0.1\" :peers \"$LVPEER\" :seconds $((SECONDS_RUN + 6)))" \
+    --eval '(uiop:quit 0)' > "$log.ours" 2>&1
+  stop_peer "$g"
+  n="$(grep -oE 'samples=[0-9]+' "$log.ours" | tail -1 | grep -oE '[0-9]+' || echo 0)"
+  peak="$(grep -oE 'peak-alive=[0-9]+' "$log.ours" | tail -1 | grep -oE '[0-9]+' || echo 0)"
+  if [[ "$n" -ge 3 && "$peak" -ge 1 ]]; then
+    note "ok" "Connext LIVELINESS -> us: $n sample(s), alive_count reached $peak (0 before the match-time fix)"
+  else
+    note "FAIL" "Connext LIVELINESS -> us: samples=$n peak-alive=$peak (need >=3 and >=1) (log: $log.ours)"; fails=1; fi
+fi
+
 # ---- Leg 24: TRANSIENT_LOCAL DURABILITY — a LATE JOINER must be replayed the history. ----
 # THE ORDERING IS THE TEST. Every other leg in this gate starts the reader first, so a writer with no
 # history at all would pass them. Here the Connext writer publishes its whole batch BEFORE our reader
@@ -677,8 +712,10 @@ echo "              reason worth stating: BOTH vendors send @mutable as PL_CDR (
 echo "              the parameter-list framing only — the PL_CDR2 (XCDR2) framing has NO live peer behind"
 echo "              it from either vendor, so its length-code choice stays externally unpinned."
 echo "              NO_KEY is gated BOTH directions vs Connext. Per-feature legs still NOT gated:"
-echo "              liveliness — a peer must be written (RTI participant liveliness is proprietary"
-echo "              NDDSPING, not standard ParticipantMessageData); writer-liveliness is next."
+echo "              LIVELINESS alive_count is gated (leg 25); the ALIVE -> NOT_ALIVE transition against"
+echo "              Connext is NOT — our peer stops asserting and ours<->ours observes the expiry, but"
+echo "              Connext stays alive past its offered lease (open: which assertion KINDS"
+echo "              %matched-writer-alive-p accepts for MANUAL_BY_TOPIC, RTPS 2.5 §8.4.13)."
 echo "              under scripts/ and interop/, but nothing runs them. (enum TK_ENUM and string8-LARGE"
 echo "              are legs 15/16; keyed FlatData 17/18; TypeLookup CLIENT 19 — the TypeLookup"
 echo "              SERVER side is still ungated: a stock Fast DDS client needs a non-stock patch"

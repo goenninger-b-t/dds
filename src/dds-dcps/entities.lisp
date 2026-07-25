@@ -3110,6 +3110,17 @@
       (:remote-writer (let ((dr (if local-eid (%participant-reader-by-entity-id p local-eid)
                                     (%participant-reader-for-topic p tname))))
                         (when dr (%reader-matched dr handle)
+                              ;; A freshly matched writer is ALIVE, and the DCPS status has to be told
+                              ;; so. The discovery sweep already ASSUMES it — %liveliness-sweep defaults
+                              ;; a writer with no LIVELINESS-STATE entry to alive and fires only on a
+                              ;; TRANSITION — so without this the count is never established: it starts
+                              ;; at 0, no alive transition ever occurs to raise it, and a later
+                              ;; not-alive has nothing to decrement. DDS 1.4 §2.2.4.1 defines
+                              ;; alive_count as the number of currently ALIVE matched writers, so 0
+                              ;; while receiving that writer's samples is simply wrong. Symmetric with
+                              ;; the sweep's own "a freshly matched writer starts ALIVE" assumption, so
+                              ;; the two cannot disagree, and %reader-unmatched drops it again below.
+                              (%reader-liveliness-changed dr handle t)
                               ;; durability-aware late-joiner gate (DDS 1.4 §2.2.3.4): a TL reader matched
                               ;; a retaining writer REQUESTS its history; a VOLATILE reader matched a
                               ;; RETAINING writer SKIPS it; a VOLATILE writer retains nothing so its match
@@ -3155,6 +3166,13 @@
       (:remote-writer (let ((dr (if local-eid (%participant-reader-by-entity-id p local-eid)
                                     (%participant-reader-for-topic p tname))))
                         (when dr (%reader-unmatched dr handle)
+                              ;; The symmetric half of the match-time ALIVE above: a writer that goes
+                              ;; away stops being an ALIVE matched writer, so alive_count must drop
+                              ;; with it. Without this the count only ever climbs and a participant
+                              ;; that churns endpoints reports more live writers than exist.
+                              ;; %reader-liveliness-changed floors at 0, so an unmatch of a writer the
+                              ;; sweep had already marked not-alive cannot drive it negative.
+                              (%reader-liveliness-changed dr handle nil)
                               (%clear-owner-on-vanish dr handle)   ; EXCLUSIVE owner loss -> takeover (S1)
                               (%on-writer-vanished dr (%guid-entityid handle)))))
       (:remote-reader (let ((dw (if local-eid (%participant-writer-by-entity-id p local-eid)
