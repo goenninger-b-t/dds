@@ -1263,9 +1263,11 @@
       passed)))
 
 (defun* run-nokey-publisher (&key (domain 0) (rate 5) (count 0)
-                                  (advertise-address "127.0.0.1") (peers nil))
+                                  (advertise-address "127.0.0.1") (peers nil)
+                                  (data-representation :xcdr2))
     (function (&key (:domain (integer 0)) (:rate (integer 1)) (:count (integer 0))
-                    (:advertise-address string) (:peers (or null string))) t)
+                    (:advertise-address string) (:peers (or null string))
+                    (:data-representation symbol)) t)
   "Publish NoKeyData (a,b) on topic 'NoKeyTopic' / type 'nokey-data' via the DCPS
    path, so the topic type's keyed-ness (NIL) selects the NO_KEY writer kind 0x03
    (RTPS 2.5 §9.3.1.2). Proves the live no-key OUT direction against a Connext
@@ -1280,8 +1282,10 @@
     (unless ts (error "run-nokey-publisher: no registered type-support \"nokey-data\""))
     (let* ((tp (dds.dcps:create-topic p "NoKeyTopic" "nokey-data" ts))
            (pub (dds.dcps:create-publisher p))
-           (dw (dds.dcps:create-datawriter pub tp
-                                           :qos (dds.qos:make-writer-qos :reliability :reliable))))
+           (dw (dds.dcps:create-datawriter
+                pub tp :qos (dds.qos:make-writer-qos
+                             :reliability :reliable
+                             :data-representation (list data-representation)))))
       (format t "~&[nokey-pub] NoKeyTopic/nokey-data domain=~d (NO_KEY writer 0x03, multicast 239.255.0.1). Ctrl-C to stop.~%"
               domain)
       (let ((period (/ 1.0 rate)) (n 0))
@@ -1306,7 +1310,15 @@
    writer. SECONDS 0 = forever (Ctrl-C). PEERS is an optional \"host:port[,host:port]\"
    list of unicast SPDP announce targets (FR-DISC-4) on top of multicast — e.g.
    \"127.0.0.1:7410\" reaches a same-host peer over loopback when the macOS application
-   firewall silently drops LAN-sourced UDP for an unapproved peer binary."
+   firewall silently drops LAN-sourced UDP for an unapproved peer binary.
+
+   DATA-REPRESENTATION is the OFFERED representation and defaults to :XCDR2 (this stack's default,
+   FR-CDR-4). Pass :XCDR1 for a stock foreign peer: a Connext DataReader generated from a plain IDL
+   advertises XCDR1 ONLY, and DATA_REPRESENTATION is an RxO policy, so an XCDR2 writer SILENTLY does
+   not match it — matched=0, no error, no INCONSISTENT_TOPIC. That is what made the us->Connext NO_KEY
+   leg look like a NO_KEY defect when it was nothing of the kind: the reader was discovered correctly
+   (topic, type, and entity kind 0x04 all right) and endpoint-match-p rejected it on
+   (:DATA-REPRESENTATION) alone."
   (let* ((ts (dds.types:find-type-support "nokey-data"))
          (p (dds.dcps:create-participant :domain domain :advertise-address advertise-address
                                          :peers (%parse-peers peers))))

@@ -314,19 +314,25 @@ if [[ "$have_connext" -eq 1 && -x interop/connext/nokey/nokey_sub && -x interop/
   # on, while the inbound leg happened to work; covering indices 0-3 removes that ordering dependence.
   NKBASE=$((7400 + 250 * DOMAIN + 10))
   NKPEER="127.0.0.1:$NKBASE,127.0.0.1:$((NKBASE + 2)),127.0.0.1:$((NKBASE + 4)),127.0.0.1:$((NKBASE + 6))"
-  # Leg 11 (us -> Connext, NO_KEY) is NOT GATED — it does not currently pass, and saying so here is
-  # the point. Our NO_KEY writer reports matched=0 against Connext's NO_KEY reader, while the REVERSE
-  # direction below passes on the identical setup. Ruled out: the @loader_path dylib problem (fixed in
-  # common.mk), the unicast SPDP peer list (the passing leg uses the same), the macOS application
-  # firewall (nokey_sub is registered "Allow incoming connections"), and domain contention (reproduced
-  # standalone on a clean dedicated domain). The archived proof run in
-  # interop/connext/nokey/captures/nokey-rev-loopback-ourpub.out shows this direction PASSING
-  # (matched=1, 160 samples), so a REGRESSION is the leading hypothesis and it is NOT diagnosed.
-  # Reproduce with:
-  #   cd interop/connext/nokey && ./nokey_sub 105 24        # terminal 1
-  #   run-nokey-publisher :domain 105 :advertise-address "127.0.0.1" :peers "127.0.0.1:33660"
-  # Gating a leg that fails would make this gate permanently red and therefore ignored — the trap
-  # `make mem` fell into — so it is recorded as an open item instead of asserted.
+  # Leg 11: us -> Connext, NO_KEY. REP=xcdr1 is REQUIRED, not tuning — see below.
+  #
+  # THIS LEG LOOKED LIKE A NO_KEY DEFECT AND WAS NOT ONE. It reported matched=0, and NO_KEY was a red
+  # herring: the remote reader was discovered perfectly (topic, type, and entity kind 0x04 all correct)
+  # and endpoint-match-p rejected it on (:DATA-REPRESENTATION) alone. A stock Connext DataReader
+  # generated from a plain IDL advertises XCDR1 ONLY; DATA_REPRESENTATION is an RxO policy; our
+  # XCDR2-default writer therefore silently does not match — matched=0, no error, no INCONSISTENT_TOPIC.
+  # Exactly the trap the Shapes leg documents, which run-nokey-publisher had no parameter to avoid.
+  log="$(mktemp)"
+  g="$(start_peer "$log" bash -c "cd interop/connext/nokey && exec ./nokey_sub $DOMAIN $((SECONDS_RUN + 8))")"
+  sleep 4
+  tmout $((SECONDS_RUN + 25)) ./scripts/with-sbcl.sh \
+    --eval "(asdf:load-system :dds-shapes)" \
+    --eval "(uiop:symbol-call :dds.shapes :run-nokey-publisher :domain $DOMAIN :advertise-address \"127.0.0.1\" :peers \"$NKPEER\" :count $((SECONDS_RUN * 5)) :rate 5 :data-representation :xcdr1)" \
+    --eval '(uiop:quit 0)' >/dev/null 2>&1
+  wait_peer "$g" $((SECONDS_RUN + 30)); stop_peer "$g"
+  n="$(grep -c '\[connext-nokey-sub\] #' "$log" || true)"
+  if [[ "$n" -ge "$MIN_SAMPLES" ]]; then note "ok" "us -> Connext NO_KEY: $n sample(s) (writer kind 0x03 matched)"; else
+    note "FAIL" "us -> Connext NO_KEY: only $n sample(s), need >= $MIN_SAMPLES (log: $log)"; fails=1; fi
   # Leg 12: Connext -> us, NO_KEY.
   log="$(mktemp)"
   g="$(start_peer "$log" bash -c "cd interop/connext/nokey && exec ./nokey_pub $DOMAIN 0")"
@@ -404,9 +410,7 @@ echo "              so DATA_FRAG REASSEMBLY is gated against Connext only). MUTA
 echo "              reason worth stating: BOTH vendors send @mutable as PL_CDR (XCDR1), so these legs gate"
 echo "              the parameter-list framing only — the PL_CDR2 (XCDR2) framing has NO live peer behind"
 echo "              it from either vendor, so its length-code choice stays externally unpinned."
-echo "              NO_KEY is gated INBOUND only (Connext -> us). The OUTBOUND direction is an OPEN"
-echo "              REGRESSION: matched=0 against Connext, though captures/ shows it once passed — see the"
-echo "              Leg 11 comment for what has been ruled out. Per-feature legs still NOT gated:"
+echo "              NO_KEY is gated BOTH directions vs Connext. Per-feature legs still NOT gated:"
 echo "              TypeLookup, keyed FlatData, liveliness, deadline, durability, security — drivers exist"
 echo "              under scripts/ and interop/, but nothing runs them."
 echo "              Say so rather than let a green line read as 'interop is covered'."
