@@ -74,9 +74,19 @@ $(GEN_SRCS) $(GEN_HDRS): .gen.stamp
 %.o: %.cxx $(GEN_HDRS)
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -c -o $@ $<
 
+# The RTI libraries are installed with an @loader_path install name, which DYLD_LIBRARY_PATH CANNOT
+# satisfy — the loader resolves @loader_path relative to the BINARY, not to the search path. Every peer
+# therefore needs the libs symlinked beside it, and doing that by hand is how peers end up built but
+# unrunnable: interop/connext/nokey/ had a working pub AND sub that died with "Library not loaded"
+# the moment anything tried to run them, which is a large part of why they were never gated. Linking
+# them here fixes every peer at once and keeps fixing new ones. The symlinks are git-ignored.
+RTILINKS := libnddscpp2 libnddsc libnddscore
 $(APPS): %: %.o $(GEN_OBJS)
 	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+ifeq ($(UNAME_S),Darwin)
+	@for l in $(RTILINKS); do ln -sf "$(LIBDIR)/$$l.dylib" "$$l.dylib"; done
+endif
 
 clean:
 	rm -f $(APPS) $(OBJS) .gen.stamp $(GEN_SRCS) $(GEN_HDRS) \
-	      $(IDL_BASE)*.hpp $(IDL_BASE)*.cxx *.o
+	      $(IDL_BASE)*.hpp $(IDL_BASE)*.cxx *.o *.dylib

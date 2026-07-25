@@ -294,6 +294,53 @@ elif [[ "$have_connext" -eq 1 ]]; then
   fails=1
 fi
 
+# ---- Legs 11/12: NO_KEY endpoints, both directions vs Connext (RTPS 2.5 §9.3.1.2). ----
+# A type's keyed-ness selects the RTPS entity KIND on the wire: 0x03/0x04 for the no-key writer/reader
+# against 0x02/0x07 for the keyed pair. That is a discovery-level property, so getting it wrong does not
+# corrupt a payload — it makes the endpoints simply not match, which is the failure mode this whole gate
+# exists to catch and the one no unit test can. Both peers have been built and sitting unused in
+# interop/connext/nokey/; gating them costs one run and closes a "driver exists but nothing runs it" gap.
+if [[ "$have_connext" -eq 1 && -x interop/connext/nokey/nokey_sub && -x interop/connext/nokey/nokey_pub ]]; then
+  export NDDSHOME
+  export DYLD_LIBRARY_PATH="$NDDSHOME/lib/arm64Darwin20clang12.0:$PWD/interop/connext/nokey:${DYLD_LIBRARY_PATH:-}"
+  # LOOPBACK + an explicit unicast SPDP peer, exactly as the archived proof runs did
+  # (interop/connext/nokey/captures/). Multicast alone does NOT bring these two together here: the
+  # macOS application firewall silently drops LAN-sourced UDP for an unapproved peer binary, and these
+  # peers get relinked. 7410 = PB(7400) + DG*domain + d1(10), so this pins the leg to domain 0.
+  # A RANGE of participant indices, not just index 0. The unicast metatraffic port is
+  # PB + DG*domain + d1 + PG*participantIndex (RTPS 2.5 §9.6.1.1), and the index a peer gets depends on
+  # what else is already bound on this domain — which, in a gate that has just run eight other legs, is
+  # not reliably 0. Pinning 7410 alone made the OUTBOUND leg announce into a port nobody was listening
+  # on, while the inbound leg happened to work; covering indices 0-3 removes that ordering dependence.
+  NKBASE=$((7400 + 250 * DOMAIN + 10))
+  NKPEER="127.0.0.1:$NKBASE,127.0.0.1:$((NKBASE + 2)),127.0.0.1:$((NKBASE + 4)),127.0.0.1:$((NKBASE + 6))"
+  # Leg 11 (us -> Connext, NO_KEY) is NOT GATED — it does not currently pass, and saying so here is
+  # the point. Our NO_KEY writer reports matched=0 against Connext's NO_KEY reader, while the REVERSE
+  # direction below passes on the identical setup. Ruled out: the @loader_path dylib problem (fixed in
+  # common.mk), the unicast SPDP peer list (the passing leg uses the same), the macOS application
+  # firewall (nokey_sub is registered "Allow incoming connections"), and domain contention (reproduced
+  # standalone on a clean dedicated domain). The archived proof run in
+  # interop/connext/nokey/captures/nokey-rev-loopback-ourpub.out shows this direction PASSING
+  # (matched=1, 160 samples), so a REGRESSION is the leading hypothesis and it is NOT diagnosed.
+  # Reproduce with:
+  #   cd interop/connext/nokey && ./nokey_sub 105 24        # terminal 1
+  #   run-nokey-publisher :domain 105 :advertise-address "127.0.0.1" :peers "127.0.0.1:33660"
+  # Gating a leg that fails would make this gate permanently red and therefore ignored — the trap
+  # `make mem` fell into — so it is recorded as an open item instead of asserted.
+  # Leg 12: Connext -> us, NO_KEY.
+  log="$(mktemp)"
+  g="$(start_peer "$log" bash -c "cd interop/connext/nokey && exec ./nokey_pub $DOMAIN 0")"
+  sleep 3
+  tmout $((SECONDS_RUN + 25)) ./scripts/with-sbcl.sh \
+    --eval "(asdf:load-system :dds-shapes)" \
+    --eval "(uiop:symbol-call :dds.shapes :run-nokey-subscriber :domain $DOMAIN :advertise-address \"127.0.0.1\" :peers \"$NKPEER\" :seconds $SECONDS_RUN)" \
+    --eval '(uiop:quit 0)' > "$log.ours" 2>&1
+  stop_peer "$g"
+  n="$(grep -c '\[nokey-sub\] sample #' "$log.ours" || true)"
+  if [[ "$n" -ge "$MIN_SAMPLES" ]]; then note "ok" "Connext -> us NO_KEY: $n sample(s) (reader kind 0x04 matched)"; else
+    note "FAIL" "Connext -> us NO_KEY: only $n sample(s), need >= $MIN_SAMPLES (log: $log.ours)"; fails=1; fi
+fi
+
 # ---- Leg 10: Fast DDS -> us, MUTABLE. The SECOND vendor's parameter framing. ----
 # Not redundant with the Connext MUTABLE legs, because the two vendors DISAGREE about the XCDR1
 # parameter framing and both readings are defensible: Connext pads a parameter's declared length to a
@@ -357,6 +404,9 @@ echo "              so DATA_FRAG REASSEMBLY is gated against Connext only). MUTA
 echo "              reason worth stating: BOTH vendors send @mutable as PL_CDR (XCDR1), so these legs gate"
 echo "              the parameter-list framing only — the PL_CDR2 (XCDR2) framing has NO live peer behind"
 echo "              it from either vendor, so its length-code choice stays externally unpinned."
-echo "              Per-feature legs (keyed/nokey, TypeLookup, keyed FlatData, liveliness, deadline,"
-echo "              durability, security) have drivers under scripts/ and interop/ but are NOT gated yet."
+echo "              NO_KEY is gated INBOUND only (Connext -> us). The OUTBOUND direction is an OPEN"
+echo "              REGRESSION: matched=0 against Connext, though captures/ shows it once passed — see the"
+echo "              Leg 11 comment for what has been ruled out. Per-feature legs still NOT gated:"
+echo "              TypeLookup, keyed FlatData, liveliness, deadline, durability, security — drivers exist"
+echo "              under scripts/ and interop/, but nothing runs them."
 echo "              Say so rather than let a green line read as 'interop is covered'."
