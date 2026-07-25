@@ -260,6 +260,43 @@ if [[ "$have_connext" -eq 1 ]]; then
     note "FAIL" "Connext -> us LARGE: only $n verified sample(s), need >= $MIN_SAMPLES (log: $log)"; fails=1; fi
 fi
 
+# ---- Legs 17/18: KEYED FLATDATA, both directions vs Connext (FR-PF-4, ADR 0015/0017; R6). ----
+# The crux is not that samples arrive: it is that a keyed FlatData instance's IDENTITY agrees across
+# vendors. Our keyhash for a FlatData sample is computed by reading the fields back out of the
+# SerializedPayload (key-hash-<name>-fd) rather than from a struct, so it is a genuinely different
+# code path from the one every other keyed leg exercises, and RTPS 2.5 §9.6.4.8 is what both sides
+# must agree on. NOTE R6: FlatData is not cleared to ship pending patent counsel — gating it here
+# tests it, it does not ship it.
+if [[ "$have_connext" -eq 1 && -x interop/keyed-flatdata/connext/keyed_flat_sub && -x interop/keyed-flatdata/connext/keyed_flat_pub ]]; then
+  export NDDSHOME
+  export DYLD_LIBRARY_PATH="$NDDSHOME/lib/arm64Darwin20clang12.0:$PWD/interop/keyed-flatdata/connext:${DYLD_LIBRARY_PATH:-}"
+  KFDOM=$((DOMAIN + 9)); KFPEER="127.0.0.1:$((7400 + 250 * KFDOM + 10))"
+  # Leg 17: us -> Connext, keyed FlatData.
+  log="$(mktemp)"
+  g="$(start_peer "$log" bash -c "cd interop/keyed-flatdata/connext && exec ./keyed_flat_sub $KFDOM $((SECONDS_RUN + 8))")"
+  sleep 4
+  tmout $((SECONDS_RUN + 25)) ./scripts/with-sbcl.sh \
+    --eval "(asdf:load-system :dds-shapes)" \
+    --eval "(uiop:symbol-call :dds.shapes :run-keyed-flat-publisher :domain $KFDOM :advertise-address \"127.0.0.1\" :peers \"$KFPEER\" :count $((SECONDS_RUN * 5)) :rate 5 :keys 3 :data-representation :xcdr1)" \
+    --eval '(uiop:quit 0)' >/dev/null 2>&1
+  wait_peer "$g" $((SECONDS_RUN + 30)); stop_peer "$g"
+  n="$(grep -c '\[connext-kflat-sub\] #' "$log" || true)"
+  if [[ "$n" -ge "$MIN_SAMPLES" ]]; then note "ok" "us -> Connext KEYED FLATDATA: $n sample(s), instances keyed by §9.6.4.8 keyhash"; else
+    note "FAIL" "us -> Connext KEYED FLATDATA: only $n sample(s), need >= $MIN_SAMPLES (log: $log)"; fails=1; fi
+  # Leg 18: Connext -> us, keyed FlatData.
+  log="$(mktemp)"
+  g="$(start_peer "$log" bash -c "cd interop/keyed-flatdata/connext && exec ./keyed_flat_pub $KFDOM 0")"
+  sleep 3
+  tmout $((SECONDS_RUN + 25)) ./scripts/with-sbcl.sh \
+    --eval "(asdf:load-system :dds-shapes)" \
+    --eval "(uiop:symbol-call :dds.shapes :run-keyed-flat-subscriber :domain $KFDOM :advertise-address \"127.0.0.1\" :peers \"$KFPEER\" :seconds $SECONDS_RUN)" \
+    --eval '(uiop:quit 0)' > "$log.ours" 2>&1
+  stop_peer "$g"
+  n="$(grep -c '\[kflat-sub\] #' "$log.ours" || true)"
+  if [[ "$n" -ge "$MIN_SAMPLES" ]]; then note "ok" "Connext -> us KEYED FLATDATA: $n sample(s), read in place from the payload"; else
+    note "FAIL" "Connext -> us KEYED FLATDATA: only $n sample(s), need >= $MIN_SAMPLES (log: $log.ours)"; fails=1; fi
+fi
+
 # ---- Legs 15/16: the two TypeObject-shape probes (enum TK_ENUM, string8 LARGE form). ----
 # Both existed as READMEs describing a manual two-terminal run, and neither had ever been gated. They
 # cover the two TypeObject encodings the logging type depends on and that ADR 0009 flags as the
@@ -518,7 +555,7 @@ echo "              reason worth stating: BOTH vendors send @mutable as PL_CDR (
 echo "              the parameter-list framing only — the PL_CDR2 (XCDR2) framing has NO live peer behind"
 echo "              it from either vendor, so its length-code choice stays externally unpinned."
 echo "              NO_KEY is gated BOTH directions vs Connext. Per-feature legs still NOT gated:"
-echo "              TypeLookup, keyed FlatData, liveliness, deadline, durability, security — drivers exist"
+echo "              TypeLookup, liveliness, deadline, durability, security — drivers exist"
 echo "              under scripts/ and interop/, but nothing runs them. (enum TK_ENUM and string8-LARGE"
-echo "              are now gated as legs 15/16.)"
+echo "              are legs 15/16; keyed FlatData is legs 17/18.)"
 echo "              Say so rather than let a green line read as 'interop is covered'."

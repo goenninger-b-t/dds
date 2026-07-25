@@ -1371,9 +1371,11 @@
     (loop for b across handle do (format s "~(~2,'0x~)" b))))
 
 (defun* run-keyed-flat-publisher (&key (domain 0) (rate 5) (count 0) (keys 3)
-                                       (dispose-after 0) (advertise-address "127.0.0.1") (peers nil))
+                                       (dispose-after 0) (advertise-address "127.0.0.1") (peers nil)
+                                       (data-representation :xcdr2))
     (function (&key (:domain (integer 0)) (:rate (integer 1)) (:count (integer 0)) (:keys (integer 1))
-                    (:dispose-after (integer 0)) (:advertise-address string) (:peers (or null string))) t)
+                    (:dispose-after (integer 0)) (:advertise-address string) (:peers (or null string))
+                    (:data-representation symbol)) t)
   "Publish keyed FlatData KeyedFlat (i32 @key id; i32 x; i32 y) on topic 'KeyedFlat' / type 'keyed-flat'
    via the DCPS COPY path (plain UDP — NO ZeroCopy/loan; the same-host ZC loan path is not wire-interop).
    Cycles id over 0..KEYS-1 so a subscriber demonstrates per-key instance grouping; for each sample prints
@@ -1390,7 +1392,8 @@
     (let* ((tp (dds.dcps:create-topic p "KeyedFlat" "keyed-flat" ts))
            (pub (dds.dcps:create-publisher p))
            (dw (dds.dcps:create-datawriter
-                pub tp :qos (dds.qos:make-writer-qos :reliability :reliable :history-kind :keep-all)))
+                pub tp :qos (dds.qos:make-writer-qos :reliability :reliable :history-kind :keep-all
+                                                    :data-representation (list data-representation))))
            (fd (make-keyed-flat-flatdata))
            (disposed (make-hash-table :test 'eql)))
       (format t "~&[kflat-pub] KeyedFlat/keyed-flat domain=~d (WITH_KEY 0x02 writer, COPY/UDP, reliable, ~d key(s)). Ctrl-C to stop.~%"
