@@ -4248,6 +4248,7 @@
                  ("relay-emit"                   . run-relay-emit-test)
                  ("original-writer-dedup"        . run-original-writer-dedup-test)
                  ("reader-concurrent-receivers"  . run-reader-concurrent-receivers-test)
+                 ("dedup-origin-cap"             . run-dedup-origin-cap-test)
                  ("dedup-cap"                    . run-dedup-cap-test)
                  ("vendor-sedp-pid"              . run-vendor-sedp-pid-test)
                  ("durability-no-double-delivery" . run-durability-no-double-delivery-test)

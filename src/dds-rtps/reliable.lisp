@@ -44,6 +44,22 @@
    (resource-exhaustion guard, NFR-SEC-POSTURE; RTPS 2.5 §8.3.7.4). A legitimately larger evicted
    run is recovered across subsequent GAP/HEARTBEAT rounds (firstSN compaction), so capping is loss-free.")
 
+(defparameter *max-dedup-origins* 256
+  "Cap on the number of distinct ORIGINAL-WRITER GUIDs a reader will track dedup state for
+   (resource-exhaustion guard, NFR-SEC-POSTURE; RTPS 2.5 §8.3.5.4).
+
+   The key is wire-supplied — it is the GUID inside PID_ORIGINAL_WRITER_INFO in a DATA's inline QoS — so
+   without a cap any peer able to send us a DATA can mint unbounded dedup-origins simply by varying it,
+   each carrying its own out-of-order window. Uncapped that is an unbounded memory DoS keyed by attacker
+   data, which is exactly the class NFR-SEC-POSTURE requires be guarded.
+
+   AT THE CAP A NEW ORIGIN IS REFUSED, AND ITS SAMPLES ARE ACCEPTED UNTRACKED — never dropped. Refusing
+   to track costs at worst a duplicate delivery if that origin also retransmits; refusing to DELIVER would
+   be silent loss, and a false reject is the worse failure. Existing origins are never evicted to make
+   room: evicting a tracked origin's watermark would risk double-delivering everything it had already
+   dedup'd, the same reasoning ADR 0024 §10.2 settled for the durability service's origin cap.
+   Refusals are COUNTED and readable via READER-DEDUP-ORIGINS-REFUSED (reported, never printed).")
+
 ;;; ---- Writer side (§8.4.2): one ReaderProxy per matched reader ----
 
 (defstruct* (reader-proxy (:constructor make-reader-proxy))
@@ -615,10 +631,32 @@
                   :type (simple-array (unsigned-byte 32) (*)))) ; reusable ACKNACK NACK-bitmap scratch (256-bit cap = 8 words, RTPS 2.5 §9.4.2.6), opt-in via reader-acknack REUSE-BITMAP on the lock-free user path — single-mutator, same receiver-thread discipline as RECEIVED (NFR-MEM)
 
 (defstruct* (dedup-origin (:constructor %make-dedup-origin))
-  "Per-original-GUID dedup state: contiguous low-watermark LO + bounded out-of-order set ABOVE.
-   In-order traffic keeps ABOVE EMPTY (LO just advances), O(1)/GUID. NFR-MEM. RTPS 2.5 §8.3.5.4."
+  "Per-original-GUID dedup state: the contiguous low-watermark LO, plus a fixed CIRCULAR BIT WINDOW
+   covering the out-of-order sequence numbers in (LO, LO+WINDOW]. RTPS 2.5 §8.3.5.4. NFR-MEM,
+   NFR-SEC-POSTURE. Mutated from the receiver threads via reader-dedup-accept-p, under the READER LOCK
+   (ADR 0085).
+
+   WHY A BIT WINDOW AND NOT A HASH SET. The set of delivered-but-not-yet-contiguous SNs was an EQL hash
+   table capped at *max-gap-range* entries, and the cap was enforced by shedding the highest entry —
+   found with a full (loop for k being each hash-key of above maximize k) ON EVERY CALL once at cap. At
+   the shipped cap of 65536 that is a 65536-key scan per sample, MEASURED AT ~146 us/call, and it is
+   REMOTE-DRIVABLE: this path is entered for any sample carrying PID_ORIGINAL_WRITER_INFO, whose GUID and
+   SN come off the wire, so a peer that streams SNs above the watermark saturates a receiver thread. The
+   window replaces both the scan and the shed with O(1) bit operations and bounds the state at
+   WINDOW bits (8 KB at 65536) instead of up to 65536 hash entries.
+
+   INDEXING. Bit (mod SN WINDOW). The live window spans at most WINDOW consecutive SNs, so that mapping is
+   injective across it; bits are cleared as LO advances through them, and an SN beyond LO+WINDOW is never
+   recorded, so no stale bit can alias a later SN.
+
+   BITS IS ALLOCATED LAZILY and IN-ORDER TRAFFIC NEVER ALLOCATES IT: SN = LO+1 just advances LO. MARKED is
+   the number of set bits, which lets the watermark advance stop immediately when nothing is pending.
+   WINDOW is frozen per origin at creation, so rebinding *max-gap-range* mid-stream cannot reindex a live
+   window (the tests bind it; production does not)."
   (lo 0 :type integer)
-  (above (make-hash-table :test 'eql) :type hash-table))   ; mutated from the receiver threads via reader-dedup-accept-p, under the READER LOCK (ADR 0085)
+  (window 0 :type fixnum)
+  (bits nil :type (or null (simple-array bit (*))))
+  (marked 0 :type fixnum))
 
 (defstruct* (rtps-reader (:constructor make-rtps-reader))
   "Stateful reliable RTPS reader (RTPS 2.5 §8.4.10): an opaque-writer-key -> WriterProxy table
@@ -641,7 +679,8 @@
   ;; another of our locks and has no ordering hazard. Entry points take it; the %-prefixed cores assume it.
   (lock (dds.pal:make-lock "rtps-reader") :type t)
   (proxies  (make-hash-table :test 'equalp) :type hash-table)   ; writer key (opaque, equalp) -> writer-proxy
-  (dedup-map (make-hash-table :test 'equalp) :type hash-table)) ; original-GUID[16] -> dedup-origin
+  (dedup-map (make-hash-table :test 'equalp) :type hash-table)  ; original-GUID[16] -> dedup-origin, capped at *max-dedup-origins*
+  (dedup-origins-refused 0 :type (integer 0)))                  ; NFR-SEC-POSTURE: new origins refused at the cap (accepted untracked, never dropped)
 
 (defun* writer-proxy-armed-p (reader writer-id)
     (function (rtps-reader t) boolean)
@@ -675,17 +714,43 @@
   (dds.pal:with-lock ((rtps-reader-lock reader))
     (%get-writer-proxy reader writer-id)))
 
+(defun* %dedup-advance (origin)
+    (function (dedup-origin) (values))
+  "Advance ORIGIN's contiguous watermark LO through every consecutive SN already marked in the window,
+   clearing each bit as it is absorbed. CALLER HOLDS THE READER LOCK.
+
+   Amortised O(1): a bit is cleared at most once per time it is set, and the loop stops the instant either
+   nothing is pending (MARKED zero — the in-order case, where it does not even look at the window) or the
+   next SN is not marked. Clearing on absorption is also what keeps the circular index safe: a bit for an
+   SN at or below LO never survives to alias an SN one window higher."
+  (let ((bits (dedup-origin-bits origin)))
+    (when bits
+      (let ((window (dedup-origin-window origin)))
+        (loop while (plusp (dedup-origin-marked origin))
+              for nxt = (1+ (dedup-origin-lo origin))
+              for i = (mod nxt window)
+              while (= 1 (sbit bits i))
+              do (setf (sbit bits i) 0)
+                 (decf (dedup-origin-marked origin))
+                 (setf (dedup-origin-lo origin) nxt)))))
+  (values))
+
 (defun* reader-dedup-accept-p (reader original-guid original-sn)
     (function (rtps-reader (or null (simple-array (unsigned-byte 8) (16))) (or null integer)) boolean)
   "Original-GUID per-SN dedup gate for relay-forwarded samples (RTPS 2.5 §8.3.5.4).
    Returns T (accept + record) when ORIGINAL-GUID is nil (PID absent — normal non-relayed path,
    never consults the map) or (ORIGINAL-GUID, ORIGINAL-SN) not yet seen; returns NIL (duplicate,
    discard) when this exact (GUID, SN) pair was already delivered. Per-GUID contiguous-watermark
-   design: LO is the highest SN advanced through contiguously (every SN <= LO is known-delivered);
-   ABOVE is the bounded out-of-order set for SNs > LO not yet compacted into LO. In-order traffic
-   keeps ABOVE EMPTY — LO just advances, O(1)/GUID (NFR-MEM). At the *max-gap-range* cap, the
-   HIGHEST entry in ABOVE is shed (never LO is advanced past an un-arrived SN) — the only residual
-   is a benign duplicate if that high out-of-order SN re-arrives; silent loss cannot occur.
+   design: LO is the highest SN advanced through contiguously (every SN <= LO is known-delivered), and
+   a fixed CIRCULAR BIT WINDOW records the out-of-order SNs in (LO, LO+WINDOW] not yet compacted into
+   LO (see DEDUP-ORIGIN). Every step is O(1): test a bit, set a bit, advance LO through the contiguous
+   run it just completed. In-order traffic touches no window at all — LO simply advances, and the
+   window is never even allocated (NFR-MEM).
+
+   AN SN BEYOND LO+WINDOW IS ACCEPTED BUT NOT RECORDED. That is the bounded residual, and it is the same
+   one the previous shed-the-highest cap had: if such an SN re-arrives it is a benign DUPLICATE. LO is
+   never advanced past an un-arrived SN, so SILENT LOSS CANNOT OCCUR — which is the direction that
+   matters, a false reject being the worst outcome here.
    INERT when ORIGINAL-GUID is nil.
 
    TAKES THE READER LOCK, and the whole seen-test-then-mark must be inside it: this is a check-then-act, so
@@ -696,27 +761,47 @@
       t                                                   ; no PID -> normal path, always accept
       (dds.pal:with-lock ((rtps-reader-lock reader))
        (let* ((outer (rtps-reader-dedup-map reader))
-             (origin (or (gethash original-guid outer)
-                         (let ((o (%make-dedup-origin)))
-                           (setf (gethash original-guid outer) o)
-                           o)))
-             (lo (dedup-origin-lo origin))
-             (above (dedup-origin-above origin)))
-        (cond
-          ((<= original-sn lo) nil)                      ; below watermark: already delivered
-          ((gethash original-sn above) nil)              ; in out-of-order set: already delivered
-          (t                                             ; ACCEPT
-           (setf (gethash original-sn above) t)
-           ;; NFR-MEM cap: shed the HIGHEST entry so lo never skips an un-arrived gap SN;
-           ;; if the shed SN re-arrives it becomes a benign duplicate (never silent loss)
-           (when (> (hash-table-count above) *max-gap-range*)
-             (let ((max-sn (loop for k being each hash-key of above maximize k)))
-               (remhash max-sn above)))
-           ;; advance watermark through the contiguous prefix in ABOVE
-           (loop while (gethash (1+ (dedup-origin-lo origin)) above)
-                 do (remhash (1+ (dedup-origin-lo origin)) above)
-                    (incf (dedup-origin-lo origin)))
-           t))))))
+              (origin (or (gethash original-guid outer)
+                          ;; NFR-SEC-POSTURE: the GUID is wire-supplied, so the origin count is capped.
+                          ;; At the cap a NEW origin is refused and its sample is ACCEPTED UNTRACKED —
+                          ;; a possible duplicate, never a silent drop (see *max-dedup-origins*).
+                          (if (>= (hash-table-count outer) *max-dedup-origins*)
+                              (progn (incf (rtps-reader-dedup-origins-refused reader))
+                                     (return-from reader-dedup-accept-p t))
+                              (let ((o (%make-dedup-origin :window *max-gap-range*)))   ; frozen per origin: a later rebind must not reindex a live window
+                                (setf (gethash original-guid outer) o)
+                                o))))
+              (window (dedup-origin-window origin))
+              (lo (dedup-origin-lo origin)))
+         (cond
+           ((<= original-sn lo) nil)                     ; below watermark: already delivered
+           ((= original-sn (1+ lo))                      ; IN-ORDER: no window touched, none allocated
+            (setf (dedup-origin-lo origin) original-sn)
+            (%dedup-advance origin)
+            t)
+           ((> original-sn (+ lo window)) t)             ; beyond the window: accept, do NOT record (bounded residual = a benign duplicate on re-arrival, never loss)
+           (t
+            (let* ((bits (or (dedup-origin-bits origin)
+                             (setf (dedup-origin-bits origin)
+                                   (make-array window :element-type 'bit :initial-element 0))))
+                   (i (mod original-sn window)))
+              (cond
+                ((= 1 (sbit bits i)) nil)                ; already delivered
+                (t
+                 (setf (sbit bits i) 1)
+                 (incf (dedup-origin-marked origin))
+                 (%dedup-advance origin)
+                 t)))))))))
+
+(defun* reader-dedup-origins-refused (reader)
+    (function (rtps-reader) (integer 0))
+  "How many NEW original-writer origins READER has refused to track because *max-dedup-origins* was
+   already reached (NFR-SEC-POSTURE). A non-zero value means either a genuinely large relay fan-in — raise
+   the cap — or a peer minting origin GUIDs; either way the samples were DELIVERED, only untracked, so the
+   observable risk is a duplicate rather than loss. A snapshot to be read, never printed: the same
+   reported-not-printed shape as the pool reject counters."
+  (dds.pal:with-lock ((rtps-reader-lock reader))
+    (rtps-reader-dedup-origins-refused reader)))
 
 (defun* reader-on-data (reader writer-id sn payload)
     (function (rtps-reader t integer (array (unsigned-byte 8) (*))) t)

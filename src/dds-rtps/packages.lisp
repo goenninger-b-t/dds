@@ -114,6 +114,7 @@
            #:get-writer-proxy #:writer-proxy #:writer-proxy-received #:writer-proxy-last-sn #:writer-proxy-first-sn
            #:writer-proxy-skip-history #:writer-proxy-armed-p
            #:*fragment-size* #:*max-reassembly-bytes* #:*max-reassembly-fragments* #:*max-gap-range*
+           #:*max-dedup-origins* #:reader-dedup-origins-refused
            #:reader-on-data-frag #:reader-frag-acknack
            #:writer-frag-plan #:writer-frag-plan-for
            #:writer-frag-heartbeat #:writer-on-nack-frag #:writer-sample-payload

@@ -389,6 +389,19 @@ KEEP_ALL writer never evicts, so `gap-sns` is empty and no GAP is sent.
   503/519/502 accepts for 500 SNs). Cost is +31 ns/sample; per-impl synchronized tables were measured as an
   alternative and rejected at 4x the cost for no extra safety
   (`bench/report/2026-07-24-reliable-reader-lock.md`).
+- **Relay dedup is a bit window, and both of its tables are capped (2026-07-25).** `reader-dedup-accept-p`
+  is the exactly-once gate for relay-forwarded samples (`PID_ORIGINAL_WRITER_INFO`). Its out-of-order set
+  is a **circular bit window** over `(lo, lo+*max-gap-range*]`, indexed `(mod sn window)` — test a bit, set
+  a bit, advance `lo` through the run it completed. It replaced an EQL hash set whose cap was enforced by
+  `(loop for k being each hash-key of above maximize k)` on **every** call once at cap: a 65 536-key scan
+  per sample, measured at **~146 µs/call**, and remote-drivable because both the origin GUID and the SN
+  come off the wire. Now **~36 ns**, and the in-order path is ~1.6× faster than before because it touches
+  no table at all (the window is allocated lazily and in-order delivery never allocates it). An SN beyond
+  `lo+window` is accepted but not recorded — a benign duplicate if it re-arrives, never silent loss.
+  `*max-dedup-origins*` (256) caps the wire-keyed origin table, which was previously unbounded; at the cap
+  a new origin is refused and its samples are **accepted untracked** (a duplicate risk, never a drop) and
+  tracked origins are never evicted. Refusals: `reader-dedup-origins-refused`.
+  See `bench/report/2026-07-25-dedup-window.md`.
 - **Connext interop is pending a Connext install.** Correctness here is established by
   byte-exact tests against the RTPS 2.5 spec clauses (e.g. the §9.4.5.4 DATA byte image and
   the §9.4.2.6 SequenceNumberSet bytes in `rtps-test.lisp`) and by an offline UDP-loopback

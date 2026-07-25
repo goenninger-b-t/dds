@@ -2417,9 +2417,13 @@
       (loop for sn from 1 to 1000
             do (dds.rtps.reliable:reader-dedup-accept-p reader2 guid-c sn))
       (let* ((origin (gethash guid-c (dds.rtps.reliable:rtps-reader-dedup-map reader2)))
-             (above-count (hash-table-count (dds.rtps.reliable::dedup-origin-above origin))))
-        (%check :dedup-inorder-above-empty (zerop above-count)
-                (format nil "in-order delivery must keep ABOVE empty (got ~d entries)" above-count))))
+             (marked (dds.rtps.reliable::dedup-origin-marked origin))
+             (bits   (dds.rtps.reliable::dedup-origin-bits origin)))
+        (%check :dedup-inorder-above-empty (zerop marked)
+                (format nil "in-order delivery must record NOTHING out-of-order (got ~d marked)" marked))
+        ;; Stronger than the old ABOVE-is-empty check: in-order traffic must not even ALLOCATE the window.
+        (%check :dedup-inorder-no-window (null bits)
+                "in-order delivery must never allocate the out-of-order bit window (LO just advances)")))
     t))
 
 ;;; Cap/shedding path: proves lo never jumps a hole and no fresh SN is ever discarded.
@@ -2614,4 +2618,55 @@
               (= n-sns (dds.rtps.reliable:writer-proxy-last-sn proxy))
               (format nil "LAST-SN is a read-compare-write and must not lose an update; expected ~d, got ~d"
                       n-sns (dds.rtps.reliable:writer-proxy-last-sn proxy))))
+    t))
+
+(defun* run-dedup-origin-cap-test ()
+    (function () t)
+  "Resource-exhaustion guard on the dedup ORIGIN table (NFR-SEC-POSTURE; RTPS 2.5 §8.3.5.4).
+
+   The key this table is grown by is WIRE-SUPPLIED — the GUID inside PID_ORIGINAL_WRITER_INFO in a DATA's
+   inline QoS — so without a cap any peer able to send us a DATA mints unbounded dedup-origins, each with
+   its own out-of-order window, simply by varying it. That is an unbounded memory DoS keyed by attacker
+   data. *max-dedup-origins* caps it.
+
+   The direction of the refusal is the point and is asserted here: at the cap a new origin is NOT tracked,
+   but its sample is still ACCEPTED (T). Refusing to track risks a duplicate; refusing to deliver would be
+   silent loss, and a false reject is the worse failure. Tracked origins are never evicted to make room —
+   evicting a watermark would risk double-delivering everything that origin had already dedup'd.
+
+   FALSIFIED, seen red, not assumed: removing the cap check fails :dedup-origin-cap-bounded (the table
+   grows to 6) and :dedup-origin-cap-counted (nothing is refused)."
+  (let* ((reader (dds.rtps.reliable:make-rtps-reader))
+         (cap 4))
+    (flet ((guid (n) (make-array 16 :element-type '(unsigned-byte 8) :initial-element n)))
+      (let ((dds.rtps.reliable:*max-dedup-origins* cap))
+        ;; CAP distinct origins are tracked; each first sample accepted
+        (loop for n from 1 to cap
+              do (%check (intern (format nil "DEDUP-ORIGIN-CAP-TRACKED-~d" n) :keyword)
+                         (eq t (dds.rtps.reliable:reader-dedup-accept-p reader (guid n) 1))
+                         (format nil "origin ~d (within cap) SN 1 -> T" n)))
+        ;; a tracked origin still dedups
+        (%check :dedup-origin-cap-still-dedups
+                (null (dds.rtps.reliable:reader-dedup-accept-p reader (guid 1) 1))
+                "a TRACKED origin must still reject its duplicate SN 1")
+        ;; two origins beyond the cap: ACCEPTED (never dropped) but NOT tracked
+        (%check :dedup-origin-cap-overflow-accepted-1
+                (eq t (dds.rtps.reliable:reader-dedup-accept-p reader (guid 90) 1))
+                "an origin beyond the cap must still be ACCEPTED (untracked, never silently lost)")
+        (%check :dedup-origin-cap-overflow-accepted-2
+                (eq t (dds.rtps.reliable:reader-dedup-accept-p reader (guid 91) 1))
+                "a second origin beyond the cap must also be ACCEPTED")
+        ;; an untracked origin cannot dedup — the documented residual, asserted so it stays documented
+        (%check :dedup-origin-cap-untracked-residual
+                (eq t (dds.rtps.reliable:reader-dedup-accept-p reader (guid 90) 1))
+                "an UNTRACKED origin's repeat is accepted again — the documented duplicate residual")
+        (let ((n (hash-table-count (dds.rtps.reliable:rtps-reader-dedup-map reader))))
+          (%check :dedup-origin-cap-bounded (= n cap)
+                  (format nil "the origin table must stay at the cap ~d however many GUIDs arrive; got ~d" cap n)))
+        (%check :dedup-origin-cap-not-evicted
+                (null (dds.rtps.reliable:reader-dedup-accept-p reader (guid 1) 1))
+                "a tracked origin must NOT have been evicted to admit a new one (its dedup state survives)")
+        (let ((refused (dds.rtps.reliable:reader-dedup-origins-refused reader)))
+          (%check :dedup-origin-cap-counted (= refused 3)
+                  (format nil "refusals must be COUNTED and readable (expected 3, got ~d)" refused)))))
     t))
