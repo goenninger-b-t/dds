@@ -3242,3 +3242,30 @@ public GitHub master for understanding only; no code copied into `src/`.
   wrong: the parameter length is padded to a multiple of 4; the list terminator carries
   FLAG_MUST_UNDERSTAND (`0x7F02`); and Connext sends `@mutable` as PL_CDR (XCDR1), not PL_CDR2 — so the
   parameter-list framing, not the EMHEADER framing, is what interoperates with it. See ADR 0086 §A5.
+
+## M4 — Fast DDS 3.6.1 MUTABLE peer + second-vendor vector (2026-07-25, ADR 0086 §A7)
+
+- **Purpose:** settle whether a SECOND vendor emits `PL_CDR2` for `@mutable`, which RTI Connext does
+  not — leaving the XCDR2 length-code choice with no external encoder behind it. Answer: **no**, Fast
+  DDS also emits `PL_CDR` (`0x0003`). The experiment instead established that the two vendors **disagree
+  with each other** on three fields of the XCDR1 parameter framing (declared lengths padded to 4 vs
+  exact; terminator `0x7F02` vs `0x3F02`), both defensibly — see ADR 0086 §A7.
+- **Sources consulted:** the OMG specifications, and the octets a live Fast DDS DataWriter transmitted,
+  received by this stack's own subscriber. No Fast DDS source was read or copied into the harness.
+- **Artifacts tracked:** `interop/fastdds/mutable/MutableData.idl`, the hand-written `mutable_pub.cpp`,
+  its `Makefile`, `profiles.xml`, `participant_guard.hpp`, the captured payload
+  `corpus/xcdr2/mutabledata-fastdds.bin` (72 octets), **and `gen/`**.
+- **On `gen/` being committed — the licence distinction, stated because it is the opposite of the
+  Connext rule and the two are easy to conflate.** `fastddsgen` output is **Apache-2.0** and is
+  committed verbatim, exactly as `interop/fastdds/shapes/gen/` and `largedata/gen/` already are (see
+  `interop/fastdds/README.md`). RTI `rtiddsgen` output is **proprietary and is never committed** —
+  `interop/connext/mutable/` therefore tracks only the IDL, the two hand-written drivers, the Makefile
+  and the README, with all generated files git-ignored. Both peers in this work package follow their
+  respective rule.
+  *(Correction to the record: the commit message for `6914459` states "fastddsgen output and the binary
+  git-ignored". That is wrong on the first half — the generated sources are committed, by the policy
+  above — and was wrong on the second half until the ignore rule was added here. The tree is correct;
+  the message was not.)*
+- **NOT done:** no vendor source read or copied; no disassembly. The vector is a SerializedPayload —
+  the OMG-specified byte layout for a sample whose values are fixed by rule in
+  `dds.bench::%corpus-mutable-sample`.
