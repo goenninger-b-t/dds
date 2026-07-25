@@ -414,7 +414,7 @@ if [[ "$have_connext" -eq 1 && -x interop/connext/mutable/mutable_sub ]]; then
   sleep 5
   tmout $((SECONDS_RUN + 25)) ./scripts/with-sbcl.sh \
     --eval "(asdf:load-system :dds-bench)" \
-    --eval "(uiop:symbol-call :dds.bench :run-mutable-publisher :domain $DOMAIN :advertise-address \"$ADV\" :count $((SECONDS_RUN * 20)) :rate 20 :representation :xcdr1)" \
+    --eval "(uiop:symbol-call :dds.bench :run-mutable-publisher :domain $DOMAIN :advertise-address \"$ADV\" :count $((SECONDS_RUN * 20)) :rate 20 :data-representation :xcdr1)" \
     --eval '(uiop:quit 0)' >/dev/null 2>&1
   wait_peer "$g" $((SECONDS_RUN + 30)); stop_peer "$g"
   # Assert the VALUES, not a sample count: a decode that silently defaulted a member would otherwise pass.

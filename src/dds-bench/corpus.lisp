@@ -181,13 +181,13 @@
   t)
 
 (defun* run-mutable-publisher (&key (domain 0) (advertise-address "127.0.0.1")
-                                    (count 200) (rate 20) (representation :xcdr1) peers)
+                                    (count 200) (rate 20) (data-representation :xcdr1) peers)
     (function (&key (:domain (integer 0)) (:advertise-address string) (:count (integer 0))
-                    (:rate (integer 1)) (:representation symbol) (:peers (or null string))) t)
+                    (:rate (integer 1)) (:data-representation symbol) (:peers (or null string))) t)
   "Publish the fixed MutableData sample on MutableCorpus so a LIVE peer can be shown decoding a
    @mutable type this stack wrote (FR-IO, ADR 0086).
 
-   REPRESENTATION defaults to :XCDR1, and that is not a tuning choice. RTI Connext sends and expects
+   DATA-REPRESENTATION defaults to :XCDR1, and that is not a tuning choice. RTI Connext sends and expects
    @mutable as PL_CDR (encoding version 1) — the vector proves it — and DATA_REPRESENTATION is an RxO
    policy, so an XCDR2-default writer SILENTLY fails to match a stock Connext reader (matched=0, no
    error). This is the same trap ADR 0057's leg documented for Shapes."
@@ -200,9 +200,9 @@
          (dw (dds.dcps:create-datawriter
               pub tp :qos (dds.qos:make-writer-qos
                            :reliability :reliable
-                           :data-representation (list representation)))))
+                           :data-representation (list data-representation)))))
     (format t "~&[mut-pub] MutableCorpus/MutableData rep=~a count=~d domain=~d~%"
-            representation count domain)
+            data-representation count domain)
     (finish-output)
     (unwind-protect
          ;; The MATCHED COUNT is reported, not just the write count. A writer that matches NOTHING still

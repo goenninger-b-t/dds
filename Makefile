@@ -8,7 +8,7 @@ CLASP := ./scripts/with-clasp.sh
 SBCL  := ./scripts/with-sbcl.sh
 LISP  ?= $(CLASP)
 
-.PHONY: all build test build-clasp build-sbcl test-clasp test-sbcl gate-build gate-mem gate-pal gate-nocond \
+.PHONY: all build test build-clasp build-sbcl test-clasp test-sbcl gate-build gate-mem gate-pal gate-nocond gate-drivers \
         build-all test-all gate-hotpath gate-types corpus fuzz wire interop \
         square-pub square-sub square-spy large-pub large-sub gated-sub corpus-capture \
         nokey-pub nokey-sub keyed-flat-pub keyed-flat-sub \
@@ -114,6 +114,12 @@ gate-pal: ; ./scripts/gate-pal.sh
 # Owner directive 2026-07-14 (NON-NEGOTIABLE): no Lisp conditions in the hot path; every condition handled
 # at latest at the toplevel DDS API. Annotation lint + asserts the receiver boundary handlers still exist.
 gate-nocond: ; ./scripts/gate-nocond.sh
+
+# Every interop driver that creates a DCPS DataWriter must be able to OFFER a data representation.
+# DATA_REPRESENTATION is an RxO policy and a stock foreign reader advertises XCDR1 only, so a driver
+# stuck on the XCDR2 default silently will not match it — matched=0, no error. Three drivers were
+# found with this omission before the lint existed.
+gate-drivers: ; ./scripts/gate-drivers.sh
 
 # The REAL build gate (operating contract §6): clean-cache rebuild + a falsification self-test.
 # `build` above is the incremental convenience load; THIS is the one that can actually fail.
