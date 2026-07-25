@@ -185,7 +185,27 @@
                                                      :ignore-key-bounds t)))
     (if (dds.types:struct-assignable-from reader-model writer-model opts)
         :compatible
-        :incompatible)))
+        (progn
+          ;; A bare INCOMPATIBLE is nearly useless for diagnosis: the verdict says a peer was
+          ;; refused but not on which of extensibility / member ids / member kinds it turned, and
+          ;; the difference between a true reject and a false-REJECT (ADR 0057) is exactly that.
+          ;; Dumping both models costs nothing — it runs once per refused endpoint, on the control
+          ;; plane, and only when the diagnostics stream is switched on.
+          (%tg-log remote :incompatible-detail
+                   (format nil "reader{ext=~a ids=~a kinds=~a} vs writer{ext=~a ids=~a kinds=~a}"
+                           (dds.types:minimal-struct-type-extensibility reader-model)
+                           (mapcar #'dds.types:minimal-struct-member-id
+                                   (dds.types:minimal-struct-type-members reader-model))
+                           (mapcar (lambda (m) (dds.types:type-identifier-kind
+                                                (dds.types:minimal-struct-member-type-identifier m)))
+                                   (dds.types:minimal-struct-type-members reader-model))
+                           (dds.types:minimal-struct-type-extensibility writer-model)
+                           (mapcar #'dds.types:minimal-struct-member-id
+                                   (dds.types:minimal-struct-type-members writer-model))
+                           (mapcar (lambda (m) (dds.types:type-identifier-kind
+                                                (dds.types:minimal-struct-member-type-identifier m)))
+                                   (dds.types:minimal-struct-type-members writer-model))))
+          :incompatible))))
 
 (defun* %gate-assess (remote local local-to remote-model)
     (function (dds.rtps.discovery:endpoint-data dds.rtps.discovery:endpoint-data

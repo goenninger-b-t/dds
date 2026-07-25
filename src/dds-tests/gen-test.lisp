@@ -751,6 +751,10 @@
   (a :i32 :id 0)
   (critical :i32 :id 9 :must-understand t))
 
+(dds.gen:define-dds-type mut-named (:extensibility :mutable)
+  (a :i32 :id 0)
+  (t-ns :i64 :id 1 :name "t_ns"))   ; the Lisp slot and the IDL member disagree by one character
+
 (defun* %mut-ser (s ser mode endianness)
     (function (t function symbol (member :little :big)) (simple-array (unsigned-byte 8) (*)))
   "Serialize S with SER into a fresh vector — a test fixture, not a data path."
@@ -952,6 +956,29 @@
               (eq :missing-parameter-list-end
                   (nth-value 1 (deserialize-mut-v1 (%mut-cursor unterminated :little) :xcdr1)))
               "a PL_CDR list with no PID_LIST_END must be refused"))
+    ;; 9b. THE WIRE NAME IS NOT THE SLOT NAME. IDL spells identifiers with '_', Lisp with '-', so a
+    ;;     slot T-NS renders "t-ns" while the IDL member is "t_ns". Assignability matches members by
+    ;;     NameHash, so that one character makes an otherwise identical type INCONSISTENT with the
+    ;;     peer's — and the symptom is not an error but a silent non-match (matched=0).
+    ;;
+    ;;     THIS IS NOT HYPOTHETICAL. It is what the live Connext MUTABLE leg hit: Connext matched our
+    ;;     writer while our gate refused its reader, a ONE-SIDED match, logged only as
+    ;;     "INCOMPATIBLE — legacy-TypeObject assignability". Before :name existed, NO type with an
+    ;;     underscore in a member name could interoperate, and nothing said so.
+    (let* ((ts (dds.types:find-type-support "mut-named"))
+           (ms (dds.types:minimal-struct-type-members (dds.types:type-support-typeobject ts)))
+           (hash-for (lambda (n) (dds.types:member-name-hash n))))
+      (%check :mutable-wire-name-overrides-slot
+              (equalp (dds.types:minimal-struct-member-name-hash (second ms))
+                      (funcall hash-for "t_ns"))
+              "an explicit :name must reach the TypeObject NameHash")
+      (%check :mutable-wire-name-differs-from-slot
+              (not (equalp (funcall hash-for "t-ns") (funcall hash-for "t_ns")))
+              "the slot-derived and IDL spellings must hash differently — that is why :name exists")
+      (%check :mutable-wire-name-defaults-to-slot
+              (equalp (dds.types:minimal-struct-member-name-hash (first ms))
+                      (funcall hash-for "a"))
+              "a member without :name keeps the downcased slot name"))
     ;; 10. The TypeObject must advertise the DECLARED ids, not member positions — they are what a peer
     ;;     matches on, and mut-v2 declares them out of order precisely so the two cannot coincide.
     (let* ((ts2 (dds.types:find-type-support "mut-v2"))

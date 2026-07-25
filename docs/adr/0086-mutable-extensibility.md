@@ -217,6 +217,33 @@ and each looking right:
 3. Our XCDR1 output is now **byte-identical to Connext's 72 octets**, and the check is falsifiable:
    reverting the sentinel to `0x3F02` alone turns `make corpus` red.
 
+### A6. The live outbound leg found a false-REJECT the vector could not: the member WIRE NAME
+
+A captured vector proves our *encoder* reproduces Connext's octets. It cannot prove Connext's own
+DataReader accepts what we write, and those are different claims. Wiring a live `us -> Connext MUTABLE`
+leg (`interop/connext/mutable/mutable_sub`) immediately showed the difference: **Connext received zero
+samples**, while Connext's own log showed it had matched *us*. A **one-sided match** — our type gate
+refusing a conformant peer, visible only as `matched=0` and one line of `INCOMPATIBLE —
+legacy-TypeObject assignability`.
+
+Both models turned out identical on extensibility, member ids and member kinds. The difference was a
+single character in a **member name**: our TypeObject announced `"t-ns"`, derived from the Lisp slot
+`t-ns`, where `MutableData.idl` declares `t_ns`. Assignability matches members by NameHash
+(§7.2.4.4.4), the hashes differ, `member-names-ids-consistent-p` fails, and an identical type is
+judged inconsistent.
+
+The underlying gap was not MUTABLE-specific and is the more important finding: **`define-dds-type` had
+no way to give a member a wire name that differs from its Lisp slot.** IDL uses `_`, Lisp uses `-`, so
+*no* type with an underscore in a member name could interoperate with a foreign peer — silently, as a
+non-match with no error anywhere. Fixed by a `:name` member option (defaulting to the downcased slot,
+duplicates rejected at macroexpansion), which now feeds the TypeObject NameHash and the content-filter
+field accessors alike. Regression: `mutable-wire-name-*` in `run-gen-mutable-test`.
+
+Two process points. This is the ADR 0057 shape recurring — a defect that *only* an outbound live leg
+can see, because inbound testing exercises the peer's gate rather than ours. And the gate's diagnostic
+was too thin to act on: `INCOMPATIBLE` named no failing condition, so it now dumps both models
+(extensibility, ids, kinds) when `*type-compat-log*` is set.
+
 The capture tooling had its own defect, worth recording because it would have silently poisoned any
 future vector: `corpus-capture` reads the buffer handed to `%deliver-user-sample`, which since the RX
 store-copy pool landed is a pooled **slot** rather than the payload — a 72-octet sample was captured as

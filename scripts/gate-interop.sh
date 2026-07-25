@@ -246,6 +246,54 @@ if [[ "$have_connext" -eq 1 ]]; then
     note "FAIL" "Connext -> us LARGE: only $n verified sample(s), need >= $MIN_SAMPLES (log: $log)"; fails=1; fi
 fi
 
+# ---- Legs 8/9: MUTABLE extensibility, both directions vs Connext (ADR 0086). ----
+# The corpus proves our ENCODER reproduces Connext's octets for a @mutable sample. It cannot prove that
+# Connext's own DataReader ACCEPTS what we write — type gate, encapsulation id, per-member framing and
+# all — and those are different claims. This leg is the second one.
+#
+# It has already earned its place. The first run scored matched=0 while Connext's log showed it had
+# matched US: a ONE-SIDED match, our type gate refusing a conformant peer. Cause: our TypeObject
+# announced the member name "t-ns" (from the Lisp slot) where the IDL declares "t_ns", and assignability
+# matches members by NameHash — so an identical type was judged inconsistent, silently, with no error
+# anywhere. That is the ADR 0057 shape exactly, and only an outbound live leg can see it.
+#
+# REP=xcdr1 is REQUIRED and is not a tuning choice: Connext sends and expects @mutable as PL_CDR
+# (encoding version 1) — the committed vector proves it — and DATA_REPRESENTATION is an RxO policy, so
+# an XCDR2-default writer silently fails to match.
+if [[ "$have_connext" -eq 1 && -x interop/connext/mutable/mutable_sub ]]; then
+  export NDDSHOME
+  export DYLD_LIBRARY_PATH="$NDDSHOME/lib/arm64Darwin20clang12.0:$PWD/interop/connext/mutable:${DYLD_LIBRARY_PATH:-}"
+  ADV="${ADVERTISE:-$(ipconfig getifaddr en0 2>/dev/null || echo 127.0.0.1)}"
+  # Leg 8: us -> Connext, MUTABLE.
+  log="$(mktemp)"
+  g="$(start_peer "$log" bash -c "cd interop/connext/mutable && exec ./mutable_sub $DOMAIN $((SECONDS_RUN + 8))")"
+  sleep 5
+  tmout $((SECONDS_RUN + 25)) ./scripts/with-sbcl.sh \
+    --eval "(asdf:load-system :dds-bench)" \
+    --eval "(uiop:symbol-call :dds.bench :run-mutable-publisher :domain $DOMAIN :advertise-address \"$ADV\" :count $((SECONDS_RUN * 20)) :rate 20 :representation :xcdr1)" \
+    --eval '(uiop:quit 0)' >/dev/null 2>&1
+  wait_peer "$g" $((SECONDS_RUN + 30)); stop_peer "$g"
+  # Assert the VALUES, not a sample count: a decode that silently defaulted a member would otherwise pass.
+  n="$(grep -c 'a=1 b=2 label=hello t_ns=3 vals=3 7 8 9' "$log" || true)"
+  if [[ "$n" -ge "$MIN_SAMPLES" ]]; then note "ok" "us -> Connext MUTABLE: $n sample(s), every member correct (STRICT oracle)"; else
+    note "FAIL" "us -> Connext MUTABLE: only $n fully-correct sample(s), need >= $MIN_SAMPLES (log: $log)"; fails=1; fi
+  # Leg 9: Connext -> us, MUTABLE. Their PL_CDR framing through our decoder.
+  log="$(mktemp)"
+  g="$(start_peer "$log" bash -c "cd interop/connext/mutable && exec ./mutable_pub $DOMAIN")"
+  sleep 3
+  tmout $((SECONDS_RUN + 25)) ./scripts/with-sbcl.sh \
+    --eval "(asdf:load-system :dds-bench)" \
+    --eval "(uiop:symbol-call :dds.bench :run-mutable-subscriber :domain $DOMAIN :advertise-address \"$ADV\" :seconds $SECONDS_RUN)" \
+    --eval '(uiop:quit 0)' > "$log.ours" 2>&1
+  stop_peer "$g"
+  n="$(grep -c 'a=1 b=2 label=hello t_ns=3 vals=3 7 8 9' "$log.ours" || true)"
+  if [[ "$n" -ge "$MIN_SAMPLES" ]]; then note "ok" "Connext -> us MUTABLE: $n sample(s), every member correct"; else
+    note "FAIL" "Connext -> us MUTABLE: only $n fully-correct sample(s), need >= $MIN_SAMPLES (log: $log.ours)"; fails=1; fi
+elif [[ "$have_connext" -eq 1 ]]; then
+  note "FAIL" "Connext MUTABLE peer not built — run: cd interop/connext/mutable && make"
+  fails=1
+fi
+
 # ---- Leg 7: us -> Fast DDS, LARGE DATA. Fragmentation against the SECOND vendor. ----
 # Fast DDS is the LENIENT peer, so this proves strictly less than the Connext large leg — but until this
 # existed, fragmentation had exactly ONE vendor behind it, and "our emitted datagram size interoperates" is
@@ -279,9 +327,11 @@ echo "gate-interop: PASS — live cross-vendor interop validated (Connext = the 
 echo "gate-interop: COVERAGE — BOTH DIRECTIONS, both vendors: vendor->us and us->vendor (the latter is"
 echo "              the direction that hid ADR 0057, and it is gated here with REP=xcdr1 because a stock"
 echo "              foreign reader advertises XCDR1 only and DATA_REPRESENTATION is RxO)."
-echo "gate-interop: NOT COVERED — Shapes + large-data only. Large-data now runs against BOTH vendors"
+echo "gate-interop: NOT COVERED — Shapes + large-data + MUTABLE only. Large-data runs against BOTH vendors"
 echo "              (Connext both directions; Fast DDS outbound — there is no Fast DDS LargeData publisher,"
-echo "              so DATA_FRAG REASSEMBLY is gated against Connext only)."
+echo "              so DATA_FRAG REASSEMBLY is gated against Connext only). MUTABLE is Connext-only for a"
+echo "              reason worth stating: Connext sends @mutable as PL_CDR (XCDR1), so these legs gate the"
+echo "              parameter-list framing; the PL_CDR2 (XCDR2) framing has NO live peer behind it."
 echo "              Per-feature legs (keyed/nokey, TypeLookup, keyed FlatData, liveliness, deadline,"
 echo "              durability, security) have drivers under scripts/ and interop/ but are NOT gated yet."
 echo "              Say so rather than let a green line read as 'interop is covered'."

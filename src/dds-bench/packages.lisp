@@ -14,7 +14,7 @@
     self-checks.")
   (:export ;; WP-CONFORMANCE-AND-PARITY WP-1: the cross-stack (ours / Connext / Fast DDS) parity harness
            #:run-echo-responder #:run-echo-pinger #:corpus-capture #:corpus-verify #:*corpus-dir* #:run-echo-ladder
-           #:mutable-corpus-capture
+           #:mutable-corpus-capture #:run-mutable-publisher #:run-mutable-subscriber
            #:mem-per-sample
            #:perf-data #:make-perf-data
            #:run-latency #:run-throughput #:run-bench #:run-bench-shmem #:run-bench-zerocopy

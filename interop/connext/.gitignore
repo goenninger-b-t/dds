@@ -53,6 +53,7 @@ MutableData.cxx
 MutableDataPlugin.hpp
 MutableDataPlugin.cxx
 mutable/mutable_pub
+mutable/mutable_sub
 
 # RTI dylib symlinks placed next to the binary: the libs are installed with an @loader_path
 # install name, which DYLD_LIBRARY_PATH cannot satisfy (same fix as interop/perftest/connext).

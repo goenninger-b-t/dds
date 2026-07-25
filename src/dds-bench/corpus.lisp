@@ -102,7 +102,10 @@
   (a :i32 :id 0 :key t)
   (b :i16 :id 1)
   (label :string :id 2)
-  (t-ns :i64 :id 3)
+  ;; :name is the IDL spelling. A Lisp slot T-NS renders "t-ns"; MutableData.idl declares "t_ns",
+  ;; and assignability matches members by NameHash — so without this the type gate refuses the peer
+  ;; that uses the very same type, silently, as matched=0.
+  (t-ns :i64 :id 3 :name "t_ns")
   (vals (:sequence :i32) :id 4))
 
 (defparameter +mutable-corpus-file+ "mutabledata-connext.bin"
@@ -173,6 +176,81 @@
       (sleep seconds)
       (dds.dcps:delete-participant p)))
   t)
+
+(defun* run-mutable-publisher (&key (domain 0) (advertise-address "127.0.0.1")
+                                    (count 200) (rate 20) (representation :xcdr1))
+    (function (&key (:domain (integer 0)) (:advertise-address string) (:count (integer 0))
+                    (:rate (integer 1)) (:representation symbol)) t)
+  "Publish the fixed MutableData sample on MutableCorpus so a LIVE peer can be shown decoding a
+   @mutable type this stack wrote (FR-IO, ADR 0086).
+
+   REPRESENTATION defaults to :XCDR1, and that is not a tuning choice. RTI Connext sends and expects
+   @mutable as PL_CDR (encoding version 1) — the vector proves it — and DATA_REPRESENTATION is an RxO
+   policy, so an XCDR2-default writer SILENTLY fails to match a stock Connext reader (matched=0, no
+   error). This is the same trap ADR 0057's leg documented for Shapes."
+  (let* ((ts (dds.types:find-type-support "mutable-data"))
+         (p (dds.dcps:create-participant :domain domain :advertise-address advertise-address
+                                         :autonomous t))
+         (tp (dds.dcps:create-topic p "MutableCorpus" "MutableData" ts))
+         (pub (dds.dcps:create-publisher p))
+         (dw (dds.dcps:create-datawriter
+              pub tp :qos (dds.qos:make-writer-qos
+                           :reliability :reliable
+                           :data-representation (list representation)))))
+    (format t "~&[mut-pub] MutableCorpus/MutableData rep=~a count=~d domain=~d~%"
+            representation count domain)
+    (finish-output)
+    (unwind-protect
+         ;; The MATCHED COUNT is reported, not just the write count. A writer that matches NOTHING still
+         ;; writes happily and reports nothing wrong — that is precisely how a false type-gate reject
+         ;; hid for six slices (ADR 0057). Without this line an outbound leg failure is indistinguishable
+         ;; from a peer that simply did not print.
+         (let ((last -1))
+           (dotimes (n count)
+             (let ((m (dds.dcps:matched-count p)))
+               (when (/= m last)
+                 (format t "~&[mut-pub] MATCHED ~d -> ~d remote reader(s)~%" (max last 0) m)
+                 (finish-output)
+                 (setf last m)))
+             (dds.dcps:write-sample dw (%corpus-mutable-sample))
+             (sleep (/ 1.0 rate))))
+      (dds.dcps:delete-participant p))
+    t))
+
+(defun* run-mutable-subscriber (&key (domain 0) (advertise-address "127.0.0.1") (seconds 20))
+    (function (&key (:domain (integer 0)) (:advertise-address string) (:seconds (integer 1))) t)
+  "Subscribe MutableCorpus and print EVERY member of every received sample, so a live leg asserts
+   VALUES rather than a sample count — a decode that silently defaulted a member would otherwise pass.
+   Used for the Connext -> us MUTABLE leg (FR-IO, ADR 0086)."
+  (let* ((ts (dds.types:find-type-support "mutable-data"))
+         (p (dds.dcps:create-participant :domain domain :advertise-address advertise-address
+                                         :autonomous t))
+         (tp (dds.dcps:create-topic p "MutableCorpus" "MutableData" ts))
+         (sub (dds.dcps:create-subscriber p))
+         (dr (dds.dcps:create-datareader
+              sub tp :qos (dds.qos:make-reader-qos :reliability :reliable))))
+    (format t "~&[mut-sub] MutableCorpus/MutableData domain=~d for ~ds~%" domain seconds)
+    (finish-output)
+    (unwind-protect
+         (let ((deadline (+ (get-internal-real-time)
+                            (* seconds internal-time-units-per-second)))
+               (n 0))
+           (loop while (< (get-internal-real-time) deadline)
+                 do (dolist (cs (dds.dcps:take-samples dr))
+                      (let ((info (dds.dcps:cached-sample-info cs))
+                            (s (dds.dcps:cached-sample-data cs)))
+                        (when (and (dds.dcps:sample-info-valid-data info) s)
+                          (incf n)
+                          (format t "~&[mut-sub] a=~d b=~d label=~a t_ns=~d vals=~d~{ ~d~}~%"
+                                  (mutable-data-a s) (mutable-data-b s) (mutable-data-label s)
+                                  (mutable-data-t-ns s) (length (mutable-data-vals s))
+                                  (coerce (mutable-data-vals s) 'list))
+                          (finish-output))))
+                    (sleep 0.05))
+           (format t "~&[mut-sub] received ~d sample(s)~%" n)
+           (finish-output))
+      (dds.dcps:delete-participant p))
+    t))
 
 (defun* %corpus-verify-mutable (path)
     (function (t) (integer 0))

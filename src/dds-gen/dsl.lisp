@@ -710,6 +710,13 @@
    recognise the id, it must discard the whole sample rather than deliver a partial one
    (XTypes 1.3 §7.4.1.2.1). It is a per-member wire flag in both encodings.
 
+   :NAME is the member's WIRE name, defaulting to the downcased slot name. It exists because the two
+   are not always the same string: IDL spells identifiers with '_' where Lisp uses '-', so a slot
+   named T-NS renders "t-ns" while the IDL member is "t_ns". Type assignability matches members by
+   NameHash, so that difference makes an otherwise identical type INCONSISTENT with the peer's — and
+   the symptom is not an error but a silent non-match (matched=0), the ADR 0057 failure shape. Give
+   the IDL spelling here whenever it differs. Duplicates are rejected at macroexpansion.
+
    EXTENSIBILITY decides the framing and the encapsulation id together (Table 60, §7.6.3.1.2):
    :final is plain CDR; :appendable prepends a DHEADER under XCDR2 and is AsFinal under XCDR1
    (rules 29/30); :mutable frames every member with its own header — EMHEADER1 under XCDR2
@@ -732,7 +739,17 @@
                              (append (%parse-member spec)
                                      (list :id (or (getf (cddr spec) :id) i)
                                            :must-understand
-                                           (and (getf (cddr spec) :must-understand) t))))
+                                           (and (getf (cddr spec) :must-understand) t)
+                                           ;; The member's WIRE name, which is not always derivable
+                                           ;; from the Lisp slot: IDL spells identifiers with '_'
+                                           ;; and Lisp with '-', so a slot T-NS renders "t-ns" while
+                                           ;; the IDL member is "t_ns". Those hash to different
+                                           ;; NameHashes, the assignability check finds the members
+                                           ;; inconsistent, and the type gate REFUSES a peer using
+                                           ;; the very same type — silently, as matched=0 with no
+                                           ;; error (the ADR 0057 failure shape). :name overrides it.
+                                           :name (or (getf (cddr spec) :name)
+                                                     (string-downcase (string (first spec)))))))
                            members)))
          (ctor (%sym pkg "MAKE-" (string name)))
          (ser  (%sym pkg "SERIALIZE-" (string name)))
@@ -782,6 +799,11 @@
         (error "define-dds-type: member :id must be an integer in [0, #x0fffffff]; got ~s" ids))
       (unless (= (length ids) (length (remove-duplicates ids)))   ; NOCOND(MACRO): macroexpansion-time
         (error "define-dds-type: duplicate member :id in ~s — an id addresses a member on the wire" name)))
+    ;; Wire names are matched by NameHash during type assignability, so two members sharing one name
+    ;; make the type ambiguous to a peer exactly as two members sharing an id do.
+    (let ((names (mapcar (lambda (m) (getf m :name)) parsed)))
+      (unless (= (length names) (length (remove-duplicates names :test #'string=)))   ; NOCOND(MACRO): macroexpansion-time
+        (error "define-dds-type: duplicate member :name in ~s — a name is matched by NameHash" name)))
     (multiple-value-bind (fd-offs fd-body) (when flatp (%flatdata-offsets parsed))
       (declare (ignorable fd-offs fd-body))
     (flet ((acc (m) (%sym pkg (string name) "-" (string (getf m :slot))))
@@ -1284,7 +1306,7 @@
                   :size ,fd-size-sym
                   :fields (list ,@(loop for m in parsed
                                         for off = (cdr (assoc (getf m :slot) fd-offs))
-                                        collect `(list ,(string-downcase (string (getf m :slot)))
+                                        collect `(list ,(getf m :name)
                                                        ,off (function ,(fd-acc m))
                                                        (function (setf ,(fd-acc m))))))))
              ;; (field-name . accessor) per scalar/string member for content filters
@@ -1292,7 +1314,7 @@
              :field-accessors
              (list ,@(loop for m in parsed
                            when (member (getf m :kind) '(:scalar))
-                             collect `(cons ,(string-downcase (string (getf m :slot)))
+                             collect `(cons ,(getf m :name)
                                             (function ,(acc m)))))
              ;; Structural Minimal TypeObject (FR-TYPE-2): member TIs for primitives/
              ;; strings/sequences; a nested-struct member carries a PENDING EK_MINIMAL
@@ -1308,7 +1330,7 @@
               ;; @id, FR-TYPE-2).
               (list ,@(loop for m in parsed
                             collect `(dds.types:make-struct-member
-                                      ,(string-downcase (string (getf m :slot)))
+                                      ,(getf m :name)
                                       ,(getf m :id)
                                       ,(ecase (getf m :kind)
                                          ;; A bounded string is STRING8 with its bound, not the

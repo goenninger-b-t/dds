@@ -251,6 +251,23 @@ on decode; that is inherent to the kind and is a per-type choice, not a default 
 *reordering* members of a mutable type is safe but *renumbering* them is not. Duplicates are rejected at
 macroexpansion — two members sharing an id would have the second silently overwrite the first on decode.
 
+**`:name` is the member's WIRE name**, defaulting to the downcased slot name — and you need it more
+often than you would guess. IDL spells identifiers with `_` where Lisp uses `-`, so a slot `t-ns`
+renders `"t-ns"` while the IDL member is `t_ns`. Type assignability matches members by **NameHash**, so
+that single character makes an otherwise identical type *inconsistent* with the peer's:
+
+```lisp
+(t-ns :i64 :id 3 :name "t_ns")     ; the IDL spelling, not the Lisp one
+```
+
+The failure mode is what makes this worth knowing: not an error, but a **silent non-match**. The live
+Connext MUTABLE leg hit exactly this — Connext matched our writer while our gate refused its reader, a
+one-sided match visible only as `matched=0` and a single `INCOMPATIBLE — legacy-TypeObject
+assignability` line. Before `:name` existed, **no type with an underscore in a member name could
+interoperate**, and nothing said so. Duplicates are rejected at macroexpansion, for the same reason
+duplicate `:id`s are. Set `dds.dcps:*type-compat-log*` to a stream to see the gate's verdicts and, on a
+reject, both models side by side.
+
 **`:must-understand t`** (`@must_understand`) marks a member a peer may not quietly ignore. If it does not
 recognise the id, it must discard the **entire sample** rather than deliver a partial one
 (§7.4.1.2.1) — reported as the status `:unknown-must-understand-member`, never signalled (ADR 0064).
