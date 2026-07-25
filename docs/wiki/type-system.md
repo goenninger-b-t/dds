@@ -280,11 +280,20 @@ are emitted, because a stock foreign reader may request either — and emitting 
 XCDR1 encapsulation id would be silently wrong bytes rather than a visible failure. Table 60 labels them
 `PL_CDR2_LE` **0x000b** and `PL_CDR_LE` **0x0003**, and RX accepts both.
 
-**RTI Connext sends `@mutable` as PL_CDR (XCDR1), not PL_CDR2.** The committed vector
-`corpus/xcdr2/mutabledata-connext.bin` — a live Connext 7.3.1 payload, gated byte-exact by `make corpus`
-— is stamped `0x0003`. So the XCDR1 leg is the one that actually carries MUTABLE to Connext, which is why
-both encodings are emitted rather than XCDR2 alone; a type that refused XCDR1 would interoperate with
-nothing while every local test still passed.
+**Both RTI Connext and Fast DDS send `@mutable` as PL_CDR (XCDR1), not PL_CDR2.** The committed vectors
+`corpus/xcdr2/mutabledata-{connext,fastdds}.bin` are both stamped `0x0003`. So the XCDR1 leg is the one
+that actually carries MUTABLE to either vendor, which is why both encodings are emitted rather than XCDR2
+alone; a type that refused XCDR1 would interoperate with nothing while every local test still passed.
+It also means the XCDR2 length-code choice has **no live peer behind it** — see below.
+
+**And the two vendors do not agree with each other.** For the same sample they differ in three fields:
+Connext pads a parameter's declared length to a multiple of 4 (`4` for a 2-octet `short`, `12` for a
+10-octet string) and sets FLAG_MUST_UNDERSTAND on the terminator (`0x7F02`); Fast DDS declares the exact
+`ssize` (`2`, `10`) and writes a bare `0x3F02`. Rules (24)/(25) say `M.value.ssize` — the Fast DDS
+reading; a PL_CDR list is also the RTPS ParameterList of RTPS 2.5 §9.4.2.11 where lengths are
+4-multiples — the Connext reading. **No encoder can be byte-exact against both**: ours matches Connext,
+the strict oracle, as a deliberate choice. What holds for either is that we *decode* their framing, and
+that is gated — the Fast DDS vector is decode-verified rather than byte-compared (ADR 0086 §A7).
 
 Traps worth knowing, all pinned by `run-gen-mutable-test` and `make corpus` (ADR 0086 §A1/§A3/§A5):
 

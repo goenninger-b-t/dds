@@ -294,6 +294,30 @@ elif [[ "$have_connext" -eq 1 ]]; then
   fails=1
 fi
 
+# ---- Leg 10: Fast DDS -> us, MUTABLE. The SECOND vendor's parameter framing. ----
+# Not redundant with the Connext MUTABLE legs, because the two vendors DISAGREE about the XCDR1
+# parameter framing and both readings are defensible: Connext pads a parameter's declared length to a
+# multiple of 4 and sets FLAG_MUST_UNDERSTAND on the list terminator (0x7F02); Fast DDS declares the
+# exact ssize and writes a bare 0x3F02. Our ENCODER can only be byte-exact against one of them, and it
+# matches Connext (the strict oracle); this leg pins the half that must hold for either, which is that
+# we DECODE the other vendor's choice. Fast DDS is loopback-whitelisted, so it needs a unicast SPDP peer.
+if [[ "$have_fastdds" -eq 1 && -x interop/fastdds/mutable/mutable_pub ]]; then
+  log="$(mktemp)"
+  g="$(start_peer "$log" ./scripts/with-fastdds.sh bash -c "cd interop/fastdds/mutable && exec ./mutable_pub 0")"
+  sleep 4
+  tmout $((SECONDS_RUN + 25)) ./scripts/with-sbcl.sh \
+    --eval "(asdf:load-system :dds-bench)" \
+    --eval "(uiop:symbol-call :dds.bench :run-mutable-subscriber :domain $DOMAIN :advertise-address \"127.0.0.1\" :peers \"127.0.0.1:7410\" :seconds $SECONDS_RUN)" \
+    --eval '(uiop:quit 0)' > "$log.ours" 2>&1
+  stop_peer "$g"
+  n="$(grep -c 'a=1 b=2 label=hello t_ns=3 vals=3 7 8 9' "$log.ours" || true)"
+  if [[ "$n" -ge "$MIN_SAMPLES" ]]; then note "ok" "Fast DDS -> us MUTABLE: $n sample(s), every member correct (2nd vendor's framing)"; else
+    note "FAIL" "Fast DDS -> us MUTABLE: only $n fully-correct sample(s), need >= $MIN_SAMPLES (log: $log.ours)"; fails=1; fi
+elif [[ "$have_fastdds" -eq 1 ]]; then
+  note "FAIL" "Fast DDS MUTABLE peer not built — run: ./scripts/with-fastdds.sh bash -c 'cd interop/fastdds/mutable && make gen && make mutable_pub'"
+  fails=1
+fi
+
 # ---- Leg 7: us -> Fast DDS, LARGE DATA. Fragmentation against the SECOND vendor. ----
 # Fast DDS is the LENIENT peer, so this proves strictly less than the Connext large leg — but until this
 # existed, fragmentation had exactly ONE vendor behind it, and "our emitted datagram size interoperates" is
@@ -329,9 +353,10 @@ echo "              the direction that hid ADR 0057, and it is gated here with R
 echo "              foreign reader advertises XCDR1 only and DATA_REPRESENTATION is RxO)."
 echo "gate-interop: NOT COVERED — Shapes + large-data + MUTABLE only. Large-data runs against BOTH vendors"
 echo "              (Connext both directions; Fast DDS outbound — there is no Fast DDS LargeData publisher,"
-echo "              so DATA_FRAG REASSEMBLY is gated against Connext only). MUTABLE is Connext-only for a"
-echo "              reason worth stating: Connext sends @mutable as PL_CDR (XCDR1), so these legs gate the"
-echo "              parameter-list framing; the PL_CDR2 (XCDR2) framing has NO live peer behind it."
+echo "              so DATA_FRAG REASSEMBLY is gated against Connext only). MUTABLE runs against BOTH vendors, for a"
+echo "              reason worth stating: BOTH vendors send @mutable as PL_CDR (XCDR1), so these legs gate"
+echo "              the parameter-list framing only — the PL_CDR2 (XCDR2) framing has NO live peer behind"
+echo "              it from either vendor, so its length-code choice stays externally unpinned."
 echo "              Per-feature legs (keyed/nokey, TypeLookup, keyed FlatData, liveliness, deadline,"
 echo "              durability, security) have drivers under scripts/ and interop/ but are NOT gated yet."
 echo "              Say so rather than let a green line read as 'interop is covered'."

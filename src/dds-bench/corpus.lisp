@@ -128,8 +128,10 @@
                      :vals (make-array 3 :element-type '(signed-byte 32)
                                          :initial-contents '(7 8 9))))
 
-(defun* mutable-corpus-capture (&key (domain 0) (advertise-address "192.168.2.148") (seconds 60))
-    (function (&key (:domain (integer 0)) (:advertise-address string) (:seconds (integer 1))) t)
+(defun* mutable-corpus-capture (&key (domain 0) (advertise-address "192.168.2.148") (seconds 60)
+                                     peers (file +mutable-corpus-file+))
+    (function (&key (:domain (integer 0)) (:advertise-address string) (:seconds (integer 1))
+                    (:peers (or null string)) (:file string)) t)
   "CAPTURE MODE for the MUTABLE vector: subscribe the MutableCorpus topic and write the FIRST payload
    RTI Connext transmits to *CORPUS-DIR*/+mutable-corpus-file+, verbatim.
 
@@ -155,17 +157,18 @@
                          (typep vec '(array (unsigned-byte 8) (*)))
                          (>= (length vec) 8))
                 (setf done t)
-                (let ((path (merge-pathnames +mutable-corpus-file+ *corpus-dir*)))
+                (let ((path (merge-pathnames file *corpus-dir*)))
                   (with-open-file (out path :direction :output :element-type '(unsigned-byte 8)
                                             :if-exists :supersede :if-does-not-exist :create)
                     (write-sequence vec out))
                   (format t "~&[corpus] captured ~a: ~d octets, encap=~2,'0x~2,'0x options=~2,'0x~2,'0x~%~
                                [corpus] body: ~a~%"
-                          +mutable-corpus-file+ (length vec) (aref vec 0) (aref vec 1)
+                          file (length vec) (aref vec 0) (aref vec 1)
                           (aref vec 2) (aref vec 3) (%hex vec))
                   (finish-output)))
               (apply orig node writer-id sn vec r))))
-    (let* ((p (%perf-participant domain advertise-address nil))
+    (let* ((p (dds.dcps:create-participant :domain domain :advertise-address advertise-address
+                                           :peers (dds.disc:parse-peers peers) :autonomous t))
            (tp (dds.dcps:create-topic p "MutableCorpus" "MutableData" ts))
            (sub (dds.dcps:create-subscriber p)))
       (dds.dcps:create-datareader
@@ -178,9 +181,9 @@
   t)
 
 (defun* run-mutable-publisher (&key (domain 0) (advertise-address "127.0.0.1")
-                                    (count 200) (rate 20) (representation :xcdr1))
+                                    (count 200) (rate 20) (representation :xcdr1) peers)
     (function (&key (:domain (integer 0)) (:advertise-address string) (:count (integer 0))
-                    (:rate (integer 1)) (:representation symbol)) t)
+                    (:rate (integer 1)) (:representation symbol) (:peers (or null string))) t)
   "Publish the fixed MutableData sample on MutableCorpus so a LIVE peer can be shown decoding a
    @mutable type this stack wrote (FR-IO, ADR 0086).
 
@@ -190,6 +193,7 @@
    error). This is the same trap ADR 0057's leg documented for Shapes."
   (let* ((ts (dds.types:find-type-support "mutable-data"))
          (p (dds.dcps:create-participant :domain domain :advertise-address advertise-address
+                                         :peers (dds.disc:parse-peers peers)
                                          :autonomous t))
          (tp (dds.dcps:create-topic p "MutableCorpus" "MutableData" ts))
          (pub (dds.dcps:create-publisher p))
@@ -217,13 +221,18 @@
       (dds.dcps:delete-participant p))
     t))
 
-(defun* run-mutable-subscriber (&key (domain 0) (advertise-address "127.0.0.1") (seconds 20))
-    (function (&key (:domain (integer 0)) (:advertise-address string) (:seconds (integer 1))) t)
+(defun* run-mutable-subscriber (&key (domain 0) (advertise-address "127.0.0.1") (seconds 20) peers)
+    (function (&key (:domain (integer 0)) (:advertise-address string) (:seconds (integer 1))
+                    (:peers (or null string))) t)
   "Subscribe MutableCorpus and print EVERY member of every received sample, so a live leg asserts
    VALUES rather than a sample count — a decode that silently defaulted a member would otherwise pass.
    Used for the Connext -> us MUTABLE leg (FR-IO, ADR 0086)."
   (let* ((ts (dds.types:find-type-support "mutable-data"))
          (p (dds.dcps:create-participant :domain domain :advertise-address advertise-address
+                                         ;; Fast DDS's profile whitelists 127.0.0.1 and never sees LAN
+                                         ;; multicast SPDP, so reaching it needs a unicast peer at its
+                                         ;; builtin metatraffic port (127.0.0.1:7410).
+                                         :peers (dds.disc:parse-peers peers)
                                          :autonomous t))
          (tp (dds.dcps:create-topic p "MutableCorpus" "MutableData" ts))
          (sub (dds.dcps:create-subscriber p))
@@ -251,6 +260,57 @@
            (finish-output))
       (dds.dcps:delete-participant p))
     t))
+
+(defparameter +mutable-fastdds-file+ "mutabledata-fastdds.bin"
+  "The SECOND vendor's PL_CDR payload for the SAME fixed MutableData sample — eProsima Fast DDS.
+
+   It is NOT byte-compared against our encoder, and that is the point of it. Fast DDS and RTI Connext
+   DISAGREE on three fields of the XCDR1 parameter framing, and both readings are defensible:
+
+     field                        Connext        Fast DDS
+     b (a 2-octet short) length    4 (padded)     2 (exact)
+     label (10-octet) length      12 (padded)    10 (exact)
+     list terminator          0x7F02 (MU set)  0x3F02 (bare)
+
+   Rules (24)/(25) say `M.value.ssize`, which is Fast DDS's literal reading; a PL_CDR list is also the
+   RTPS ParameterList of RTPS 2.5 §9.4.2.11, where lengths are 4-multiples, which is Connext's. Table 34
+   marks PID_LIST_END must-understand; rule (23) names a bare `PID_SENTINEL`. No encoder can be
+   byte-exact against both, so ours matches Connext — the strict oracle — and this vector instead pins
+   the half that MUST hold for either: that we DECODE the other vendor's choice correctly.")
+
+(defun* %corpus-verify-mutable-decode (path)
+    (function (t) (integer 0))
+  "Verify the Fast DDS vector by DECODING it and checking every field, rather than by re-encoding it.
+
+   A byte comparison would be the wrong test here: it would fail on a conformant peer's legitimately
+   different framing choice and would say nothing about the property that actually matters, which is
+   that a second vendor's payload round-trips through our decoder intact. Returns the mismatch count."
+  (let* ((bytes (with-open-file (in path :element-type '(unsigned-byte 8))
+                  (let ((v (make-array (file-length in) :element-type '(unsigned-byte 8))))
+                    (read-sequence v in) v)))
+         (want (%corpus-mutable-sample)))
+    (multiple-value-bind (got status)
+        (dds.dcps::%deserialize-payload (dds.types:find-type-support "mutable-data")
+                                        (dds.core.buffer:octet-buffer-over bytes))
+      (cond
+        ((or status (null got))
+         (format t "~&  FAIL ~a: decode refused it — status ~s~%" +mutable-fastdds-file+ status)
+         1)
+        ((and (= (mutable-data-a got) (mutable-data-a want))
+              (= (mutable-data-b got) (mutable-data-b want))
+              (string= (mutable-data-label got) (mutable-data-label want))
+              (= (mutable-data-t-ns got) (mutable-data-t-ns want))
+              (equalp (coerce (mutable-data-vals got) 'list)
+                      (coerce (mutable-data-vals want) 'list)))
+         (format t "~&  ok   ~a (~d octets, PL_CDR/XCDR1, DECODE-verified — a 2nd vendor's framing)~%"
+                 +mutable-fastdds-file+ (length bytes))
+         0)
+        (t
+         (format t "~&  FAIL ~a: decoded to a DIFFERENT sample: a=~s b=~s label=~s t-ns=~s vals=~s~%"
+                 +mutable-fastdds-file+ (mutable-data-a got) (mutable-data-b got)
+                 (mutable-data-label got) (mutable-data-t-ns got)
+                 (coerce (mutable-data-vals got) 'list))
+         1)))))
 
 (defun* %corpus-verify-mutable (path)
     (function (t) (integer 0))
@@ -310,6 +370,11 @@
             ((string= name +mutable-corpus-file+)
              (incf n)
              (incf bad (%corpus-verify-mutable f)))
+            ;; The second vendor's vector is DECODE-verified, not byte-compared — see
+            ;; +mutable-fastdds-file+ for why no encoder can be byte-exact against both.
+            ((string= name +mutable-fastdds-file+)
+             (incf n)
+             (incf bad (%corpus-verify-mutable-decode f)))
             ((member name *corpus-verified-elsewhere* :test #'string=)
              (format t "~&  --   ~a (verified elsewhere — see *corpus-verified-elsewhere*)~%" name))
             (t

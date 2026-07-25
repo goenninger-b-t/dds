@@ -257,6 +257,42 @@ each committed IDL and asserts every member name exists, spelled identically, in
 stack publishes for it. It is falsifiable — removing one `:name` makes it name the exact member — and
 it refuses to pass vacuously if no pair was compared.
 
+### A7. Two vendors, two conformant PL_CDR framings — so "byte-exact" is a CHOICE here
+
+A second peer was built (`interop/fastdds/mutable/`) to settle the length-code question A2 left open,
+on the theory that Fast DDS might emit PL_CDR2 where Connext does not. **It does not** — Fast DDS also
+stamps `@mutable` as `0x0003` PL_CDR. So the LC 4-vs-5/6 choice has no live peer behind it from either
+available vendor, and it stays externally unpinned. That is now a tested answer rather than an open
+unknown.
+
+The experiment paid off differently, and more usefully. For the *same* fixed sample the two vendors
+produce 72 octets that **differ in three fields** — precisely the three the Connext vector had just
+made us "correct":
+
+| field | Connext | Fast DDS |
+|---|---|---|
+| `b` (a 2-octet `short`), declared length | 4 — padded | 2 — exact |
+| `label` (10 octets), declared length | 12 — padded | 10 — exact |
+| list terminator | `0x7F02` (FLAG_MUST_UNDERSTAND set) | `0x3F02` (bare) |
+
+Both readings are defensible, which is the point. Rules (24)/(25) say `M.value.ssize` — Fast DDS's
+literal reading. A PL_CDR list is also the RTPS ParameterList of RTPS 2.5 §9.4.2.11, where parameter
+lengths are 4-multiples — Connext's structural reading. Table 34 marks PID_LIST_END must-understand;
+rule (23) names only a bare `PID_SENTINEL`.
+
+**No encoder can be byte-exact against both.** Ours matches Connext, and that is a deliberate choice —
+Connext is the strict oracle, and the RTPS ParameterList convention is the better-grounded of the two —
+not a discovered truth. A5's three "corrections" should be read accordingly: they made us byte-exact
+against *Connext*, and would have been equally justified in the other direction had Fast DDS been
+captured first. That is a caution about how much a single vector proves.
+
+What must hold for *either* vendor is that we DECODE their choice, and that is what the Fast DDS vector
+now gates: `mutabledata-fastdds.bin` is **decode-verified, not byte-compared** (`%corpus-verify-mutable-decode`,
+falsified by corrupting a member id), plus a live `Fast DDS -> us MUTABLE` leg. Our decoder handles both
+without special-casing: it forces the position to each member's declared end and re-aligns before the
+next parameter id, so a padded or an exact length reads identically; and `pl-pid-decode` masks the flag
+bits off before comparing, so both terminators are recognised.
+
 The capture tooling had its own defect, worth recording because it would have silently poisoned any
 future vector: `corpus-capture` reads the buffer handed to `%deliver-user-sample`, which since the RX
 store-copy pool landed is a pooled **slot** rather than the payload — a 72-octet sample was captured as
