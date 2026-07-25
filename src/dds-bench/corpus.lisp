@@ -12,6 +12,16 @@
 
 (in-package #:dds.bench)
 
+(defparameter *corpus-verified-elsewhere*
+  '("logevent-connext.bin")
+  "Corpus vectors this gate does NOT verify, each because another gate does — named here so they are
+   ACCOUNTED FOR rather than silently ignored, and so adding one is a deliberate edit.
+
+   logevent-connext.bin is the @appendable LogEvent vector; it is verified byte-exact by
+   dds.tests::run-log-corpus-test in `make test`, not here, because this corpus machinery lives in
+   dds-bench and dds-bench does not load dds-log. Anything in the corpus directory that is neither
+   parseable as a case nor listed here FAILS the gate.")
+
 (defparameter *corpus-dir* "corpus/xcdr2/"
   "Directory holding the byte-exact XCDR2 reference vectors + their manifest (FR-CDR-8). One .bin per case,
    each the SerializedPayload RTI Connext put ON THE WIRE for a known PerfData sample.")
@@ -96,6 +106,19 @@
     (dolist (f files)
       (let* ((name (file-namestring f))
              (id-len (%corpus-parse-name name)))
+        ;; EVERY vector must be accounted for. Previously an unrecognised file was silently skipped, so a
+        ;; newly-dropped vector could sit in the corpus directory forever while the gate still said PASS —
+        ;; the shape of a gate that cannot fail. Now it is verified here, named in
+        ;; *corpus-verified-elsewhere*, or it is a FAILURE.
+        (when (null id-len)
+          (if (member name *corpus-verified-elsewhere* :test #'string=)
+              (format t "~&  --   ~a (verified elsewhere — see *corpus-verified-elsewhere*)~%" name)
+              (progn
+                (incf bad)
+                (format t "~&  FAIL ~a: unrecognised corpus vector — this gate verifies nothing for it.~%~
+                             Name it perfdata-id<ID>-len<LEN>.bin so it is checked here, or add it to~%~
+                             *corpus-verified-elsewhere* naming the gate that does.~%"
+                        name))))
         (when id-len
           (destructuring-bind (id . len) id-len
             (incf n)
@@ -112,7 +135,8 @@
                  (format t "~&  FAIL ~a: expected ~d octets, got ~d~%    connext: ~a~%    ours:    ~a~%"
                          name (length expect) (length got)
                          (%hex expect) (%hex got)))))))))
-    (format t "~&corpus: ~d vector(s), ~d mismatch(es) — ~a~%" n bad (if (zerop bad) "PASS" "FAIL"))
+    (format t "~&corpus: ~d vector(s) verified here, ~d deferred, ~d file(s) total, ~d mismatch(es) — ~a~%"
+            n (length *corpus-verified-elsewhere*) (length files) bad (if (zerop bad) "PASS" "FAIL"))
     bad))
 
 (defun* %corpus-parse-name (name)

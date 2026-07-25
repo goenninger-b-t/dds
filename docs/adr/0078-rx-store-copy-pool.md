@@ -1,6 +1,15 @@
 # ADR 0078 — the receiver's store-copy is drawn from an arena pool and carries its own extent
 
-- **Status:** REVERTED 2026-07-21 (heap corruption on Linux — see "Why this was reverted")
+- **Status:** ✅ **RE-LANDED 2026-07-24 (`5fc98e1`) — the design below is SOUND and shipped.** It was
+  REVERTED 2026-07-21 for heap corruption on Linux, and the "Why this was reverted" section below is kept
+  verbatim as the record. **That diagnosis was WRONG and is corrected by ADR 0085**: the corruption was an
+  unlocked `rtps-reader` driven by three receiver threads, not this pool. The pool merely TRIGGERED it by
+  removing ~36 B/sample of GC-heap garbage, which shifted collection cadence enough to fire a latent race.
+  Two specific claims below are false and are refuted in ADR 0085: that `pool-release` wrote out of bounds
+  "at (safety 0)" (there is no global safety-0 policy — that `svref` is bounds-checked), and that a
+  retention reading a recycled buffer could be the mechanism (a *read* cannot clobber an object header;
+  `alloc-static` memory is in the glibc heap, outside SBCL's dynamic space entirely). Re-landed with an
+  exactly-once release from a per-node checkout set and a `dds.disc:*rx-store-pool-enabled*` kill-switch.
 - **Date:** 2026-07-21
 - **Requirements:** NFR-MEM (0 bytes/sample), NFR-PERF-3 (the peer GC-tail), NFR-PERF-8, NFR-SEC-POSTURE (the payload extent is the bounds check)
 - **Relates to:** ADR 0062 (the allocation budget); WP-DDS-SECURITY-ZEROALLOC-AEAD T5a/T5b (the payload + decode pools this mirrors); ADR 0073 (the drain already decodes in place); ADR 0077 (the TX-side struct pool)
