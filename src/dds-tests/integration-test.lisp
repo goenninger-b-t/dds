@@ -912,6 +912,48 @@
                      (null (dds.rtps.history:cache-change-instance-key-hash (%last-writer-change ka-keyed)))
                      "KEEP_ALL keyed writer must SKIP the handle computation -> instance-key-hash NIL"))
         (dds.dcps:delete-participant p3)))
+    ;; TX-KEYHASH (ADR 0087): the reused scratch must not change WHAT is computed, and must not make the
+    ;; RETAINED handle shared. These three assertions are the falsification of the three ways the slice
+    ;; could go wrong; (d) is the one that fails loudly if the out-array is ever pooled too.
+    (let* ((kts (dds.types:find-type-support "shape-type"))
+           (p4 (dds.dcps:create-participant :domain (test-domain))))
+      (unwind-protect
+           (let* ((ktw4 (dds.dcps:create-topic p4 "TxKhSquare" "shape-type" kts))
+                  (pub4 (dds.dcps:create-publisher p4))
+                  (dw4 (dds.dcps:create-datawriter
+                        pub4 ktw4 :qos (dds.qos:make-writer-qos :history-kind :keep-last :history-depth 4)))
+                  (blue (make-shape-type :color "BLUE" :x 1 :y 2 :shapesize 10))
+                  (red  (make-shape-type :color "RED"  :x 3 :y 4 :shapesize 20)))
+             ;; (d) two instances written in sequence must hold DISTINCT, non-aliased handle objects.
+             ;; The first handle is captured BY REFERENCE: if the writer ever recycled its 16-octet
+             ;; result array, the second write would overwrite the first change's handle in place and
+             ;; KEEP_LAST would evict the wrong instance. Comparing a retained reference (not a copy)
+             ;; is the whole point of the check.
+             (dds.dcps:write-sample dw4 blue)
+             (let ((blue-handle (dds.rtps.history:cache-change-instance-key-hash (%last-writer-change dw4))))
+               (dds.dcps:write-sample dw4 red)
+               (let ((red-handle (dds.rtps.history:cache-change-instance-key-hash (%last-writer-change dw4))))
+                 (%check :tx-keyhash-not-aliased
+                         (and (not (eq blue-handle red-handle))
+                              (equalp blue-handle (funcall (dds.types:type-support-key-hash kts) blue))
+                              (equalp red-handle (funcall (dds.types:type-support-key-hash kts) red)))
+                         "each instance's RETAINED handle must survive later writes — a recycled TX out-array would alias them")))
+             ;; (e) the scratch path and the allocating fallback must produce byte-identical handles.
+             ;; Holding KEYHASH-BUSY forces the fallback, which is the path a concurrent writer takes.
+             (let* ((with-scratch (copy-seq (dds.dcps::%write-key-hash dw4 blue)))
+                    (fallback (progn (dds.pal:cas (dds.dcps::dw-keyhash-busy dw4) 0 1)
+                                     (prog1 (copy-seq (dds.dcps::%write-key-hash dw4 blue))
+                                       (dds.pal:cas (dds.dcps::dw-keyhash-busy dw4) 1 0)))))
+               (%check :tx-keyhash-fallback-identical
+                       (equalp with-scratch fallback)
+                       "the CAS-contended allocating fallback must yield a byte-identical handle"))
+             ;; (f) the try-lock must be RELEASED. A leaked flag is invisible to every correctness test:
+             ;; the handles stay right and the writer just silently allocates forever after.
+             (dds.dcps:write-sample dw4 blue)
+             (%check :tx-keyhash-lock-released
+                     (zerop (dds.pal:atomic-cell-value (dds.dcps::dw-keyhash-busy dw4)))
+                     "KEYHASH-BUSY must be 0 after a write — a leaked try-lock silently disables the scratch"))
+        (dds.dcps:delete-participant p4)))
     t)
 
 ;;; Instance lifecycle + read/take + SampleInfo (M3 #2, FR-DCPS-4). Uses the keyed

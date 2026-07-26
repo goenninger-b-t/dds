@@ -119,6 +119,8 @@
    (loans :initform '() :accessor dw-loans)                ; WP-FLATDATA-LOAN-WRITE (R6, ADR 0042): outstanding writer-loans (writer-close safety sweep)
    (loan-freelist :initform '() :accessor dw-loan-freelist) ; WP-FLATDATA-LOAN-WRITE: recycled writer-loan structs (the struct+view recycle; the registry cell + retained payload are the documented v1 per-write cost)
    (loan-encap :initform nil :accessor dw-loan-encap)      ; WP-FLATDATA-LOAN-WRITE (ADR 0042): the type's 4-octet encap header+options, cached once from the FlatData ctor (%loan-encap-header) — written into every slot-backed loan's slot
+   (keyhash-scratch :initform nil :accessor dw-keyhash-scratch) ; TX-KEYHASH (ADR 0087): reusable :big cursor over a 256-octet buffer for the per-write instance-handle key serialization — the writer twin of dr-keyhash-scratch (ADR 0075), created once, zero per-sample make-octet-buffer/cursor/free-static (NFR-MEM)
+   (keyhash-busy :initform (dds.pal:make-atomic-cell) :accessor dw-keyhash-busy) ; TX-KEYHASH (ADR 0087): CAS try-lock guarding KEYHASH-SCRATCH — a DataWriter may be written CONCURRENTLY (DDS 1.4 §2.2.2.4.2.11 places no single-thread restriction on write), and two threads serializing keys through one buffer would interleave into a WRONG instance handle; the loser allocates instead, byte-identically
    (status-lock :initform (dds.pal:make-lock "dw-status") :accessor dw-status-lock))
   (:documentation "DDS DataWriter: publishes typed samples on a Topic, carrying its
    PUBLICATION_MATCHED, OFFERED_INCOMPATIBLE_QOS and LIVELINESS_LOST statuses and optional
@@ -1418,10 +1420,31 @@
   "The instance handle to thread onto SAMPLE's data CacheChange (WP-KEEPLAST, ADR 0019,
    DDS 1.4 §2.2.3.18): computed via the topic type-support ONLY when DW is KEEP_LAST (a
    KEEP_ALL writer never evicts per-instance, so it needs no handle), else NIL. For an unkeyed
-   type %instance-handle returns the SHARED +instance-handle-nil+ (eq, no allocation); a keyed
-   type allocates a fresh keyhash. NIL on a KEEP_ALL writer keeps the default path 0-alloc."
+   type %instance-handle returns the SHARED +instance-handle-nil+ (eq, no allocation).
+
+   TX-KEYHASH (ADR 0087, NFR-MEM): a KEYED writer serializes the key through DW's REUSED scratch cursor
+   instead of a fresh 256-octet buffer per write — measured 112.0 -> 32.1 B/call, i.e. ~80 B/sample off
+   the TX path, byte-identical handles (the RX drain has done this since ADR 0075; this is its TX twin).
+
+   The RESULT array is still allocated fresh, deliberately: the handle is RETAINED on THREE paths —
+   threaded onto the CacheChange for KEEP_LAST per-instance eviction; used as a dw-instances EQUALP hash
+   key; and, when the offered DEADLINE is finite, passed on by %deadline-touch-writer as the
+   dw-deadline-timers key. Recycling it would alias every change's handle and mutate live keys. The
+   deadline path is the nastiest because it is CONDITIONAL — under the default DURATION_INFINITE it arms
+   nothing, so a recycled array would look correct until someone configured a DEADLINE. Only the SCRATCH
+   is reusable; closing the remaining 32 B needs the ADR 0076 stable-handle indirection on the writer side.
+
+   Concurrency: guarded by a CAS try-lock, NOT a lock. A DataWriter may be written concurrently, and a
+   shared serialization buffer would interleave into a WRONG instance handle — a silent mis-attribution,
+   not a crash. The thread that wins KEYHASH-BUSY uses the scratch; a concurrent writer takes the
+   allocating path, which is exactly today's behaviour and byte-identical. Never blocks the write path."
   (when (%writer-keeplast-p dw)
-    (%instance-handle (topic-type-support (dw-topic dw)) sample)))
+    (let ((ts (topic-type-support (dw-topic dw)))
+          (busy (dw-keyhash-busy dw)))
+      (if (zerop (dds.pal:cas busy 0 1))
+          (unwind-protect (%instance-handle ts sample (%writer-keyhash-scratch dw))
+            (dds.pal:cas busy 1 0))
+          (%instance-handle ts sample)))))
 
 (defun* write-sample (dw sample &optional source-timestamp)
     (function (data-writer t &optional (or null integer))
@@ -1737,6 +1760,14 @@
   (let ((kh (dds.types:type-support-key-hash ts)))
     (if kh (funcall kh sample kh-scratch out-scratch) +instance-handle-nil+)))
 
+(defun* %make-keyhash-scratch ()
+    (function () t)
+  "A fresh :big key-serialization cursor over a 256-octet buffer — the ONE definition of the scratch shape
+   both the RX drain (dr-keyhash-scratch, ADR 0075) and the TX write (dw-keyhash-scratch, ADR 0087) reuse.
+   :big because the key-hash is always serialized BIG-ENDIAN XCDR2 regardless of the payload's
+   representation (RTPS 2.5 §9.6.4.8)."
+  (dds.core.buffer:cursor (dds.core.buffer:make-octet-buffer 256) :endianness :big))
+
 (defun* %reader-keyhash-scratch (dr)
     (function (data-reader) t)
   "DR's reusable :big key-serialization cursor (over a 256-octet buffer), created on first use — the drain's
@@ -1744,8 +1775,17 @@
    (RX-POOLING, ADR 0075, NFR-MEM). Single-threaded per reader (the drain runs on the user thread; take is
    single-threaded-per-reader, the same discipline that lets the drain mutate the reader cache unlocked)."
   (or (dr-keyhash-scratch dr)
-      (setf (dr-keyhash-scratch dr)
-            (dds.core.buffer:cursor (dds.core.buffer:make-octet-buffer 256) :endianness :big))))
+      (setf (dr-keyhash-scratch dr) (%make-keyhash-scratch))))
+
+(defun* %writer-keyhash-scratch (dw)
+    (function (data-writer) t)
+  "DW's reusable :big key-serialization cursor, created on first use — the TX twin of
+   %reader-keyhash-scratch (TX-KEYHASH, ADR 0087, NFR-MEM). ⚠️ ONLY safe to use while holding DW's
+   KEYHASH-BUSY CAS try-lock: unlike the reader's drain, a DataWriter has NO single-thread discipline
+   (DDS 1.4 §2.2.2.4.2.11 permits concurrent write on one writer), and two threads serializing keys
+   through one buffer would interleave into a wrong instance handle. %write-key-hash is the only caller."
+  (or (dw-keyhash-scratch dw)
+      (setf (dw-keyhash-scratch dw) (%make-keyhash-scratch))))
 
 (defun* %reader-keyhash-out (dr)
     (function (data-reader) (simple-array (unsigned-byte 8) (16)))

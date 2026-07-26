@@ -787,8 +787,15 @@ the source as deferred or simplified — do not rely on them yet:
 - **RESOURCE_LIMITS rejection is at the DCPS cache.** `SAMPLE_REJECTED` enforcement
   (`max_samples`, `max_instances`, `max_samples_per_instance`) happens in the reader's drain,
   not in the RTPS HistoryCache.
-- **Types: `:final` extensibility only.** `define-dds-type` rejects `:appendable`/`:mutable`,
-  and only scalar/string `@key` members are supported (see [Type system](type-system.md)).
+- **Types: `@key` is scalar/string only.** All three extensibility kinds ship — `define-dds-type`
+  accepts `:final`, `:appendable` and `:mutable` (ADR 0086; MUTABLE is byte-exact against a live
+  Connext vector and all three run live in `make interop`) — but only scalar/string `@key` members
+  are supported (see [Type system](type-system.md)).
+- **A keyed KEEP_LAST writer reuses one key-hash scratch per writer** (ADR 0087). Writing the *same*
+  `DataWriter` from several threads concurrently is safe and correct: the scratch is taken with a CAS
+  try-lock, and a thread that loses it falls back to the previous allocating path, producing a
+  byte-identical handle. The only consequence is that concurrent writers on one `DataWriter` do not
+  all get the zero-allocation path — writing from one thread per `DataWriter` does.
 
 ## See also
 

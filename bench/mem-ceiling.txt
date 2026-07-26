@@ -29,5 +29,14 @@
 # IMPROVEMENT in CI, which is red until someone reads the CI number and lowers that row too. This is not
 # hypothetical: CI was red from the 5th TX slice for exactly this reason. AFTER a win, check the CI
 # gate-mem number and lower the OTHER arch's row in the same or an immediate follow-up commit.
-arm64  1910
-x86_64 1950
+#
+# LOWERED 2026-07-26 (ADR 0087 — the TX key-hash serialization scratch is CAS-borrowed). BOTH rows were
+# measured directly on this slice, and the two arches moved by materially different amounts, which is why
+# neither was derived from the other:
+#   arm64   1852.2 -> 1769.8   (-82.4)   dev box, Apple silicon, SBCL
+#   x86_64  1902.8 -> 1777.4   (-125.4)  Ubuntu 24.04 x86_64, SBCL — same-image A/B (the shipped body
+#                                        measured, then %write-key-hash redefined to its pre-0087 body)
+# The x86_64 row had also gone stale since 2026-07-21 (wins landed on both arches without it being
+# re-measured), so its drop is larger than this slice alone; the A/B above isolates the slice's own share.
+arm64  1800
+x86_64 1810
