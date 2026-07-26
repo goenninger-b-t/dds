@@ -4056,6 +4056,7 @@
                  ("purge-reliable-only"      . run-purge-reliable-only-test)
                  ("rtps-gap-handling"        . run-gap-handling-test)
                  ("rtps-reliable-multiwriter" . run-reliable-multiwriter-test)
+                 ("rtps-proxy-key-retention" . run-proxy-key-retention-test)   ; ADR 0088
                  ("property-based"           . run-pbt-tests)
                  ("udp-loopback"             . run-udp-loopback-test)
                  ("rtps-discovery-spdp"      . dds.rtps.discovery:run-discovery-test)

@@ -1,6 +1,6 @@
 # ADR 0088 — the control-path `%source-guid` is lookup-only, and should stop allocating
 
-- **Status:** **Proposed — needs an owner decision between Option A and Option B (§4).** The owner authorised a PAL contract ADR (2026-07-26); this ADR argues that a PAL contract change is the *more* invasive of the two viable routes and is not the one it recommends. The decision is the owner's.
+- **Status:** **Accepted — Option B, owner decision 2026-07-26.** The owner first authorised a PAL contract ADR (Option A); after reading §4/§5 they chose **Option B explicitly on principle — *"I want this fixed by construction"* — independent of the size of the byte win.** That framing is the reason the design below leans on invariants (write-once entries, verified hits) rather than on an audit obligation. Implemented and measured; see §9.
 - **Date:** 2026-07-26
 - **Requirements:** NFR-MEM (0 bytes/sample), NFR-PERF-3 (the peer GC-tail), NFR-PERF-8
 - **Relates to:** ADR 0062 (the allocation campaign — and §6, whose reasoning applies directly here); ADR 0076 (the RX stable-handle precedent); ADR 0087 (the TX twin, landed); ADR 0078 (why a receive-path change is handled carefully); ADR 0041 (PAL atomics)
@@ -133,6 +133,58 @@ its own slice with its own `gate-mem` before/after, validated on both impls and 
   rejects it and still yields the correct proxy.
 - `gate-mem` before/after on **both** architectures — arm64 and x86_64 moved by materially different
   amounts on ADR 0087 (−82.4 vs −125.4), so neither may be predicted from the other.
+
+## 9. As built (Option B) — and two things the measurement corrected
+
+**Shipped shape.** `%retained-endpoint-key` (the §3 prerequisite) at both proxy-creation sites;
+`writer-lookup-key` + `%guid-names-endpoint-p` + `%build-endpoint-guid` + a `key-cache` slot on
+`rtps-writer`; the ACKNACK site in `dataplane.lisp` calls the lookup instead of building a GUID.
+
+**Measured on BOTH architectures** (per §7 — neither may be predicted from the other):
+
+| arch | before | after | delta |
+|---|---|---|---|
+| arm64 | 1769.8 | **1742.1** | **−27.7** |
+| x86_64 | 1777.4 | **1704.5** | **−72.9** |
+
+x86_64 gained ~2.6× more, the same arch divergence as ADR 0065 (−175 vs −708) and ADR 0087 (−82.4 vs
+−125.4). Suite **607 passed** (606 + the new test) on SBCL-macOS and SBCL-Linux.
+
+### ⚠️ 9.1 The first cut won NOTHING, and only the byte measurement said so
+
+The miss-path builder was first passed as a **closure**, `(lambda () (%source-guid src-prefix rid))`.
+A closure over the prefix and id **allocates on EVERY call — cache hits included** — so the change merely
+swapped a 32-octet GUID for a closure of similar size: `gate-mem` moved **+1.6 B, i.e. not at all.**
+Passing the *components* and letting the miss path call `%build-endpoint-guid` produced the −27.7.
+
+**No correctness test could have caught this** — the code was right, the cache hit, every assertion
+passed, and the optimisation was simply absent. It is the sharpest illustration in this campaign of why
+`gate-mem` is the oracle and a design argument is not: the reasoning for the slice was sound and the
+first implementation of it still won zero. `%build-endpoint-guid`'s docstring records this so the
+callback shape is not reintroduced.
+
+### 9.2 §1's per-call number was inflated — the in-situ cost is lower
+
+§1 reports `%source-guid` at **32.1 B/call** from an isolated harness; measured **in situ** in the live
+workload it is **87.5 B/sample across 4.40 calls ≈ 19.9 B/call**. The isolated figure over-reports by
+**~1.6×** — the same class of error ADR 0062's own "⚠️ CORRECTION" section records (there, ~3.5×). The
+realistic prize in §6 should therefore be read as the lower half of its range, which is what landed.
+**Rule reaffirmed: size a candidate in situ, and treat any per-site harness number as an upper bound.**
+
+### 9.3 The receiver-phase ranking, corrected
+
+The attribution table is **INCLUSIVE of callees**, and `%lane-drain` calls `on-datagram` — i.e. the whole
+receive pipeline — so its 393.6 B/sample largely *is* `%handle-datagram`, overlapping rather than adding.
+Reading it as an independent target is wrong. Subtracting children from parents gives the real ranking of
+the 817.8 B/sample receiver phase, which is **the submessage handlers**, led by ACKNACK:
+
+| handler | own cost (excl. children) |
+|---|---|
+| `%on-user-acknack` | ~240 → **~212** after this ADR |
+| `%handle-datagram` own | ~153 |
+| `%on-user-heartbeat` | ~109 |
+| `%on-user-data` own | ~66 (of 174.8; `%deliver-data-on-readers` is 109.2) |
+| `dispatch-message` own | ~22 (nearly pure routing) |
 
 ## 8. Also measured while scoping (corrects a stale note)
 

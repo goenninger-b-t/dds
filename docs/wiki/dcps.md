@@ -796,6 +796,13 @@ the source as deferred or simplified — do not rely on them yet:
   try-lock, and a thread that loses it falls back to the previous allocating path, producing a
   byte-identical handle. The only consequence is that concurrent writers on one `DataWriter` do not
   all get the zero-allocation path — writing from one thread per `DataWriter` does.
+- **The reliable engine owns its endpoint keys** (ADR 0088). A remote endpoint's 16-octet GUID is
+  retained by the `ReaderProxy`/`WriterProxy` tables **only on creation, and only as a private copy**,
+  so a caller may pass a reused or cached buffer without the table aliasing it. Internally the writer
+  keeps a small **write-once** cache of remote-reader GUIDs so the per-datagram ACKNACK path need not
+  build one; every cache hit is verified octet-for-octet, so the cache can only ever be *slower* than
+  building a key, never wrong. Nothing here is on the public API — it is recorded because it is the
+  invariant that makes passing a non-fresh key safe.
 
 ## See also
 

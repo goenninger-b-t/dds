@@ -38,5 +38,11 @@
 #                                        measured, then %write-key-hash redefined to its pre-0087 body)
 # The x86_64 row had also gone stale since 2026-07-21 (wins landed on both arches without it being
 # re-measured), so its drop is larger than this slice alone; the A/B above isolates the slice's own share.
-arm64  1800
-x86_64 1810
+#
+# LOWERED 2026-07-26 (ADR 0088 — the control-path proxy-key cache). Both rows measured directly again,
+# and again the two arches moved by materially different amounts, which is why neither is ever derived
+# from the other:
+#   arm64   1769.8 -> 1742.1  (-27.7)
+#   x86_64  1777.4 -> 1704.5  (-72.9)
+arm64  1775
+x86_64 1740

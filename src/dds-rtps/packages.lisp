@@ -106,6 +106,9 @@
   (:export #:rtps-writer #:make-rtps-writer #:rtps-writer-hc #:rtps-writer-entityid #:writer-write #:writer-heartbeat
            #:writer-lifecycle-change #:rtps-writer-max-blocking-ns #:%writer-signal-space
            #:writer-data-list #:writer-unsent-list #:writer-on-acknack #:writer-purge-acked #:get-reader-proxy
+           ;; ADR 0088: the control-path proxy-key lookup — the disc layer's ACKNACK handler uses this
+           ;; instead of building a fresh 16-octet GUID per datagram just to index the proxy table.
+           #:writer-lookup-key
            #:init-reader-proxy-base #:writer-finalize-durability #:rtps-writer-finalized #:writer-unmatch-reader
            #:reader-proxy #:reader-proxy-acked-base #:reader-proxy-unsent-base
            #:rtps-reader #:make-rtps-reader #:reader-on-data #:reader-on-heartbeat

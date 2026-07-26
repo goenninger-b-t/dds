@@ -903,6 +903,72 @@
             "writer B's HEARTBEAT range must advance independently"))
   t)
 
+(defun* %guid-of (prefix entity-id)
+    (function ((simple-array (unsigned-byte 8) (12)) (unsigned-byte 32))
+              (simple-array (unsigned-byte 8) (16)))
+  "A 16-octet GUID from PREFIX ++ ENTITY-ID (RTPS 2.5 §9.4.4 / §9.3.1.2) — the test-local twin of the
+   disc layer's %source-guid, so the reliable tests need no disc dependency."
+  (let ((g (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)))
+    (replace g prefix :end2 12)
+    (setf (aref g 12) (ldb (byte 8 24) entity-id) (aref g 13) (ldb (byte 8 16) entity-id)
+          (aref g 14) (ldb (byte 8 8) entity-id)  (aref g 15) (ldb (byte 8 0) entity-id))
+    g))
+
+(defun* run-proxy-key-retention-test ()
+    (function () t)
+  "Test: ADR 0088 — the proxy tables OWN their keys, and the control-path GUID cache is safe by
+   construction.
+
+   (a) THE LOAD-BEARING ONE. Look a ReaderProxy up with a MUTABLE buffer, then MUTATE that buffer, then
+   look up again with an equal-valued key. The same proxy must come back. Before %retained-endpoint-key
+   this FAILS: the table kept the caller's array, mutating it changed the live hash key in place, the
+   proxy became unfindable, a second one was created — and the writer's acked-base silently stopped
+   advancing. This assertion is the whole justification for the copy; if it is ever weakened, the copy
+   can be deleted without any test noticing.
+
+   (b) The cache must never return a key for the WRONG endpoint: a GUID cached for one (prefix,
+   entity-id) is rejected for another, even when they collide on the cache slot (mod +key-cache-size+).
+
+   (c) A cache HIT must be the identical object (no per-datagram allocation), and a MISS must still
+   produce the correct GUID.
+
+   (d) The cache is BOUNDED: driving many distinct remote endpoints through it never grows it past
+   +key-cache-size+ (a peer chooses how many readers it creates, so an unbounded cache would be
+   remote-drivable, NFR-SEC-POSTURE)."
+  (let* ((w (dds.rtps.reliable:make-rtps-writer))
+         (mutable (%aliasing-writer-guid #x0a))
+         (p1 (dds.rtps.reliable:get-reader-proxy w mutable)))
+    (setf (aref mutable 11) #xFF)   ; the caller reuses/mutates its buffer
+    (let ((p2 (dds.rtps.reliable:get-reader-proxy w (%aliasing-writer-guid #x0a))))
+      (%check :proxy-key-retained
+              (eq p1 p2)
+              "the proxy table must OWN its key — mutating the caller's buffer must not orphan the proxy"))
+    (let* ((prefix-a (make-array 12 :element-type '(unsigned-byte 8) :initial-element #x11))
+           (prefix-b (make-array 12 :element-type '(unsigned-byte 8) :initial-element #x22))
+           (ga (dds.rtps.reliable:writer-lookup-key w prefix-a 1))
+           (ga2 (dds.rtps.reliable:writer-lookup-key w prefix-a 1)))
+      (%check :key-cache-hit-is-same-object
+              (and (eq ga ga2) (equalp ga (%guid-of prefix-a 1)))
+              "a second lookup of the same endpoint must HIT the cache — the SAME object, no rebuild")
+      ;; different PREFIX, same entity-id -> same cache slot, must NOT be confused
+      (let ((gb (dds.rtps.reliable:writer-lookup-key w prefix-b 1)))
+        (%check :key-cache-rejects-wrong-prefix
+                (and (not (eq ga gb)) (equalp gb (%guid-of prefix-b 1)))
+                "a cached GUID must be REJECTED for a different prefix that collides on the slot"))
+      ;; different entity-id, same prefix
+      (let ((gc (dds.rtps.reliable:writer-lookup-key w prefix-a 2)))
+        (%check :key-cache-rejects-wrong-entity
+                (equalp gc (%guid-of prefix-a 2))
+                "a cached GUID must be REJECTED for a different entity-id"))
+      ;; bounded: drive 64 distinct endpoints through it
+      (dotimes (i 64)
+        (dds.rtps.reliable:writer-lookup-key w prefix-a (+ 100 i)))
+      (%check :key-cache-bounded
+              (= (length (dds.rtps.reliable::rtps-writer-key-cache w))
+                 dds.rtps.reliable::+key-cache-size+)
+              "the key cache must stay bounded — a peer chooses how many readers it creates")))
+  t)
+
 ;;; Send-once writer push: the writer pushes UNSENT changes once (RTPS 2.5 §8.4.2.2,
 ;;; next_unsent_change / unsent_changes) and repairs ONLY requested_changes on ACKNACK.
 ;;; Regression for the O(N^2) DATA storm where the whole unacked history was re-pushed

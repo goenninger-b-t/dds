@@ -96,6 +96,7 @@
   (last-sn 0 :type integer)
   (hb-count 0 :type integer)
   (proxies (make-hash-table :test 'equalp) :type hash-table)   ; reader key (opaque, equalp) -> reader-proxy
+  (key-cache nil :type (or null simple-vector))   ; ADR 0088: bounded WRITE-ONCE cache of 16-octet remote-reader GUIDs, so the per-datagram control path (ACKNACK) looks a proxy up without building a fresh key; entries are never mutated in place, so a concurrent reader sees a whole valid GUID or NIL and %writer-lookup-key's byte-compare decides — a race can only MISS, never return a wrong key (NFR-MEM)
   (frag-hb-count 0 :type integer)   ; HEARTBEAT_FRAG Count, separate from hb-count
   (lock (dds.pal:make-lock) :type t)
   (space-cv (dds.pal:make-condvar) :type t)   ; signalled (under LOCK) when the cache shrinks; writer-write waits on it when full (ADR 0016 §Backpressure)
@@ -181,14 +182,108 @@
         (dds.rtps.history:hc-add-change hc (funcall make-change sn))
         sn))))
 
+(defun* %retained-endpoint-key (key)
+    (function (t) t)
+  "KEY, COPIED if it is a sequence — the private key a proxy table RETAINS (ADR 0088, NFR-MEM).
+
+   The proxy tables are the only structures that outlive the call holding the caller's key; every other
+   use of an endpoint key is a transient lookup. Copying HERE, at the single point of retention, is what
+   makes it SAFE BY CONSTRUCTION for a caller to pass a reused or cached buffer — rather than safe by an
+   audit of every present and future caller, which is the durability objection ADR 0062 §6 raised against
+   a shared scratch. Without it a reused caller buffer would BE the live hash key: the next datagram
+   mutates it in place, the proxy becomes unfindable, a fresh one is created, and the writer's acked-base
+   SILENTLY stops advancing — no crash, no error, just reliability quietly ceasing to work.
+
+   Cost is one COPY-SEQ per endpoint per process lifetime (measured: 1 creation per 3000 samples against
+   9901 lookups). An integer — the value-level tests' key — has nothing to alias and passes through."
+  (if (typep key 'sequence) (copy-seq key) key))
+
+(defconstant +key-cache-size+ 4
+  "How many remote-endpoint GUIDs a writer caches for the control-path proxy lookup (ADR 0088). BOUNDED
+   on purpose: the number of remote readers is chosen by the PEERS, so an unbounded cache would be a
+   remote-drivable growth path (NFR-SEC-POSTURE). A writer with more than this many matched readers
+   simply misses more often and falls back to building a key — slower, never wrong.")
+
+(defun* %guid-names-endpoint-p (guid src-prefix entity-id)
+    (function ((simple-array (unsigned-byte 8) (16)) (simple-array (unsigned-byte 8) (12))
+               (unsigned-byte 32))
+              boolean)
+  "Does the 16-octet GUID name exactly the endpoint (SRC-PREFIX, ENTITY-ID)? The full 16-octet identity
+   test (RTPS 2.5 §9.4.4 / §9.3.1.2: GUID = GuidPrefix ++ EntityId), allocation-free.
+
+   THIS COMPARISON IS THE WHOLE SAFETY ARGUMENT of the key cache (ADR 0088). It is not a hint or a hash
+   check to be skipped on the fast path: a cache hit is believed ONLY because these 16 octets matched, so
+   a stale, half-published or wrong-slot entry can never be mistaken for the right one. Weakening this to
+   a fingerprint would reintroduce a collision class whose symptom is the WRONG ReaderProxy — silently
+   mis-attributed reliability state, not a crash."
+  (and (dotimes (i 12 t) (unless (= (aref guid i) (aref src-prefix i)) (return nil)))
+       (= (aref guid 12) (ldb (byte 8 24) entity-id))
+       (= (aref guid 13) (ldb (byte 8 16) entity-id))
+       (= (aref guid 14) (ldb (byte 8 8) entity-id))
+       (= (aref guid 15) (ldb (byte 8 0) entity-id))
+       t))
+
+(defun* %build-endpoint-guid (src-prefix entity-id)
+    (function ((simple-array (unsigned-byte 8) (12)) (unsigned-byte 32))
+              (simple-array (unsigned-byte 8) (16)))
+  "A fresh 16-octet GUID = SRC-PREFIX ++ ENTITY-ID (RTPS 2.5 §9.4.4 / §9.3.1.2). The miss path of
+   WRITER-LOOKUP-KEY builds its own key rather than taking a builder callback: a closure over the prefix
+   and id would allocate ON EVERY CALL, including cache HITS, which silently trades one 32-octet
+   allocation for another and wins nothing (measured — the first cut of ADR 0088 did exactly this and
+   moved gate-mem by +1.6 B, i.e. not at all)."
+  (let ((g (make-array 16 :element-type '(unsigned-byte 8))))
+    (replace g src-prefix :end2 12)
+    (setf (aref g 12) (ldb (byte 8 24) entity-id) (aref g 13) (ldb (byte 8 16) entity-id)
+          (aref g 14) (ldb (byte 8 8) entity-id)  (aref g 15) (ldb (byte 8 0) entity-id))
+    g))
+
+(defun* writer-lookup-key (writer src-prefix entity-id)
+    (function (rtps-writer (simple-array (unsigned-byte 8) (12)) (unsigned-byte 32))
+              (simple-array (unsigned-byte 8) (16)))
+  "The 16-octet GUID naming remote endpoint (SRC-PREFIX, ENTITY-ID), from WRITER's bounded key cache when
+   it is already there, else built by %BUILD-ENDPOINT-GUID and remembered (ADR 0088, NFR-MEM). The disc layer's
+   control path (an inbound ACKNACK, ~1 per sample) calls this instead of constructing a fresh GUID per
+   datagram purely to index the proxy table.
+
+   SAFE BY CONSTRUCTION, not by audit — the property the owner chose this design for:
+   1. A cache entry is WRITTEN ONCE, as a whole array, and NEVER MUTATED afterwards. So nothing that is
+      handed a cached GUID can observe it change underneath — including the proxy table, which may retain
+      it (and copies it anyway, %retained-endpoint-key). Contrast a shared scratch buffer, whose safety
+      depends on every present and future consumer copying before it retains (ADR 0062 §6).
+   2. A hit is believed only after %guid-names-endpoint-p matches all 16 octets, so a wrong or partially
+      published entry is REJECTED, not used.
+   3. Therefore this needs NO lock even though several receiver threads may call it for one writer
+      concurrently: slot reads/writes of whole arrays do not tear, and any interleaving loses at worst
+      the memo (a MISS -> rebuild), never correctness. Two threads racing to fill a slot store
+      EQUALP-identical arrays.
+
+   Returns a GUID the caller may retain or hand on. Allocates only on a miss."
+  (let ((cache (or (rtps-writer-key-cache writer)
+                   (setf (rtps-writer-key-cache writer)
+                         (make-array +key-cache-size+ :initial-element nil)))))
+    (dotimes (i +key-cache-size+)
+      (let ((g (svref cache i)))
+        (when (and g (%guid-names-endpoint-p g src-prefix entity-id))
+          (return-from writer-lookup-key g))))
+    (let ((fresh (%build-endpoint-guid src-prefix entity-id)))
+      ;; Replacement is indexed by the entity-id so a steady set of remote readers keeps stable slots;
+      ;; a collision just overwrites, which costs a later miss and never a wrong answer.
+      (setf (svref cache (mod entity-id +key-cache-size+)) fresh)
+      fresh)))
+
 (defun* get-reader-proxy (writer reader-id)
     (function (rtps-writer t) reader-proxy)
   "The ReaderProxy for the matched reader named by the opaque per-endpoint key READER-ID, created on
    first use. The key is treated only as an equalp hash key (the disc layer passes the remote reader's
    full 16-octet GUID; the value-level tests pass an integer): a SequenceNumber is unique only within
-   one writer GUID (RTPS 2.5 §8.3.5.4), so each remote reader's watermarks are kept independent."
+   one writer GUID (RTPS 2.5 §8.3.5.4), so each remote reader's watermarks are kept independent.
+
+   READER-ID IS NOT RETAINED ON A LOOKUP, AND IS COPIED WHEN IT IS (%retained-endpoint-key, ADR 0088):
+   the stored key is a private copy, so a caller MAY pass a reused/cached buffer. This is the contract
+   the GUID cache in %writer-lookup-key relies on."
   (or (gethash reader-id (rtps-writer-proxies writer))
-      (setf (gethash reader-id (rtps-writer-proxies writer)) (make-reader-proxy))))
+      (setf (gethash (%retained-endpoint-key reader-id) (rtps-writer-proxies writer))
+            (make-reader-proxy))))
 
 (defun* writer-unmatch-reader (writer reader-id)
     (function (rtps-writer t) boolean)
@@ -698,9 +793,14 @@
   "GET-WRITER-PROXY's body. CALLER HOLDS THE READER LOCK — which is what makes the get-or-create ATOMIC.
    Unlocked, two receiver threads racing the same new writer both miss, both construct, and both SETF: one
    proxy is silently dropped along with every received-SN marker recorded into it, so the reader NACKs
-   samples it already holds (RTPS 2.5 §8.3.5.4)."
+   samples it already holds (RTPS 2.5 §8.3.5.4).
+
+   WRITER-ID IS NOT RETAINED ON A LOOKUP, AND IS COPIED WHEN IT IS — the reader-side twin of
+   GET-READER-PROXY's contract (%retained-endpoint-key, ADR 0088); see there for why the copy is
+   load-bearing rather than defensive."
   (or (gethash writer-id (rtps-reader-proxies reader))
-      (setf (gethash writer-id (rtps-reader-proxies reader)) (make-writer-proxy))))
+      (setf (gethash (%retained-endpoint-key writer-id) (rtps-reader-proxies reader))
+            (make-writer-proxy))))
 
 (defun* get-writer-proxy (reader writer-id)
     (function (rtps-reader t) writer-proxy)

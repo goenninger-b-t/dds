@@ -3591,8 +3591,16 @@
       (when w
         (incf (disc-node-acks-in node))   ; a matched reader (incl. RTI) acked our writer
         (multiple-value-bind (resends gaps)
-            (dds.rtps.reliable:writer-on-acknack w
-                                                 (%source-guid src-prefix rid) base numbits bitmap t)   ; acquire send-refs on resends, atomic with the read (release-safety)
+            (dds.rtps.reliable:writer-on-acknack
+             w
+             ;; ADR 0088: the ACKNACK arrives ~once per sample and its GUID is used ONLY to index the
+             ;; ReaderProxy table — pure lookup garbage (measured: 9901 proxy lookups per 1 creation).
+             ;; Take the writer's cached key when it already knows this remote reader; a GUID is built
+             ;; only on a miss. A cached key is verified octet-for-octet before use, so this can be
+             ;; slower than building one, never wrong. NOTE it takes the COMPONENTS, not a builder
+             ;; closure — a closure would allocate on every call, hits included, and win nothing.
+             (dds.rtps.reliable:writer-lookup-key w src-prefix rid)
+             base numbits bitmap t)   ; acquire send-refs on resends, atomic with the read (release-safety)
           (unwind-protect
                (let* ((*emit-writer* w)   ; WP-N-ENDPOINT-S1: retransmit + GAP + frag-HB under the ADDRESSED writer's own GUID/HC
                       (dest (%prefix-user-destination node src-prefix))
