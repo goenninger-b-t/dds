@@ -38,6 +38,48 @@
 (defconstant +status-subscription-matched+       (ash 1 14)
   "DDS StatusKind bit SUBSCRIPTION_MATCHED_STATUS (dds_rtf2_dcps.idl §92).")
 
+;;;; VENDOR-EXTENSION StatusKind bits (ADR 0080, ADR 0089). Defined HERE, above *status-kind->bit*,
+;;;; because that map references them and a forward reference would fail at load.
+
+(defconstant +status-unaddressable-peer+          (ash 1 24)
+  "VENDOR-EXTENSION StatusKind bit UNADDRESSABLE_PEER — NOT an OMG status. DDS 1.4 defines no status for
+   'a remote endpoint matched on topic/type/QoS but cannot be addressed', so this stack defines one rather
+   than report the condition unusably. Deliberately placed at bit 24, far above the OMG range (bits 0-14,
+   dds_rtf2_dcps.idl §80-92), so a future standard StatusKind can never collide with it. Owner directive
+   2026-07-22: anything that MATCHES must be ADDRESSABLE; if it is not, that is an ERROR and must be
+   announced through the normal status machinery — bitmask + StatusCondition + listener + get_*_status.")
+
+(defconstant +status-reliable-writer-cache-changed+ (ash 1 25)
+  "VENDOR-EXTENSION StatusKind bit RELIABLE_WRITER_CACHE_CHANGED — NOT an OMG status. The reliable
+   writer's send window of UNACKNOWLEDGED samples crossed one of four thresholds: it became empty, it
+   became full (RESOURCE_LIMITS max_samples), it rose to the HIGH watermark, or it fell to the LOW
+   watermark (the two vendor QoS thresholds, dds.qos:qos-writer-cache-high-watermark / -low-watermark).
+
+   EDGE-triggered on those four crossings, never on every change of the count — that distinction is the
+   whole design (ADR 0089). A reliable exchange changes the unacked count on every write and every
+   ACKNACK, so a level-triggered version fires per sample: it would flood a listener while telling it
+   nothing, and the listener runs on a receiver thread. The thresholds are what turn a level into an
+   event, which is why the status needs a QoS at all.
+
+   It is how an application observes backpressure building — an unacked count that climbs to the high
+   watermark and does not drain means a reader is not keeping up, which DDS 1.4 otherwise surfaces only
+   indirectly, as a write() that starts timing out once the cache is already full.")
+
+(defconstant +status-reliable-reader-activity-changed+ (ash 1 26)
+  "VENDOR-EXTENSION StatusKind bit RELIABLE_READER_ACTIVITY_CHANGED — NOT an OMG status. A matched
+   remote reader of this writer became ACTIVE (it ACKNACKed) or INACTIVE (it stopped, per the same
+   evidence LIVELINESS uses). Distinct from PUBLICATION_MATCHED, which reports discovery-level
+   matching: a reader can stay matched while ceasing to acknowledge anything.")
+
+;;; Bit 27 is RESERVED, not free. It carried a SAMPLE_REMOVED status that was withdrawn before this
+;;; slice landed (ADR 0089 §Rejected): our only firing reason was ':acked', which RTI reports under no
+;;; such name, and its two loss reasons are reported elsewhere — a KEEP_LAST overwrite of unacked data by
+;;; RELIABLE_WRITER_CACHE_CHANGED's replaced-unacked-sample-count (RTI puts it in the same place), and a
+;;; RESOURCE_LIMITS refusal by write()'s own return code. Connext's real on_sample_removed is a
+;;; loan-reclaim callback carrying a DDS_Cookie_t, which this stack cannot honestly offer while the ADR
+;;; 0042 writer-loan retains its payload: there would be nothing for the application to reclaim.
+;;; Leaving 27 unused keeps any persisted or logged mask from silently changing meaning.
+
 (defparameter *status-kind->bit*
   (list (cons :inconsistent-topic +status-inconsistent-topic+)
         (cons :offered-deadline-missed +status-offered-deadline-missed+)
@@ -51,9 +93,19 @@
         (cons :liveliness-lost +status-liveliness-lost+)
         (cons :liveliness-changed +status-liveliness-changed+)
         (cons :publication-matched +status-publication-matched+)
-        (cons :subscription-matched +status-subscription-matched+))
-  "Maps a DDS communication-status keyword to its StatusKind bit (dds_rtf2_dcps.idl §80-92),
-   shared by %notify-status callers and the StatusCondition trigger predicate.")
+        (cons :subscription-matched +status-subscription-matched+)
+        ;; VENDOR EXTENSIONS (bits 24+, not OMG). They MUST appear here, not only as constants:
+        ;; %status-active-p ends in (and bit (logtest ...)), so a kind missing from this map yields
+        ;; bit = NIL and its StatusCondition NEVER TRIGGERS — the status still sets its bitmask bit and
+        ;; still reaches listeners, so the omission is invisible except to a WaitSet. UNADDRESSABLE_PEER
+        ;; was missing since ADR 0080 while its own docstring promised "bitmask + StatusCondition +
+        ;; listener + get_*_status" (ADR 0089).
+        (cons :unaddressable-peer +status-unaddressable-peer+)
+        (cons :reliable-writer-cache-changed +status-reliable-writer-cache-changed+)
+        (cons :reliable-reader-activity-changed +status-reliable-reader-activity-changed+))
+  "Maps a DDS communication-status keyword to its StatusKind bit (dds_rtf2_dcps.idl §80-92 for the OMG
+   statuses; bits 24+ are this implementation's vendor extensions), shared by %notify-status callers and
+   the StatusCondition trigger predicate.")
 
 ;;; ---- The DDS state masks (dds_rtf2_dcps.idl §294-320: SampleStateKind / ViewStateKind /
 ;;;      InstanceStateKind + the ANY_*_STATE masks). The IDL models each mask as a bitmask over the
@@ -185,13 +237,6 @@
   (last-reason :not-rejected :type sample-rejected-reason)
   (last-instance-handle nil :type (or null (array (unsigned-byte 8) (*)))))
 
-(defconstant +status-unaddressable-peer+          (ash 1 24)
-  "VENDOR-EXTENSION StatusKind bit UNADDRESSABLE_PEER — NOT an OMG status. DDS 1.4 defines no status for
-   'a remote endpoint matched on topic/type/QoS but cannot be addressed', so this stack defines one rather
-   than report the condition unusably. Deliberately placed at bit 24, far above the OMG range (bits 0-14,
-   dds_rtf2_dcps.idl §80-92), so a future standard StatusKind can never collide with it. Owner directive
-   2026-07-22: anything that MATCHES must be ADDRESSABLE; if it is not, that is an ERROR and must be
-   announced through the normal status machinery — bitmask + StatusCondition + listener + get_*_status.")
 
 (defstruct* (unaddressable-peer-status (:constructor make-unaddressable-peer-status)
                                        (:copier copy-unaddressable-peer-status))
@@ -206,6 +251,66 @@
   (last-guid nil :type t)
   (last-locator-kinds '() :type list)
   (last-locator-names '() :type list))
+
+;;;; ---------------------------------------------------------------------------------------------
+;;;; VENDOR-EXTENSION reliability statuses (ADR 0089). NOT OMG statuses — DDS 1.4 defines none of
+;;;; them; they exist for parity with the RTI Connext extension listeners an application may already
+;;;; be written against. Bits 25-26, immediately after UNADDRESSABLE_PEER at 24 and far above the OMG
+;;;; range (bits 0-14, dds_rtf2_dcps.idl §80-92), so a future standard StatusKind can never collide.
+;;;; Each one is wired to a REAL event; a status nothing fires is worse than an absent one, because it
+;;;; reads as supported (the LIVELINESS_CHANGED.alive_count defect, fixed 2026-07-25, was exactly that).
+;;;; Two callbacks the first cut of this slice carried were WITHDRAWN rather than shipped under a
+;;;; Connext name with different firing rules — SAMPLE_REMOVED (see the reserved bit 27 above) and
+;;;; on_destination_unreachable, which does not exist in the Connext 7.3 DataWriterListener at all.
+
+
+(defstruct* (reliable-writer-cache-changed-status
+             (:constructor make-reliable-writer-cache-changed-status)
+             (:copier copy-reliable-writer-cache-changed-status))
+  "DataWriter RELIABLE_WRITER_CACHE_CHANGED status (VENDOR EXTENSION, see the constant of the same name).
+
+   FOUR EVENT COUNTS, one per threshold the send window can cross — EMPTY-COUNT (it drained to nothing),
+   FULL-COUNT (it reached RESOURCE_LIMITS max_samples), LOW-WATERMARK-COUNT and HIGH-WATERMARK-COUNT (it
+   fell to / rose to the vendor QoS thresholds) — each with the *-CHANGE delta since the status was last
+   read. EMPTY and LOW coincide at the default low watermark of 0 and separate as soon as it is raised;
+   they are kept apart because 'drained' and 'below the threshold I asked about' are different questions.
+
+   TWO LEVELS, which are read, not counted: UNACKED-SAMPLE-COUNT is the CURRENT occupancy of the send
+   window — changes written but not yet acknowledged by every matched reliable reader — and
+   UNACKED-SAMPLE-PEAK its high-water mark. The peak is the operational number: a level sampled after a
+   burst has drained says nothing about the burst. It is deliberately NOT reset on read (see
+   get-reliable-writer-cache-changed-status); a high-water mark that resets reports the last quiet moment.
+
+   REPLACED-UNACKED-SAMPLE-COUNT is the only number here that names DATA LOSS: changes a KEEP_LAST
+   writer overwrote while they were still unacknowledged, i.e. samples the application wrote that no
+   matched reader ever received and that no longer exist to retransmit. Monotonic, never reset.
+
+   The field set mirrors RTI Connext's status of the same name (public API documentation, see
+   docs/provenance.md 2026-07-26) so an application ported from Connext finds the numbers it expects."
+  (empty-count 0 :type integer)
+  (empty-count-change 0 :type integer)
+  (full-count 0 :type integer)
+  (full-count-change 0 :type integer)
+  (low-watermark-count 0 :type integer)
+  (low-watermark-count-change 0 :type integer)
+  (high-watermark-count 0 :type integer)
+  (high-watermark-count-change 0 :type integer)
+  (unacked-sample-count 0 :type integer)
+  (unacked-sample-peak 0 :type integer)
+  (replaced-unacked-sample-count 0 :type integer))
+
+(defstruct* (reliable-reader-activity-changed-status
+             (:constructor make-reliable-reader-activity-changed-status)
+             (:copier copy-reliable-reader-activity-changed-status))
+  "DataWriter RELIABLE_READER_ACTIVITY_CHANGED status (VENDOR EXTENSION). ACTIVE-COUNT / INACTIVE-COUNT
+   are the CURRENT numbers of matched remote readers acknowledging and not acknowledging this writer;
+   the *-CHANGE fields are the deltas since the status was last read. LAST-INSTANCE-HANDLE is the
+   16-octet GUID of the reader whose activity last changed."
+  (active-count 0 :type integer)
+  (active-count-change 0 :type integer)
+  (inactive-count 0 :type integer)
+  (inactive-count-change 0 :type integer)
+  (last-instance-handle nil :type (or null (array (unsigned-byte 8) (*)))))
 
 (defstruct* (inconsistent-topic-status (:constructor make-inconsistent-topic-status)
                                       (:copier copy-inconsistent-topic-status))

@@ -99,6 +99,19 @@
          (or (dds.qos:duration-infinite-p lease)
              (< (dds.qos:duration->seconds period) (dds.qos:duration->seconds lease))))))
 
+(defun* %writer-cache-watermarks-consistent-p (qos)
+    (function (dds.qos:qos) boolean)
+  "T iff QOS's RELIABLE_WRITER_CACHE watermarks (vendor extension, ADR 0089) are self-consistent: when BOTH
+   are set the LOW watermark is STRICTLY BELOW the HIGH watermark. Equal thresholds leave no hysteresis
+   band, so a single sample sitting exactly on the boundary satisfies both the rise-to-high and the
+   fall-to-low test at once. Either watermark NIL (the default) disables the episode machinery and is
+   trivially consistent — a LOW without a HIGH closes an episode nothing can open, which is inert rather
+   than contradictory, and is left to the application. Reports +qos-policy-id-invalid+: the policy is a
+   vendor extension with no OMG QosPolicyId_t, and an id is never invented (see the qos struct docstring)."
+  (let ((low (dds.qos:qos-writer-cache-low-watermark qos))
+        (high (dds.qos:qos-writer-cache-high-watermark qos)))
+    (or (null low) (null high) (< low high))))
+
 (defun* %qos-consistent-p (qos)
     (function (dds.qos:qos) (values boolean integer))
   "Validate the DDS 1.4 cross-policy consistency rules that raise INCONSISTENT_POLICY,
@@ -107,8 +120,9 @@
    RESOURCE_LIMITS id); §2.2.3.18 HISTORY (KEEP_LAST) depth <= RESOURCE_LIMITS.max_samples_per_
    instance (else the HISTORY id). A consistent QoS yields (values T +qos-policy-id-invalid+). Also
    enforced: the DISCOVERY_CONFIG vendor extension (announce period finite, positive, and shorter than the
-   announced lease — %discovery-config-consistent-p), reporting +qos-policy-id-invalid+ as it carries no
-   OMG policy id.
+   announced lease — %discovery-config-consistent-p) and the RELIABLE_WRITER_CACHE watermarks (low strictly
+   below high — %writer-cache-watermarks-consistent-p), each reporting +qos-policy-id-invalid+ as neither
+   carries an OMG policy id.
    Policies the stack does not yet model (TIME_BASED_FILTER minimum_separation vs DEADLINE) are
    not checked here — recorded as a follow-on, not silently claimed."
   (let ((max-samples (dds.qos:qos-resource-max-samples qos))
@@ -122,5 +136,7 @@
                (> (dds.qos:qos-history-depth qos) mspi))
       (return-from %qos-consistent-p (values nil +qos-policy-id-history+)))
     (unless (%discovery-config-consistent-p qos)
+      (return-from %qos-consistent-p (values nil +qos-policy-id-invalid+)))
+    (unless (%writer-cache-watermarks-consistent-p qos)
       (return-from %qos-consistent-p (values nil +qos-policy-id-invalid+)))
     (values t +qos-policy-id-invalid+)))

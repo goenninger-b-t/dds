@@ -325,6 +325,80 @@ no listener up the chain is enabled, the bit stays set and no callback fires. Re
 | `dds.dcps:on-requested-deadline-missed` / `on-sample-lost` (`l reader status`); `dds.dcps:on-offered-deadline-missed` (`l writer status`) | DataReader/DataWriterListener callbacks that fire in v1 (WP-DCPS-API-COMPLETION S4, DDS 1.4 §2.2.3.7 / §2.2.4.1). DEADLINE misses fire from a per-participant background monitor thread; SAMPLE_LOST fires on a best-effort SN-skip (drain) or an irrecoverable reliable GAP. |
 | `dds.dcps:get-offered-deadline-missed-status` (`writer`) / `get-requested-deadline-missed-status` / `get-sample-lost-status` (`reader`) | Snapshot getters for the three S4 statuses; each applies the §2.2.2.1.9 read-communication-status reset (zeroes `total_count_change`, clears the status-changed bit; `total_count` stays monotonic). |
 
+#### Adding a status: it needs THREE registrations, and each omission fails silently
+
+A `defconstant` plus a status struct is **not enough**. A communication status must be registered in
+`*status-kind->bit*` (`statuses.lisp`), in `*status-listener-invokers*` (`entities.lisp`) **and** as an
+`on-<name>` generic function (`listeners.lisp`). Miss one and it fails in a different, mostly invisible way
+each time — no bit means its StatusCondition never triggers (only a WaitSet reveals it); no invoker means
+`%notify-status` **funcalls `NIL` on a receiver thread, where the error is swallowed**, so the callback
+simply never arrives while every other path keeps working. This has now bitten twice. `make test`'s
+`status-registration-completeness` asserts all three for every registered status (exempting the two
+level-based ones, `DATA_AVAILABLE` and `DATA_ON_READERS`, which bypass `%notify-status` entirely). See
+ADR 0089 §2.
+
+### Vendor-extension statuses (ADR 0080, ADR 0089) — NOT DDS 1.4
+
+These are **not OMG statuses**; DDS 1.4 defines none of them. They occupy StatusKind bits 24+, far above
+the OMG range (bits 0–14), so a future standard StatusKind can never collide. Bit 27 is **reserved, not
+free** (see ADR 0089 §5). They ride exactly the same machinery as the standard statuses — bitmask bit,
+StatusCondition, containment-chain listener walk, `get_*_status` snapshot with the §2.2.2.1.9 read-reset.
+
+| Symbol | Description |
+|---|---|
+| `dds.dcps:+status-unaddressable-peer+` (bit 24) | A remote endpoint was topic/type/QoS compatible but its participant advertises no locator this implementation can send to, so the match was **refused** rather than recorded and silently never delivered (ADR 0080). No Connext counterpart — Connext's answer is an internal locator reachability ping, not an application notification. |
+| `dds.dcps:+status-reliable-writer-cache-changed+` (bit 25) | The reliable writer's **send window** of unacknowledged samples crossed a threshold: it emptied, it filled to `RESOURCE_LIMITS max_samples`, or it rose to / fell back to a watermark. |
+| `dds.dcps:+status-reliable-reader-activity-changed+` (bit 26) | A matched remote reader started or stopped acknowledging this writer. Distinct from PUBLICATION_MATCHED: a reader can stay matched while acknowledging nothing. |
+| `dds.dcps:get-unaddressable-peer-status` (`participant`) | Snapshot: `-total-count`, `-total-count-change`, `-last-guid`, `-last-locator-kinds`, `-last-locator-names`. |
+| `dds.dcps:get-reliable-writer-cache-changed-status` (`dw`) | Snapshot: four event counts (`-empty-count`, `-full-count`, `-low-watermark-count`, `-high-watermark-count`, each with `-change`), two levels (`-unacked-sample-count`, `-unacked-sample-peak`) and `-replaced-unacked-sample-count`. The read-reset zeroes the four `*_change` deltas; **the peak and the replaced count are deliberately NOT reset** — a high-water mark that resets on read reports the last quiet moment instead of the worst one, and losing the running total of already-lost data to the act of looking at it would make the number unusable. |
+| `dds.dcps:get-reliable-reader-activity-changed-status` (`dw`) | Snapshot: `-active-count`, `-inactive-count` (+ `-change`) and `-last-instance-handle`. `active_count` counts **distinct** readers — the active set is the truth, so a repeated ACKNACK cannot inflate it. |
+| `dds.dcps:on-unaddressable-peer` (`l participant status`) | Fires from the discovery thread when a match is refused for unaddressability. |
+| `dds.dcps:on-reliable-writer-cache-changed` (`l writer status`) | Fires on a threshold crossing — see the watermarks below. |
+| `dds.dcps:on-reliable-reader-activity-changed` (`l writer status`) | Fires when a matched reader joins or leaves the acknowledging set. |
+
+**The watermarks, and why they default to off.** `dds.qos:qos-writer-cache-low-watermark` /
+`qos-writer-cache-high-watermark` are a DataWriter-scoped vendor QoS (FR-QOS-4: no RxO semantics, never in
+SEDP, no OMG `QosPolicyId_t`), measured in unacknowledged samples, **`nil` by default**. They define a
+**backpressure episode**: rising to the high watermark opens one, falling to the low watermark or draining
+to empty closes one. The low and empty transitions only fire inside an open episode — otherwise a reliable
+writer with one sample in flight would report a drain to zero on *every* sample, which is an application
+callback on the data path saying nothing.
+
+RTI Connext defaults the corresponding fields to `{0, 1}`; **we deliberately do not**. There the pair
+primarily drives an internal mode (the switch to `fast_heartbeat_period`) and the status change costs two
+counter increments; here it drives an application callback, and at `{0, 1}` an ordinary exchange fires
+twice per sample. A status whose purpose is to announce backpressure must be silent when there is none.
+With the watermarks unset the status still reports the FULL transition and still tracks every level, so
+`get-reliable-writer-cache-changed-status` remains useful at all times. Set the high watermark to a depth
+at which *your* writer is in trouble. Both set ⇒ low must be strictly below high (INCONSISTENT_POLICY).
+
+```lisp
+;; Be told when 500 samples are outstanding, and again when it recovers to 50.
+(let ((dw (dds.dcps:create-datawriter
+           pub topic :qos (dds.qos:make-writer-qos
+                           :reliability :reliable :history-kind :keep-all
+                           :writer-cache-low-watermark 50
+                           :writer-cache-high-watermark 500))))
+  (dds.dcps:set-writer-listener dw my-listener '(:reliable-writer-cache-changed))
+  ;; ... and at any time, without a listener:
+  (let ((st (dds.dcps:get-reliable-writer-cache-changed-status dw)))
+    (format t "~d unacked (peak ~d), ~d replaced while unacked~%"
+            (dds.dcps:reliable-writer-cache-changed-status-unacked-sample-count st)
+            (dds.dcps:reliable-writer-cache-changed-status-unacked-sample-peak st)
+            (dds.dcps:reliable-writer-cache-changed-status-replaced-unacked-sample-count st))))
+```
+
+`replaced-unacked-sample-count` is the one number here that names **actual data loss**: samples a
+KEEP_LAST writer overwrote while they were still unacknowledged, so no matched reader ever received them
+and they no longer exist to retransmit.
+
+**Not provided, deliberately** (ADR 0089 §5): `on_sample_removed` — in Connext that is a loan-reclaim
+callback carrying a `DDS_Cookie_t`, fired only for cookie / Zero-Copy-FlatData samples, and this stack's
+writer-loan retains its payload so there would be nothing to reclaim; the loss information it might carry
+lives in `replaced-unacked-sample-count` instead. `on_destination_unreachable` — **does not exist** in the
+Connext 7.3 DataWriterListener. `on_instance_replaced` — needs an `instance_replacement` QoS and a
+writer-side eviction path this stack does not have (it *rejects* at `max_instances` rather than evicting).
+
 ### Advisory type-compatibility (ADR 0009)
 
 When a remote endpoint matches a local DataReader/DataWriter, the matcher assesses the peer's advertised complete TypeObject (the RTI vendor `PID_TYPE_OBJECT_LB`, when the peer carries one) against the local type's member-name fingerprint and records the verdict on the local entity. This is **purely advisory / diagnostic** — the peer is already matched on topic + type name, and the heuristic **never gates or rejects a match** (RTI's legacy TypeObject is not the OMG CompleteTypeObject, so a missing name is inconclusive). See [type system](type-system.md) for the fingerprint and the verdict keywords.

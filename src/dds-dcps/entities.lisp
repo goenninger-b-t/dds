@@ -119,6 +119,12 @@
    (loans :initform '() :accessor dw-loans)                ; WP-FLATDATA-LOAN-WRITE (R6, ADR 0042): outstanding writer-loans (writer-close safety sweep)
    (loan-freelist :initform '() :accessor dw-loan-freelist) ; WP-FLATDATA-LOAN-WRITE: recycled writer-loan structs (the struct+view recycle; the registry cell + retained payload are the documented v1 per-write cost)
    (loan-encap :initform nil :accessor dw-loan-encap)      ; WP-FLATDATA-LOAN-WRITE (ADR 0042): the type's 4-octet encap header+options, cached once from the FlatData ctor (%loan-encap-header) — written into every slot-backed loan's slot
+   ;; ADR 0089 vendor-extension reliability statuses (bits 25-26). Writer-side, like the DDS statuses above.
+   (rw-cache-changed :initform (make-reliable-writer-cache-changed-status) :accessor dw-rw-cache-changed)
+   (rr-activity :initform (make-reliable-reader-activity-changed-status) :accessor dw-rr-activity)
+   (rw-last-unacked :initform 0 :accessor dw-rw-last-unacked) ; ADR 0089: the last send-window level this writer reported, so the per-write notification can decide "no threshold crossed" from two integer reads and return before building anything (the ADR 0088 lesson: a closure allocates on every call, misses and hits alike)
+   (rw-armed :initform nil :accessor dw-rw-armed) ; ADR 0089: T while a BACKPRESSURE EPISODE is open — set when the send window rises to the high watermark, cleared when it falls back to the low one. Without it the low and empty transitions fire on ordinary traffic (a 1-deep exchange drains to zero on every sample), which is the flood the watermarks exist to prevent
+   (active-readers :initform (make-hash-table :test 'equalp) :accessor dw-active-readers) ; remote reader GUID -> T while it is acknowledging; the SET is the truth, so a repeated ACKNACK cannot inflate active-count
    (keyhash-scratch :initform nil :accessor dw-keyhash-scratch) ; TX-KEYHASH (ADR 0087): reusable :big cursor over a 256-octet buffer for the per-write instance-handle key serialization — the writer twin of dr-keyhash-scratch (ADR 0075), created once, zero per-sample make-octet-buffer/cursor/free-static (NFR-MEM)
    (keyhash-busy :initform (dds.pal:make-atomic-cell) :accessor dw-keyhash-busy) ; TX-KEYHASH (ADR 0087): CAS try-lock guarding KEYHASH-SCRATCH — a DataWriter may be written CONCURRENTLY (DDS 1.4 §2.2.2.4.2.11 places no single-thread restriction on write), and two threads serializing keys through one buffer would interleave into a WRONG instance handle; the loser allocates instead, byte-identically
    (status-lock :initform (dds.pal:make-lock "dw-status") :accessor dw-status-lock))
@@ -286,7 +292,16 @@
         (cons :liveliness-changed (lambda (l e s) (on-liveliness-changed l e s)))
         (cons :liveliness-lost (lambda (l e s) (on-liveliness-lost l e s)))
         (cons :requested-deadline-missed (lambda (l e s) (on-requested-deadline-missed l e s)))
-        (cons :offered-deadline-missed (lambda (l e s) (on-offered-deadline-missed l e s))))
+        (cons :offered-deadline-missed (lambda (l e s) (on-offered-deadline-missed l e s)))
+        ;; VENDOR EXTENSIONS (ADR 0080, ADR 0089). A status MUST appear here or %notify-status funcalls
+        ;; the NIL this assoc returns — and it does so on a RECEIVER THREAD, where the error is swallowed:
+        ;; the notification silently never arrives and every other path (bitmask, snapshot) still works.
+        ;; That is exactly how the first cut of ADR 0089 measured INERT on a live reliable exchange.
+        (cons :unaddressable-peer (lambda (l e s) (on-unaddressable-peer l e s)))
+        (cons :reliable-writer-cache-changed
+              (lambda (l e s) (on-reliable-writer-cache-changed l e s)))
+        (cons :reliable-reader-activity-changed
+              (lambda (l e s) (on-reliable-reader-activity-changed l e s))))
   "Maps a communication-status keyword to the closure invoking its on_<status> listener callback
    (listener entity snapshot). The status-generic seam the %notify-status propagation walk uses to
    deliver a status to whichever listener in the containment chain handles it (DDS 1.4 §2.2.4.1).")
@@ -823,6 +838,14 @@
                 (lambda (rid n)
                   (let ((dr (%participant-reader-by-entity-id p rid)))
                     (when dr (%fire-sample-lost dr n)))))
+          (setf (dds.disc:disc-node-on-writer-cache node)   ; ADR 0089: RELIABLE_WRITER_CACHE_CHANGED
+                (lambda (wid unacked replaced)
+                  (let ((dw (%participant-writer-by-entity-id p wid)))
+                    (when dw (%notify-writer-cache-changed dw unacked replaced)))))
+          (setf (dds.disc:disc-node-on-reader-activity node)   ; ADR 0089: RELIABLE_READER_ACTIVITY_CHANGED
+                (lambda (wid reader-guid activep)
+                  (let ((dw (%participant-writer-by-entity-id p wid)))
+                    (when dw (%notify-reader-activity dw reader-guid activep)))))
           (%install-type-gate p)   ; FR-TYPE-4 assignability gate (type-gate.lisp)
           (when identity           ; DDS-Security §8.7 auth manager — only for a security-enabled participant
             ;; pass the configured signed Permissions octets so the handshake emits c.perm (§9.3.2.1, T6)
@@ -2381,8 +2404,18 @@
   "The local DataWriter in P whose engine EntityId is WID, or NIL (WP-N-ENDPOINT-2C2, ADR 0048): writer-side
    mirror of %participant-reader-by-entity-id (keyed on dw-entity-id). Maps the matched-local EntityId threaded
    by %fire-match back to its DCPS DataWriter, so PUBLICATION_MATCHED/OFFERED_INCOMPATIBLE_QOS + the §8.5.2
-   crypto-token + the durability match-side land on the RIGHT same-topic writer (not the first-by-topic)."
-  (find wid (%participant-writers p) :key #'dw-entity-id :test #'=))
+   crypto-token + the durability match-side land on the RIGHT same-topic writer (not the first-by-topic).
+
+   ADR 0089 made this ALLOCATION-FREE. It used to be (find wid (%participant-writers p) ...), and
+   %participant-writers APPENDs a fresh list of every writer in the participant on every call — fine for
+   the match-time callers it was written for, but this now also resolves the writer for the vendor
+   reliability statuses, once per write and once per ACKNACK. Measured at 43.7 bytes/sample; walking the
+   containment tree directly costs nothing and every other caller benefits too."
+  (dolist (c (dp-children p) nil)
+    (when (typep c 'publisher)
+      (dolist (w (pub-writers c))
+        (when (= wid (dw-entity-id w))
+          (return-from %participant-writer-by-entity-id w))))))
 
 (defun* %participant-readers-for-writer-guid (p guid)
     (function (domain-participant (simple-array (unsigned-byte 8) (16))) list)
@@ -3772,6 +3805,231 @@
       (prog1 (copy-unaddressable-peer-status s)
         (setf (unaddressable-peer-status-total-count-change s) 0)
         (%clear-status-changed p +status-unaddressable-peer+)))))
+
+;;;; ---- ADR 0089 vendor-extension reliability statuses. Each rides the %notify-status chokepoint, so
+;;;; it gets the bitmask bit + StatusCondition + most-specific-listener walk + snapshot for free.
+
+(defun* %writer-cache-max-samples (qos)
+    (function (t) (or null (integer 1)))
+  "QOS's RESOURCE_LIMITS max_samples as a finite positive bound, or NIL when it is the DDS
+   LENGTH_UNLIMITED sentinel -1 (the default) or QOS is absent — an unlimited cache can never become
+   FULL, so the RELIABLE_WRITER_CACHE_CHANGED full-transition simply does not arise for it (ADR 0089)."
+  (and (typep qos 'dds.qos:qos)
+       (let ((n (dds.qos:qos-resource-max-samples qos)))
+         (and (plusp n) n))))
+
+(defun* %writer-cache-edges (dw unacked was armed)
+    (function (data-writer (integer 0) (integer 0) t) (values t t t t))
+  "The four RELIABLE_WRITER_CACHE_CHANGED threshold crossings implied by DW's send window moving from WAS
+   to UNACKED while a backpressure episode is or is not open (ARMED), as
+   (values EMPTIED FILLED CROSSED-LOW CROSSED-HIGH) — ADR 0089.
+
+   Every one is an EDGE: true only when the move CROSSED the threshold, never while the level merely sits
+   beyond it. A writer parked above its high watermark has ONE high-watermark event, not one per write.
+
+   THREE OF THE FOUR ARE ALSO GATED ON THE EPISODE, which is what makes the status usable. The high
+   watermark OPENS an episode; the low watermark and the drain to empty CLOSE one. An exchange that never
+   reaches the high watermark is not in trouble, so its perfectly ordinary drains to zero are not events —
+   without this gate a reliable writer with one sample in flight reports an empty transition on EVERY
+   sample, which is a per-sample application callback on the data path saying nothing. With both watermarks
+   NIL (the default) no episode can ever open, so only FILLED remains: an absolute condition — the cache is
+   at RESOURCE_LIMITS max_samples and the next write blocks or is refused — that needs no episode to mean
+   something. Pure and allocation-free, so a caller can evaluate it before building anything.
+
+   An ABSENT or non-dds.qos:qos QoS yields no watermarks and no bound, i.e. no events at all — the same
+   defensive shape as %writer-liveliness-kind. This runs on the per-sample write path, where a condition
+   is forbidden outright (the no-conditions rule), so it must not be able to signal one."
+  (let* ((q (entity-qos dw))
+         (qp (typep q 'dds.qos:qos))
+         (low (and qp (dds.qos:qos-writer-cache-low-watermark q)))
+         (high (and qp (dds.qos:qos-writer-cache-high-watermark q)))
+         (maxs (%writer-cache-max-samples q)))
+    (values (and armed (zerop unacked) (plusp was))                   ; episode drained to empty
+            (and maxs (< was maxs) (>= unacked maxs))                 ; filled to RESOURCE_LIMITS max_samples
+            (and armed low (> was low) (<= unacked low))              ; episode fell back TO the low watermark
+            (and (not armed) high (< was high) (>= unacked high)))))  ; rose TO the high watermark: episode opens
+
+;;; The four RELIABLE_WRITER_CACHE_CHANGED edges as bits of one fixnum (ADR 0089). They are a BITMASK
+;;; rather than four flags for a measured reason: four separate variables that are assigned inside the
+;;; status lock and then read by the notification closure are, to SBCL, four MUTABLE CLOSED-OVER
+;;; variables, and it heap-allocates a value cell for each — 123.5 bytes/sample on the per-sample write
+;;; path, paid whether or not any edge was actually crossed. One immutably-bound fixnum is copied into
+;;; the closure and costs nothing. Same family of defect as ADR 0088's builder closure.
+(defconstant +wc-edge-empty+ 1 "RELIABLE_WRITER_CACHE_CHANGED edge bit: the send window drained to empty.")
+(defconstant +wc-edge-full+  2 "RELIABLE_WRITER_CACHE_CHANGED edge bit: the cache reached RESOURCE_LIMITS max_samples.")
+(defconstant +wc-edge-low+   4 "RELIABLE_WRITER_CACHE_CHANGED edge bit: an open episode fell back to the low watermark.")
+(defconstant +wc-edge-high+  8 "RELIABLE_WRITER_CACHE_CHANGED edge bit: the send window rose to the high watermark, opening an episode.")
+
+(defun* %writer-cache-record-level (s unacked replaced)
+    (function (reliable-writer-cache-changed-status (integer 0) (integer 0)) t)
+  "Record the two RELIABLE_WRITER_CACHE_CHANGED LEVELS on S: the current send-window occupancy UNACKED
+   (raising the peak if it is a new high-water mark) and the monotonic REPLACED count of KEEP_LAST
+   overwrites of unacknowledged data (ADR 0089). Levels are recorded on EVERY move of the window, whether
+   or not that move was an event, so a snapshot read between two events still reports the truth.
+   MUST be called under the entity's status lock."
+  (setf (reliable-writer-cache-changed-status-unacked-sample-count s) unacked
+        (reliable-writer-cache-changed-status-replaced-unacked-sample-count s) replaced)
+  (when (> unacked (reliable-writer-cache-changed-status-unacked-sample-peak s))
+    (setf (reliable-writer-cache-changed-status-unacked-sample-peak s) unacked))
+  t)
+
+(defun* %writer-cache-apply (dw unacked replaced)
+    (function (data-writer (integer 0) (integer 0)) (integer 0 15))
+  "Under DW's STATUS LOCK: record the send-window levels and return the bitmask of thresholds this move
+   crossed (0 = none). Also opens or closes the backpressure episode — the high watermark opens one, the
+   low watermark or a drain to empty closes it (ADR 0089).
+
+   THE LOCK IS NOT OPTIONAL. The two callers are different threads — the application's write thread and a
+   receiver thread draining an ACKNACK — and an edge is defined by a PAIR of levels. Reading the previous
+   level unlocked would let the two interleave into a crossing that never happened, or lose one that did.
+   The lock is a leaf: the disc layer reads the engine state BEFORE calling, never while holding a writer
+   lock, so this cannot participate in a cycle.
+
+   Returns a fixnum, and the caller binds it once, precisely so the notification closure captures an
+   immutable value rather than four mutable ones — see the +WC-EDGE-*+ constants for what that cost."
+  (dds.pal:with-lock ((%entity-status-lock dw))
+    (let ((s (dw-rw-cache-changed dw))
+          (was (dw-rw-last-unacked dw)))
+      (if (and (= was unacked)
+               (= replaced (reliable-writer-cache-changed-status-replaced-unacked-sample-count s)))
+          0
+          (multiple-value-bind (emptied filled crossed-low crossed-high)
+              (%writer-cache-edges dw unacked was (dw-rw-armed dw))
+            (cond (crossed-high (setf (dw-rw-armed dw) t))
+                  ((or crossed-low emptied) (setf (dw-rw-armed dw) nil)))
+            (setf (dw-rw-last-unacked dw) unacked)
+            (%writer-cache-record-level s unacked replaced)
+            (logior (if emptied +wc-edge-empty+ 0) (if filled +wc-edge-full+ 0)
+                    (if crossed-low +wc-edge-low+ 0) (if crossed-high +wc-edge-high+ 0)))))))
+
+(defun* %notify-writer-cache-changed (dw unacked replaced)
+    (function (data-writer (integer 0) (integer 0)) t)
+  "RELIABLE_WRITER_CACHE_CHANGED (VENDOR EXTENSION, ADR 0089): DW's send window now holds UNACKED changes
+   not yet acknowledged by every matched reliable reader, and REPLACED changes have been overwritten by
+   KEEP_LAST while still unacknowledged. Called from BOTH sites where the window moves — the write path
+   (it rises) and the ACKNACK purge (it falls).
+
+   THE LEVEL IS RECORDED ON EVERY CALL; THE STATUS FIRES ONLY ON A THRESHOLD CROSSING. Those are different
+   things and conflating them is what made the first cut of this status unusable: a reliable exchange moves
+   the unacked count twice per sample, so notifying on every move puts an application callback on the data
+   path and reports nothing an application can act on. Levels (the count, its peak, the replaced count) are
+   read out of the snapshot by get-reliable-writer-cache-changed-status; only the empty / full / low / high
+   crossings are events.
+
+   The compare-and-record runs under the entity's STATUS LOCK because the two callers are different threads
+   — the application's write thread and a receiver thread draining an ACKNACK — and an edge is defined by a
+   pair of levels. Reading the previous level unlocked would let the two interleave into a crossing that
+   never happened, or lose one that did. The lock is a leaf here: no writer/engine lock is ever held across
+   it (the disc layer reads the engine state before calling, never inside), so it cannot participate in a
+   cycle.
+
+   ALLOCATION (NFR-MEM): this sits on the per-sample write path, so the guard is HERE and not inside the
+   notification. An unmoved window returns after two integer compares; a move that crosses nothing costs a
+   locked update of two slots. %notify-status is reached only on a real crossing — its APPLY-FN closure
+   allocates on every call whether or not anything changed, which is exactly the defect that cost ADR 0088
+   its entire first-cut win."
+  (let ((edges (%writer-cache-apply dw unacked replaced)))
+    (unless (zerop edges)
+      (%notify-status dw +status-reliable-writer-cache-changed+ :reliable-writer-cache-changed
+       (lambda ()
+         (let ((s (dw-rw-cache-changed dw)))
+           (when (logtest edges +wc-edge-empty+)
+             (incf (reliable-writer-cache-changed-status-empty-count s))
+             (incf (reliable-writer-cache-changed-status-empty-count-change s)))
+           (when (logtest edges +wc-edge-full+)
+             (incf (reliable-writer-cache-changed-status-full-count s))
+             (incf (reliable-writer-cache-changed-status-full-count-change s)))
+           (when (logtest edges +wc-edge-low+)
+             (incf (reliable-writer-cache-changed-status-low-watermark-count s))
+             (incf (reliable-writer-cache-changed-status-low-watermark-count-change s)))
+           (when (logtest edges +wc-edge-high+)
+             (incf (reliable-writer-cache-changed-status-high-watermark-count s))
+             (incf (reliable-writer-cache-changed-status-high-watermark-count-change s)))
+           (values t (copy-reliable-writer-cache-changed-status s)
+                   (lambda ()
+                     (setf (reliable-writer-cache-changed-status-empty-count-change s) 0
+                           (reliable-writer-cache-changed-status-full-count-change s) 0
+                           (reliable-writer-cache-changed-status-low-watermark-count-change s) 0
+                           (reliable-writer-cache-changed-status-high-watermark-count-change s) 0)))))))
+    t))
+
+(defun* %notify-reader-activity (dw reader-guid activep)
+    (function (data-writer t t) t)
+  "RELIABLE_READER_ACTIVITY_CHANGED (VENDOR EXTENSION, ADR 0089): the matched remote reader named by
+   READER-GUID is now acknowledging DW (ACTIVEP true) or has stopped. Membership of DW-ACTIVE-READERS is
+   the truth rather than a counter, so a repeated ACKNACK from an already-active reader is NOT an event
+   and cannot inflate active_count — the counter-only shape is how LIVELINESS_CHANGED.alive_count came
+   to be inert (fixed 2026-07-25), and it is not repeated here.
+
+   THE MEMBERSHIP TEST RUNS FIRST, AND THAT IS AN ALLOCATION FIX, NOT A MICRO-OPTIMISATION. This is called
+   once per inbound ACKNACK — about once per sample — and %notify-status takes a CLOSURE, which is built on
+   every call whether or not anything changed. Measured at 76.4 bytes/sample before this guard. In the
+   steady state the answer is always 'this reader was already active', so the guard returns before anything
+   is built. It is the same defect ADR 0088 found in its own first cut, inherited here unchanged.
+
+   The guard takes the status lock because the active-reader set is a hash table mutated under that lock by
+   the apply-fn below; an unlocked GETHASH racing a REMHASH can read a table mid-rehash. It is a
+   double-check: apply-fn re-tests membership under the lock it holds, so a race between the two only costs
+   a redundant closure, never a wrong count."
+  (unless (let ((known (dds.pal:with-lock ((%entity-status-lock dw))
+                         (nth-value 1 (gethash reader-guid (dw-active-readers dw))))))
+            (if activep known (not known)))
+    (%notify-status dw +status-reliable-reader-activity-changed+ :reliable-reader-activity-changed
+     (lambda ()
+       (let* ((s (dw-rr-activity dw))
+              (tbl (dw-active-readers dw))
+              (known (nth-value 1 (gethash reader-guid tbl)))
+              (changed (if activep (not known) known)))
+         (when changed
+           (if activep (setf (gethash reader-guid tbl) t) (remhash reader-guid tbl))
+           (let ((n (hash-table-count tbl)))
+             (setf (reliable-reader-activity-changed-status-active-count s) n)
+             (if activep
+                 (incf (reliable-reader-activity-changed-status-active-count-change s))
+                 (progn (incf (reliable-reader-activity-changed-status-inactive-count s))
+                        (incf (reliable-reader-activity-changed-status-inactive-count-change s)))))
+           (setf (reliable-reader-activity-changed-status-last-instance-handle s)
+                 (and (typep reader-guid '(array (unsigned-byte 8) (*))) reader-guid)))
+         (values changed
+                 (and changed (copy-reliable-reader-activity-changed-status s))
+                 (lambda ()
+                   (setf (reliable-reader-activity-changed-status-active-count-change s) 0
+                         (reliable-reader-activity-changed-status-inactive-count-change s) 0)))))))
+  t)
+
+(defun* get-reliable-writer-cache-changed-status (dw)
+    (function (data-writer) reliable-writer-cache-changed-status)
+  "DataWriter::get_reliable_writer_cache_changed_status (VENDOR EXTENSION, ADR 0089) — a snapshot of DW's
+   reliable send window: the four threshold-crossing counts (empty / full / low watermark / high
+   watermark), the current unacked-sample count and its high-water peak, and the count of unacknowledged
+   samples KEEP_LAST has replaced. Mirrors the read-communication-status reset (DDS 1.4 §2.2.2.1.9):
+   resets the four *_change deltas and clears the status bit.
+
+   TWO FIELDS ARE DELIBERATELY NOT RESET, and both for the same reason — they are cumulative facts, not
+   deltas. UNACKED-SAMPLE-PEAK is a high-water mark: resetting it on read would report the last quiet
+   moment instead of the worst one, which is the only moment worth knowing. REPLACED-UNACKED-SAMPLE-COUNT
+   is a running total of data already lost; a reader of this status wants 'how much have I lost', and
+   losing that history to the act of looking at it would make the number unusable."
+  (dds.pal:with-lock ((%entity-status-lock dw))
+    (let ((s (dw-rw-cache-changed dw)))
+      (prog1 (copy-reliable-writer-cache-changed-status s)
+        (setf (reliable-writer-cache-changed-status-empty-count-change s) 0
+              (reliable-writer-cache-changed-status-full-count-change s) 0
+              (reliable-writer-cache-changed-status-low-watermark-count-change s) 0
+              (reliable-writer-cache-changed-status-high-watermark-count-change s) 0)
+        (%clear-status-changed dw +status-reliable-writer-cache-changed+)))))
+
+(defun* get-reliable-reader-activity-changed-status (dw)
+    (function (data-writer) reliable-reader-activity-changed-status)
+  "DataWriter::get_reliable_reader_activity_changed_status (VENDOR EXTENSION, ADR 0089) — a snapshot of
+   how many matched remote readers are currently acknowledging DW and how many have stopped. Mirrors the
+   read-communication-status reset (DDS 1.4 §2.2.2.1.9)."
+  (dds.pal:with-lock ((%entity-status-lock dw))
+    (let ((s (dw-rr-activity dw)))
+      (prog1 (copy-reliable-reader-activity-changed-status s)
+        (setf (reliable-reader-activity-changed-status-active-count-change s) 0
+              (reliable-reader-activity-changed-status-inactive-count-change s) 0)
+        (%clear-status-changed dw +status-reliable-reader-activity-changed+)))))
 
 (defun* %on-disc-inconsistent-topic (p name)
     (function (domain-participant string) t)

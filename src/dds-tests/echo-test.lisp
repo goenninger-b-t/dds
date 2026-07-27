@@ -4173,6 +4173,10 @@
                  ("unfragmented-to-shmem-dest" . run-unfragmented-to-shmem-dest-test)
                  ("rti-shmem-locator"        . run-rti-shmem-locator-test)
                  ("unaddressable-match-refused" . run-unaddressable-match-refused-test)
+                 ;; ADR 0089: the vendor-extension DataWriter reliability statuses
+                 ("status-registration-completeness" . run-status-registration-completeness-test)
+                 ("vendor-writer-status"     . run-vendor-writer-status-test)
+                 ("writer-unacked-count"     . run-writer-unacked-count-test)
                  ("rx-store-pool"            . run-rx-store-pool-test)
                  ("dcps-disabled-endpoint-silent" . run-dcps-disabled-endpoint-silent-test)
                  ("dcps-builtin-topics"      . run-dcps-builtin-topics-test)

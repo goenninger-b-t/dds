@@ -90,7 +90,15 @@
    FINALIZED (durability-finalize, DDS 1.4 §2.2.3.4; the OPT-IN extension ON TOP of the conformant default,
    NIL = standard TRANSIENT_LOCAL) when T makes writer-purge-acked treat a TRANSIENT_LOCAL writer as
    VOLATILE — re-enabling the full-ACK purge so the retained late-joiner history is RELEASED once all current
-   readers ACK; monotonic (set once by writer-finalize-durability, never cleared in v1)."
+   readers ACK; monotonic (set once by writer-finalize-durability, never cleared in v1).
+
+   ACKED-WATERMARK + REPLACED-UNACKED are the two engine facts the vendor RELIABLE_WRITER_CACHE_CHANGED
+   status is derived from (ADR 0089). ACKED-WATERMARK is min(acked-base) over the CURRENTLY MATCHED readers
+   — the writer-global acknowledged watermark, maintained by writer-purge-acked whether or not it goes on
+   to purge, so it stays true for a TRANSIENT_LOCAL writer that retains everything. REPLACED-UNACKED counts
+   changes that KEEP_LAST overwrote while they were still BELOW that watermark's reach, i.e. samples the
+   application wrote that no longer exist and were never acknowledged by every matched reader. It is the
+   one number in the whole status that names actual data loss."
   (hc nil :type (or null dds.rtps.history:history-cache))  ; a HistoryCache
   (entityid 0 :type (unsigned-byte 32))   ; WP-N-ENDPOINT-S1 (ADR 0048): this writer's own RTPS EntityId (RTPS 2.5 §9.3.1.2); the send fan-out stamps it so each local DataWriter's DATA/HEARTBEAT carry its OWN GUID (0 = unset, the pre-S1 default)
   (last-sn 0 :type integer)
@@ -101,7 +109,9 @@
   (lock (dds.pal:make-lock) :type t)
   (space-cv (dds.pal:make-condvar) :type t)   ; signalled (under LOCK) when the cache shrinks; writer-write waits on it when full (ADR 0016 §Backpressure)
   (max-blocking-ns nil :type (or null (integer 0)))   ; RELIABILITY.max_blocking_time in ns; NIL = never block (unlimited cache)
-  (finalized nil :type boolean))   ; durability-finalize (DDS 1.4 §2.2.3.4 extension): a TL writer reverts to the VOLATILE full-ACK purge
+  (finalized nil :type boolean)   ; durability-finalize (DDS 1.4 §2.2.3.4 extension): a TL writer reverts to the VOLATILE full-ACK purge
+  (acked-watermark 1 :type integer)      ; ADR 0089: min(acked-base) over matched readers; 1 = nothing acknowledged yet
+  (replaced-unacked 0 :type integer))    ; ADR 0089: monotonic count of KEEP_LAST evictions of a not-fully-acked change
 
 (defmacro %with-writer-lock ((writer) &body body)
   "Serialize BODY's access to WRITER's HistoryCache + proxies (publish thread vs receiver thread). The
@@ -178,8 +188,11 @@
                                            (/ remaining 1000000000.0d0)))))
         (when (>= (dds.rtps.history:hc-change-count hc) max-samples)   ; still full (deadline passed / no blocking): reject, NO SN consumed
           (return-from %writer-add-bounded :timeout)))
-      (let ((sn (incf (rtps-writer-last-sn writer))))                  ; room confirmed (or unlimited / KEEP_LAST)
-        (dds.rtps.history:hc-add-change hc (funcall make-change sn))
+      (let* ((sn (incf (rtps-writer-last-sn writer)))                  ; room confirmed (or unlimited / KEEP_LAST)
+             (evicted (nth-value 1 (dds.rtps.history:hc-add-change hc (funcall make-change sn)))))
+        ;; ADR 0089: a KEEP_LAST eviction at or above the acked watermark destroyed data no reader has.
+        (when (and evicted (>= (the integer evicted) (rtps-writer-acked-watermark writer)))
+          (incf (rtps-writer-replaced-unacked writer)))
         sn))))
 
 (defun* %retained-endpoint-key (key)
@@ -645,17 +658,43 @@
    writer-finalize-durability) OVERRIDES the retain for a non-VOLATILE writer: a FINALIZED writer purges
    exactly as :VOLATILE — the retained late-joiner history is RELEASED once all current readers ACK (the
    owner has declared no more late-joiners expected). So the purge runs iff there is a matched reader AND
-   the writer is :VOLATILE OR FINALIZED; an un-finalized TRANSIENT_LOCAL writer is byte-identical to before."
-  (if (or (null reader-keys)
-          (and (not (eq durability :volatile)) (not (rtps-writer-finalized writer))))
+   the writer is :VOLATILE OR FINALIZED; an un-finalized TRANSIENT_LOCAL writer still purges NOTHING.
+
+   ADR 0089 moved the acked-watermark computation ABOVE that durability gate, so an un-finalized
+   TRANSIENT_LOCAL writer now takes the writer lock (to read its readers' proxies) where it previously
+   returned 0 without one. Its PURGE behaviour is unchanged; only the watermark is newly recorded, and it
+   has to be — that writer retains everything, so it purges nothing from which its send-window occupancy
+   could otherwise be derived, and reporting its stored history as 'unacknowledged' is exactly the defect
+   ADR 0089 §4.3 fixes. With no matched readers the function still returns 0 without taking the lock."
+  (if (null reader-keys)
       0
       (let ((purged (%with-writer-lock (writer)
-                      (dds.rtps.history:hc-purge-below
-                       (rtps-writer-hc writer)
-                       (loop for k in reader-keys
-                             minimize (reader-proxy-acked-base (get-reader-proxy writer k)))))))
+                      (let ((base (loop for k in reader-keys
+                                        minimize (reader-proxy-acked-base (get-reader-proxy writer k)))))
+                        ;; ADR 0089: record the watermark BEFORE the durability gate. It is what makes the
+                        ;; unacked count and the replaced-unacked count true for a TRANSIENT_LOCAL writer,
+                        ;; which retains its whole history and so purges nothing to derive them from.
+                        (setf (rtps-writer-acked-watermark writer) base)
+                        (if (and (not (eq durability :volatile)) (not (rtps-writer-finalized writer)))
+                            0
+                            (dds.rtps.history:hc-purge-below (rtps-writer-hc writer) base))))))
         (when (plusp purged) (%writer-signal-space writer))   ; the cache shrank: wake any blocked writer-write
         purged)))
+
+(defun* writer-unacked-count (writer)
+    (function (rtps-writer) (integer 0))
+  "The number of changes WRITER has written that are NOT YET acknowledged by every matched reader — the
+   occupancy of its send window (ADR 0089), = last-SN - acked-watermark + 1, clamped at 0. O(1): both terms
+   are maintained incrementally (the watermark by writer-purge-acked on every ACKNACK), so the vendor
+   RELIABLE_WRITER_CACHE_CHANGED status costs no scan of the HistoryCache.
+
+   NOT the same as HC-CHANGE-COUNT, which is every change the cache STORES. The two coincide only for a
+   VOLATILE writer that has just purged; they diverge for a TRANSIENT_LOCAL writer (which RETAINS its acked
+   history for late-joiners, so its stored count is the whole history and its unacked count may be zero) and
+   whenever no reader has yet ACKed. Reporting the stored count as 'unacknowledged' would tell a
+   TRANSIENT_LOCAL application it has unbounded backpressure while it in fact has none."
+  (%with-writer-lock (writer)
+    (max 0 (- (rtps-writer-last-sn writer) (rtps-writer-acked-watermark writer) -1))))
 
 (defun* writer-finalize-durability (writer)
     (function (rtps-writer) (eql t))

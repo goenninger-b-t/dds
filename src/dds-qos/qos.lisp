@@ -138,7 +138,31 @@
    (PID_PARTICIPANT_LEASE_DURATION): how long a peer keeps us alive after our last announcement before
    pruning us as stale (RTPS 2.5 §8.5.3.3.2). Default {100, 0} = the spec default (RTPS 2.5 Table 9.18).
    It MUST exceed the announce period (else peers age us out between our own announcements) — enforced by
-   the DCPS consistency validator (INCONSISTENT_POLICY)."
+   the DCPS consistency validator (INCONSISTENT_POLICY).
+
+   WRITER-CACHE-LOW-WATERMARK / WRITER-CACHE-HIGH-WATERMARK are a second VENDOR EXTENSION (ADR 0089),
+   DATAWRITER-scoped, measured in UNACKNOWLEDGED SAMPLES, and NIL (disabled) by default. They are the two
+   thresholds that define a BACKPRESSURE EPISODE for the vendor RELIABLE_WRITER_CACHE_CHANGED status: the
+   send window rising to HIGH opens one, and its falling back to LOW closes it. Like DISCOVERY_CONFIG they
+   have NO request/offered semantics (absent from qos-rxo-compatible), are never advertised in SEDP, carry
+   no OMG QosPolicyId_t, and are ignored on every entity except a DataWriter. When BOTH are set LOW MUST be
+   strictly below HIGH — equal thresholds leave no hysteresis band, so one sample sitting on the boundary
+   satisfies both tests at once; enforced by the DCPS consistency validator (INCONSISTENT_POLICY).
+
+   THE DEFAULT IS DISABLED, WHICH IS A DELIBERATE DIVERGENCE FROM RTI CONNEXT, whose corresponding
+   DataWriterProtocol fields default to {0, 1}. Connext can afford that default because there the pair
+   primarily drives an INTERNAL mode — the switch to fast_heartbeat_period — and the status change is a
+   by-product costing two counter increments. Here the pair drives an APPLICATION CALLBACK. At {0, 1} a
+   reliable exchange with one sample in flight crosses HIGH on every write and LOW on every acknowledgement:
+   two listener invocations per sample, on the write and receiver threads. That is not a cost problem to be
+   optimised away, it is the wrong semantics — a status whose purpose is to announce backpressure must be
+   SILENT when there is none. Adopting the numeric default while omitting the mechanism it was chosen for
+   would be parity in appearance only.
+
+   So: disabled by default, and the status then reports the FULL transition (an absolute condition needing
+   no episode) and keeps its levels — unacked count, peak, replaced-unacked — continuously readable through
+   get-reliable-writer-cache-changed-status at no cost. Set HIGH to a depth at which YOUR writer is in
+   trouble to be told when it gets there, and LOW below it to be told when it recovers."
   (reliability :best-effort :type (member :best-effort :reliable))
   (reliability-max-blocking (make-qos-duration 0 100000000) :type qos-duration) ; 100 ms
   (durability :volatile :type (member :volatile :transient-local :transient :persistent))
@@ -181,7 +205,10 @@
   (type-consistency (make-type-consistency-enforcement) :type type-consistency-enforcement)
   ;; DISCOVERY_CONFIG (VENDOR EXTENSION, participant-scoped, not RxO, not in SEDP) — see the struct docstring.
   (discovery-announce-period (make-qos-duration 1 0) :type qos-duration)
-  (discovery-lease-duration (make-qos-duration 100 0) :type qos-duration))
+  (discovery-lease-duration (make-qos-duration 100 0) :type qos-duration)
+  ;; RELIABLE_WRITER_CACHE watermarks (VENDOR EXTENSION, writer-scoped, not RxO, not in SEDP) — see above.
+  (writer-cache-low-watermark nil :type (or null (integer 0)))
+  (writer-cache-high-watermark nil :type (or null (integer 1))))
 
 (defun* make-writer-qos (&rest args)
     (function (&rest t) qos)

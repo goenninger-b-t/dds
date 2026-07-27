@@ -187,6 +187,8 @@
   ;; (UNADDRESSABLE-REPORTED dedups: this sits on the SEDP path, which re-announces indefinitely).
   ;; UNADDRESSABLE-COUNT counts distinct refused remotes for diagnostics.
   (on-unaddressable nil :type t)
+  (on-writer-cache nil :type t)      ; ADR 0089: (lambda (writer-entityid unacked replaced-unacked) ...) — the DCPS hook for RELIABLE_WRITER_CACHE_CHANGED. Fired from BOTH sites where the send window moves: the WRITE path (it rises) and the ACKNACK purge (it falls). Firing only on ACKNACK would miss every high-watermark crossing of a writer under real backpressure, whose reader by definition is not ACKing. Engine state is read HERE and passed in, so dds.dcps never resolves an rtps-writer. NIL = nobody is listening (the default, zero cost)
+  (on-reader-activity nil :type t)   ; ADR 0089: (lambda (writer-entityid reader-guid activep) ...) — the DCPS hook for RELIABLE_READER_ACTIVITY_CHANGED, fired from the ACKNACK path, which IS the evidence that a matched reader is acknowledging. NIL = nobody is listening
   (unaddressable-count 0 :type (integer 0))
   (unaddressable-reported (make-hash-table :test 'equalp) :type hash-table)
 

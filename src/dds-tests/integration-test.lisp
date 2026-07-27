@@ -5507,6 +5507,243 @@
       (dds.dcps:delete-participant p)))
   t)
 
+(defun* run-status-registration-completeness-test ()
+    (function () t)
+  "ADR 0089: EVERY communication status this stack defines MUST be registered in all THREE places, and
+   this test is the guard that makes that structural rather than remembered.
+
+   THE DEFECT IT PREVENTS, which has now occurred twice. A status needs (1) an entry in
+   *STATUS-KIND->BIT*, (2) an entry in *STATUS-LISTENER-INVOKERS*, and (3) an ON-<NAME> generic function.
+   Miss any one and it fails SILENTLY, in a different way each time:
+     - no bit    => %status-active-p ends in (and bit (logtest ...)), so bit = NIL and its StatusCondition
+                    NEVER TRIGGERS. The bitmask and the snapshot still work, so only a WaitSet reveals it.
+     - no invoker=> %notify-status FUNCALLS THE NIL that assoc returned — on a receiver or discovery
+                    thread, where the error is swallowed. Every other path keeps working; the callback
+                    simply never arrives.
+     - no GF     => there is nothing for the invoker to call.
+   UNADDRESSABLE_PEER shipped missing (1) and (2) from ADR 0080 until 2026-07-26, with a docstring
+   promising all four delivery mechanisms. The first cut of ADR 0089's own statuses registered only the
+   constant and measured COMPLETELY INERT on a live exchange. No correctness test catches an inert status,
+   because nothing it should have done was ever asserted — so the registration itself is asserted here.
+
+   THE TWO EXEMPTIONS ARE EXEMPT FOR A REASON, not to make the test pass. DATA_AVAILABLE and
+   DATA_ON_READERS are LEVEL-based (there are unread samples / some reader has data), not change-based.
+   They never travel through %notify-status at all — %fire-data-available and %fire-data-on-readers walk
+   the containment chain themselves and call the generic function directly, and no bitmask bit is set or
+   reset for them. So they need the bit (the conditions machinery tests it) and the generic function, but
+   an invoker entry would be dead code. Every OTHER status is change-based and needs all three.
+
+   FALSIFIED: delete any one of the three entries for any status below and exactly one check fails."
+  (let ((level-based '(:data-available :data-on-readers)))
+    (dolist (kw (mapcar #'car dds.dcps::*status-kind->bit*))
+      (unless (member kw level-based)
+        (%check :status-reg-invoker
+                (cdr (assoc kw dds.dcps::*status-listener-invokers*))
+                (format nil "status ~s has a StatusKind bit but NO listener invoker — %notify-status would ~
+                             funcall NIL on a receiver thread, where the error is swallowed" kw)))
+      ;; the third registration: something for the invoker to call
+      (let ((gf (find-symbol (format nil "ON-~a" (symbol-name kw)) '#:dds.dcps)))
+        (%check :status-reg-generic
+                (and gf (fboundp gf))
+                (format nil "status ~s has no ON-~a generic function — the invoker has nothing to call"
+                        kw (symbol-name kw))))))
+  (dolist (kw (mapcar #'car dds.dcps::*status-listener-invokers*))
+    (%check :status-reg-bit
+            (cdr (assoc kw dds.dcps::*status-kind->bit*))
+            (format nil "status ~s has a listener invoker but NO StatusKind bit — %status-active-p would ~
+                         yield NIL and its StatusCondition would never trigger" kw)))
+  ;; The two callbacks withdrawn in ADR 0089 must be gone from BOTH maps, not half-removed.
+  (dolist (kw '(:sample-removed :destination-unreachable))
+    (%check :status-reg-withdrawn
+            (and (null (assoc kw dds.dcps::*status-kind->bit*))
+                 (null (assoc kw dds.dcps::*status-listener-invokers*)))
+            (format nil "withdrawn status ~s must not remain registered anywhere (ADR 0089)" kw)))
+  t)
+
+(defun* run-vendor-writer-status-test ()
+    (function () t)
+  "ADR 0089: the two VENDOR-EXTENSION DataWriter reliability statuses — RELIABLE_WRITER_CACHE_CHANGED and
+   RELIABLE_READER_ACTIVITY_CHANGED.
+
+   THE THING UNDER TEST IS THAT THE CACHE STATUS IS EDGE-TRIGGERED AND EPISODE-GATED. A reliable exchange
+   moves the unacked count twice per sample, so a level-triggered version fires per sample: it floods a
+   listener that runs on a receiver thread and reports nothing actionable. The first cut of this slice did
+   exactly that, and so did the second — with RTI's own default watermarks {0, 1}, because at one sample in
+   flight every write crosses the high watermark and every acknowledgement drains to the low one. gate-mem
+   caught that as +763 bytes/sample; :vwc-quiet-by-default below is what catches it as the SEMANTIC defect
+   it actually is, which is the assertion that should exist whether or not anyone is counting bytes.
+
+   FALSIFIED: drop the episode gate from %writer-cache-edges and :vwc-quiet-by-default fails; make
+   %notify-writer-cache-changed fire on every change and :vwc-edge-high-once fails; drop the level
+   recording from the no-event path and :vwc-level-tracked fails; reset the peak or the replaced count on
+   read and :vwc-peak-survives-read / :vwc-replaced-survives-read fail."
+  (let ((ts (dds.types:find-type-support "dcps-msg"))
+        (p (dds.dcps:create-participant :domain (test-domain))))
+    (unwind-protect
+         (let* ((tp (dds.dcps:create-topic p "VendorStatusTopic" "dcps-msg" ts))
+                (tp0 (dds.dcps:create-topic p "VendorStatusTopicDefault" "dcps-msg" ts))
+                (pub (dds.dcps:create-publisher p))
+                ;; high watermark 3 so the band {0,3} is wide enough to hold a non-event move
+                (dw (dds.dcps:create-datawriter
+                     pub tp :qos (dds.qos:make-writer-qos :reliability :reliable
+                                                          :writer-cache-low-watermark 0
+                                                          :writer-cache-high-watermark 3)))
+                ;; a writer left at the DEFAULT QoS: no watermarks, so no episode can ever open
+                (dw0 (dds.dcps:create-datawriter
+                      pub tp0 :qos (dds.qos:make-writer-qos :reliability :reliable))))
+           ;; --- THE REGRESSION GUARD: an ordinary reliable exchange must be SILENT ---
+           (dotimes (i 8)                                  ; 8 samples, each written then fully acknowledged
+             (dds.dcps::%notify-writer-cache-changed dw0 1 0)
+             (dds.dcps::%notify-writer-cache-changed dw0 0 0))
+           (let ((st (dds.dcps:get-reliable-writer-cache-changed-status dw0)))
+             (%check :vwc-quiet-by-default
+                     (and (zerop (dds.dcps:reliable-writer-cache-changed-status-empty-count st))
+                          (zerop (dds.dcps:reliable-writer-cache-changed-status-low-watermark-count st))
+                          (zerop (dds.dcps:reliable-writer-cache-changed-status-high-watermark-count st)))
+                     "a writer at the DEFAULT QoS must report NO events for a healthy reliable exchange. A status whose purpose is to announce backpressure must be silent when there is none - and every event here would be an application callback on the data path, twice per sample")
+             (%check :vwc-quiet-still-tracks-levels
+                     (= 1 (dds.dcps:reliable-writer-cache-changed-status-unacked-sample-peak st))
+                     "...while still tracking the LEVELS, which is what makes a silent default honest rather than inert: get_*_status reports the send window at any time, at no cost"))
+           ;; --- the edge predicate itself, exhaustively, before any status machinery is involved ---
+           (flet ((edges (now was &optional (armed nil))
+                    (multiple-value-list (dds.dcps::%writer-cache-edges dw now was armed))))
+             (%check :vwc-edge-high-on-rise (fourth (edges 3 2))
+                     "rising TO the high watermark opens an episode")
+             (%check :vwc-edge-high-once (not (fourth (edges 4 3 t)))
+                     "staying ABOVE the high watermark is not a second crossing — the event is the edge")
+             (%check :vwc-edge-low-on-fall (third (edges 0 2 t))
+                     "falling TO the low watermark closes an OPEN episode")
+             (%check :vwc-edge-low-needs-episode (not (third (edges 0 2)))
+                     "the same fall with NO episode open is not an event — ordinary traffic below the high watermark is not backpressure recovering")
+             (%check :vwc-edge-empty (first (edges 0 2 t)) "an open episode draining to nothing is an empty transition")
+             (%check :vwc-edge-empty-needs-episode (not (first (edges 0 2)))
+                     "draining to nothing with no episode open is not an event — this is the exact edge a 1-deep reliable exchange hits on every single sample")
+             (%check :vwc-edge-none (not (some #'identity (edges 2 1)))
+                     "a move strictly inside the band crosses nothing at all"))
+           ;; --- the status: only crossings are events, but every move records the level ---
+           (dds.dcps::%notify-writer-cache-changed dw 1 0)     ; 0 -> 1: inside the band
+           (let ((st (dds.dcps:get-reliable-writer-cache-changed-status dw)))
+             (%check :vwc-no-event-between
+                     (zerop (dds.dcps:reliable-writer-cache-changed-status-high-watermark-count st))
+                     "a move that crosses no threshold must NOT fire the status")
+             (%check :vwc-level-tracked
+                     (= 1 (dds.dcps:reliable-writer-cache-changed-status-unacked-sample-count st))
+                     "the send-window level is recorded even when the move is not an event"))
+           (dds.dcps::%notify-writer-cache-changed dw 3 0)     ; 1 -> 3: rises TO the high watermark
+           (dds.dcps::%notify-writer-cache-changed dw 5 0)     ; 3 -> 5: already above; not a new event
+           (let ((st (dds.dcps:get-reliable-writer-cache-changed-status dw)))
+             (%check :vwc-high-counted
+                     (= 1 (dds.dcps:reliable-writer-cache-changed-status-high-watermark-count st))
+                     "rising to the high watermark fires exactly once, not once per write above it")
+             (%check :vwc-peak
+                     (= 5 (dds.dcps:reliable-writer-cache-changed-status-unacked-sample-peak st))
+                     "the peak follows the highest level seen, not the level at read time"))
+           (dds.dcps::%notify-writer-cache-changed dw 0 2)     ; 5 -> 0: drains, and 2 replaced meanwhile
+           (let ((st (dds.dcps:get-reliable-writer-cache-changed-status dw)))
+             (%check :vwc-low-and-empty
+                     (and (= 1 (dds.dcps:reliable-writer-cache-changed-status-low-watermark-count st))
+                          (= 1 (dds.dcps:reliable-writer-cache-changed-status-empty-count st)))
+                     "draining to zero is BOTH a low-watermark crossing and an empty transition at low=0")
+             (%check :vwc-replaced
+                     (= 2 (dds.dcps:reliable-writer-cache-changed-status-replaced-unacked-sample-count st))
+                     "replaced-unacked is carried through — it is the one field naming actual data loss")
+             (%check :vwc-change-reset
+                     (zerop (dds.dcps:reliable-writer-cache-changed-status-high-watermark-count-change st))
+                     "reading resets the *_change deltas of counts read on a PREVIOUS call"))
+           (let ((st (dds.dcps:get-reliable-writer-cache-changed-status dw)))
+             (%check :vwc-peak-survives-read
+                     (= 5 (dds.dcps:reliable-writer-cache-changed-status-unacked-sample-peak st))
+                     "the peak is NOT reset by reading — a high-water mark that resets reports the last
+                      quiet moment instead of the worst one")
+             (%check :vwc-replaced-survives-read
+                     (= 2 (dds.dcps:reliable-writer-cache-changed-status-replaced-unacked-sample-count st))
+                     "the replaced-unacked total is NOT reset by reading — losing the history of lost data
+                      to the act of looking at it would make the number unusable"))
+           ;; --- reader activity is a SET, so a repeated ACKNACK from a known reader is not an event ---
+           (let ((g1 (make-array 16 :element-type '(unsigned-byte 8) :initial-element #x41))
+                 (g2 (make-array 16 :element-type '(unsigned-byte 8) :initial-element #x42)))
+             (dds.dcps::%notify-reader-activity dw g1 t)
+             (dds.dcps::%notify-reader-activity dw g1 t)
+             (dds.dcps::%notify-reader-activity dw g2 t)
+             (let ((st (dds.dcps:get-reliable-reader-activity-changed-status dw)))
+               (%check :vra-set-not-counter
+                       (= 2 (dds.dcps:reliable-reader-activity-changed-status-active-count st))
+                       "active_count counts DISTINCT readers — a repeated ACKNACK from a known reader must
+                        not inflate it (the shape that made LIVELINESS_CHANGED.alive_count inert)"))
+             (dds.dcps::%notify-reader-activity dw g1 nil)
+             (let ((st (dds.dcps:get-reliable-reader-activity-changed-status dw)))
+               (%check :vra-deactivate
+                       (and (= 1 (dds.dcps:reliable-reader-activity-changed-status-active-count st))
+                            (= 1 (dds.dcps:reliable-reader-activity-changed-status-inactive-count st)))
+                       "a reader that stops acknowledging leaves the active set and is counted inactive"))))
+      (dds.dcps:delete-participant p)))
+  ;; --- the watermark QoS is consistency-checked: no hysteresis band is a configuration error ---
+  (%check :vwc-qos-inconsistent
+          (not (nth-value 0 (dds.dcps::%qos-consistent-p
+                             (dds.qos:make-writer-qos :writer-cache-low-watermark 4
+                                                      :writer-cache-high-watermark 4))))
+          "low >= high must be INCONSISTENT_POLICY — equal thresholds have no hysteresis, so one sample on the boundary satisfies both crossing tests at once")
+  (%check :vwc-qos-consistent
+          (and (nth-value 0 (dds.dcps::%qos-consistent-p (dds.qos:make-writer-qos)))
+               (nth-value 0 (dds.dcps::%qos-consistent-p
+                             (dds.qos:make-writer-qos :writer-cache-low-watermark 2
+                                                      :writer-cache-high-watermark 8))))
+          "the disabled default and any properly ordered pair must both be consistent")
+  t)
+
+(defun* run-writer-unacked-count-test ()
+    (function () t)
+  "ADR 0089: WRITER-UNACKED-COUNT reports the SEND WINDOW, not the HistoryCache occupancy.
+
+   THE DEFECT THIS PINS. The first cut passed HC-CHANGE-COUNT — every change the cache STORES — as the
+   unacknowledged count. For a VOLATILE writer that has just purged, the two happen to coincide, which is
+   why a live probe looked correct. They diverge exactly where it matters: a TRANSIENT_LOCAL writer RETAINS
+   its acknowledged history for late-joiners (DDS 1.4 §2.2.3.4), so its stored count is the whole history
+   forever while its true unacked count may be zero. Reporting the stored count would have told such an
+   application it was under unbounded backpressure while nothing at all was wrong.
+
+   FALSIFIED: return HC-CHANGE-COUNT from WRITER-UNACKED-COUNT and :wuc-transient-local fails."
+  (let* ((hc (dds.rtps.history:make-history-cache :keep-all 1 nil nil))
+         (w (dds.rtps.reliable:make-rtps-writer :hc hc))
+         (rk (make-array 16 :element-type '(unsigned-byte 8) :initial-element #x51)))
+    (%check :wuc-fresh (zerop (dds.rtps.reliable:writer-unacked-count w))
+            "a writer that has written nothing has an empty send window")
+    (dotimes (i 4) (dds.rtps.reliable:writer-write w (octets (1+ i) 0 0 0)))   ; SN 1..4
+    (%check :wuc-all-unacked (= 4 (dds.rtps.reliable:writer-unacked-count w))
+            "with no reader having ACKed, every written change is unacknowledged")
+    ;; the reader acknowledges through SN 2 (acked-base 3), then the writer purges as VOLATILE
+    (dds.rtps.reliable:writer-on-acknack w rk 3 0 (make-array 0 :element-type '(unsigned-byte 32)) nil)
+    (dds.rtps.reliable:writer-purge-acked w (list rk) :volatile)
+    (%check :wuc-after-ack (= 2 (dds.rtps.reliable:writer-unacked-count w))
+            "after an ACK through SN 2, SN 3 and 4 remain unacknowledged")
+    (%check :wuc-matches-store-when-volatile
+            (= (dds.rtps.history:hc-change-count hc) (dds.rtps.reliable:writer-unacked-count w))
+            "for a VOLATILE writer that has just purged the two counts COINCIDE — which is precisely why
+             a live probe could not tell them apart"))
+  ;; TRANSIENT_LOCAL: the purge is a no-op, the store keeps everything, the send window still drains
+  (let* ((hc (dds.rtps.history:make-history-cache :keep-all 1 nil nil))
+         (w (dds.rtps.reliable:make-rtps-writer :hc hc))
+         (rk (make-array 16 :element-type '(unsigned-byte 8) :initial-element #x52)))
+    (dotimes (i 4) (dds.rtps.reliable:writer-write w (octets (1+ i) 0 0 0)))   ; SN 1..4
+    (dds.rtps.reliable:writer-on-acknack w rk 5 0 (make-array 0 :element-type '(unsigned-byte 32)) nil)  ; acked through SN 4
+    (dds.rtps.reliable:writer-purge-acked w (list rk) :transient-local)
+    (%check :wuc-transient-local-retains
+            (= 4 (dds.rtps.history:hc-change-count hc))
+            "a TRANSIENT_LOCAL writer RETAINS its acked history for late-joiners — nothing is purged")
+    (%check :wuc-transient-local
+            (zerop (dds.rtps.reliable:writer-unacked-count w))
+            "...yet its send window is EMPTY: everything written has been acknowledged. Reporting the
+             stored count here would claim unbounded backpressure on a perfectly healthy writer"))
+  ;; KEEP_LAST overwriting an unacknowledged change is the one event that names real data loss
+  (let* ((hc (dds.rtps.history:make-history-cache :keep-last 2 nil nil))
+         (w (dds.rtps.reliable:make-rtps-writer :hc hc)))
+    (dotimes (i 4) (dds.rtps.reliable:writer-write w (octets (1+ i) 0 0 0)))   ; depth 2: SN 1,2 evicted
+    (%check :wuc-replaced-unacked
+            (= 2 (dds.rtps.reliable:rtps-writer-replaced-unacked w))
+            "KEEP_LAST evicting a change no reader has acknowledged is counted as replaced-unacked —
+             data the application wrote that no longer exists and was never delivered"))
+  t)
+
 (defun* %seed-reader-participant (node prefix-byte port)
     (function (dds.disc:disc-node (unsigned-byte 8) (unsigned-byte 16))
               (values (simple-array (unsigned-byte 8) (12)) cons))

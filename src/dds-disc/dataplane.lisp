@@ -2327,7 +2327,16 @@
         (setf (dds.rtps.history:cache-change-source-timestamp change) source-timestamp))
       (when (and zc-slot change)   ; ADR 0042: register the armed change for the post-push-pass / teardown leak sweep
         (dds.pal:with-lock ((disc-node-lock node))
-          (push change (disc-node-zc-armed-changes node))))))
+          (push change (disc-node-zc-armed-changes node))))
+      ;; ADR 0089: the send window just ROSE. The ACKNACK site alone would only ever report it FALLING, so
+      ;; a writer whose reader has stopped acknowledging — precisely the case a high watermark exists to
+      ;; announce — would never be seen to cross it. The DCPS side early-exits without allocating unless a
+      ;; watermark was actually crossed, so a healthy exchange pays a slot read and an integer compare.
+      (let ((cache-hook (disc-node-on-writer-cache node)))
+        (when cache-hook
+          (funcall cache-hook (dds.rtps.reliable:rtps-writer-entityid writer)
+                   (dds.rtps.reliable:writer-unacked-count writer)
+                   (dds.rtps.reliable:rtps-writer-replaced-unacked writer))))))
   (cond
     ((disc-node-flow-controller node)   ; WP-ASYNC-FLOW paced async send; WP-N-ENDPOINT-S1B: signal THIS writer's per-writer flow-state (re-resolve the writer — the writer let has closed)
      (%flow-signal (disc-node-flow-controller node)
@@ -3616,9 +3625,37 @@
           ;; changes are not fully acked, so they are never purged. A TRANSIENT_LOCAL writer (DDS 1.4
           ;; §2.2.3.4) RETAINS its acked history for late-joiners — the durability arg makes the purge a
           ;; no-op for it (HISTORY-bounded, not ACK-bounded); a VOLATILE writer purges as before.
-          (dds.rtps.reliable:writer-purge-acked w (%matched-reader-keys node)
-                                                (%local-writer-durability
-                                                 node (dds.rtps.reliable:rtps-writer-entityid w)))))))
+          (dds.rtps.reliable:writer-purge-acked
+           w (%matched-reader-keys node)
+           (%local-writer-durability node (dds.rtps.reliable:rtps-writer-entityid w)))
+          ;; ADR 0089: the ACKNACK is BOTH vendor reliability facts at once — it is the only evidence that
+          ;; this reader is still acknowledging, and the purge it drives is what lowers the send window.
+          ;; Reporting from here (not from the engine) is what keeps dds.rtps free of DCPS.
+          (%notify-writer-reliability node w src-prefix rid)))))
+  t)
+
+(defun* %notify-writer-reliability (node w src-prefix rid)
+    (function (disc-node dds.rtps.reliable:rtps-writer (simple-array (unsigned-byte 8) (12))
+               (unsigned-byte 32))
+              t)
+  "Deliver W's post-ACKNACK reliability state to the DCPS vendor-status hooks (ADR 0089): the reader named
+   by (SRC-PREFIX, RID) is acknowledging, and the send window is now at WRITER-UNACKED-COUNT.
+
+   The engine state is read HERE and passed in, so dds.dcps never resolves an rtps-writer and
+   rtps-writer-last-sn stays engine-internal. The reader GUID comes from WRITER-LOOKUP-KEY, not a freshly
+   built one: the ACKNACK path runs ~once per sample, and that cache exists precisely so it does not
+   allocate a GUID per datagram (ADR 0088). Its entries are written once and never mutated, so the DCPS
+   side may RETAIN this GUID as its active-reader set key — safe by construction rather than by audit.
+   Both hooks NIL (nobody created a DataWriter listening for these) costs two slot reads."
+  (let ((cache-hook (disc-node-on-writer-cache node))
+        (activity-hook (disc-node-on-reader-activity node))
+        (wid (dds.rtps.reliable:rtps-writer-entityid w)))
+    (when activity-hook
+      (funcall activity-hook wid (dds.rtps.reliable:writer-lookup-key w src-prefix rid) t))
+    (when cache-hook
+      (funcall cache-hook wid
+               (dds.rtps.reliable:writer-unacked-count w)
+               (dds.rtps.reliable:rtps-writer-replaced-unacked w))))
   t)
 
 (defun* %on-user-data-frag (node c flags body-len buf src-prefix)

@@ -61,6 +61,7 @@ a package-qualified accessor.
 | `dds.qos:qos-resource-max-instances` | RESOURCE_LIMITS `max_instances` (`-1` = `LENGTH_UNLIMITED`) | `-1` |
 | `dds.qos:qos-resource-max-samples-per-instance` | RESOURCE_LIMITS `max_samples_per_instance` (`-1` = `LENGTH_UNLIMITED`) | `-1` |
 | `dds.qos:qos-type-consistency` | TYPE_CONSISTENCY_ENFORCEMENT policy (a `type-consistency-enforcement`, reader-only, not RxO) | `(make-type-consistency-enforcement)` |
+| `dds.qos:qos-writer-cache-high-watermark` / `-low-watermark` | RELIABLE_WRITER_CACHE watermarks (**vendor extension**, ADR 0089; writer-only, not RxO, not in SEDP) — unacknowledged-sample thresholds that open and close a backpressure episode; see below | `nil` (disabled) |
 
 ### Endpoint-flavoured constructors
 
@@ -214,6 +215,48 @@ would flap in and out of every peer's discovery set. Violating it yields `INCONS
   :qos (dds.qos:make-qos
          :discovery-announce-period (dds.qos:make-qos-duration 0 250000000)
          :discovery-lease-duration  (dds.qos:make-qos-duration 5 0)))
+```
+
+### RELIABLE_WRITER_CACHE watermarks (vendor extension, ADR 0089) — backpressure episodes
+
+The second vendor extension, and the same shape as the first: **DataWriter-scoped** (ignored on any
+other entity), **no** RxO semantics, never advertised in SEDP, and no OMG `QosPolicyId_t`, so an
+inconsistency reports `+qos-policy-id-invalid+` rather than an invented id.
+
+| Accessor | Meaning | Default |
+|---|---|---|
+| `dds.qos:qos-writer-cache-high-watermark` | Unacknowledged samples at which a **backpressure episode opens** — the writer's send window has built up | `nil` (disabled) |
+| `dds.qos:qos-writer-cache-low-watermark` | Unacknowledged samples at which an open episode **closes** — the writer has recovered | `nil` (disabled) |
+
+They are the thresholds behind the vendor `RELIABLE_WRITER_CACHE_CHANGED` status (see
+[DCPS](dcps.md#vendor-extension-statuses-adr-0080-adr-0089)). Rising to the high watermark opens an
+episode; falling to the low watermark, or draining to empty, closes one. **The low and empty
+transitions fire only inside an open episode** — otherwise a reliable writer with one sample in flight
+would report a drain to zero on *every* sample, which is an application callback on the data path saying
+nothing.
+
+**Consistency rule:** when both are set, low must be **strictly below** high — equal thresholds leave no
+hysteresis band, so a single sample sitting on the boundary satisfies both crossing tests at once.
+Violating it yields `INCONSISTENT_POLICY`. Either one left `nil` disables the episode machinery and is
+trivially consistent.
+
+**Why the default is disabled, unlike Connext.** RTI documents `low_watermark = 0`,
+`high_watermark = 1` for the corresponding `DataWriterProtocol` fields. There the pair primarily drives
+an *internal* mode — the switch to `fast_heartbeat_period` — and the status change costs two counter
+increments. Here it drives an *application callback*, and at `{0, 1}` an exchange with one sample in
+flight crosses high on every write and low on every acknowledgement: two invocations per sample. A
+status whose purpose is to announce backpressure must be silent when there is none, so this stack
+diverges deliberately. Disabled, the status still reports the FULL transition and still tracks its
+levels, so `get-reliable-writer-cache-changed-status` stays useful at all times.
+
+```lisp
+;; tell me when 500 samples are outstanding, and again when it recovers to 50
+(dds.dcps:create-datawriter
+  pub topic
+  :qos (dds.qos:make-writer-qos
+         :reliability :reliable :history-kind :keep-all
+         :writer-cache-high-watermark 500
+         :writer-cache-low-watermark  50))
 ```
 
 ## Examples

@@ -159,7 +159,30 @@
            #:on-liveliness-changed
            #:on-publication-matched #:on-offered-incompatible-qos
            #:on-offered-deadline-missed #:on-liveliness-lost
-           #:on-inconsistent-topic
+           #:on-inconsistent-topic #:on-unaddressable-peer
+           ;; ADR 0089: VENDOR-EXTENSION listener operations (not DDS 1.4) — Connext-compatible
+           ;; notifications riding the same status machinery.
+           #:on-reliable-writer-cache-changed #:on-reliable-reader-activity-changed
+           #:get-reliable-writer-cache-changed-status #:get-reliable-reader-activity-changed-status
+           #:+status-reliable-writer-cache-changed+ #:+status-reliable-reader-activity-changed+
+           #:reliable-writer-cache-changed-status
+           #:reliable-writer-cache-changed-status-empty-count
+           #:reliable-writer-cache-changed-status-empty-count-change
+           #:reliable-writer-cache-changed-status-full-count
+           #:reliable-writer-cache-changed-status-full-count-change
+           #:reliable-writer-cache-changed-status-low-watermark-count
+           #:reliable-writer-cache-changed-status-low-watermark-count-change
+           #:reliable-writer-cache-changed-status-high-watermark-count
+           #:reliable-writer-cache-changed-status-high-watermark-count-change
+           #:reliable-writer-cache-changed-status-unacked-sample-count
+           #:reliable-writer-cache-changed-status-unacked-sample-peak
+           #:reliable-writer-cache-changed-status-replaced-unacked-sample-count
+           #:reliable-reader-activity-changed-status
+           #:reliable-reader-activity-changed-status-active-count
+           #:reliable-reader-activity-changed-status-active-count-change
+           #:reliable-reader-activity-changed-status-inactive-count
+           #:reliable-reader-activity-changed-status-inactive-count-change
+           #:reliable-reader-activity-changed-status-last-instance-handle
            #:set-reader-listener #:set-writer-listener
            ;; WP-DCPS-API-COMPLETION S3.T1: uniform set_listener/get_listener on all six kinds
            #:set-listener #:get-listener

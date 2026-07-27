@@ -462,27 +462,36 @@
   (incf (history-cache-count hc)))
 
 (defun* hc-add-change (hc change)
-    (function (history-cache cache-change) symbol)
+    (function (history-cache cache-change) (values symbol (or null integer)))
   "Add CHANGE, enforcing HISTORY + RESOURCE_LIMITS (FR-RTPS-5). Returns :OK,
    :DUPLICATE (SN already present), or :REJECTED-RESOURCE-LIMITS (KEEP_ALL at
    max_samples). KEEP_LAST keeps the last DEPTH values PER INSTANCE (DDS 1.4 §2.2.3.18):
    when CHANGE's instance is at depth, its OWN oldest SN is evicted (a NIL/HANDLE_NIL
-   keyhash collapses to one bucket = global KEEP_LAST)."
+   keyhash collapses to one bucket = global KEEP_LAST).
+
+   The SECOND value is the SN this add EVICTED, or NIL if it evicted nothing (ADR 0089). Only the
+   KEEP_LAST branch can evict. It is returned rather than counted here because whether an eviction
+   destroyed UNACKNOWLEDGED data is a WRITER question — it depends on the acked watermark across matched
+   readers, which a HistoryCache has no view of — and because this file is hot-path (NFR-MEM): an extra
+   value costs nothing, whereas a callback or a status reference here would put allocation and
+   cross-layer coupling on the per-sample write path. Callers reading a single value are unaffected."
   (let ((sn (cache-change-sn change)))
     (cond
-      ((nth-value 1 (gethash sn (history-cache-changes hc))) :duplicate)
+      ((nth-value 1 (gethash sn (history-cache-changes hc))) (values :duplicate nil))
       ((eq (history-cache-kind hc) :keep-last)
        (%hc-store hc sn change)
        (let ((bucket (gethash (%hc-bucket-key (cache-change-instance-key-hash change))
-                              (history-cache-instances hc))))
+                              (history-cache-instances hc)))
+             (evicted nil))
          (when (> (length bucket) (history-cache-depth hc))
-           (%hc-remove-change hc (first bucket))))               ; evict this instance's oldest, not the global oldest
-       :ok)
+           (setf evicted (first bucket))
+           (%hc-remove-change hc evicted))                       ; evict this instance's oldest, not the global oldest
+         (values :ok evicted)))
       (t
        (if (and (history-cache-max-samples hc)
                 (>= (history-cache-count hc) (history-cache-max-samples hc)))
-           :rejected-resource-limits
-           (progn (%hc-store hc sn change) :ok))))))
+           (values :rejected-resource-limits nil)
+           (progn (%hc-store hc sn change) (values :ok nil)))))))
 
 (defun* hc-changes-from (hc base)
     (function (history-cache integer) list)

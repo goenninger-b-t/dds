@@ -3269,3 +3269,75 @@ public GitHub master for understanding only; no code copied into `src/`.
 - **NOT done:** no vendor source read or copied; no disassembly. The vector is a SerializedPayload —
   the OMG-specified byte layout for a sample whose values are fixed by rule in
   `dds.bench::%corpus-mutable-sample`.
+
+## 2026-07-26 — RTI Connext PUBLIC API documentation consulted for extension-listener semantics
+
+**What was consulted, and why.** The owner asked for parity with six RTI Connext DataWriterListener
+extension callbacks, and then asked precisely when Connext fires two of them. Answering from memory would
+have been guesswork, so RTI's **public online API reference and User's Manual** on `community.rti.com`
+were read:
+
+- `.../7.3.0/doc/api/connext_dds/api_cpp/classDDSDataWriterListener.html` — the callback list and each
+  callback's firing condition and argument type.
+- `.../current/doc/api/connext_dds/api_c/group__DDSDataWriterResourceLimitsQosModule.html` and
+  `.../structDDS__DataWriterResourceLimitsQosPolicy.html` — `instance_replacement`,
+  `replace_empty_instances`, and the replaceability precondition.
+- `.../current/doc/manuals/.../RTPS_Locators.htm` — the locator REACHABILITY PING mechanism.
+
+**Scope of the reading — deliberately narrow.** PUBLIC DOCUMENTATION ONLY: no RTI header, no shipped
+source, no `rtiddsgen` output, and no disassembly. Nothing was copied. What was taken is *behavioural
+description* — when a callback fires and what it is handed — which is the same class of information a
+published specification provides and is what any interoperating implementation must know.
+
+**Why this is not a clean-room problem, and where the line is.** The operating contract forbids copying
+RTI source, headers or generated output; it does not forbid reading a vendor's published description of
+observable behaviour. These are VENDOR-EXTENSION statuses with no OMG clause behind them, so there is no
+specification to implement from — the public documentation *is* the only citable source, and the
+alternative is inventing semantics and calling them parity.
+
+**What it changed.** Three corrections, all in our favour for honesty:
+1. `on_sample_removed` fires in Connext only for samples written **with a cookie or under Zero
+   Copy/FlatData**, and is handed a `DDS_Cookie_t`. It is NOT a general "a sample left the cache" event.
+2. `on_reliable_writer_cache_changed` is **watermark-driven** (empty / full / high- and low-watermark
+   crossings), not per-change.
+3. **`on_destination_unreachable` does not appear in the 7.3 DataWriterListener at all.** It had been
+   listed from memory; Connext's actual answer to an unreachable destination is the internal locator
+   REACHABILITY PING (5.3.0+), which stops using the locator rather than notifying the application.
+
+Any callback we ship under a Connext name must match the semantics above or be documented as
+deliberately different — a familiar name with different firing rules is worse than a new name.
+
+## 2026-07-26 (addendum) — the RTI status FIELD SET, and one default deliberately not adopted
+
+**What was consulted.** Two further pages of the same **public** RTI Connext API reference, to settle the
+field set of the status this stack was about to define rather than invent one:
+
+- `.../7.3.0/doc/api/connext_dds/api_cpp/structDDS__ReliableWriterCacheChangedStatus.html` — the seven
+  fields and what each counts.
+- `.../7.3.0/doc/api/connext_dds/api_cpp/structDDS__RtpsReliableWriterProtocol__t.html` — the
+  `high_watermark` / `low_watermark` fields: their unit, their documented defaults, and which QoS policy
+  carries them.
+
+Same narrow scope as the 2026-07-26 entry above: **public documentation only**, no header, no shipped
+source, no generated output, no disassembly, nothing copied. What was taken is *behavioural description* —
+what a status counts and when a threshold crossing is reported.
+
+**What it changed, and one thing it deliberately did not.**
+
+1. The status carries **four** event counts, not two: empty, full, **low watermark** and **high
+   watermark**. Our first cut had only empty and full, which is why it had no way to be anything but
+   level-triggered.
+2. It carries `replaced_unacknowledged_sample_count`. That is where RTI puts the "a sample was overwritten
+   while still unacknowledged" fact — so this stack puts it there too, which is what allowed the separate
+   `SAMPLE_REMOVED` status to be withdrawn rather than renamed (ADR 0089 §5).
+3. The watermarks live in the **DataWriterProtocol** QoS, are measured in unacknowledged samples, and are
+   documented with defaults `low_watermark = 0`, `high_watermark = 1`.
+
+**The defaults were read and then NOT adopted, on purpose.** In Connext the pair primarily drives an
+internal mechanism — the switch to `fast_heartbeat_period` — and the status change is a by-product. This
+stack has no such mechanism, so here the pair drives an application callback, and at `{0, 1}` an ordinary
+reliable exchange with one sample in flight fires twice per sample. Copying the number while omitting the
+mechanism it was chosen for would be parity in appearance only. Both watermarks therefore default to
+disabled here, and the divergence is documented at the QoS slot, in `docs/wiki/dcps.md` and in ADR 0089
+§4.2 rather than left for someone to discover. Reading a vendor's published defaults tells you what they
+chose; it does not tell you it is right for a different design.
