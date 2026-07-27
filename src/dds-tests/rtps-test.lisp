@@ -2881,3 +2881,215 @@
             (= (dds.dcps:rxo-policy-id :acknowledgment-kind) dds.dcps:+qos-policy-id-invalid+)
             "a vendor policy must report +qos-policy-id-invalid+, never an invented id that could collide with a future OMG assignment"))
   t)
+
+(defun* %app-ack-covers-p (intervals sn)
+    (function (list integer) t)
+  "T if SN falls inside one of the (FIRST LAST FLAGS PAYLOAD) intervals an APP_ACK would carry. The
+   predicate the false-ack assertions are written against: an interval covering an UNACKNOWLEDGED sequence
+   number is the exact defect ADR 0090 says must never ship."
+  (dolist (iv intervals nil)
+    (when (and (<= (first iv) sn) (<= sn (second iv))) (return t))))
+
+(defun* run-app-ack-state-test ()
+    (function () t)
+  "ADR 0090 slice A3b: the reader-side APP-ACK state machine's SAFETY properties. The corpus gate
+   (%rtps-corpus-verify-state-machine) already proves this machine reproduces RTI's octets BYTE FOR BYTE
+   for the captured in-order exchange; what it cannot reach are the cases RTI's five-sample capture never
+   exercised — an acknowledgment for a sample never read, a double acknowledge, holes, and the interval
+   cap. Those are exactly where a false ack would be born, so they are asserted here.
+
+   ⚠️ THE GOVERNING PRINCIPLE IS INVERTED FROM THE REST OF THE STACK. Everywhere else a false REJECT is
+   the worst outcome; here a writer that believes a sample acknowledged may PURGE it and report success,
+   so an under-report is a delay and an over-report is silent data loss. Every assertion below is written
+   in that direction: it checks that an unacknowledged sequence number is NOT covered, never merely that
+   the acknowledged ones are.
+
+   FALSIFIED: let app-ack-acknowledge succeed without app-ack-note-accessed and :aas-refuses-unaccessed
+   goes red; coalesce a pending run with an adjacent unacknowledged SN and :aas-hole-not-covered goes red;
+   drop the interval cap and :aas-cap-holds goes red."
+  (let ((flag-new dds.rtps.reliable:+app-ack-flags-newly-acked+)
+        (flag-old dds.rtps.reliable:+app-ack-flags-previously-reported+))
+    ;; (1) A sample the application never accessed is NOT acknowledgeable, and nothing is emitted for it.
+    (let ((s (dds.rtps.reliable:make-app-ack-state)))
+      (%check :aas-refuses-unaccessed
+              (eq :not-accessed (dds.rtps.reliable:app-ack-acknowledge s 7))
+              "acknowledging a sample the application never read must be REFUSED — accepting it on faith lets the writer purge a sample nobody processed")
+      (%check :aas-refused-emits-nothing
+              (null (dds.rtps.reliable:app-ack-intervals s))
+              "a refused acknowledgment must leave nothing pending — a refusal that still put the SN on the wire would be the false ack itself"))
+    ;; (2) The normal path, and its idempotency. A second acknowledge must not re-emit.
+    (let ((s (dds.rtps.reliable:make-app-ack-state)))
+      (dds.rtps.reliable:app-ack-note-accessed s 1)
+      (%check :aas-acknowledges (eq :acknowledged (dds.rtps.reliable:app-ack-acknowledge s 1))
+              "an accessed sample must acknowledge")
+      (let ((iv (dds.rtps.reliable:app-ack-intervals s)))
+        (%check :aas-first-interval
+                (equal iv (list (list 1 1 flag-new nil)))
+                "the first acknowledgment must carry exactly [1,1] with the newly-acked flags — the shape RTI's capture shows")
+        (%check :aas-count-starts-at-one (= 1 (dds.rtps.reliable:app-ack-commit s))
+                "the APP_ACK count must start at 1, as RTI's does"))
+      (%check :aas-double-ack-is-already (eq :already (dds.rtps.reliable:app-ack-acknowledge s 1))
+              "acknowledging twice must be idempotent, not an error — a DDS API must not punish it")
+      (%check :aas-double-ack-emits-nothing (null (dds.rtps.reliable:app-ack-intervals s))
+              "a repeated acknowledgment must not re-emit an APP_ACK")
+      ;; Re-reading an already-acknowledged sample must not make it acknowledgeable again.
+      (dds.rtps.reliable:app-ack-note-accessed s 1)
+      (%check :aas-reread-not-resurrected (null (dds.rtps.reliable:app-ack-intervals s))
+              "re-reading an acknowledged sample must not resurrect it as newly acknowledgeable — it would re-emit forever"))
+    ;; (3) ⭐ THE FALSE-ACK PROPERTY. Access 1,2,3; acknowledge 1 and 3 only. SN 2 must appear in NO interval.
+    (let ((s (dds.rtps.reliable:make-app-ack-state)))
+      (dolist (sn '(1 2 3)) (dds.rtps.reliable:app-ack-note-accessed s sn))
+      (dds.rtps.reliable:app-ack-acknowledge s 1)
+      (dds.rtps.reliable:app-ack-acknowledge s 3)
+      (let ((iv (dds.rtps.reliable:app-ack-intervals s)))
+        (%check :aas-hole-not-covered
+                (not (%app-ack-covers-p iv 2))
+                "SN 2 was read but NOT acknowledged, so no emitted interval may cover it — a run widened across the hole is precisely the false ack")
+        (%check :aas-hole-acked-covered
+                (and (%app-ack-covers-p iv 1) (%app-ack-covers-p iv 3))
+                "the two acknowledged SNs must both be covered")
+        (%check :aas-ascending
+                (equal iv (sort (copy-list iv) #'< :key #'first))
+                "intervals must be ascending by firstSN — the only ordering ever observed on RTI's wire")))
+    ;; (4) acknowledge-all covers ACCESSED samples only, never merely received ones.
+    (let ((s (dds.rtps.reliable:make-app-ack-state)))
+      (dds.rtps.reliable:app-ack-note-accessed s 5)
+      (%check :aas-all-moves-accessed (= 1 (dds.rtps.reliable:app-ack-acknowledge-all s))
+              "acknowledge-all must move every accessed sample")
+      (let ((iv (dds.rtps.reliable:app-ack-intervals s)))
+        (%check :aas-all-covers-accessed (%app-ack-covers-p iv 5) "the accessed SN must be acknowledged")
+        (%check :aas-all-skips-unaccessed
+                (not (%app-ack-covers-p iv 6))
+                "an SN the application never accessed must NOT be acknowledged by acknowledge-all — acknowledging the reader's whole cache would acknowledge exactly the samples this feature exists to protect"))
+      (%check :aas-all-idempotent (zerop (dds.rtps.reliable:app-ack-acknowledge-all s))
+              "a second acknowledge-all with nothing outstanding must move nothing"))
+    ;; (5) The previously-reported / newly-acked split survives a second round (the capture's own shape).
+    (let ((s (dds.rtps.reliable:make-app-ack-state)))
+      (dds.rtps.reliable:app-ack-note-accessed s 1)
+      (dds.rtps.reliable:app-ack-acknowledge s 1)
+      (dds.rtps.reliable:app-ack-intervals s)
+      (dds.rtps.reliable:app-ack-commit s)
+      (dds.rtps.reliable:app-ack-note-accessed s 2)
+      (dds.rtps.reliable:app-ack-acknowledge s 2)
+      (%check :aas-reported-split
+              (equal (dds.rtps.reliable:app-ack-intervals s)
+                     (list (list 1 1 flag-old nil) (list 2 2 flag-new nil)))
+              "the second APP_ACK must carry [1,1] previously-reported and [2,2] newly-acked as TWO intervals — merging them into [1,2] emits octets RTI never emits"))
+    ;; (5b) Multi-run merging, and the BRIDGE: acknowledging the sequence number between two runs must
+    ;; coalesce all three, and must not do so one moment before the bridge is actually acknowledged.
+    (let ((s (dds.rtps.reliable:make-app-ack-state)))
+      (dolist (sn '(1 2 4 5)) (dds.rtps.reliable:app-ack-note-accessed s sn))
+      (dds.rtps.reliable:app-ack-acknowledge-all s)
+      (%check :aas-two-runs
+              (equal (dds.rtps.reliable:app-ack-intervals s)
+                     (list (list 1 2 flag-new nil) (list 4 5 flag-new nil)))
+              "acknowledging 1,2,4,5 must emit TWO intervals — [1,2] and [4,5] — because SN 3 was never accessed and no run may span it")
+      (dds.rtps.reliable:app-ack-commit s)
+      (dds.rtps.reliable:app-ack-note-accessed s 3)
+      (dds.rtps.reliable:app-ack-acknowledge s 3)
+      (%check :aas-bridge-emits-separately
+              (equal (dds.rtps.reliable:app-ack-intervals s)
+                     (list (list 1 2 flag-old nil) (list 3 3 flag-new nil) (list 4 5 flag-old nil)))
+              "the bridging SN must be emitted as its own newly-acked interval BETWEEN the two previously-reported runs, ascending — reported and pending are never merged with each other")
+      (dds.rtps.reliable:app-ack-commit s)
+      (%check :aas-bridge-coalesces
+              (equal (dds.rtps.reliable:app-ack-state-reported s) (list (cons 1 5)))
+              "once committed, the bridge must coalesce all three runs into ONE [1,5] — a merge that walked sequence numbers instead of runs would be correct here but O(range); this asserts the result, and the O(runs) merge is what makes an acknowledge-all after a million samples cost one comparison"))
+    ;; (6) The interval cap holds even when EVERY run is pending, so we never emit what our own parser rejects.
+    (let ((s (dds.rtps.reliable:make-app-ack-state))
+          (cap dds.rtps.message:+app-ack-max-intervals+))
+      (loop for sn from 1 to (* 2 (+ cap 5)) by 2
+            do (dds.rtps.reliable:app-ack-note-accessed s sn)
+               (dds.rtps.reliable:app-ack-acknowledge s sn))
+      (let ((iv (dds.rtps.reliable:app-ack-intervals s)))
+        (%check :aas-cap-holds (<= (length iv) cap)
+                "the emitted interval count must never exceed +app-ack-max-intervals+ — our own parser rejects a body over that cap, so emitting one would be emitting a message we would refuse")
+        (%check :aas-cap-drops-never-widens
+                (notany (lambda (i) (%app-ack-covers-p iv i))
+                        (list 2 4 (* 2 (+ cap 4))))
+                "capping must DROP whole intervals, never widen one across an unacknowledged SN"))))
+  t)
+
+(defun* %app-ack-pid-value (qos role)
+    (function (t t) t)
+  "Serialize an endpoint-data carrying QOS in ROLE (:writer / :reader) and return the u32 value of
+   PID_ACKNOWLEDGMENT_KIND (0x800b) in the emitted SEDP ParameterList, or NIL if the PID is absent.
+   Located by its pid+len marker (0b 80 04 00, little-endian), the same way the PID_DATA_REPRESENTATION
+   wire test locates its parameter."
+  (let* ((data (dds.rtps.discovery:make-endpoint-data
+                :topic-name "AckKind" :type-name "ShapeType" :role role :qos qos))
+         (ob (dds.core.buffer:make-octet-buffer 512))
+         (wc (dds.core.buffer:cursor ob :endianness :little))
+         (vec (dds.core.buffer:octet-buffer-vec ob)))
+    (dds.rtps.discovery:serialize-endpoint-data wc data)
+    (let ((at (loop for i from 0 to (- (dds.core.buffer:cursor-position wc) 8)
+                    when (and (= (aref vec i) #x0b) (= (aref vec (1+ i)) #x80)
+                              (= (aref vec (+ i 2)) #x04) (= (aref vec (+ i 3)) #x00))
+                      return i)))
+      (when at
+        (logior (aref vec (+ at 4)) (ash (aref vec (+ at 5)) 8)
+                (ash (aref vec (+ at 6)) 16) (ash (aref vec (+ at 7)) 24))))))
+
+(defun* run-acknowledgment-kind-wire-test ()
+    (function () t)
+  "ADR 0090 slice A3b: ACKNOWLEDGMENT_KIND on the SEDP wire under RTI's vendor PID 0x800b.
+
+   ⭐ WHY THIS EXISTS AT ALL — SLICE A3a SHIPPED THE RxO GATE WITHOUT THE WIRE. The policy was checked by
+   equality against a value no peer ever advertised, so every remote endpoint read as :PROTOCOL and an
+   application-acknowledgment pair could NEVER MATCH. The gate was correct and the feature was unreachable;
+   this test is what would have caught that, and it is written wire-first for exactly that reason.
+
+   THE PID AND ITS VALUES WERE MEASURED, NOT GUESSED. The interop/connext/appack harness was re-run against
+   live Connext 7.3.1 with acknowledgment_kind changed in USER_QOS_PROFILES.xml, and the SEDP publication +
+   subscription ParameterLists compared across three settings: 0x800b was the ONLY field that moved, it
+   moved on BOTH endpoint kinds, and it is ABSENT under PROTOCOL. PROTOCOL -> absent, APPLICATION_AUTO -> 1,
+   APPLICATION_EXPLICIT -> 3, matching RTI's published enumeration order. Full account at
+   dds.rtps.message:+pid-acknowledgment-kind+.
+
+   FALSIFIED: emit the PID unconditionally and :akw-protocol-omitted goes red (we would put a parameter on
+   every endpoint's wire that RTI omits); map an unknown code to :protocol instead of :unsupported and
+   :akw-unknown-is-unsupported goes red, which is the mapping that would silently match a peer whose
+   acknowledgment semantics we do not implement."
+  (flet ((emit (kind role)
+           (%app-ack-pid-value (dds.qos:make-qos :reliability :reliable :acknowledgment-kind kind) role)))
+    ;; Omitted at the default, exactly as RTI omits it — an endpoint not using the feature is byte-identical.
+    (%check :akw-protocol-omitted
+            (and (null (emit :protocol :writer)) (null (emit :protocol :reader)))
+            "PID_ACKNOWLEDGMENT_KIND must be ABSENT under :PROTOCOL on both roles — RTI omits it at the default, and emitting it would change the wire of every endpoint that does not use the feature")
+    ;; Emitted by BOTH roles: an RxO-checked policy neither side can see cannot be checked.
+    (%check :akw-auto-both-roles
+            (and (eql 1 (emit :application-auto :writer)) (eql 1 (emit :application-auto :reader)))
+            "APPLICATION_AUTO must emit 1 on BOTH the publication and the subscription record — the value and the both-roles placement are what the live capture shows")
+    (%check :akw-explicit-both-roles
+            (and (eql 3 (emit :application-explicit :writer)) (eql 3 (emit :application-explicit :reader)))
+            "APPLICATION_EXPLICIT must emit 3 on both roles — RTI's enumeration order, confirmed by capture"))
+  ;; Round trip: what we emit, we must read back identically.
+  (dolist (kind '(:protocol :application-auto :application-explicit))
+    (let* ((qos (dds.qos:make-qos :reliability :reliable :acknowledgment-kind kind))
+           (data (dds.rtps.discovery:make-endpoint-data
+                  :topic-name "AckKind" :type-name "ShapeType" :role :writer :qos qos))
+           (ob (dds.core.buffer:make-octet-buffer 512))
+           (wc (dds.core.buffer:cursor ob :endianness :little)))
+      (dds.rtps.discovery:serialize-endpoint-data wc data)
+      (let* ((rc (dds.core.buffer:cursor ob :endianness :little))
+             (back (dds.rtps.discovery:parse-endpoint-data rc :writer)))
+        (%check :akw-round-trip
+                (and back (eq kind (dds.qos:qos-acknowledgment-kind
+                                    (dds.rtps.discovery:endpoint-data-qos back))))
+                (format nil "acknowledgment-kind ~s must survive the SEDP round trip" kind)))))
+  ;; ⚠️ An acknowledgment kind we do not implement must become :UNSUPPORTED, which matches NOTHING.
+  (let ((peer (dds.qos:make-qos :reliability :reliable :acknowledgment-kind :unsupported)))
+    (%check :akw-unknown-is-unsupported
+            (eq :unsupported (dds.rtps.discovery::%wire-acknowledgment-kind 2))
+            "RTI's APPLICATION_ORDERED (2) — and every future value — must decode to :UNSUPPORTED: its semantics are unsourced, and mapping it to :PROTOCOL would silently match a peer whose idea of 'acknowledged' we do not implement")
+    (%check :akw-unsupported-matches-nothing
+            (notany (lambda (k)
+                      (nth-value 0 (dds.qos:qos-rxo-compatible
+                                    peer
+                                    (dds.qos:make-reader-qos :reliability :reliable :acknowledgment-kind k))))
+                    '(:protocol :application-auto :application-explicit))
+            "an :UNSUPPORTED peer must match NONE of the kinds we offer — INCOMPATIBLE_QOS is the one outcome an operator can see and act on")
+    (%check :akw-unsupported-refused-locally
+            (not (nth-value 0 (dds.dcps::%qos-consistent-p peer)))
+            "a LOCAL endpoint must not be creatable with :UNSUPPORTED — offering a guarantee with no implementation behind it is the silent stall this policy exists to prevent"))
+  t)

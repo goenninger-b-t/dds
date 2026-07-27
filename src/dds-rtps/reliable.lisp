@@ -1257,3 +1257,233 @@
                       (len (min fragment-size (- sample-size off))))
                  (push (list f 1 off len) out)))
     (nreverse out)))
+
+;;; ---- APP-ACK reader-side state (RTI VENDOR EXTENSION, ADR 0090 slice A3b) ----
+;;;
+;;; THERE IS NO SPEC CLAUSE. Application acknowledgment appears nowhere in RTPS 2.5, so — exactly as for
+;;; the codec in dds.rtps.message — the citations here are to the ADR 0090 CAPTURE of a live RTI Connext
+;;; 7.3.1 exchange, not to a clause. The behaviour reproduced below is the one the capture shows: the
+;;; reader sends a CUMULATIVE picture each time — the run of sequence numbers it has already reported,
+;;; plus the newly acknowledged one as a SEPARATE interval — and a monotone COUNT that mirrors ACKNACK's.
+;;;
+;;; ⚠️ A FALSE ACK IS WORSE THAN NO ACK. For most of this stack a false REJECT is the worst outcome; here
+;;; it is inverted, because a writer that believes a sample acknowledged may PURGE it and report success.
+;;; Every operation below therefore resolves an ambiguous case to "not yet acknowledged": an SN the
+;;; application never accessed is REFUSED rather than acked, a run that will not fit the interval cap is
+;;; DROPPED rather than widened, and nothing ever merges an unacknowledged SN into an acknowledged run.
+
+(defconstant +app-ack-flags-newly-acked+ #x0000
+  "The intervalFlags value RTI Connext puts on the interval carrying the JUST-acknowledged sequence number
+   (ADR 0090 capture). THIS RECORDS AN OBSERVATION, NOT A DECODED MEANING: the intervalFlags encoding is
+   not pinned — only two values have ever been provoked — so this constant says where RTI placed this
+   value, and claims nothing about what the bits mean. See dds.rtps.message:write-app-ack.")
+
+(defconstant +app-ack-flags-previously-reported+ #x0100
+  "The intervalFlags value RTI Connext puts on the coalesced run of sequence numbers it has ALREADY
+   reported in an earlier APP_ACK (ADR 0090 capture). Same caveat as +app-ack-flags-newly-acked+: an
+   observation of placement, not an interpretation of the bits.")
+
+(defstruct* (app-ack-state (:constructor make-app-ack-state))
+  "Reader-side application-acknowledgment state for ONE matched remote writer (ADR 0090 slice A3b): which
+   of that writer's sequence numbers the application has accessed, which it has acknowledged, and which of
+   those have already been carried in an APP_ACK. Owned by the DCPS DataReader (NOT by writer-proxy):
+   two same-topic DataReaders SHARE one engine writer-proxy (ADR 0048 WP-N-ENDPOINT) but acknowledge
+   INDEPENDENTLY, so per-proxy state would let one reader's acknowledgment speak for the other — a false
+   ack, the one failure this feature must never produce.
+
+   ACCESSED, REPORTED and PENDING are each an ASCENDING, DISJOINT, NON-ADJACENT list of (FIRST . LAST)
+   conses — a run list, not a per-SN set. In-order traffic (the overwhelmingly common case) collapses to
+   ONE cons per list however many samples pass through, so the state is O(1) in the sample count and grows
+   only with the number of HOLES the application leaves.
+
+     ACCESSED  read/taken by the application but not yet acknowledged — the ONLY SNs acknowledge-sample
+               and acknowledge-all may act on. A sample the application never saw is not acknowledgeable
+               at any price.
+     PENDING   acknowledged since the last APP_ACK; carried with +app-ack-flags-newly-acked+.
+     REPORTED  already carried in an earlier APP_ACK; re-sent cumulatively with
+               +app-ack-flags-previously-reported+, which is what the capture shows RTI doing.
+
+   COUNT is the monotone per-(reader, writer) APP_ACK counter, mirroring ACKNACK's (RTPS 2.5 §8.3.7.1),
+   which the writer echoes in APP_ACK_CONF."
+  (accessed '() :type list)
+  (reported '() :type list)
+  (pending '() :type list)
+  (count 0 :type (unsigned-byte 32)))
+
+(defun* %runs-member-p (runs sn)
+    (function (list integer) t)
+  "T if SN falls inside one of the (FIRST . LAST) runs in RUNS."
+  (dolist (r runs nil)
+    (when (and (<= (car r) sn) (<= sn (cdr r))) (return t))))
+
+(defun* %runs-add (runs sn)
+    (function (list integer) list)
+  "RUNS with SN inserted, keeping the list ASCENDING, DISJOINT and COALESCED across adjacency. Returns a
+   FRESH list; RUNS is not mutated (a caller may be holding the old value for the wire it is building)."
+  (when (%runs-member-p runs sn) (return-from %runs-add runs))
+  (let ((out '()) (lo sn) (hi sn) (placed nil))
+    (dolist (r runs)
+      (cond
+        (placed (push r out))
+        ;; entirely below the new SN and not adjacent to it -> keep as is
+        ((< (1+ (cdr r)) sn) (push r out))
+        ;; adjacent below / adjacent above / spanning -> absorb into the growing run
+        ((<= (car r) (1+ hi)) (setf lo (min lo (car r)) hi (max hi (cdr r))))
+        (t (push (cons lo hi) out) (push r out) (setf placed t))))
+    (unless placed (push (cons lo hi) out))
+    (nreverse out)))
+
+(defun* %runs-remove (runs sn)
+    (function (list integer) list)
+  "RUNS with SN removed, splitting the containing run if SN is interior. Returns a FRESH list."
+  (let ((out '()))
+    (dolist (r runs)
+      (cond
+        ((or (< sn (car r)) (> sn (cdr r))) (push r out))
+        (t (when (< (car r) sn) (push (cons (car r) (1- sn)) out))
+           (when (< sn (cdr r)) (push (cons (1+ sn) (cdr r)) out)))))
+    (nreverse out)))
+
+(defun* %runs-merge (a b)
+    (function (list list) list)
+  "The union of two run lists, ascending, disjoint and coalesced across adjacency. Returns FRESH conses;
+   neither input is mutated.
+
+   MERGES RUN BY RUN, NOT SEQUENCE NUMBER BY SEQUENCE NUMBER, and the difference is not cosmetic: a run
+   spans an arbitrary range, so folding one in by walking its members costs O(range) — linear in the
+   number of samples the application has read — where merging the runs themselves is linear in the number
+   of RUNS, which the interval cap bounds. An acknowledge-all after a million in-order samples is one run,
+   and must cost one comparison rather than a million."
+  (let ((all (sort (append (copy-list a) (copy-list b)) #'< :key #'car))
+        (out '()))
+    (dolist (r all)
+      (let ((top (first out)))
+        ;; TOP is always a cons this loop built, never one of the inputs, so widening it in place is safe.
+        (if (and top (<= (car r) (1+ (cdr top))))
+            (setf (cdr top) (max (cdr top) (cdr r)))
+            (push (cons (car r) (cdr r)) out))))
+    (nreverse out)))
+
+(defun* app-ack-note-accessed (state sn)
+    (function (app-ack-state integer) t)
+  "Record that the application has READ or TAKEN the writer's sample SN, making it eligible for a later
+   acknowledge-sample / acknowledge-all (ADR 0090 A3b). IDEMPOTENT, and a NO-OP for an SN already
+   acknowledged — re-reading a sample the application has already acknowledged must not resurrect it as
+   newly acknowledgeable, which would re-emit it on the wire forever. Returns T if the SN was newly
+   recorded."
+  (when (or (%runs-member-p (app-ack-state-reported state) sn)
+            (%runs-member-p (app-ack-state-pending state) sn)
+            (%runs-member-p (app-ack-state-accessed state) sn))
+    (return-from app-ack-note-accessed nil))
+  (setf (app-ack-state-accessed state) (%runs-add (app-ack-state-accessed state) sn))
+  t)
+
+(defun* app-ack-acknowledge (state sn)
+    (function (app-ack-state integer) t)
+  "Acknowledge the writer's sample SN on the application's behalf. Returns :ACKNOWLEDGED if it moved from
+   accessed to pending, :ALREADY if it was acknowledged before (idempotent — the DDS API must not punish a
+   double acknowledge), or :NOT-ACCESSED if the application never read or took it.
+
+   :NOT-ACCESSED IS THE SAFETY CASE AND IT REFUSES. The caller holds a SampleInfo, which it can only have
+   obtained from a read/take — but a fabricated, stale or cross-reader one would otherwise acknowledge a
+   sample this reader's application never saw, and the writer would then be entitled to purge it. Under
+   ADR 0090's design principle every ambiguous case resolves to 'not yet acknowledged', so an SN that is
+   not on the accessed list is refused, never acknowledged on faith."
+  (cond
+    ((or (%runs-member-p (app-ack-state-reported state) sn)
+         (%runs-member-p (app-ack-state-pending state) sn))
+     :already)
+    ((not (%runs-member-p (app-ack-state-accessed state) sn)) :not-accessed)
+    (t (setf (app-ack-state-accessed state) (%runs-remove (app-ack-state-accessed state) sn)
+             (app-ack-state-pending state) (%runs-add (app-ack-state-pending state) sn))
+       :acknowledged)))
+
+(defun* app-ack-acknowledge-all (state)
+    (function (app-ack-state) (integer 0))
+  "Acknowledge every sample of this writer the application has ACCESSED and not yet acknowledged. Returns
+   the number of sequence numbers moved.
+
+   ACCESSED, NOT RECEIVED — and that distinction is the whole feature. Acknowledging everything the READER
+   holds would acknowledge samples sitting undelivered in its cache, i.e. exactly the samples APP-ACK
+   exists to keep the writer from purging (DDS 1.4 has no such notion at all; RTI's acknowledge_all
+   likewise acknowledges previously ACCESSED samples)."
+  (let ((moved 0))
+    (dolist (r (app-ack-state-accessed state))
+      (incf moved (1+ (- (cdr r) (car r)))))
+    (setf (app-ack-state-pending state)
+          (%runs-merge (app-ack-state-pending state) (app-ack-state-accessed state))
+          (app-ack-state-accessed state) '())
+    moved))
+
+(defun* app-ack-intervals (state)
+    (function (app-ack-state) list)
+  "The interval list for the NEXT APP_ACK, in dds.rtps.message:write-app-ack's shape —
+   ((FIRST-SN LAST-SN INTERVAL-FLAGS PAYLOAD) ...) with PAYLOAD always NIL (response_data is not in this
+   slice) — or NIL when nothing is pending and there is therefore nothing to send. PURE: computes without
+   committing, so a caller that fails to send has not lost the distinction.
+
+   REPORTED AND PENDING RUNS ARE NEVER MERGED, even when adjacent. The capture is explicit on this: RTI's
+   third APP_ACK carries [1,2] previously-reported and [3,3] newly-acked as TWO intervals rather than one
+   [1,3] — so a merge would emit octets RTI never emits, and the corpus round trip would catch it.
+
+   THE RESULT IS SORTED ASCENDING BY FIRST-SN rather than emitted reported-then-pending. In the in-order
+   case those are the same list (every reported SN is below the new one), so this reproduces the capture
+   byte for byte; out of order they differ, and ascending is the only ordering ever OBSERVED on the wire.
+   Emitting a descending interval list would be inventing wire.
+
+   CAPPED AT dds.rtps.message:+app-ack-max-intervals+, the same bound our own parser enforces, so we never
+   emit a message we would ourselves reject. Over the cap, PREVIOUSLY-REPORTED runs are dropped LOWEST
+   FIRST; if that is still not enough (a pathological application acknowledging 1024+ disjoint runs before
+   any emission), the lowest PENDING runs go too. Both are the safe direction — an omitted interval leaves
+   the writer believing those samples are NOT YET acknowledged, so it retains them.
+
+   ⚠️ THE ONE COST OF THAT, STATED PLAINLY: a dropped pending run is folded into REPORTED by app-ack-commit
+   regardless, so app-ack-acknowledge will answer :ALREADY for it while the writer was never told. That is
+   a STALL (the writer retains a sample the application is done with), never a false ack, and it takes
+   1024+ holes to reach. The alternative — an uncapped interval list — is an unbounded, remote-influenced
+   message, which NFR-SEC-POSTURE forbids and our own parser would reject on arrival."
+  (when (null (app-ack-state-pending state)) (return-from app-ack-intervals nil))
+  (let ((all '()))
+    (dolist (r (app-ack-state-reported state))
+      (push (list (car r) (cdr r) +app-ack-flags-previously-reported+ nil) all))
+    (dolist (r (app-ack-state-pending state))
+      (push (list (car r) (cdr r) +app-ack-flags-newly-acked+ nil) all))
+    (setf all (sort (nreverse all) #'< :key #'first))
+    ;; TWO LINEAR PASSES, not a remove-the-worst loop. The list is ASCENDING, so the first OVER
+    ;; previously-reported entries ARE the lowest ones and NTHCDR drops the lowest remaining — no repeated
+    ;; LENGTH/FIND/REMOVE scan. The distinction matters here specifically: how many runs there are depends
+    ;; on which samples the network delivered and in what order, so a quadratic guard is remotely-driveable
+    ;; CPU (NFR-SEC-POSTURE), which is the same defect family as an uncapped loop bound.
+    (let ((over (- (length all) dds.rtps.message:+app-ack-max-intervals+)))
+      (when (plusp over)
+        (let ((keep '()))
+          (dolist (iv all)
+            (if (and (plusp over) (= (third iv) +app-ack-flags-previously-reported+))
+                (decf over)
+                (push iv keep)))
+          (setf all (nreverse keep)))
+        (when (plusp over) (setf all (nthcdr over all)))))
+    all))
+
+(defun* app-ack-commit (state)
+    (function (app-ack-state) (unsigned-byte 32))
+  "Fold the pending runs into the reported set and return the APP_ACK COUNT to stamp on the message just
+   built. Call AFTER app-ack-intervals, once the message is on its way.
+
+   COMMITTING BEFORE THE SEND IS ACKNOWLEDGED IS DELIBERATE AND SAFE. If the datagram is lost, those SNs
+   are reported in the NEXT APP_ACK as previously-reported rather than newly-acked — a different
+   intervalFlags value on an interval that still names them, so the writer still learns they are
+   acknowledged. Nothing is dropped; only the flag differs, and this stack does not interpret that flag.
+
+   The reported set is bounded at dds.rtps.message:+app-ack-max-intervals+ runs by dropping the LOWEST
+   (oldest, already-reported) ones — the same safe direction app-ack-intervals uses, and the reason a
+   pathologically hole-punching application cannot grow this state without limit (NFR-SEC-POSTURE)."
+  (setf (app-ack-state-reported state)
+        (%runs-merge (app-ack-state-reported state) (app-ack-state-pending state))
+        (app-ack-state-pending state) '())
+  (let ((over (- (length (app-ack-state-reported state))
+                 dds.rtps.message:+app-ack-max-intervals+)))
+    (when (plusp over)
+      (setf (app-ack-state-reported state) (nthcdr over (app-ack-state-reported state)))))
+  (setf (app-ack-state-count state)
+        (logand (1+ (app-ack-state-count state)) #xFFFFFFFF)))

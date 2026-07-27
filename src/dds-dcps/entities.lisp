@@ -145,6 +145,7 @@
    (instance-recs :initform (make-hash-table :test 'equalp) :accessor dr-instance-recs) ; handle -> instance-rec (DDS 1.4 §2.2.2.5.1.3)
    (drained :initform (make-hash-table :test 'equalp) :accessor dr-drained) ; 16-octet source GUID -> highest engine SN drained for that writer (§8.3.5.4: SN is per-writer)
    (lifecycle-drained :initform '() :accessor dr-lifecycle-drained) ; engine lifecycle (GUID . SN) composite keys already consumed (user thread)
+   (app-acks :initform nil :accessor dr-app-acks) ; ADR 0090 A3b: 16-octet remote-writer GUID (equalp) -> dds.rtps.reliable:app-ack-state. LAZY — NIL until this reader's ACKNOWLEDGMENT_KIND is an APPLICATION kind, so a :PROTOCOL reader (the default, and everything gate-mem measures) never allocates the table and every APP-ACK site below is one NIL test. Per DATAREADER, deliberately NOT on the engine writer-proxy: two same-topic readers SHARE a proxy (ADR 0048) but acknowledge independently, and one speaking for the other is a FALSE ACK
    (sub-matched :initform (make-subscription-matched-status) :accessor dr-sub-matched)
    (req-incompat :initform (make-requested-incompatible-qos-status) :accessor dr-req-incompat)
    (sample-rejected :initform (make-sample-rejected-status) :accessor dr-sample-rejected)
@@ -377,10 +378,28 @@
 
 (defstruct* (sample-info (:constructor make-sample-info))
   "DDS 1.4 SampleInfo (dds_rtf2_dcps.idl §SampleInfo). v1 populates the three states +
-   valid-data + instance-handle; source/publication handle, generation counts and the
-   ranks default to 0/nil and are filled in by later increments. State kinds are kept
-   as keywords (READ/NOT_READ, NEW/NOT_NEW, ALIVE/NOT_ALIVE_DISPOSED/_NO_WRITERS).
-   sequence-number is a vendor extension (the RTPS writer SN)."
+   valid-data + instance-handle; the generation counts and ranks default to 0/nil and are
+   filled in by later increments. State kinds are kept as keywords (READ/NOT_READ,
+   NEW/NOT_NEW, ALIVE/NOT_ALIVE_DISPOSED/_NO_WRITERS). sequence-number is a vendor
+   extension (the RTPS writer SN).
+
+   PUBLICATION-HANDLE is the 16-octet GUID of the remote DataWriter that wrote this sample
+   (DDS 1.4 §2.2.2.5.4; this stack's InstanceHandle_t for a remote endpoint is its GUID, the
+   same convention subscription-matched-status-last-publication-handle follows). Populated
+   on every delivery path since ADR 0090 A3b, which needs it: acknowledge-sample identifies a
+   sample by (writer, sequence number), and a sequence number is unique only within one
+   writer GUID (RTPS 2.5 §8.3.5.4) — acknowledging by SN alone would acknowledge a DIFFERENT
+   writer's sample of the same number, a false ack.
+
+   ⚠️ IT IS ALIASED, NOT COPIED, AND THAT IS A LOAD-BEARING INVARIANT. The value is the exact
+   object the disc node holds in disc-node-sample-writer-guids, which %source-guid freshly
+   allocates per received sample and NOTHING ever mutates. Aliasing makes this field cost ZERO
+   bytes per sample where a copy-seq would cost ~32 (NFR-MEM; gate-mem has under 40 B of
+   headroom), and it is safe only because that object is immutable. THE CONSTRAINT THIS PLACES
+   ON ADR 0088: a memoised invariant per-writer GUID (its Option B) keeps this safe; a SHARED
+   MUTABLE SCRATCH (its Option A) would silently rewrite a handle the application is already
+   holding. ADR 0088 recommends against Option A on other grounds; this is one more, and it is
+   application-visible rather than internal."
   (sample-state :not-read :type (member :read :not-read))
   (view-state :new :type (member :new :not-new))
   (instance-state :alive :type (member :alive :not-alive-disposed :not-alive-no-writers))
@@ -2521,6 +2540,122 @@
     (setf (gethash sguid (dr-drained dr)) (max sn (or prior 0))))
   t)
 
+;;; ---- APPLICATION ACKNOWLEDGMENT (VENDOR EXTENSION, ADR 0090 slice A3b) ----
+;;;
+;;; DDS 1.4 defines nothing here and neither does RTPS 2.5 — wait_for_acknowledgments is PROTOCOL-level,
+;;; and an exhaustive search of the spec finds no application acknowledgment at all. This mirrors RTI's
+;;; DataReader::acknowledge_sample / acknowledge_all, gated on the ACKNOWLEDGMENT_KIND QoS (slice A3a).
+;;;
+;;; ⚠️ A FALSE ACK IS WORSE THAN NO ACK — the inversion that shapes every decision below. Elsewhere in
+;;; this stack a false REJECT is the worst outcome; here a writer that believes a sample acknowledged may
+;;; PURGE it and report success, so an unacknowledged sample is a delay and a wrongly-acknowledged one is
+;;; silent data loss. Every ambiguous case therefore resolves to "not yet acknowledged".
+
+(defun* %reader-app-ack-explicit-p (dr)
+    (function (data-reader) t)
+  "T if DR's ACKNOWLEDGMENT_KIND is :APPLICATION-EXPLICIT — the only kind this slice implements.
+   :APPLICATION-AUTO is accepted by the QoS and its RxO gate (A3a) but acknowledges on read/take, which is
+   a later slice; until it exists, an :APPLICATION-AUTO reader acknowledges NOTHING rather than something
+   approximate. Under-acknowledging stalls a writer visibly; over-acknowledging loses data silently."
+  (let ((q (entity-qos dr)))
+    (and q (eq (dds.qos:qos-acknowledgment-kind q) :application-explicit))))
+
+(defun* %reader-app-ack-state (dr wguid)
+    (function (data-reader t) t)
+  "DR's app-ack state for remote writer WGUID, created on demand, or NIL when WGUID is not a 16-octet GUID.
+   The table itself is allocated lazily, so a :PROTOCOL reader never pays for it."
+  (unless (and wguid (typep wguid '(array (unsigned-byte 8) (*))) (= 16 (length wguid)))
+    (return-from %reader-app-ack-state nil))
+  (unless (dr-app-acks dr)
+    (setf (dr-app-acks dr) (make-hash-table :test 'equalp)))
+  (or (gethash wguid (dr-app-acks dr))
+      (setf (gethash wguid (dr-app-acks dr))
+            (dds.rtps.reliable:make-app-ack-state))))
+
+(defun* %note-accessed (dr info)
+    (function (data-reader sample-info) t)
+  "Record that the application has just been handed the sample described by INFO, making it eligible for a
+   later acknowledge-sample / acknowledge-all (ADR 0090 A3b). Called from EVERY path that hands a sample to
+   the application and marks it READ — %select-samples, take-loaned, read-loaned — which is the whole of
+   'accessed'.
+
+   A NO-OP UNLESS THE READER IS :APPLICATION-EXPLICIT, so the default reader pays one keyword comparison
+   per returned sample and allocates nothing (NFR-MEM). A sample whose publication-handle is missing is
+   SKIPPED rather than recorded under a guessed writer: acknowledging the wrong writer's sequence number is
+   exactly the false ack this feature must not produce."
+  (when (%reader-app-ack-explicit-p dr)
+    (let ((state (%reader-app-ack-state dr (sample-info-publication-handle info))))
+      (when state
+        (dds.rtps.reliable:app-ack-note-accessed state (sample-info-sequence-number info)))))
+  t)
+
+(defun* %reader-emit-app-ack (dr wguid state)
+    (function (data-reader t t) (integer 0))
+  "Emit ONE APP_ACK to writer WGUID carrying STATE's pending acknowledgments, and commit them. Returns the
+   number of datagrams sent (0 if nothing was pending, or if the writer's participant is undiscovered).
+
+   THE COMMIT HAPPENS EVEN WHEN THE SEND RESOLVES TO NO DESTINATION, and that is deliberate: the pending
+   runs move to REPORTED, so the next APP_ACK still names them (with the previously-reported intervalFlags
+   instead of the newly-acked one). Nothing is dropped by a lost or unsendable message — only a flag this
+   stack does not interpret differs — whereas leaving them pending would re-emit them forever."
+  (let ((intervals (dds.rtps.reliable:app-ack-intervals state)))
+    (when (null intervals) (return-from %reader-emit-app-ack 0))
+    (let ((count (dds.rtps.reliable:app-ack-commit state)))
+      (dds.disc:node-send-app-ack (dp-node (sub-participant (dr-subscriber dr)))
+                                  (dr-entity-id dr) wguid intervals count))))
+
+(defun* acknowledge-sample (dr info)
+    (function (data-reader sample-info) t)
+  "DataReader::acknowledge_sample (VENDOR EXTENSION, ADR 0090; RTI's DDS_DataReader_acknowledge_sample) —
+   tell the writer that named this sample that the APPLICATION has processed it, so it may stop retaining
+   it. INFO is the SampleInfo the sample was read or taken with; the sample is identified by its
+   publication-handle (the writer's GUID) and sequence-number, because a sequence number is unique only
+   within one writer (RTPS 2.5 §8.3.5.4). One APP_ACK is emitted, unicast to that writer's participant.
+
+   Returns a DDS 1.4 ReturnCode_t:
+     :OK                     acknowledged (or already acknowledged — the call is idempotent).
+     :NOT-ENABLED            DR is not enabled (DDS 1.4 §2.2.2.1.1.7).
+     :BAD-PARAMETER          INFO carries no publication-handle, so no writer can be named.
+     :PRECONDITION-NOT-MET   DR's ACKNOWLEDGMENT_KIND is not :APPLICATION-EXPLICIT, or this reader's
+                             application never read or took that sample.
+
+   ⚠️ THE :PRECONDITION-NOT-MET ARM IS THE SAFETY ARM AND IT REFUSES ON PURPOSE. A SampleInfo can only
+   normally come from this reader's own read/take, but a stale one, one belonging to a different reader, or
+   a fabricated one would otherwise acknowledge a sample this application never saw — after which the
+   writer is entitled to purge it. Refusing costs a retained sample; accepting on faith costs the sample
+   itself, so the ambiguous case resolves to 'not yet acknowledged' (ADR 0090)."
+  (unless (entity-enabled-p dr) (return-from acknowledge-sample +retcode-not-enabled+))
+  (unless (%reader-app-ack-explicit-p dr) (return-from acknowledge-sample +retcode-precondition-not-met+))
+  (let ((state (%reader-app-ack-state dr (sample-info-publication-handle info))))
+    (when (null state) (return-from acknowledge-sample +retcode-bad-parameter+))
+    (let ((verdict (dds.rtps.reliable:app-ack-acknowledge state (sample-info-sequence-number info))))
+      (case verdict
+        (:not-accessed +retcode-precondition-not-met+)
+        (:already +retcode-ok+)
+        (t (%reader-emit-app-ack dr (sample-info-publication-handle info) state)
+           +retcode-ok+)))))
+
+(defun* acknowledge-all (dr)
+    (function (data-reader) t)
+  "DataReader::acknowledge_all (VENDOR EXTENSION, ADR 0090; RTI's DDS_DataReader_acknowledge_all) —
+   acknowledge every sample this reader's application has ACCESSED and not yet acknowledged, emitting one
+   APP_ACK per matched writer that has any. Returns :OK, :NOT-ENABLED, or :PRECONDITION-NOT-MET when
+   ACKNOWLEDGMENT_KIND is not :APPLICATION-EXPLICIT. A reader with nothing outstanding returns :OK and
+   sends nothing.
+
+   ACCESSED, NOT RECEIVED — the distinction IS the feature. Acknowledging everything the reader HOLDS would
+   acknowledge samples still sitting undelivered in its cache, i.e. precisely the samples application
+   acknowledgment exists to keep a writer from purging. RTI's acknowledge_all likewise covers previously
+   accessed samples."
+  (unless (entity-enabled-p dr) (return-from acknowledge-all +retcode-not-enabled+))
+  (unless (%reader-app-ack-explicit-p dr) (return-from acknowledge-all +retcode-precondition-not-met+))
+  (when (dr-app-acks dr)
+    (maphash (lambda (wguid state)
+               (when (plusp (dds.rtps.reliable:app-ack-acknowledge-all state))
+                 (%reader-emit-app-ack dr wguid state)))
+             (dr-app-acks dr)))
+  +retcode-ok+)
+
 (defun* %drain-one-loan (dr ts key marker sn sguid)
     (function (data-reader t cons dds.disc:zc-loan-marker integer t) t)
   "WP-FLATDATA-ZC-LOAN (R6, ADR 0017; NOT cleared for ship — pending counsel): turn an UNRESOLVED ZC-LOAN-MARKER
@@ -2555,6 +2690,7 @@
                                      :sample-state :not-read :view-state :new
                                      :instance-state (instance-rec-state rec) :valid-data t
                                      :instance-handle handle :sequence-number sn
+                                     :publication-handle sguid   ; DDS 1.4 §2.2.2.5.4; ALIASED, never copied — see the slot docstring
                                      :source-timestamp (dds.disc:node-sample-timestamp   ; S5.T4
                                                         (dp-node (sub-participant (dr-subscriber dr))) key)
                                      :disposed-generation-count (instance-rec-disposed-gen-count rec)
@@ -2584,6 +2720,7 @@
                                :sample-state :not-read :view-state :new
                                :instance-state (instance-rec-state rec) :valid-data t
                                :instance-handle handle :sequence-number sn
+                               :publication-handle sguid   ; DDS 1.4 §2.2.2.5.4; ALIASED, never copied — see the slot docstring
                                :source-timestamp (dds.disc:node-sample-timestamp node key)   ; S5.T4
                                :disposed-generation-count (instance-rec-disposed-gen-count rec)
                                :no-writers-generation-count (instance-rec-no-writers-gen-count rec)))))))
@@ -2647,6 +2784,7 @@
         (setf (sample-info-view-state info) (if (gethash handle (dr-instances dr)) :not-new :new))
         (pushnew handle touched :test #'equalp)
         (setf (sample-info-sample-state info) :read)
+        (%note-accessed dr info)   ; ADR 0090 A3b: accessed is what makes a sample acknowledgeable
         (push d data)
         (cond ((dds.types:flatdata-view-p d) (push d loans))     ; FlatData: the view is both DATA and loan (ADR 0017)
               ((dds.disc:secured-loan-handle-p (cached-sample-loan cs)) (push (cached-sample-loan cs) loans)))))   ; secured: the pooled-buffer handle (ADR 0038 (i)); NIL otherwise
@@ -2669,6 +2807,7 @@
         (setf (sample-info-view-state info) (if (gethash handle (dr-instances dr)) :not-new :new))
         (pushnew handle touched :test #'equalp)
         (setf (sample-info-sample-state info) :read)
+        (%note-accessed dr info)   ; ADR 0090 A3b: accessed is what makes a sample acknowledgeable
         (push d data)
         (cond ((dds.types:flatdata-view-p d) (push d loans))     ; FlatData: the view is both DATA and loan (ADR 0017)
               ((dds.disc:secured-loan-handle-p (cached-sample-loan cs)) (push (cached-sample-loan cs) loans)))))   ; secured: the pooled-buffer handle (ADR 0038 (i))
@@ -2814,6 +2953,7 @@
                                              :sample-state :not-read :view-state :new
                                              :instance-state (instance-rec-state rec) :valid-data t
                                              :instance-handle handle :sequence-number sn
+                                             :publication-handle sguid   ; DDS 1.4 §2.2.2.5.4; ALIASED, never copied — see the slot docstring
                                              :source-timestamp (dds.disc:node-sample-timestamp node key)   ; S5.T4
                                              :disposed-generation-count (instance-rec-disposed-gen-count rec)
                                              :no-writers-generation-count (instance-rec-no-writers-gen-count rec))))))))))))))
@@ -2985,6 +3125,7 @@
              (setf (sample-info-instance-state info) (%snapshot-instance-state dr info))
              (pushnew h touched :test #'equalp))
            (setf (sample-info-sample-state info) :read)
+           (%note-accessed dr info)   ; ADR 0090 A3b: accessed is what makes a sample acknowledgeable
            (%release-secured-copy-loan dr node cs)   ; release the secured decode loan (data struct is independent); FlatData view untouched
            (incf n)
            (push cs out))

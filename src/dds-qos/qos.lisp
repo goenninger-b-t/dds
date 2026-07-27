@@ -173,6 +173,17 @@
      :PROTOCOL (default)     acknowledged by the RTPS protocol — today's behaviour, unchanged.
      :APPLICATION-AUTO       acknowledged when the subscribing application ACCESSES it (read/take).
      :APPLICATION-EXPLICIT   acknowledged only on an explicit acknowledge-sample / acknowledge-all.
+     :UNSUPPORTED            DECODE-ONLY. Not settable on a local endpoint (qos-validate refuses it);
+                             it is where a DISCOVERED peer's acknowledgment kind lands when this stack
+                             does not implement it — RTI's APPLICATION_ORDERED, whose semantics are
+                             unsourced, and any future value. It equals nothing we offer, so the equality
+                             gate below refuses the match: the safe answer when we cannot know when the
+                             peer considers a sample acknowledged.
+
+   It is propagated in SEDP under RTI's vendor PID 0x800b, identified by measurement against live Connext
+   (see dds.rtps.message:+pid-acknowledgment-kind+) and OMITTED at :PROTOCOL exactly as RTI omits it — so
+   an endpoint that does not use the feature puts nothing extra on the wire, and a peer that never sends
+   the PID reads as :PROTOCOL, which is what both RTI and a peer ignorant of the policy actually mean.
 
    ⚠️ RxO IS BY EQUALITY, NOT BY RANK, and that is the safety-critical part of this policy. Every other
    ordered policy has a 'a stronger offer satisfies a weaker request' direction. This one has NO safe
@@ -231,8 +242,10 @@
   (writer-cache-low-watermark nil :type (or null (integer 0)))
   (writer-cache-high-watermark nil :type (or null (integer 1)))
   ;; ACKNOWLEDGMENT_KIND (VENDOR EXTENSION, ADR 0090) — RxO-checked by EQUALITY; see the docstring.
+  ;; :UNSUPPORTED is DECODE-ONLY (never settable on a local endpoint — qos-validate refuses it): it is
+  ;; where every acknowledgment kind this stack does not implement lands, so it matches nothing we offer.
   (acknowledgment-kind :protocol
-                       :type (member :protocol :application-auto :application-explicit)))
+                       :type (member :protocol :application-auto :application-explicit :unsupported)))
 
 (defun* make-writer-qos (&rest args)
     (function (&rest t) qos)

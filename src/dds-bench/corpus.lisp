@@ -471,9 +471,90 @@
          (subseq out 0 (dds.core.buffer:cursor-position c)))
         (t nil)))))
 
+(defparameter +app-ack-replay-vectors+
+  '(("appack-connext-1interval.bin"  1)
+    ("appack-connext-2intervals.bin" 2))
+  "The captured APP_ACK submessages RTI Connext emitted for the FIRST and SECOND acknowledged sample of the
+   ADR 0090 capture, paired with the sequence number acknowledged at that step. Driven in order by
+   %RTPS-CORPUS-VERIFY-STATE-MACHINE. The capture ran to five samples; only these two were committed, and
+   two steps are enough to distinguish the cumulative model from every simpler one — the second message is
+   where reported-vs-newly-acked first has to be got right.")
+
+(defun* %rtps-corpus-verify-state-machine ()
+    (function () (integer 0))
+  "Drive the reader-side APP-ACK STATE MACHINE (ADR 0090 A3b) through the captured exchange and require the
+   octets it produces to be IDENTICAL to the ones RTI Connext emitted. Returns the mismatch count.
+
+   ⭐ THIS VERIFIES THE STATE MACHINE, NOT THE CODEC. %RTPS-CORPUS-VERIFY-ONE already round-trips the
+   codec: it decodes RTI's bytes and re-encodes exactly what it decoded, so it proves the layout and
+   proves nothing whatever about WHICH INTERVALS A READER SHOULD SEND. That is the harder half and the
+   one with no specification behind it — application acknowledgment appears nowhere in RTPS 2.5, so the
+   only available oracle is RTI's own behaviour. Here the intervals are DERIVED from our state after N
+   acknowledge calls, with nothing read out of the captured file except the writer's GUID; if our model of
+   'a cumulative run of previously-reported SNs plus the newly acknowledged one as a separate interval'
+   were wrong — a merged [1,3] instead of [1,2]+[3,3], the two intervalFlags values swapped, a count that
+   did not start at 1 — the bytes would differ and this fails.
+
+   It is the ADR 0090 A2 lesson applied one level up: a round trip verifies what it re-derives, so re-derive
+   as much as possible. A2 re-derived the layout from the decode; this re-derives the CONTENT from the API."
+  (let* ((first-path (merge-pathnames (first (first +app-ack-replay-vectors+)) *rtps-corpus-dir*))
+         (probe (and (probe-file first-path)
+                     (with-open-file (in first-path :element-type '(unsigned-byte 8))
+                       (let ((v (make-array (file-length in) :element-type '(unsigned-byte 8))))
+                         (read-sequence v in) v)))))
+    (when (or (null probe) (< (length probe) 32))
+      (format t "~&  FAIL app-ack state machine: ~a missing or short — nothing to replay against~%"
+              first-path)
+      (return-from %rtps-corpus-verify-state-machine 1))
+    ;; RTI's own ids, so the comparison is against the captured octets and not a re-labelled variant.
+    ;; The virtual-writer GUID comes STRAIGHT OUT OF THE CAPTURE (offset 16 = submessage header 4 +
+    ;; readerId 4 + writerId 4 + virtualWriterCount 4) for the same reason %rtps-corpus-reencode does.
+    (let ((reader-id #x80000007) (writer-id #x80000002)
+          (guid (subseq probe 16 32))
+          (state (dds.rtps.reliable:make-app-ack-state))
+          (bad 0))
+      (dolist (step +app-ack-replay-vectors+ bad)
+        (destructuring-bind (name sn) step
+          (let ((path (merge-pathnames name *rtps-corpus-dir*)))
+            (cond
+              ((null (probe-file path))
+               (incf bad)
+               (format t "~&  FAIL app-ack state machine: ~a is missing~%" name))
+              (t
+               (let ((raw (with-open-file (in path :element-type '(unsigned-byte 8))
+                            (let ((v (make-array (file-length in) :element-type '(unsigned-byte 8))))
+                              (read-sequence v in) v))))
+                 ;; The application reads the sample, then acknowledges it — the two-step the API requires.
+                 ;; An acknowledge without the read must REFUSE (a sample the application never saw is not
+                 ;; acknowledgeable), so skipping note-accessed here would turn this red, which is the point.
+                 (dds.rtps.reliable:app-ack-note-accessed state sn)
+                 (let ((verdict (dds.rtps.reliable:app-ack-acknowledge state sn)))
+                   (unless (eq verdict :acknowledged)
+                     (incf bad)
+                     (format t "~&  FAIL app-ack state machine: acknowledging SN ~d returned ~s~%"
+                             sn verdict)))
+                 (let* ((intervals (dds.rtps.reliable:app-ack-intervals state))
+                        (count (dds.rtps.reliable:app-ack-commit state))
+                        (out (make-array 512 :element-type '(unsigned-byte 8) :initial-element 0))
+                        (c (dds.core.buffer:cursor (dds.core.buffer:octet-buffer-over out)
+                                                   :endianness :little)))
+                   (dds.rtps.message:write-app-ack c reader-id writer-id guid intervals count)
+                   (let ((got (subseq out 0 (dds.core.buffer:cursor-position c))))
+                     (cond
+                       ((and (= (length got) (length raw)) (every #'= got raw))
+                        (format t "~&  ok   ~a (state machine: ack SN ~d -> ~d interval(s), count ~d, ~
+                                     BYTE-EXACT vs RTI)~%"
+                                name sn (length intervals) count))
+                       (t
+                        (incf bad)
+                        (format t "~&  FAIL ~a: the state machine's APP_ACK differs from RTI's bytes~%~
+                                     ~&    intervals: ~s  count: ~d~%    connext: ~a~%    ours:    ~a~%"
+                                name intervals count (%hex raw) (%hex got)))))))))))))))
+
 (defun* %rtps-corpus-verify ()
     (function () (integer 0))
-  "Verify every captured RTPS submessage vector in *rtps-corpus-dir*. Returns the mismatch count.
+  "Verify every captured RTPS submessage vector in *rtps-corpus-dir*, then replay the APP-ACK state
+   machine against them. Returns the mismatch count.
    An EMPTY directory is a FAILURE, not a pass: a gate whose corpus silently vanished reads green while
    verifying nothing, which is the shape make corpus was already burned by once (ADR 0086)."
   (let ((files (sort (directory (merge-pathnames "*.bin" *rtps-corpus-dir*)) #'string< :key #'namestring))
@@ -483,6 +564,7 @@
               *rtps-corpus-dir*)
       (return-from %rtps-corpus-verify 1))
     (dolist (f files) (incf bad (%rtps-corpus-verify-one f)))
+    (incf bad (%rtps-corpus-verify-state-machine))
     bad))
 
 (defun* corpus-verify ()

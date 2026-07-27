@@ -646,6 +646,26 @@
 (defun* %wire-ownership (n)
     (function ((unsigned-byte 32)) symbol)
   "Map a PID_OWNERSHIP wire code to an OWNERSHIP kind keyword (1=EXCLUSIVE, else the default :shared); an unknown code never rejects (FR-QOS-2)." (if (= n 1) :exclusive :shared))
+(defun* %acknowledgment-kind-wire (k)
+    (function (symbol) (unsigned-byte 32))
+  "Map an ACKNOWLEDGMENT_KIND keyword to its PID_ACKNOWLEDGMENT_KIND wire code (ADR 0090; RTI's
+   DDS_ReliabilityQosPolicyAcknowledgmentModeKind, pinned by the three-run capture documented at
+   dds.rtps.message:+pid-acknowledgment-kind+, NOT from any clause). :UNSUPPORTED is decode-only and never
+   reaches here — an endpoint carrying it was refused at creation." (ecase k (:protocol 0) (:application-auto 1) (:application-explicit 3)))
+(defun* %wire-acknowledgment-kind (n)
+    (function ((unsigned-byte 32)) symbol)
+  "Map a PID_ACKNOWLEDGMENT_KIND wire code to an ACKNOWLEDGMENT_KIND keyword (ADR 0090): 0=:PROTOCOL,
+   1=:APPLICATION-AUTO, 3=:APPLICATION-EXPLICIT.
+
+   ⚠️ EVERY OTHER VALUE MAPS TO :UNSUPPORTED, AND THAT IS THE OPPOSITE OF THIS FILE'S USUAL RULE. Every
+   other wire-kind mapper here falls back to the DEFAULT and never rejects (FR-QOS-2), because for those
+   policies a false reject is the worst outcome. This one is inverted: falling back to :PROTOCOL would
+   silently match a peer whose writer waits for acknowledgments we will never send (a stall) or whose
+   reader believes it holds a guarantee we are not honouring (data loss) — the two failure modes ADR 0090
+   §4 exists to prevent. :UNSUPPORTED equals nothing we offer, so the RxO gate refuses the match and
+   reports INCOMPATIBLE_QOS, which is the one outcome an operator can see. RTI's APPLICATION_ORDERED (2)
+   lands here deliberately: no published explanation of its semantics was found, and implementing a guess
+   under RTI's name is what ADR 0089 §5 forbids." (case n (0 :protocol) (1 :application-auto) (3 :application-explicit) (t :unsupported)))
 (defun* %wire-destination-order (n)
     (function ((unsigned-byte 32)) symbol)
   "Map a PID_DESTINATION_ORDER wire code to a DESTINATION_ORDER keyword (DDS 1.4 PSM
@@ -793,7 +813,17 @@
     (when (eq (endpoint-data-role data) :writer)
       (multiple-value-bind (c vec) (%make-scratch 4)
         (dds.core.buffer:put-u32 c (ldb (byte 32 0) (dds.qos:qos-ownership-strength q)))
-        (dds.rtps.message:write-parameter cursor dds.rtps.message:+pid-ownership-strength+ vec 0 4))))
+        (dds.rtps.message:write-parameter cursor dds.rtps.message:+pid-ownership-strength+ vec 0 4)))
+    ;; PID_ACKNOWLEDGMENT_KIND (0x800b, RTI vendor — ADR 0090; no OMG clause exists). Emitted by BOTH
+    ;; roles, because this is the one vendor policy in this stack that is RxO-CHECKED and a policy neither
+    ;; side can see cannot be checked: without this the A3a gate compares every peer against :PROTOCOL and
+    ;; an application-acknowledgment pair NEVER MATCHES. OMITTED AT :PROTOCOL, exactly as RTI omits it —
+    ;; absent means :PROTOCOL, which is also the right reading of a peer that has never heard of the
+    ;; policy, so the wire stays byte-identical for every endpoint that does not use the feature.
+    (unless (eq (dds.qos:qos-acknowledgment-kind q) :protocol)
+      (multiple-value-bind (c vec) (%make-scratch 4)
+        (dds.core.buffer:put-u32 c (%acknowledgment-kind-wire (dds.qos:qos-acknowledgment-kind q)))
+        (dds.rtps.message:write-parameter cursor dds.rtps.message:+pid-acknowledgment-kind+ vec 0 4))))
   ;; PID_TYPE_INFORMATION (idl @id 0x0075): opaque pre-serialized XTypes TypeInformation,
   ;; emitted only when present (peers skip unknown PIDs — backward-compatible).
   (let ((ti (endpoint-data-type-information data)))
@@ -909,6 +939,14 @@
        (setf (dds.qos:qos-ownership-strength (endpoint-data-qos data))
              (let ((u (dds.core.buffer:get-u32 cursor)))
                (if (>= u #x80000000) (- u #x100000000) u)))))
+    ;; PID_ACKNOWLEDGMENT_KIND (0x800b, RTI vendor — ADR 0090). Absent = :PROTOCOL (the struct default),
+    ;; which is both what RTI means by omitting it and the right reading of a peer that has never heard of
+    ;; the policy. An unrecognised code becomes :UNSUPPORTED and therefore matches nothing — see
+    ;; %wire-acknowledgment-kind for why this one mapper rejects where every other one defaults.
+    ((= pid dds.rtps.message:+pid-acknowledgment-kind+)
+     (when (= len 4)
+       (setf (dds.qos:qos-acknowledgment-kind (endpoint-data-qos data))
+             (%wire-acknowledgment-kind (dds.core.buffer:get-u32 cursor)))))
     ((= pid dds.rtps.message:+pid-type-information+)
      (when (> len 0)
        (let ((ti (make-array len :element-type '(unsigned-byte 8))))

@@ -3541,6 +3541,52 @@
                                          (cadr pd) (cddr pd) (car pd))))))))))))))
   t)
 
+(defun* node-send-app-ack (node reader-entity-id writer-guid intervals count)
+    (function (disc-node (unsigned-byte 32) (simple-array (unsigned-byte 8) (16)) list (unsigned-byte 32))
+              (integer 0))
+  "Reader side: emit ONE RTI-format APP_ACK (0x1c) naming INTERVALS of WRITER-GUID's sequence numbers that
+   the application has acknowledged, stamped with COUNT and this reader's READER-ENTITY-ID (ADR 0090 slice
+   A3b). Returns the number of datagrams sent — 1, or 0 when the writer's participant is undiscovered or
+   resolves to no usable destination. Called from the DCPS acknowledge-sample / acknowledge-all on the USER
+   thread, hence the tx-msg scratch buffer (the receiver thread's is rx-tx-msg).
+
+   ⚠️ IT IS UNICAST TO THE WRITER'S PARTICIPANT ALONE, AND THAT IS A SAFETY PROPERTY, NOT AN OPTIMISATION.
+   A reader's ACKNACK goes to every matched writer-bearing participant (%match-destinations-prefixed),
+   which is harmless because an ACKNACK is keyed by a SequenceNumberSet the wrong writer simply will not
+   recognise. An APP_ACK is not: it names a writerId, and two writers in DIFFERENT participants routinely
+   share an EntityId (RTPS 2.5 §8.3.5.4 — a sequence number is unique only within one writer GUID). Fanned
+   out, this message would tell a same-EntityId writer elsewhere that ITS samples at those sequence numbers
+   were acknowledged by an application that never saw them, and that writer may then purge them and report
+   success. That is the FALSE ACK ADR 0090 is written around, so the destination is resolved from the
+   writer's own GUID prefix (%prefix-user-destination) and nothing else.
+
+   THE VENDOR-ID QUESTION IS NOT DODGED, IT IS ANSWERED HONESTLY. Submessage id 0x1c sits in the OMG
+   PROTOCOL-reserved range 0x00-0x7f, not the vendor range (RTPS 2.5 §9.4.5.1.1), so its meaning is
+   RTI's, taken there rather than in the range the spec provides for exactly this. We emit it under OUR
+   OWN VendorId — write-header stamps *vendor-id*, never RTI's. Claiming RTI's VendorId would make every
+   other submessage in the datagram interpretable under RTI's rules and would be a lie about who sent it;
+   a peer that does not recognise 0x1c under our VendorId skips it by §8.3.3.2 rule 3 and loses nothing.
+   Whether Connext accepts an APP_ACK from a foreign VendorId is a FACT TO BE MEASURED against a live
+   writer (ADR 0090 slice A2-live), not a thing to design around in advance."
+  (when (null intervals) (return-from node-send-app-ack 0))
+  (let* ((prefix (subseq writer-guid 0 12))
+         (wid (logior (ash (aref writer-guid 12) 24) (ash (aref writer-guid 13) 16)
+                      (ash (aref writer-guid 14) 8) (aref writer-guid 15)))
+         (dest (%prefix-user-destination node prefix)))
+    (cond
+      ((null dest) 0)
+      (t
+       ;; flet + dynamic-extent (ADR 0072): %send-msg-buf funcalls the builder and never stores it, so this
+       ;; stack-allocates instead of consing a closure per acknowledgment.
+       ;; virtualWriterGuid = the writer's OWN GUID: the capture shows Connext emitting virtualWriterCount 1
+       ;; with exactly that, so the virtual-writer indirection is degenerate for an ordinary writer and this
+       ;; stack — which has no virtual-writer model — can satisfy it without inventing one (ADR 0090 §3.1).
+       (flet ((%build-app-ack (mc)
+                (dds.rtps.message:write-app-ack mc reader-entity-id wid writer-guid intervals count)))
+         (declare (dynamic-extent #'%build-app-ack))
+         (%send-msg-buf node (disc-node-tx-msg node) #'%build-app-ack (car dest) (cdr dest) prefix))
+       1))))
+
 (defun* %on-user-gap (node c flags src-prefix)
     (function (disc-node dds.core.buffer:cursor (unsigned-byte 8) (simple-array (unsigned-byte 8) (12))) t)
   "Reader side: a GAP from a matched remote writer marks the SNs it declares irrelevant — the half-open range

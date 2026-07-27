@@ -1,0 +1,56 @@
+SEDP vendor ParameterIds vs acknowledgment_kind - RTI Connext 7.3.1 (ADR 0090 slice A3b)
+================================================================================================
+
+HOW THIS WAS PRODUCED. The capture harness in the parent directory was run THREE TIMES with
+exactly one thing changed - acknowledgment_kind in USER_QOS_PROFILES.xml - and the SEDP
+publication (writerId 0x000003c2) and subscription (0x000004c2) ParameterLists compared:
+
+    python3 captures/sedpscan.py <capture.pcap>
+
+Loopback UDP was captured with tcpdump (classic pcap, so no editcap step; tshark on macOS
+writes pcapng and does not dissect DLT_NULL frames anyway). Only vendor-range PIDs (>= 0x8000)
+and PID_RELIABILITY (0x001a) are shown - those are the ones that could plausibly carry the
+policy, and RELIABILITY is shown to demonstrate that it does NOT (it stays the standard 12
+octets: kind + max_blocking_time, with no room for an extra field).
+
+------------------------------------------------------------------------------------------------
+acknowledgment_kind = APPLICATION_AUTO (the committed A0 capture)
+------------------------------------------------------------------------------------------------
+PUB: {'0x8000': '07030100', '0x8002': 'len16', '0x800b': '01000000', '0x8021': 'len232'}
+SUB: {'0x001a': '020000000000000099999919', '0x8000': '07030100', '0x8002': 'len16', '0x8009': '01000000', '0x800b': '01000000', '0x8015': '0100000000000000', '0x8021': 'len232'}
+
+------------------------------------------------------------------------------------------------
+acknowledgment_kind = APPLICATION_EXPLICIT
+------------------------------------------------------------------------------------------------
+PUB: {'0x8000': '07030100', '0x8002': 'len16', '0x800b': '03000000', '0x8021': 'len232'}
+SUB: {'0x001a': '020000000000000099999919', '0x8000': '07030100', '0x8002': 'len16', '0x8009': '01000000', '0x800b': '03000000', '0x8015': '0100000000000000', '0x8021': 'len232'}
+
+------------------------------------------------------------------------------------------------
+acknowledgment_kind = PROTOCOL (RTI's default)
+------------------------------------------------------------------------------------------------
+PUB: {'0x8000': '07030100', '0x8002': 'len16', '0x8021': 'len232'}
+SUB: {'0x001a': '020000000000000099999919', '0x8000': '07030100', '0x8002': 'len16', '0x8009': '00000000', '0x8015': '0100000000000000', '0x8021': 'len232'}
+
+================================================================================================
+THE FINDING
+================================================================================================
+
+0x800b is the ONLY field that moves, and it moves on BOTH endpoint kinds:
+
+    PROTOCOL (the default)   PID ABSENT from both records
+    APPLICATION_AUTO         01000000  on both
+    APPLICATION_EXPLICIT     03000000  on both
+
+Every other vendor PID is byte-identical across all three runs: 0x8000 (07030100 = the 7.3.1.0
+product version), 0x8002 (entity virtual GUID), 0x8021 (the compressed TypeObject), and the
+reader-only 0x8015. The values agree with the published
+DDS_ReliabilityQosPolicyAcknowledgmentModeKind ordering - PROTOCOL 0, APPLICATION_AUTO 1,
+APPLICATION_ORDERED 2, APPLICATION_EXPLICIT 3 - so the mapping rests on TWO INDEPENDENT
+SOURCES rather than on one observation.
+
+ONE CORRELATED OBSERVATION DELIBERATELY NOT ACTED ON: 0x8009 appears on the SUBSCRIPTION
+record ONLY, reading 1 whenever acknowledgment_kind is an APPLICATION kind and 0 under
+PROTOCOL. Being reader-only it cannot be the RxO-paired policy, and no published explanation
+of it was found, so it is neither emitted nor interpreted. Naming a field we have not
+identified is what ADR 0089 section 5 forbids.
+

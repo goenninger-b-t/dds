@@ -61,9 +61,10 @@
            #:write-heartbeat #:parse-heartbeat-body
            #:write-acknack #:parse-acknack-body
            #:write-gap #:parse-gap-body
-           ;; ADR 0090: RTI vendor-extension APP_ACK / APP_ACK_CONF — DECODE ONLY, and only ever
-           ;; interpretable under VendorId RTI (RTPS 2.5 §9.4.5.1.1). Nothing here emits them.
+           ;; ADR 0090: RTI vendor-extension APP_ACK / APP_ACK_CONF, interpretable only under a VendorId
+           ;; that gives 0x1c/0x1d this meaning (RTPS 2.5 §9.4.5.1.1) — RTI's, or our own for what we emit.
            #:+submsg-app-ack+ #:+submsg-app-ack-conf+ #:+vendor-id-rti+
+           #:+app-ack-max-virtual-writers+ #:+app-ack-max-intervals+
            #:parse-app-ack-body #:parse-app-ack-conf-body
            #:write-app-ack #:write-app-ack-conf
            #:write-info-ts #:parse-info-ts #:+info-ts-flag-invalidate+
@@ -87,7 +88,7 @@
            #:+pid-builtin-endpoint-set+ #:+pid-endpoint-guid+ #:+pid-key-hash+
            #:+pid-status-info+ #:+pid-data-representation+
            #:+pid-type-information+ #:+pid-type-object-lb+ #:+pid-shmem-host-uuid+
-           #:+pid-zerocopy-capable+
+           #:+pid-zerocopy-capable+ #:+pid-acknowledgment-kind+
            #:+pid-entity-virtual-guid+ #:+pid-service-kind+ #:+service-kind-persistence+
            #:+pid-original-writer-info+
            #:encode-original-writer-info #:parse-original-writer-info
@@ -132,7 +133,15 @@
            #:writer-release-change-ref #:writer-release-change-refs
            #:writer-acquire-payload-buffer #:writer-release-payload-buffer #:writer-ensure-payload-pool
            ;; WP-FLATDATA-LOAN-WRITE one-shot pre-committed-slot transitions (FR-PF-4, R6, ADR 0042)
-           #:writer-zc-claim #:writer-zc-unarm))
+           #:writer-zc-claim #:writer-zc-unarm
+           ;; ADR 0090 A3b: reader-side APP-ACK state. Owned by the DCPS DataReader, NOT by writer-proxy —
+           ;; same-topic readers share a proxy but acknowledge independently, and one speaking for the
+           ;; other would be a FALSE ACK, the one failure this feature must never produce.
+           #:app-ack-state #:make-app-ack-state #:app-ack-state-count
+           #:app-ack-state-accessed #:app-ack-state-reported #:app-ack-state-pending
+           #:app-ack-note-accessed #:app-ack-acknowledge #:app-ack-acknowledge-all
+           #:app-ack-intervals #:app-ack-commit
+           #:+app-ack-flags-newly-acked+ #:+app-ack-flags-previously-reported+))
 
 ;;;; dds.rtps.discovery — SPDP Locator_t codec + SPDPdiscoveredParticipantData
 ;;;; build/parse (RTPS 2.5 §8.5.3 / §9.6.2). Wire constants pinned from the in-repo

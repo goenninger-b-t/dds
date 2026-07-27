@@ -4059,6 +4059,9 @@
                  ("rtps-proxy-key-retention" . run-proxy-key-retention-test)   ; ADR 0088
                  ("app-ack-hostile"          . run-app-ack-hostile-test)     ; ADR 0090
                  ("acknowledgment-kind-rxo"  . run-acknowledgment-kind-rxo-test) ; ADR 0090
+                 ("app-ack-state"            . run-app-ack-state-test)      ; ADR 0090 A3b
+                 ("acknowledgment-kind-wire" . run-acknowledgment-kind-wire-test) ; ADR 0090 A3b
+                 ("app-ack-emit"             . run-app-ack-emit-test)       ; ADR 0090 A3b
                  ("property-based"           . run-pbt-tests)
                  ("udp-loopback"             . run-udp-loopback-test)
                  ("rtps-discovery-spdp"      . dds.rtps.discovery:run-discovery-test)

@@ -62,7 +62,7 @@ a package-qualified accessor.
 | `dds.qos:qos-resource-max-samples-per-instance` | RESOURCE_LIMITS `max_samples_per_instance` (`-1` = `LENGTH_UNLIMITED`) | `-1` |
 | `dds.qos:qos-type-consistency` | TYPE_CONSISTENCY_ENFORCEMENT policy (a `type-consistency-enforcement`, reader-only, not RxO) | `(make-type-consistency-enforcement)` |
 | `dds.qos:qos-writer-cache-high-watermark` / `-low-watermark` | RELIABLE_WRITER_CACHE watermarks (**vendor extension**, ADR 0089; writer-only, not RxO, not in SEDP) — unacknowledged-sample thresholds that open and close a backpressure episode; see below | `nil` (disabled) |
-| `dds.qos:qos-acknowledgment-kind` | ACKNOWLEDGMENT_KIND (**vendor extension**, ADR 0090) — `:protocol` / `:application-auto` / `:application-explicit`; **RxO-checked by EQUALITY** between RELIABLE endpoints; see below | `:protocol` |
+| `dds.qos:qos-acknowledgment-kind` | ACKNOWLEDGMENT_KIND (**vendor extension**, ADR 0090) — `:protocol` / `:application-auto` / `:application-explicit` (+ the decode-only `:unsupported`); **RxO-checked by EQUALITY** between RELIABLE endpoints; propagated in SEDP under RTI's vendor PID 0x800b, omitted at the default; see below | `:protocol` |
 
 ### Endpoint-flavoured constructors
 
@@ -270,8 +270,9 @@ has only `wait_for_acknowledgments`, which is protocol-level — so this mirrors
 | `dds.qos:qos-acknowledgment-kind` | when a sample counts as acknowledged |
 |---|---|
 | `:protocol` *(default)* | by the RTPS protocol — today's behaviour, unchanged |
-| `:application-auto` | when the subscribing application **accesses** it (`read`/`take`) |
+| `:application-auto` | when the subscribing application **accesses** it (`read`/`take`) — *the QoS and its wire propagation are in place; the acknowledgment itself is a later slice* |
 | `:application-explicit` | only on an explicit `acknowledge-sample` / `acknowledge-all` |
+| `:unsupported` | **decode-only.** Where a discovered peer's acknowledgment kind lands when this stack does not implement it (RTI's `APPLICATION_ORDERED`, whose semantics are unsourced, and any future value). It matches nothing we offer, and a *local* endpoint may not be created with it (`INCONSISTENT_POLICY`) |
 
 **Every other ordered policy has a safe direction** — a stronger offer satisfies a weaker request. This
 one has **none**, because the two mismatches fail in *opposite* ways and neither announces itself:
@@ -303,6 +304,58 @@ keyword form, so it is identifiable.
   :qos (dds.qos:make-reader-qos :reliability :reliable
                                 :acknowledgment-kind :application-explicit))
 ```
+
+#### On the wire: `PID_ACKNOWLEDGMENT_KIND` (0x800b)
+
+The policy is propagated in SEDP under RTI's vendor ParameterId **0x800b**, a `u32`, on **both** the
+publication and the subscription record — an RxO-checked policy neither side can see cannot be checked, and
+before this was wired every peer read as `:protocol` and an application-acknowledgment pair could never
+match at all.
+
+The PID and its values were **identified by measurement, not guessed**: the ADR 0090 capture harness was
+run three times against live Connext 7.3.1 with only `acknowledgment_kind` changed, and 0x800b was the sole
+field that moved (`PROTOCOL` → absent, `APPLICATION_AUTO` → 1, `APPLICATION_EXPLICIT` → 3, matching RTI's
+published enumeration order). **It is omitted at `:protocol`, exactly as RTI omits it** — an endpoint not
+using the feature puts nothing extra on the wire, and an absent PID reads as `:protocol`, which is both
+what RTI means by omitting it and the right reading of a peer that has never heard of the policy.
+
+An unrecognised code decodes to `:unsupported`, which matches nothing. That inverts this stack's usual
+rule for wire enumerations (fall back to the default, never reject): here falling back to `:protocol` would
+silently produce one of the two failure modes above, which is the whole reason the policy is RxO-checked.
+
+### Acknowledging a sample (`:application-explicit`)
+
+```lisp
+;; take, process, then acknowledge — the writer may not purge until you do
+(dolist (cs (dds.dcps:take-samples dr))
+  (handle (dds.dcps:cached-sample-data cs))
+  (dds.dcps:acknowledge-sample dr (dds.dcps:cached-sample-info cs)))
+
+;; or acknowledge everything this reader's application has accessed so far
+(dds.dcps:acknowledge-all dr)
+```
+
+| Symbol | Description |
+|---|---|
+| `dds.dcps:acknowledge-sample` | `(acknowledge-sample dr sample-info)` → `:ok` / `:not-enabled` / `:bad-parameter` / `:precondition-not-met`. Identifies the sample by its `publication-handle` (the writer's GUID) + `sequence-number`. Idempotent. |
+| `dds.dcps:acknowledge-all` | `(acknowledge-all dr)` → `:ok` / `:not-enabled` / `:precondition-not-met`. Acknowledges every sample the application has **accessed** and not yet acknowledged, one APP_ACK per writer. |
+
+Three things worth knowing before you rely on it:
+
+- **Only ACCESSED samples are acknowledgeable.** `acknowledge-all` covers what the application has read or
+  taken — not everything the reader holds. Acknowledging the reader's cache would acknowledge exactly the
+  samples this feature exists to keep a writer from purging. A sequence number the application never
+  accessed is **refused** with `:precondition-not-met`, never acknowledged on faith.
+- **`SampleInfo.publication_handle` is required**, because a sequence number is unique only within one
+  writer (RTPS 2.5 §8.3.5.4). It is populated on every delivery path.
+- **A `:protocol` reader refuses** with `:precondition-not-met`: it never negotiated the guarantee, and a
+  writer matched to it purges on protocol acknowledgments alone.
+
+The acknowledgment travels as an RTI-format `APP_ACK` (0x1c) **unicast to the acknowledged writer's
+participant alone** — never fanned out, because the submessage names a `writerId` and two writers in
+different participants routinely share an EntityId. The writer-side effect (a sample is not purgeable until
+app-acked) and the `on-application-acknowledgment` listener are a later slice; see
+[ADR 0090](../adr/0090-application-acknowledgment.md) §6.
 
 ## Examples
 

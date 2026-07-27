@@ -15,6 +15,8 @@ is protocol-level. There is therefore no specification to implement from and no 
 | `captures/rtpsscan.py` | enumerates RTPS submessages straight from the pcap, independently of any dissector |
 | `captures/appack_decode.py` | decodes the APP_ACK bodies **and self-checks the layout** |
 | `captures/appack-decoded.txt` | the decode, committed so the finding is reviewable without rerunning anything |
+| `captures/sedpscan.py` | dumps the SEDP publication/subscription vendor ParameterIds from a capture |
+| `captures/acknowledgment-kind-pids.txt` | the **three-run experiment that identified PID 0x800b** as `acknowledgment_kind`, committed for the same reason — reviewable without Connext installed |
 
 ## Why `APPLICATION_AUTO` and not `APPLICATION_EXPLICIT`
 
@@ -43,6 +45,27 @@ python3 captures/appack_decode.py <your.pcap>   # classic pcap; use editcap -F p
 
 `tshark` on macOS did **not** dissect these DLT_NULL loopback frames (it reports them as raw `Packet NN`),
 which is why the scanners above parse the framing directly rather than relying on it.
+
+## The QoS is on the wire too — PID 0x800b (slice A3b)
+
+`acknowledgment_kind` is propagated in SEDP under RTI vendor ParameterId **0x800b**, a `u32`, on **both**
+the publication and the subscription record, and **omitted at `PROTOCOL`**. That was established by running
+this harness **three times** with only that one value changed and comparing the ParameterLists:
+
+```sh
+# edit USER_QOS_PROFILES.xml, then for each setting:
+tcpdump -i lo0 -s 0 -w run.pcap udp &     # classic pcap; no editcap needed
+./appack_sub 130 12 & sleep 3; ./appack_pub 130 3 16
+python3 captures/sedpscan.py run.pcap
+```
+
+`0x800b` was the only field that moved — absent under `PROTOCOL`, `1` under `APPLICATION_AUTO`, `3` under
+`APPLICATION_EXPLICIT` — matching RTI's published enumeration order. Full output in
+`captures/acknowledgment-kind-pids.txt`.
+
+**Why it had to be measured.** Slice A3a's RxO gate checks this policy by equality, and a policy neither
+side can see cannot be checked: before this was wired, every discovered endpoint read as `PROTOCOL` and an
+application-acknowledgment pair could never match at all.
 
 ## Still unpinned
 

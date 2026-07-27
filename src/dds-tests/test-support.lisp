@@ -178,3 +178,8 @@
   "logging-service OTP-supervisor isolation offset (ADR 0082 §6/§7, FR-LOG-7): one collector whose drain thread is
    killed via the *log-runner-fault* hook, so the supervisor's restart + restart-intensity-shed paths are exercised
    on its own domain (48 is taken by the runner test's second collector).")
+(defconstant +td-app-ack+ 50
+  "APP-ACK emission isolation offset (ADR 0090 A3b): THREE participants — the acknowledged writer, a DECOY
+   writer on the same topic in a DIFFERENT participant, and the reader — on their own domain. The decoy is
+   the whole point of the test, and it only proves anything if no foreign participant shares the domain:
+   the assertion is that the reader's APP_ACK reaches the writer it names and NOTHING ELSE.")

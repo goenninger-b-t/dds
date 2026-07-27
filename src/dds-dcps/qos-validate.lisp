@@ -112,6 +112,17 @@
         (high (dds.qos:qos-writer-cache-high-watermark qos)))
     (or (null low) (null high) (< low high))))
 
+(defun* %acknowledgment-kind-offerable-p (qos)
+    (function (dds.qos:qos) boolean)
+  "T unless QOS's ACKNOWLEDGMENT_KIND (vendor extension, ADR 0090) is :UNSUPPORTED, which a LOCAL endpoint
+   may never carry. :UNSUPPORTED is a DECODE-ONLY value — where a discovered peer's acknowledgment kind
+   lands when this stack does not implement it (RTI's APPLICATION_ORDERED, whose semantics are unsourced,
+   and any future value). Setting it locally would OFFER a guarantee with no implementation behind it: a
+   matched peer would wait for acknowledgments that never come, which is the silent stall ADR 0090 §4 is
+   written to prevent. Refused as INCONSISTENT_POLICY citing +qos-policy-id-invalid+ — the policy is a
+   vendor extension with no OMG QosPolicyId_t, and an id is never invented."
+  (not (eq (dds.qos:qos-acknowledgment-kind qos) :unsupported)))
+
 (defun* %qos-consistent-p (qos)
     (function (dds.qos:qos) (values boolean integer))
   "Validate the DDS 1.4 cross-policy consistency rules that raise INCONSISTENT_POLICY,
@@ -121,8 +132,9 @@
    instance (else the HISTORY id). A consistent QoS yields (values T +qos-policy-id-invalid+). Also
    enforced: the DISCOVERY_CONFIG vendor extension (announce period finite, positive, and shorter than the
    announced lease — %discovery-config-consistent-p) and the RELIABLE_WRITER_CACHE watermarks (low strictly
-   below high — %writer-cache-watermarks-consistent-p), each reporting +qos-policy-id-invalid+ as neither
-   carries an OMG policy id.
+   below high — %writer-cache-watermarks-consistent-p) and ACKNOWLEDGMENT_KIND (never the decode-only
+   :UNSUPPORTED on a local endpoint — %acknowledgment-kind-offerable-p), each reporting
+   +qos-policy-id-invalid+ as none carries an OMG policy id.
    Policies the stack does not yet model (TIME_BASED_FILTER minimum_separation vs DEADLINE) are
    not checked here — recorded as a follow-on, not silently claimed."
   (let ((max-samples (dds.qos:qos-resource-max-samples qos))
@@ -138,5 +150,7 @@
     (unless (%discovery-config-consistent-p qos)
       (return-from %qos-consistent-p (values nil +qos-policy-id-invalid+)))
     (unless (%writer-cache-watermarks-consistent-p qos)
+      (return-from %qos-consistent-p (values nil +qos-policy-id-invalid+)))
+    (unless (%acknowledgment-kind-offerable-p qos)
       (return-from %qos-consistent-p (values nil +qos-policy-id-invalid+)))
     (values t +qos-policy-id-invalid+)))

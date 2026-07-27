@@ -12821,3 +12821,99 @@
                  "a present-but-uninflatable legacy LB falls OPEN to :compatible")
       (dds.dcps:delete-participant p)))
   t)
+
+(defun* run-app-ack-emit-test ()
+    (function () t)
+  "ADR 0090 slice A3b, end to end over the real wire: a DataReader under ACKNOWLEDGMENT_KIND
+   :APPLICATION-EXPLICIT takes a sample, calls acknowledge-sample, and the APP_ACK it emits arrives at the
+   writer that wrote it — AND NOWHERE ELSE.
+
+   ⭐ THE DECOY IS THE TEST. Three participants: PW holds the writer that actually writes, PX holds a
+   SECOND writer on the SAME topic with the SAME QoS that writes nothing, and PR holds the reader, matched
+   to both. A reader's ACKNACK is broadcast to every matched writer-bearing participant and that is
+   harmless, because an ACKNACK is keyed by a SequenceNumberSet a foreign writer simply will not recognise.
+   AN APP_ACK IS NOT: it names a writerId, and two writers in different participants routinely share an
+   EntityId (RTPS 2.5 §8.3.5.4 — a sequence number is unique only within one writer GUID). Fanned out, this
+   message would tell PX's writer that ITS sample 1 was acknowledged by an application that never saw it,
+   after which PX may purge it and report success. So the assertion that matters is the NEGATIVE one:
+   PX's node must have recognised ZERO APP_ACKs.
+
+   Also asserted: publication-handle reaches the application (acknowledge-sample identifies a sample by
+   writer GUID + sequence number and cannot work without it), the acknowledgment is idempotent and does not
+   re-emit, and a :PROTOCOL reader refuses to acknowledge at all.
+
+   FALSIFIED: point node-send-app-ack at %match-destinations-prefixed instead of %prefix-user-destination
+   and :aae-decoy-silent goes red while every other assertion stays green — a targeted failure naming
+   exactly the defect."
+  (let* ((ts (dds.types:find-type-support "dcps-msg"))
+         (dom (test-domain +td-app-ack+))
+         (aq (list :reliability :reliable :acknowledgment-kind :application-explicit))
+         (pw (dds.dcps:create-participant :domain dom))    ; the writer that is acknowledged
+         (px (dds.dcps:create-participant :domain dom))    ; the DECOY: same topic, same QoS, writes nothing
+         (pr (dds.dcps:create-participant :domain dom)))   ; the reader
+    (unwind-protect
+         (let* ((tw (dds.dcps:create-topic pw "AppAckTopic" "dcps-msg" ts))
+                (tx (dds.dcps:create-topic px "AppAckTopic" "dcps-msg" ts))
+                (tr (dds.dcps:create-topic pr "AppAckTopic" "dcps-msg" ts))
+                (dw (dds.dcps:create-datawriter (dds.dcps:create-publisher pw) tw
+                                                :qos (apply #'dds.qos:make-writer-qos aq)))
+                (dx (dds.dcps:create-datawriter (dds.dcps:create-publisher px) tx
+                                                :qos (apply #'dds.qos:make-writer-qos aq)))
+                (dr (dds.dcps:create-datareader (dds.dcps:create-subscriber pr) tr
+                                                :qos (apply #'dds.qos:make-reader-qos aq)))
+                (node-w (dds.dcps::dp-node pw))
+                (node-x (dds.dcps::dp-node px)))
+           (declare (ignorable dx))
+           ;; The reader must match BOTH writers, or the decoy proves nothing.
+           (loop repeat 250
+                 until (>= (dds.dcps:matched-count pr) 2)
+                 do (dds.dcps:spin pw) (dds.dcps:spin px) (dds.dcps:spin pr) (sleep 0.02))
+           (%check :aae-matched-both (>= (dds.dcps:matched-count pr) 2)
+                   "the reader must match BOTH writers — with only one matched, the decoy assertion is vacuous")
+           (dds.dcps:write-sample dw (make-dcps-msg :id 1 :text "app-ack"))
+           (let ((got nil))
+             (loop repeat 250 until got
+                   do (let ((s (dds.dcps:take-samples dr)))
+                        (when s (setf got (first s))))
+                      (sleep 0.02))
+             (%check :aae-took-sample (and got t) "the reader must take the written sample")
+             (when got
+               (let* ((info (dds.dcps:cached-sample-info got))
+                      (handle (dds.dcps:sample-info-publication-handle info)))
+                 (%check :aae-publication-handle
+                         (and handle (= 16 (length handle))
+                              (equalp (subseq handle 0 12) (dds.dcps:participant-guid-prefix pw)))
+                         "SampleInfo.publication_handle must be the writing participant's GUID — acknowledge-sample identifies a sample by (writer, SN) and cannot work without it")
+                 (%check :aae-acknowledged
+                         (eq dds.dcps:+retcode-ok+ (dds.dcps:acknowledge-sample dr info))
+                         "acknowledge-sample on a taken sample must return :OK")
+                 ;; Let the datagram land.
+                 (loop repeat 100
+                       until (plusp (dds.disc:disc-node-app-acks-received node-w))
+                       do (dds.dcps:spin pw) (dds.dcps:spin px) (sleep 0.02))
+                 (%check :aae-arrived
+                         (plusp (dds.disc:disc-node-app-acks-received node-w))
+                         "the APP_ACK must ARRIVE at the writer's participant — recognised under a VendorId that gives 0x1c this meaning")
+                 (%check :aae-decoy-silent
+                         (zerop (dds.disc:disc-node-app-acks-received node-x))
+                         "⚠️ the DECOY participant must have received NO APP_ACK: fanning this message out would tell a same-EntityId writer elsewhere that its sample was acknowledged by an application that never saw it, and it may then purge it — the false ack ADR 0090 is written around")
+                 (let ((before (dds.disc:disc-node-app-acks-received node-w)))
+                   (%check :aae-idempotent
+                           (eq dds.dcps:+retcode-ok+ (dds.dcps:acknowledge-sample dr info))
+                           "a repeated acknowledge-sample must be idempotent, not an error")
+                   (loop repeat 20 do (dds.dcps:spin pw) (sleep 0.01))
+                   (%check :aae-no-reemit
+                           (= before (dds.disc:disc-node-app-acks-received node-w))
+                           "a repeated acknowledgment must not put a second APP_ACK on the wire")))))
+           ;; A :PROTOCOL reader (the default) must refuse to acknowledge at all — it never negotiated the
+           ;; guarantee, and a writer matched to it purges on protocol acks alone.
+           (let* ((tp (dds.dcps:create-topic pr "AppAckPlain" "dcps-msg" ts))
+                  (dp (dds.dcps:create-datareader (dds.dcps:create-subscriber pr) tp)))
+             (%check :aae-protocol-reader-refuses
+                     (eq dds.dcps:+retcode-precondition-not-met+
+                         (dds.dcps:acknowledge-all dp))
+                     "a :PROTOCOL reader must refuse to acknowledge — its writer purges on protocol acks and never asked for an application acknowledgment")))
+      (dds.dcps:delete-participant pw)
+      (dds.dcps:delete-participant px)
+      (dds.dcps:delete-participant pr))
+    t))

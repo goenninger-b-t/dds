@@ -38,6 +38,9 @@
            #:read-next-sample #:take-next-sample
            ;; WP-FLATDATA-ZC-LOAN literal-0-copy loan API (FR-PF-3/4, R6, ADR 0017)
            #:take-loaned #:read-loaned #:return-loan #:return-all-loans
+           ;; ADR 0090 A3b: application acknowledgment (VENDOR EXTENSION — DDS 1.4 and RTPS 2.5 define
+           ;; none). Effective only under ACKNOWLEDGMENT_KIND :APPLICATION-EXPLICIT.
+           #:acknowledge-sample #:acknowledge-all
            ;; WP-FLATDATA-LOAN-WRITE zero-copy TX loan API (FR-PF-4, R6, ADR 0042)
            #:loan-sample #:write-loaned #:discard-loan #:writer-loan #:writer-loan-p
            #:writer-loan-sample #:discard-all-loans

@@ -296,6 +296,8 @@
   (sample-writer-guids (make-hash-table :test 'equalp) :type hash-table) ; src GUID -> SN -> 16-octet source GUID (EXCLUSIVE ownership arbitration, DDS 1.4 §2.2.3.9.2)
   (durability-gate-active nil :type boolean)   ; ADR 0059: T once the DCPS layer owns the reader-side durability baseline (create-datareader / %reader-durability-init arm a WriterProxy per matched writer). ONLY then does "matched but no proxy" mean the ADR 0043 window — a bare dds.disc node (the low-level tests, the shapes runners) never arms by design, so the HEARTBEAT guard must not fire there.
   (hb-unarmed-drops 0 :type (integer 0))   ; ADR 0043 residual / ADR 0059: user HEARTBEATs dropped because the writer was MATCHED but its reader-side durability baseline was not yet ARMED. MUST stay 0: the window is unreachable while SEDP + user HEARTBEATs share the one unicast rx thread. A non-zero value means a WP reopened it (user-data multicast / split metatraffic) and MUST arm the baseline atomically with %record-match — the drop keeps it fail-SAFE (no silent DURABILITY violation) but the writer's history request is delayed a HEARTBEAT period until then.
+  (app-acks-received 0 :type (integer 0))   ; ADR 0090 A3b: inbound APP_ACK (0x1c) submessages RECOGNISED — i.e. that arrived under a VendorId giving 0x1c this meaning (RTI's, or our own for what we emit). RECOGNISED IS NOT PROCESSED: this slice emits application acknowledgments and counts arrivals so an ours<->ours test can prove the datagram landed; the writer-side APPLICATION watermark, on-application-acknowledgment and APP_ACK_CONF are slice A3c and DO NOT EXIST YET. Nothing reads this counter to decide anything about a sample's fate — a writer that purged on it would be purging on an unprocessed message
+  (app-ack-confs-received 0 :type (integer 0)) ; ADR 0090 A3b: inbound APP_ACK_CONF (0x1d) submessages recognised, same VendorId gate and the same "recognised, not processed" caveat. Counted separately because the two travel in OPPOSITE directions — APP_ACK reader->writer, APP_ACK_CONF writer->reader — so one counter for both would hide which leg of the exchange actually ran
   (decode-fail-counts (make-hash-table :test 'equalp) :type hash-table) ; ADR 0031 lim.1 + ADR 0059: src GUID -> (KM sender_key_id . (SN -> consecutive KM-PRESENT decode-failure count)); the key-id STAMP resets the classification if a writer's KM is ever rotated (so samples under a NEW key are never suppressed by the STALE key's failures — discharges the ADR 0031 lim.1 forward requirement); bounds retransmit churn of a permanently-undecodable secured sample (never counts a missing-KM failure); pruned on writer unmatch + capped (NFR-MEM/NFR-SEC-POSTURE)
   (sample-origins (make-hash-table :test 'equalp) :type hash-table) ; src GUID -> SN -> (effective-origin-GUID . effective-origin-SN): the PID_ORIGINAL_WRITER_INFO logical origin when the received sample was relayed (RTPS 2.5 §8.3.5.4), absent for a direct sample (then the wire GUID/SN IS the origin)
   (capture-data-key-hash nil :type boolean) ; durability collect node opts in to materialize the wire PID_KEY_HASH on :data (control-plane); default NIL = byte-identical, no hot-path alloc (ADR 0029, RTPS 2.5 §9.6.4.8)
@@ -1528,6 +1530,21 @@
   (let ((p (make-array 12 :element-type '(unsigned-byte 8))))
     (replace p (dds.core.buffer:octet-buffer-vec buf) :start2 8 :end2 20)
     p))
+
+(defun* %source-vendor-id (buf)
+    (function (dds.core.buffer:octet-buffer) (unsigned-byte 16))
+  "The sender's 16-bit VendorId from the RTPS header of datagram BUF (offset 6, BIG-ENDIAN — the Header's
+   fields are not subject to a submessage E flag; RTPS 2.5 §9.4.4 / §8.3.5.2). Zero-alloc: two AREFs.
+
+   READ FOR ONE REASON — §9.4.5.1.1 makes a vendor submessage's meaning DEPENDENT on the VendorId current
+   when it is encountered, so a submessage id outside the standard set can only be interpreted once this
+   is known. A datagram shorter than the 20-octet header never reaches here (dispatch-message rejects it),
+   but this is called from %handle-datagram BEFORE dispatch, so it bounds-checks rather than trusting SIZE
+   (NFR-SEC-POSTURE) and reports VENDORID_UNKNOWN for a runt, which matches no gate."
+  (let ((v (dds.core.buffer:octet-buffer-vec buf)))
+    (if (< (length v) 8)
+        dds.rtps.message:+vendor-id-unknown+
+        (logior (ash (aref v 6) 8) (aref v 7)))))
 
 ;; Endpoint GUID classifiers: defined in dataplane.lisp (loaded after this file).
 (declaim (ftype (function ((simple-array (unsigned-byte 8) (16))) t) %writer-guid-p %reader-guid-p))
@@ -2901,7 +2918,29 @@
          ((and (= id dds.rtps.message:+submsg-heartbeat-frag+) (disc-node-on-heartbeat-frag node) (not enforce-rtps))
           (funcall (disc-node-on-heartbeat-frag node) c flags src-prefix))
          ((and (= id dds.rtps.message:+submsg-nack-frag+) (disc-node-on-nack-frag node) (not enforce-rtps))
-          (funcall (disc-node-on-nack-frag node) c flags)))))
+          (funcall (disc-node-on-nack-frag node) c flags))
+         ;; ADR 0090 A3b: RTI's vendor APP_ACK / APP_ACK_CONF, RECOGNISED (counted) but NOT PROCESSED —
+         ;; the writer-side APPLICATION watermark and on-application-acknowledgment are slice A3c. The
+         ;; counters exist so an ours<->ours test can prove an emitted APP_ACK actually ARRIVED; nothing
+         ;; downstream reads them, so a sample's fate never turns on an unprocessed message.
+         ;;
+         ;; THE VENDORID GATE IS MANDATORY, NOT DEFENSIVE. 0x1c/0x1d live in the OMG PROTOCOL-reserved
+         ;; range 0x00-0x7f (RTPS 2.5 §9.4.5.1.1) — space the OMG may still assign — so these ids mean
+         ;; "application acknowledgment" ONLY under a VendorId that says so: RTI's, or OUR OWN for the
+         ;; messages this stack emits. Under any other vendor the submessage is skipped by construction
+         ;; (dispatch-message repositions to body-start + body-len, §8.3.3.2 rule 3), exactly as before.
+         ;; It is deliberately NOT gated on (not enforce-rtps): counting cannot be forged into anything —
+         ;; there is no state to corrupt — and gating a pure counter would make the T10 drop invisible.
+         ;; The VendorId is read HERE rather than hoisted into the enclosing LET*: every datagram would
+         ;; otherwise pay for it, and only these two submessage ids ever need it.
+         ((and (or (= id dds.rtps.message:+submsg-app-ack+)
+                   (= id dds.rtps.message:+submsg-app-ack-conf+))
+               (let ((vendor (%source-vendor-id buf)))
+                 (or (= vendor dds.rtps.message:+vendor-id-rti+)
+                     (= vendor dds.rtps.message:*vendor-id*))))
+          (if (= id dds.rtps.message:+submsg-app-ack+)
+              (incf (disc-node-app-acks-received node))
+              (incf (disc-node-app-ack-confs-received node)))))))
        (declare (dynamic-extent #'%rx-dispatch-submsg))
        (dds.rtps.message:dispatch-message cursor #'%rx-dispatch-submsg size)))
     t))

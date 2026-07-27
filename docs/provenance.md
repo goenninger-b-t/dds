@@ -3382,3 +3382,38 @@ method ADR 0086 used for MUTABLE, with the dissector serving only as a labelled 
 
 Both are recorded in ADR 0090 §3, and they are why that ADR asks the owner a scope question instead of
 proposing an implementation.
+
+## 2026-07-27 (slice A3b) — RTI Connext SEDP vendor PID 0x800b, identified by controlled experiment
+
+**Source consulted.** No new document and no new tool. The **live RTI Connext 7.3.1 wire**, via the
+capture harness already committed at `interop/connext/appack/` — peers written here against RTI's public
+API, no `rtiddsgen` output or RTI source read into the tree.
+
+**What was done.** Slice A3b needed `acknowledgment_kind` on the SEDP wire (without it the ADR 0090 A3a
+RxO gate compares every peer against `:protocol` and an application-acknowledgment pair can never match).
+Rather than invent a ParameterId or guess RTI's, the harness was run **three times** with the single value
+`acknowledgment_kind` changed in `USER_QOS_PROFILES.xml`, capturing loopback UDP with `tcpdump` (classic
+pcap, so no `editcap` step) and comparing the SEDP publication and subscription ParameterLists with a
+short ad-hoc parser over the framing this stack already implements:
+
+| `acknowledgment_kind` | SEDP publication 0x800b | SEDP subscription 0x800b |
+|---|---|---|
+| `PROTOCOL` (the default) | absent | absent |
+| `APPLICATION_AUTO` | `01 00 00 00` | `01 00 00 00` |
+| `APPLICATION_EXPLICIT` | `03 00 00 00` | `03 00 00 00` |
+
+`0x800b` was the **only** field that moved; every other vendor PID (`0x8000` product version, `0x8002`
+entity virtual GUID, `0x8021` compressed TypeObject, and the reader-only `0x8015`) was byte-identical
+across all three runs. The values agree with the published `DDS_ReliabilityQosPolicyAcknowledgmentModeKind`
+ordering (PROTOCOL 0, APPLICATION_AUTO 1, APPLICATION_ORDERED 2, APPLICATION_EXPLICIT 3), so the reading
+rests on **two independent sources**, not on one observation.
+
+**Why this is clean-room (NFR-IP).** What was taken is a **wire value observed from a running product** —
+the same class of artefact as `PID_TYPE_OBJECT_LB` (0x8021) and `PID_ENTITY_VIRTUAL_GUID` (0x8002), both
+identified the same way and already shipped. No RTI source, header, or generated code was read, decompiled
+or adapted; the octets are the interoperability contract, not RTI's expression of it.
+
+**One observation deliberately NOT acted on.** Vendor PID `0x8009` appeared on the **subscription record
+only**, reading 1 whenever `acknowledgment_kind` was an APPLICATION kind and 0 under PROTOCOL. Being
+reader-only it cannot be the RxO-paired policy, and no published explanation of it was found, so it is
+neither emitted nor interpreted. Naming a field we have not identified is what ADR 0089 §5 forbids.

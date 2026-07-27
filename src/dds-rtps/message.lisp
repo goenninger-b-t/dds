@@ -1094,6 +1094,36 @@
 ;;;; NOT cleared for ship — pending counsel (R6); see ADR 0014.
 (defconstant +pid-zerocopy-capable+           #x8041
   "Vendor PID (1 octet, 1 = endpoint understands WP-ZEROCOPY references). ADR 0014; ours, NOT a spec clause.")
+(defconstant +pid-acknowledgment-kind+        #x800b
+  "PID_ACKNOWLEDGMENT_KIND — RTI Connext VENDOR SEDP parameter (high-bit 0x8000 vendor range) carrying
+   DDS_ReliabilityQosPolicy.acknowledgment_kind as a u32 in the ParameterList's endianness. NOT an OMG-spec
+   PID: application acknowledgment appears nowhere in DDS 1.4 or RTPS 2.5 (ADR 0090 §1).
+
+   ⭐ IDENTIFIED BY MEASUREMENT, NOT BY GUESS, AND FALSIFIED THREE WAYS. The interop/connext/appack harness
+   was re-run against live Connext 7.3.1 with the acknowledgment_kind changed in USER_QOS_PROFILES.xml and
+   the SEDP publication + subscription ParameterLists compared; 0x800b was the ONLY field that moved, and it
+   moved in lockstep on BOTH endpoint kinds:
+
+     PROTOCOL (the default)   PID ABSENT from both records
+     APPLICATION_AUTO         01 00 00 00  on both
+     APPLICATION_EXPLICIT     03 00 00 00  on both
+
+   Three settings, three distinct observations, every other vendor PID byte-identical across all three. The
+   values line up with the published DDS_ReliabilityQosPolicyAcknowledgmentModeKind order (PROTOCOL 0,
+   APPLICATION_AUTO 1, APPLICATION_ORDERED 2, APPLICATION_EXPLICIT 3), so the mapping is corroborated by
+   two independent sources rather than assumed from one.
+
+   OMITTED AT THE DEFAULT, as RTI omits it — see dds.rtps.discovery's writer. A peer that never sends this
+   PID is :PROTOCOL, which is also what a non-RTI peer that has never heard of application acknowledgment
+   is, and is the correct reading for both.
+
+   Clean-room (NFR-IP): observed on the wire, exactly as +pid-type-object-lb+ and +pid-entity-virtual-guid+
+   were. No RTI source, header or rtiddsgen output was read. Provenance: docs/provenance.md.
+
+   ⚠️ A CORRELATED OBSERVATION WE DELIBERATELY DO NOT EMIT: vendor PID 0x8009 appeared on the SUBSCRIPTION
+   record only, reading 1 whenever acknowledgment_kind was an APPLICATION kind and 0 under PROTOCOL. Being
+   reader-only it cannot be the RxO-paired policy, and its meaning is unsourced, so it is neither emitted
+   nor interpreted — naming a field we have not identified is what ADR 0089 §5 forbids.")
 (defconstant +pid-original-writer-info+       #x0061
   "PID_ORIGINAL_WRITER_INFO — GUID + SequenceNumber of the original writer (RTPS 2.5 §8.3.5.4, Table 9.12).
    Carried in inline-QoS of DATA/DATA_FRAG sent by a Persistence Service replaying retained samples to late

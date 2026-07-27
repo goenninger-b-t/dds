@@ -144,6 +144,48 @@ over-estimate that fifteen minutes of capture would have caught. Recorded rather
 lesson is that the cost argument against a wire feature should not be written *before* looking at the
 wire, when looking is this cheap.
 
+## 3.2 ⭐ THE QoS IS ON THE WIRE TOO — PID 0x800b, identified by measurement (slice A3b)
+
+Slice A3b began by trying to make an `:application-explicit` pair match, and it could not. **Slice A3a
+shipped the RxO gate without the wire.** `acknowledgment-kind` was never propagated in SEDP, so every
+discovered endpoint read as `:protocol`, the equality gate compared each peer against a value nobody
+advertised, and an application-acknowledgment pair **could never match at all**. The gate was correct and
+the feature was unreachable — a shape worth naming, because a policy neither side can see cannot be
+RxO-checked, and nothing in A3a's tests could notice (they called `qos-rxo-compatible` directly).
+
+The fix needed a ParameterId, and rather than invent one, the A0 capture harness was re-run three times
+against live Connext 7.3.1 with `acknowledgment_kind` changed in `USER_QOS_PROFILES.xml`, comparing the
+SEDP publication and subscription ParameterLists:
+
+| `acknowledgment_kind` | SEDP publication 0x800b | SEDP subscription 0x800b |
+|---|---|---|
+| `PROTOCOL` (the default) | **absent** | **absent** |
+| `APPLICATION_AUTO` | `01 00 00 00` | `01 00 00 00` |
+| `APPLICATION_EXPLICIT` | `03 00 00 00` | `03 00 00 00` |
+
+**0x800b was the only field that moved**, it moved on both endpoint kinds, and every other vendor PID was
+byte-identical across all three runs. The values line up with the published
+`DDS_ReliabilityQosPolicyAcknowledgmentModeKind` order (PROTOCOL 0, APPLICATION_AUTO 1,
+APPLICATION_ORDERED 2, APPLICATION_EXPLICIT 3), so the mapping rests on two independent sources rather
+than on one observation. Clean-room: octets off the wire, exactly as `PID_TYPE_OBJECT_LB` and
+`PID_ENTITY_VIRTUAL_GUID` were identified; no RTI source, header or `rtiddsgen` output was read.
+
+Two consequences worth stating:
+
+- **We omit it at `:protocol`, as RTI does.** An endpoint not using the feature puts nothing extra on the
+  wire, and "absent" reads as `:protocol` — which is what RTI means by omitting it *and* the right reading
+  of a peer that has never heard of the policy.
+- **An unrecognised code becomes `:unsupported`, which matches nothing.** This inverts the rule every other
+  wire-kind mapper in `dds.rtps.discovery` follows (fall back to the default, never reject — FR-QOS-2).
+  For this policy falling back to `:protocol` would silently match a peer whose writer waits for
+  acknowledgments we never send, or whose reader believes a guarantee we are not honouring: §4's two
+  failure modes exactly. `APPLICATION_ORDERED` lands there deliberately — its semantics remain unsourced.
+
+**A correlated observation deliberately not acted on:** vendor PID `0x8009` appeared on the *subscription*
+record only, reading 1 whenever `acknowledgment_kind` was an APPLICATION kind and 0 under PROTOCOL. Being
+reader-only it cannot be the RxO-paired policy, and its meaning is unsourced, so it is neither emitted nor
+interpreted (ADR 0089 §5).
+
 ## 4. Why this is worth doing at all
 
 APP-ACK is the difference between *"the middleware has it"* and *"the application has processed it."* For
@@ -219,11 +261,38 @@ writer's own GUID satisfies the ordinary case.
   44 for two). The **decoder ignores that field**, so its meaning had never had to be understood — decode
   verification cannot test what it does not read. Still outstanding for A2: the *live* leg (our reader
   acknowledging a Connext writer), which needs the A3 QoS before there is anything to drive it.
-- **Slice A3 — the DCPS semantics.** The QoS (`acknowledgment-kind`, RxO-gated — a writer offering
-  application acks must not match a reader that will never send them; that is a silent stall, the ADR 0057
-  shape), the reader API, the writer-side application watermark beside ADR 0089's acked-watermark, and
-  `on-application-acknowledgment` with **all three registrations** (ADR 0089 §2), covered automatically by
-  the completeness test.
+- **Slice A3a — the QoS + its RxO gate. ✅ DONE.** `acknowledgment-kind`, RxO-checked **by equality**: a
+  writer offering application acks must not match a reader that will never send them (silent stall), and a
+  `:protocol` writer must not match an application reader (silent data loss). Neither direction is safe, so
+  neither is allowed. **Its gap, found by A3b and recorded in §3.2: the policy was never put on the wire**,
+  so the gate compared every peer against `:protocol` and the pair could not match. Closed in A3b.
+- **Slice A3b — SEDP propagation + the reader API + emission. ✅ DONE.**
+  - `PID_ACKNOWLEDGMENT_KIND` (0x800b) in SEDP, both roles, omitted at `:protocol` — §3.2.
+  - `acknowledge-sample` / `acknowledge-all` on the DataReader, returning DDS ReturnCode_t. Both act only
+    on samples the application has **ACCESSED** (read or taken): acknowledging the reader's whole cache
+    would acknowledge exactly the samples this feature exists to keep a writer from purging. An SN that was
+    never accessed is **refused** (`PRECONDITION_NOT_MET`), never acknowledged on faith.
+  - `SampleInfo.publication_handle` is now populated — `acknowledge-sample` identifies a sample by (writer
+    GUID, sequence number), because a sequence number is unique only within one writer (RTPS 2.5 §8.3.5.4).
+    It is **aliased, not copied**, which costs 0 B/sample and places a constraint on ADR 0088: a memoised
+    invariant GUID (its Option B) keeps this safe, a shared mutable scratch (its Option A) would rewrite a
+    handle the application already holds.
+  - The reader-side interval state machine, whose emitted octets are **byte-compared against RTI's captured
+    APP_ACKs** by `make corpus` — the A2 round-trip lesson applied one level up: A2 re-derived the *layout*
+    from a decode, this re-derives the *content* from the API and reproduces RTI's bytes for both committed
+    vectors.
+  - `node-send-app-ack`, **unicast to the writer's participant alone**. A reader's ACKNACK is fanned out to
+    every matched peer harmlessly, because it is keyed by a SequenceNumberSet a foreign writer will not
+    recognise; an APP_ACK names a *writerId*, and two writers in different participants routinely share an
+    EntityId — fanned out it would tell a same-EntityId writer elsewhere that its sample was acknowledged
+    by an application that never saw it. The integration test asserts the negative: a decoy participant
+    with a same-topic writer receives **zero**.
+  - Inbound 0x1c/0x1d are **recognised and counted** under a VendorId that gives them this meaning (RTI's,
+    or ours for what we emit), so the ours↔ours test can prove the datagram landed. Recognised is **not**
+    processed — no watermark, no listener, no APP_ACK_CONF.
+- **Slice A3c — the writer side.** The APPLICATION watermark beside ADR 0089's acked-watermark (a change is
+  not purgeable until app-acked), APP_ACK_CONF, and `on-application-acknowledgment` with **all three
+  registrations** (ADR 0089 §2), covered automatically by the completeness test.
 - **`APPLICATION_ORDERED` stays out of scope** until its semantics can be sourced. No published explanation
   was found, and inventing one under RTI's name is what ADR 0089 §5 forbade.
 
