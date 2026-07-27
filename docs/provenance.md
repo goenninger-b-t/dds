@@ -3341,3 +3341,44 @@ mechanism it was chosen for would be parity in appearance only. Both watermarks 
 disabled here, and the divergence is documented at the QoS slot, in `docs/wiki/dcps.md` and in ADR 0089
 §4.2 rather than left for someone to discover. Reading a vendor's published defaults tells you what they
 chose; it does not tell you it is right for a different design.
+
+## 2026-07-27 — the Wireshark RTPS dissector + RTI public API docs, for APP-ACK (ADR 0090)
+
+**What was consulted, and why.** Application acknowledgment is an RTI vendor extension with **no OMG
+clause at all** — verified, not assumed: an exhaustive search of `docs/specs/rtps-2_5.pdf` (11 088
+extracted lines) and `rtps-2_5-xmi.xml` returns **zero** occurrences of application acknowledgment in any
+phrasing, and `dds_rtf2_dcps.idl` mentions only `wait_for_acknowledgments`, which is protocol-level. With
+no specification to implement from, two external sources were read:
+
+1. **RTI's public API reference** (`community.rti.com/.../7.3.0/...`) — `DDS_ReliabilityQosPolicy`,
+   `DDS_ReliabilityQosPolicyAcknowledgmentModeKind` and `DDS_AcknowledgmentInfo`: the four acknowledgment
+   modes, what causes a sample to become acknowledged in each, and the four fields of the info struct.
+   Same narrow scope as the 2026-07-26 entries: **public documentation only**, no header, no shipped
+   source, no `rtiddsgen` output, no disassembly, nothing copied.
+
+2. **The Wireshark RTPS dissector**, via the *installed binary's own metadata* — `tshark -G values` and
+   `tshark -G fields` on Wireshark 4.6.6. This yields the submessage-id table (`APP_ACK 0x1c`,
+   `APP_ACK_CONF 0x1d`) and the dissector's field names for their structure (`virtualWriterCount`,
+   `octetsToNextVirtualWriter`, `intervalCount`, `intervalFlags`, `intervalPayloadLength`, `count`).
+
+**Why the Wireshark reading is sound, and where its line is.** Wireshark is **GPL** — the operating
+contract permits reading open source *for understanding* while forbidding copying, because copying imports
+the licence (NFR-IP, IMPLEMENTATION-PLAN §11). Nothing was copied: what was taken is a **field-name
+inventory produced by running the shipped tool's own introspection flags**, which is the same class of
+information a protocol-analyser UI displays to any user. No dissector source was read or adapted, and none
+will be — if a codec is written it will be written from a **live capture** validated byte-for-byte, the
+method ADR 0086 used for MUTABLE, with the dissector serving only as a labelled view of those bytes.
+
+**What it changed — two findings that reshaped the ADR before a line of code existed.**
+1. **`APP_ACK` 0x1c / `APP_ACK_CONF` 0x1d sit in the OMG protocol-reserved range 0x00–0x7f**, not the
+   vendor range 0x80–0xff that RTPS 2.5 §9.4.5.1.1 sets aside for exactly this purpose. RTI occupies a
+   whole cluster there (0x14, 0x17–0x1e) while using the vendor range elsewhere (`DATA_FRAG_SESSION 0x81`).
+   Anything we emit at 0x1c would squat on space the OMG may assign, and is interpretable only under a
+   VendorId gate.
+2. **The format is built on RTI's *virtual writer* abstraction** (the outer loop is `virtualWriterCount`;
+   `HEARTBEAT_VIRTUAL 0x1e` is its sibling) — an identity model this stack does not have. So "APP-ACK
+   interop with Connext" is materially larger than the feature name suggests, which is precisely the kind
+   of thing that is invisible until someone looks at the wire.
+
+Both are recorded in ADR 0090 §3, and they are why that ADR asks the owner a scope question instead of
+proposing an implementation.

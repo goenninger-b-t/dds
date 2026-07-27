@@ -87,6 +87,19 @@ interop/fastdds/log/log_pub
 interop/fastdds/log/participant_guard.hpp
 interop/fastdds/log/profiles.xml
 
+# APP-ACK capture harness (ADR 0090): rtiddsgen output + binaries (clean-room: never checked in).
+# The PCAP AND THE DECODE ARE COMMITTED ON PURPOSE — application acknowledgment has no OMG clause, so
+# that capture IS the specification this stack will be built against, and a finding nobody can re-read
+# is not evidence.
+interop/connext/appack/ShapeType.hpp
+interop/connext/appack/ShapeType.cxx
+interop/connext/appack/ShapeTypePlugin.hpp
+interop/connext/appack/ShapeTypePlugin.cxx
+interop/connext/appack/.gen.stamp
+interop/connext/appack/appack_pub
+interop/connext/appack/appack_sub
+interop/connext/appack/captures/__pycache__/
+
 # RTI dylib symlinks. interop/connext/common/common.mk's `rtilinks` target drops these beside EVERY
 # Connext peer binary, in whatever directory that peer lives — they are absolute paths into a
 # machine-specific Connext install, so they are generated, never committed. A per-directory rule is

@@ -42,6 +42,14 @@ decode.err
 tshark.err
 *.out
 
+# ADR 0090 APP-ACK capture is kept: application acknowledgment has NO OMG clause, so this pcap and its
+# decode ARE the specification the codec will be written against. A wire finding nobody can re-read is
+# not evidence, so these are deliberately exempt from the transient-artifact sweep above.
+!appack/captures/
+!appack/captures/*.pcap
+!appack/captures/*.txt
+!appack/captures/*.py
+
 # archived no-key interop proof captures are kept (force-added under nokey/captures/)
 !nokey/captures/
 !nokey/captures/*.pcap
