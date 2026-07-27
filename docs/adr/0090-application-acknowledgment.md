@@ -186,6 +186,50 @@ record only, reading 1 whenever `acknowledgment_kind` was an APPLICATION kind an
 reader-only it cannot be the RxO-paired policy, and its meaning is unsourced, so it is neither emitted nor
 interpreted (ADR 0089 §5).
 
+## 3.3 ⭐ A2-LIVE — measured against RTI Connext 7.3.1, and it overturned this ADR's own caution
+
+Slices A3b/A3c emit APP_ACK (0x1c) and PID 0x800b under **OUR** VendorId (0x01FF), never RTI's — claiming
+RTI's would make every other submessage in the datagram interpretable under RTI's rules and would misstate
+who sent it. Whether Connext *honours* either from a foreign VendorId was left as a fact to measure. It has
+now been measured, on loopback against live Connext 7.3.1, and **the answer is yes in both directions**:
+
+| leg | result |
+|---|---|
+| our `:application-explicit` reader ← Connext `APPLICATION_EXPLICIT` writer | **matched**; we sent 5 APP_ACK, **Connext confirmed all 5** with APP_ACK_CONF |
+| our `:application-auto` writer → Connext `APPLICATION_AUTO` reader | **matched**; Connext sent APP_ACKs, we processed 2 covering SN 1–5, the APPLICATION watermark advanced and **the HistoryCache was released to 0** |
+| our `:protocol` reader ← Connext `APPLICATION_EXPLICIT` writer | **we refuse the match — Connext matches anyway and delivers all 5 samples** |
+
+The first row is evidenced **on the wire by sender VendorId**, not by our own counters: the capture holds
+5 × APP_ACK from `01ff` (ours) and 5 × APP_ACK_CONF from `0101` (RTI). RTI confirms only an APP_ACK it
+accepted, so the confirmation *is* the acceptance.
+
+**⚠️ THE CORRECTION THIS FORCES.** Before measuring, a vendor gate was proposed — match an APPLICATION
+acknowledgment kind only against a VendorId proven to interoperate, refusing RTI until demonstrated. **That
+gate would have broken a combination that demonstrably works, and it is dropped.** This is the second time
+in this ADR that fifteen minutes of capture overturned an argument written first (§3.1 was the first). The
+rule is now explicit: *on this feature, do not reason about the wire before looking at it.*
+
+**⚠️ THE HAZARD THAT IS REAL, AND IT IS NOT ABOUT VendorId.** Row 3: **RTI does not refuse to match a reader
+that cannot acknowledge.** Its `APPLICATION_EXPLICIT` writer matched our `:protocol` reader and delivered
+every sample; that writer is then waiting for acknowledgments which will never come. DDS matching is
+per-side, so our own equality gate — which correctly refused the match locally — **cannot stop the peer from
+matching us**. We can be the *cause* of a foreign writer's unbounded retention and cannot prevent it.
+
+What we can do, and do:
+- **Our own writer cannot be stalled this way.** The equality gate refuses a `:protocol` reader, so it never
+  enters `%matched-reader-keys` and never pins the purge watermark; and row 2 shows a live Connext reader
+  does acknowledge us.
+- **The refusal is already visible**, not silent: it raises `REQUESTED_INCOMPATIBLE_QOS` naming
+  `:acknowledgment-kind` (asserted by `:rxo-ack-names-the-policy`). That is the operator-actionable signal.
+- **The limit is documented rather than papered over.** No mechanism in DDS lets one participant prevent
+  another from matching it.
+
+*(An aside worth keeping: row 2 initially did not match at all, and the cause was `DATA_REPRESENTATION`,
+not application acknowledgment — `make-writer-qos` offers XCDR2 only, and the Connext reader in this
+configuration accepted XCDR1. Recorded so the next person does not read it as an app-ack failure.)*
+
+Evidence: `interop/connext/appack/captures/a2live-results.txt`.
+
 ## 4. Why this is worth doing at all
 
 APP-ACK is the difference between *"the middleware has it"* and *"the application has processed it."* For

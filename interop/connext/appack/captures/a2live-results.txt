@@ -1,0 +1,79 @@
+A2-live: OUR stack vs LIVE RTI Connext 7.3.1, application acknowledgment (ADR 0090 §3.3)
+========================================================================================
+
+THE QUESTION. We emit APP_ACK (submessage 0x1c) and the acknowledgment_kind ParameterId 0x800b under
+OUR OWN VendorId (0x01FF), never RTI's -- claiming RTI's would make every other submessage in the
+datagram interpretable under RTI's rules and would misstate who sent it. Whether Connext HONOURS
+either from a foreign VendorId cannot be settled by reading code. These are the measurements.
+
+Transport: loopback UDPv4 (the harness profile forces it; Connext prefers SHMEM same-host, which
+never reaches the wire). Capture: tcpdump -i lo0 (classic pcap, no editcap needed).
+
+LEG 1 - our :application-explicit READER  <-  Connext APPLICATION_EXPLICIT writer
+-------------------------------------------------------------------------------
+A2LIVE domain=130 reader-kind=:APPLICATION-EXPLICIT advertising 127.0.0.1
+A2LIVE RESULT discovered=1 matched=1 taken=5 acked=5 app-acks-sent-arrivals=0 app-ack-confs-received=5
+A2LIVE Q1-match=MATCHED Q2-conf=CONF-RECEIVED
+
+  wire evidence (submessage counted by SENDER vendorId, from the capture itself):
+    vendorId 01ff (US)          APP_ACK       x5
+    vendorId 0101 (RTI Connext) APP_ACK_CONF  x5
+  => Connext ACCEPTED our APP_ACK from a foreign VendorId and CONFIRMED every one.
+     RTI confirms only an APP_ACK it accepted, so the confirmation IS the acceptance.
+
+LEG 2 - our :application-auto WRITER  ->  Connext APPLICATION_AUTO reader
+------------------------------------------------------------------------
+A2LIVEW domain=138 writer-kind=:APPLICATION-AUTO
+A2LIVEW discovered=1 matched=1
+A2LIVEW wrote=5 stored-after-write=5
+A2LIVEW RESULT matched=1 stored-at-end=0 app-acks=2 last-sn=5 app-unacked=0
+A2LIVEW VERDICT history RELEASED
+[connext-appack-sub] RESULT: took 5 sample(s)
+  => Connext's reader app-acked US; our APPLICATION watermark advanced to SN 5 and the
+     HistoryCache was RELEASED to 0. A Connext reader cannot stall our writer.
+
+     NOTE this leg first failed to match at all, and the cause was DATA_REPRESENTATION,
+     NOT application acknowledgment: make-writer-qos offers XCDR2 only and the Connext
+     reader in this configuration accepted XCDR1. Recorded so it is not misread.
+
+LEG 3 (CONTROL) - our :protocol READER  <-  Connext APPLICATION_EXPLICIT writer
+------------------------------------------------------------------------------
+A2LIVE domain=132 reader-kind=:PROTOCOL advertising 127.0.0.1
+A2LIVE RESULT discovered=1 matched=0 taken=5 acked=0 app-acks-sent-arrivals=0 app-ack-confs-received=0
+A2LIVE Q1-match=NO-MATCH Q2-conf=NO-CONF
+  => WE refuse the match (matched=0, REQUESTED_INCOMPATIBLE_QOS naming :acknowledgment-kind).
+     CONNEXT MATCHES ANYWAY and delivers all 5 samples. Its writer is then waiting for
+     acknowledgments that will never come.
+
+⚠️ AN UNRELATED OBSERVATION FROM LEG 3, NOT AN APP-ACK FINDING, BUT LOUDER THAN ONE
+====================================================================================
+Leg 3 reports matched=0 AND taken=5. Our reader refused the match on RxO -- and still delivered the
+refused writer's samples to the application. The RxO gate decided "incompatible" and the data arrived
+anyway, which makes the gate's verdict advisory rather than binding.
+
+Hypothesis (NOT yet confirmed): the WP-N-ENDPOINT-S2 delivery route falls back to the primary reader
+when a source GUID has no route -- documented there as the "N=1/pre-match" case -- so an unmatched
+remote writer's samples land on the primary. That path predates application acknowledgment; app-ack
+merely made it observable, because this is the first QoS whose refusal is expected to be absolute.
+
+It needs its own investigation and is recorded here rather than folded into ADR 0090.
+
+WHAT THIS SETTLES
+=================
+1. Cross-vendor application acknowledgment WORKS IN BOTH DIRECTIONS under our own VendorId.
+   A proposed "vendor gate" -- match an APPLICATION kind only against a proven VendorId -- was
+   DROPPED as a result: it would have refused a combination that demonstrably works.
+
+2. RTI DOES NOT REFUSE to match a reader that cannot acknowledge. DDS matching is per-side, so our
+   own equality gate cannot stop a peer from matching us: we can be the CAUSE of a foreign writer's
+   unbounded retention and cannot prevent it. Our own writer is protected (the gate keeps a
+   :protocol reader out of the purge watermark) and our refusal is visible, not silent.
+
+REPRODUCING
+===========
+  export NDDSHOME=/Applications/rti_connext_dds-7.3.1 CONNEXTDDS_ARCH=arm64Darwin20clang12.0
+  # edit USER_QOS_PROFILES.xml for the acknowledgment_kind under test, then per leg:
+  tcpdump -i lo0 -s 0 -w run.pcap udp &
+  ./appack_pub <domain> 5 18       # leg 1/3: RTI writes, our reader acknowledges
+  ./appack_sub <domain> 24         # leg 2:   RTI reads, our writer is acknowledged
+  python3 captures/rtpsscan.py run.pcap     # submessages + vendorIds actually on the wire
