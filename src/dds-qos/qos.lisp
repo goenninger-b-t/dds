@@ -245,7 +245,15 @@
   ;; :UNSUPPORTED is DECODE-ONLY (never settable on a local endpoint — qos-validate refuses it): it is
   ;; where every acknowledgment kind this stack does not implement lands, so it matches nothing we offer.
   (acknowledgment-kind :protocol
-                       :type (member :protocol :application-auto :application-explicit :unsupported)))
+                       :type (member :protocol :application-auto :application-explicit :unsupported))
+  ;; ACKNOWLEDGMENT_DEADLINE (VENDOR EXTENSION, ADR 0090 A4) — DataWriter-scoped, NOT RxO, NOT in SEDP.
+  ;; ⚠️ FINITE BY DEFAULT, and that is a DELIBERATE INVERSION of the ADR 0089 watermarks, which default to
+  ;; DISABLED on the principle that a status announcing backpressure must be silent when there is none.
+  ;; Here the governing requirement is the opposite (owner directive: a writer must NEVER stall silently),
+  ;; so unbounded retention has to be ASKED FOR — set +duration-infinite+ to accept it explicitly. 60 s is
+  ;; long enough that a slow-but-working consumer never trips it and short enough to be actionable; a trip
+  ;; costs a status and nothing else, because the writer NEVER purges on expiry (that would be a false ack).
+  (acknowledgment-deadline (make-qos-duration 60 0) :type qos-duration))
 
 (defun* make-writer-qos (&rest args)
     (function (&rest t) qos)

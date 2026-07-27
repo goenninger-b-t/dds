@@ -3620,6 +3620,31 @@
          (%send-msg-buf node (disc-node-tx-msg node) #'%build-app-ack (car dest) (cdr dest) prefix))
        1))))
 
+(defun* node-writer-app-unacked (node writer-id)
+    (function (disc-node (unsigned-byte 32)) t)
+  "The application-acknowledgment backlog of NODE's local writer WRITER-ID, as
+   (values UNACKED-COUNT OLDEST-UNACKNOWLEDGED-SN LAGGARD-READER-GUID) — or (values 0 0 NIL) when the
+   writer is unknown or nothing is matched.
+
+   THE PULL DIRECTION IS THE POINT. Every other engine→DCPS report in this stack is PUSHED from an inbound
+   event (an ACKNACK, an APP_ACK) that carries the state with it. The acknowledgment watchdog fires when
+   NOTHING has arrived, so there is no event to carry anything and the DCPS layer — which must never
+   resolve an rtps-writer itself — needs somewhere to ask. This is that somewhere, and it is the only
+   pull-shaped accessor of its kind: keeping it explicit is what stops dds.dcps from reaching into the
+   engine directly.
+
+   OLDEST-UNACKNOWLEDGED-SN is the lowest APPLICATION watermark across matched readers, i.e. the first
+   sequence number nobody's application has confirmed — the number an operator needs to know how far back
+   the backlog reaches. Off the hot path: called from the monitor thread on expiry, never per sample."
+  (let ((w (%user-writer-for node writer-id)))
+    (if (null w)
+        (values 0 0 nil)
+        (let ((keys (%matched-reader-keys node)))
+          (multiple-value-bind (laggard base) (dds.rtps.reliable:writer-app-laggard w keys)
+            (values (dds.rtps.reliable:writer-app-unacked-count w keys)
+                    (or base 0)
+                    laggard))))))
+
 (defun* %local-writer-app-ack-p (node &optional writer-id)
     (function (disc-node &optional (or null (unsigned-byte 32))) t)
   "T iff NODE's local user writer WRITER-ID offers an APPLICATION acknowledgment kind (ADR 0090), read

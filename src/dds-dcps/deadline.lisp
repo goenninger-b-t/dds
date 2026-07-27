@@ -26,7 +26,7 @@
    instance) and reused across every subsequent write/sample (NFR-MEM: no per-sample cons)."
   (endpoint nil :type t)
   (handle nil :type t)
-  (kind :offered :type (member :offered :requested))
+  (kind :offered :type (member :offered :requested :app-ack))   ; ADR 0090 A4: :APP-ACK is a per-WRITER timer (HANDLE is the keyword :app-ack, which cannot collide with a 16-octet instance handle in this equalp table), not per-instance — the acknowledgment watchdog rides this wheel rather than spawning a second thread
   (period 1 :type (integer 1))
   (expiry 0 :type (integer 0)))
 
@@ -117,8 +117,8 @@
 
 ;;; ---- arm / rearm (user thread: write-sample / %drain-one-sample) ----
 
-(defun* %deadline-arm-or-rearm (endpoint handle period)
-    (function (t t (integer 1)) t)
+(defun* %deadline-arm-or-rearm (endpoint handle period &optional (kind (%endpoint-deadline-kind endpoint)))
+    (function (t t (integer 1) &optional keyword) t)
   "Arm — or, for an already-tracked instance, REARM (0-alloc: reuse the per-instance timer slot,
    just push EXPIRY one period ahead) — ENDPOINT's per-instance DEADLINE for HANDLE (DDS 1.4
    §2.2.3.7). EXPIRY is mutated under the monitor lock (the monitor thread reads it). Since the new
@@ -133,7 +133,7 @@
               (setf (deadline-timer-expiry existing) (+ (%lease-now) period)))))
         (let ((mon (%endpoint-ensure-monitor endpoint))
               (tm (%make-deadline-timer :endpoint endpoint :handle handle
-                                        :kind (%endpoint-deadline-kind endpoint)
+                                        :kind kind
                                         :period period :expiry (+ (%lease-now) period))))
           (setf (gethash handle tbl) tm)
           (dds.pal:with-lock ((deadline-monitor-lock mon))
@@ -250,7 +250,10 @@
           (:offered (%fire-offered-deadline-missed (deadline-timer-endpoint tm)
                                                    (deadline-timer-handle tm)))
           (:requested (%fire-requested-deadline-missed (deadline-timer-endpoint tm)
-                                                       (deadline-timer-handle tm))))))))
+                                                       (deadline-timer-handle tm)))
+          ;; ADR 0090 A4: the acknowledgment watchdog. REPORTS AND NEVER PURGES — releasing the samples
+          ;; here would discard data no application processed, which is the false ack ADR 0090 forbids.
+          (:app-ack (%fire-application-acknowledgment-overdue (deadline-timer-endpoint tm))))))))
 
 (defun* %fire-offered-deadline-missed (dw handle)
     (function (data-writer t) t)

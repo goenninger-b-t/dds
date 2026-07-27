@@ -178,6 +178,14 @@
            #:application-acknowledgment-status-last-subscription-handle
            #:application-acknowledgment-status-last-sequence-number
            #:application-acknowledgment-status-app-unacked-sample-count
+           #:on-application-acknowledgment-overdue #:get-application-acknowledgment-overdue-status
+           #:+status-application-acknowledgment-overdue+
+           #:application-acknowledgment-overdue-status
+           #:application-acknowledgment-overdue-status-total-count
+           #:application-acknowledgment-overdue-status-total-count-change
+           #:application-acknowledgment-overdue-status-last-subscription-handle
+           #:application-acknowledgment-overdue-status-oldest-unacknowledged-sequence-number
+           #:application-acknowledgment-overdue-status-app-unacked-sample-count
            #:reliable-writer-cache-changed-status
            #:reliable-writer-cache-changed-status-empty-count
            #:reliable-writer-cache-changed-status-empty-count-change

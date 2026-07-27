@@ -749,6 +749,24 @@
                           minimize (reader-proxy-app-acked-base (get-reader-proxy writer k)))))
           (max 0 (- (rtps-writer-last-sn writer) base -1))))))
 
+(defun* writer-app-laggard (writer reader-keys)
+    (function (rtps-writer list) t)
+  "The reader in READER-KEYS whose APPLICATION watermark is LOWEST — the one holding this writer's history
+   back — as (values READER-KEY APP-ACKED-BASE), or (values NIL NIL) when READER-KEYS is empty.
+
+   IT NAMES A READER BECAUSE A COUNT CANNOT BE ACTED ON. 'Seven samples are overdue' tells an operator
+   there is a problem; 'reader G has acknowledged nothing since sequence number 3' tells them WHERE it is.
+   Ties resolve to the FIRST key at the lowest base — arbitrary but stable, and with several equally-stuck
+   readers any of them is a correct answer to 'who is holding this up'."
+  (if (null reader-keys)
+      (values nil nil)
+      (%with-writer-lock (writer)
+        (let ((best nil) (best-base nil))
+          (dolist (k reader-keys (values best best-base))
+            (let ((b (reader-proxy-app-acked-base (get-reader-proxy writer k))))
+              (when (or (null best-base) (< b best-base))
+                (setf best k best-base b))))))))
+
 (defun* writer-unacked-count (writer)
     (function (rtps-writer) (integer 0))
   "The number of changes WRITER has written that are NOT YET acknowledged by every matched reader — the

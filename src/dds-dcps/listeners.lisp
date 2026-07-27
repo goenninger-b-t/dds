@@ -156,6 +156,21 @@
    never fires, which is correct rather than inert.")
   (:method ((listener listener) writer status) (declare (ignore writer status)) nil))
 
+(defgeneric on-application-acknowledgment-overdue (listener writer status)
+  (:documentation "VENDOR EXTENSION (not DDS 1.4): a sample of WRITER's has gone un-application-acknowledged
+   for longer than its ACKNOWLEDGMENT_DEADLINE (ADR 0090 A4). STATUS is an
+   APPLICATION-ACKNOWLEDGMENT-OVERDUE-STATUS naming the LAGGARD reader, the oldest unconfirmed sequence
+   number, and the backlog.
+
+   THIS IS THE CALLBACK THAT MAKES A STALL AUDIBLE. Under an APPLICATION acknowledgment kind a writer
+   retains until the subscriber's application confirms; on_reliable_reader_activity_changed still reports
+   that reader as ACTIVE, because its RTPS layer is acknowledging perfectly well. Without this, the
+   difference between a slow consumer and a stopped one is invisible until RESOURCE_LIMITS is reached.
+
+   ⚠️ NOTHING IS PURGED ON EXPIRY. Releasing the samples would be a false ack — discarding data no
+   application processed. The deadline buys visibility; what to do about it is the application's call.")
+  (:method ((listener listener) writer status) (declare (ignore writer status)) nil))
+
 ;;;; NOT DEFINED HERE, deliberately (ADR 0089 §Rejected):
 ;;;;
 ;;;;   on_destination_unreachable — DOES NOT EXIST in the Connext 7.3 DataWriterListener. It was carried

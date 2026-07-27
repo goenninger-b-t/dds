@@ -356,6 +356,29 @@ writer's own GUID satisfies the ordinary case.
     and let the writer purge samples no application processed — the same permanent-data-loss shape the
     ACKNACK gate exists to stop, and worse here because the loss is silent by construction.
 
+- **Slice A4 — the acknowledgment watchdog. ✅ DONE.** Owner directive, verbatim: *"We never must allow for
+  a writer stalling - NEVER."* A3c made a writer retain until the application confirms; A4 makes it
+  impossible for that retention to be **silent**.
+  - **`ACKNOWLEDGMENT_DEADLINE`**, a DataWriter-scoped vendor duration, **FINITE BY DEFAULT (60 s)** — a
+    deliberate inversion of the ADR 0089 watermarks, which default to disabled on the principle that a
+    backpressure status must be silent when there is none. Here silence *is* the defect, so unbounded
+    retention must be **opted into** with `+duration-infinite+`.
+  - **`APPLICATION_ACKNOWLEDGMENT_OVERDUE`** at StatusKind **bit 29**, with all three registrations, naming
+    the **laggard reader**, the **oldest unconfirmed sequence number** and the backlog — a bare count says
+    there is a problem, a GUID and a sequence number say where it is and how far back it reaches.
+  - **IT REPORTS AND NEVER PURGES.** Releasing the samples on expiry would discard data no application
+    processed — the false ack this ADR forbids outright. Asserted, not just stated: `:aao-not-purged`.
+  - **No new thread.** It rides the existing per-participant deadline monitor as a third timer kind
+    (`:app-ack`, keyed by a sentinel that cannot collide with a 16-octet instance handle), armed on write
+    and disarmed when the backlog drains. A `:protocol` writer arms nothing and pays one keyword comparison.
+  - **One new pull-shaped accessor**, `dds.disc:node-writer-app-unacked`. Every other engine→DCPS report is
+    *pushed* by an inbound event that carries its state; this one fires because **nothing arrived**, so
+    there is no event to carry anything. Keeping the pull explicit and singular is what stops `dds.dcps`
+    from reaching into the engine.
+  - **What it does NOT do**, measured in §3.3: it cannot stop a *foreign* writer from retaining. RTI does
+    not refuse to match a reader that cannot acknowledge, and DDS matching is per-side. This protects our
+    writer and makes our own refusals visible; the rest is outside our reach.
+
 ### 6.2 ⚠️ A FOURTH SILENT FAILURE MODE IN THE STATUS MACHINERY, found by A3c
 
 ADR 0089 established that a status needs **three registrations** and that each omission fails silently in

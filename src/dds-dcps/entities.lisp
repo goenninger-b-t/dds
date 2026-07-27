@@ -122,7 +122,8 @@
    ;; ADR 0089 vendor-extension reliability statuses (bits 25-26). Writer-side, like the DDS statuses above.
    (rw-cache-changed :initform (make-reliable-writer-cache-changed-status) :accessor dw-rw-cache-changed)
    (rr-activity :initform (make-reliable-reader-activity-changed-status) :accessor dw-rr-activity)
-   (app-ack :initform (make-application-acknowledgment-status) :accessor dw-app-ack) ; ADR 0090 A3c: APPLICATION_ACKNOWLEDGMENT — fires only when a matched reader's APPLICATION acknowledges, which under :PROTOCOL never happens (nothing sends an APP_ACK), so a default writer's status stays at zero without any gate
+   (app-ack :initform (make-application-acknowledgment-status) :accessor dw-app-ack)
+   (app-ack-overdue :initform (make-application-acknowledgment-overdue-status) :accessor dw-app-ack-overdue) ; ADR 0090 A4: APPLICATION_ACKNOWLEDGMENT_OVERDUE — armed only when ACKNOWLEDGMENT_KIND is an APPLICATION kind AND the deadline is finite, so a :protocol writer never arms a timer ; ADR 0090 A3c: APPLICATION_ACKNOWLEDGMENT — fires only when a matched reader's APPLICATION acknowledges, which under :PROTOCOL never happens (nothing sends an APP_ACK), so a default writer's status stays at zero without any gate
    (rw-last-unacked :initform 0 :accessor dw-rw-last-unacked) ; ADR 0089: the last send-window level this writer reported, so the per-write notification can decide "no threshold crossed" from two integer reads and return before building anything (the ADR 0088 lesson: a closure allocates on every call, misses and hits alike)
    (rw-armed :initform nil :accessor dw-rw-armed) ; ADR 0089: T while a BACKPRESSURE EPISODE is open — set when the send window rises to the high watermark, cleared when it falls back to the low one. Without it the low and empty transitions fire on ordinary traffic (a 1-deep exchange drains to zero on every sample), which is the flood the watermarks exist to prevent
    (active-readers :initform (make-hash-table :test 'equalp) :accessor dw-active-readers) ; remote reader GUID -> T while it is acknowledging; the SET is the truth, so a repeated ACKNACK cannot inflate active-count
@@ -305,7 +306,9 @@
         (cons :reliable-reader-activity-changed
               (lambda (l e s) (on-reliable-reader-activity-changed l e s)))
         (cons :application-acknowledgment
-              (lambda (l e s) (on-application-acknowledgment l e s))))
+              (lambda (l e s) (on-application-acknowledgment l e s)))
+        (cons :application-acknowledgment-overdue
+              (lambda (l e s) (on-application-acknowledgment-overdue l e s))))
   "Maps a communication-status keyword to the closure invoking its on_<status> listener callback
    (listener entity snapshot). The status-generic seam the %notify-status propagation walk uses to
    deliver a status to whichever listener in the containment chain handles it (DDS 1.4 §2.2.4.1).")
@@ -1553,6 +1556,7 @@
       (when (eq :timeout rc)
         (return-from %write-sample-1 +retcode-timeout+)))   ; full bounded cache, max_blocking_time elapsed
     (assert-liveliness dw)
+    (%app-ack-deadline-arm dw)   ; ADR 0090 A4: (re)arm the acknowledgment watchdog (no-op unless APPLICATION-acked with a finite deadline)
     (%deadline-touch-writer dw kh sample)   ; WP-DCPS-API-COMPLETION S4: (re)arm this instance's offered DEADLINE (no-op + 0-alloc when DEADLINE is INFINITE; reuses the KEEP_LAST keyhash)
     (let ((h (or kh (%instance-handle (topic-type-support (dw-topic dw)) sample))))   ; S5.T1: write auto-registers the instance (DDS 1.4 §2.2.2.4.2.2)
       (unless (gethash h (dw-instances dw))                                            ; first write of this instance -> record its key holder (get_key_value); steady state is a lock-free gethash
@@ -4191,6 +4195,7 @@
              (and (typep reader-guid '(array (unsigned-byte 8) (*))) reader-guid)
              (application-acknowledgment-status-last-sequence-number s) last-sn
              (application-acknowledgment-status-app-unacked-sample-count s) app-unacked)
+       (when (zerop app-unacked) (%app-ack-deadline-disarm dw))   ; nothing outstanding -> nothing can be overdue
        ;; %notify-status's apply-fn contract is (values CHANGED-P SNAPSHOT RESET-THUNK) — returning the
        ;; snapshot alone makes it the CHANGED-P value and hands the listener NIL, which is how the first
        ;; cut of this fired a callback carrying no status at all. Always CHANGED: an application
@@ -4214,6 +4219,77 @@
       (prog1 (copy-application-acknowledgment-status s)
         (setf (application-acknowledgment-status-total-count-change s) 0)
         (%clear-status-changed dw +status-application-acknowledgment+)))))
+
+(defun* %app-ack-deadline-period (dw)
+    (function (data-writer) (or null (integer 1)))
+  "DW's ACKNOWLEDGMENT_DEADLINE in internal-time-units, or NIL when the watchdog does not apply — the
+   writer is not under an APPLICATION acknowledgment kind, or the deadline is INFINITE (the explicit
+   opt-out into unbounded silent retention). NIL is the whole cost for a :PROTOCOL writer: one keyword
+   comparison on the write path, no timer, no monitor thread."
+  (let ((q (entity-qos dw)))
+    (when (and q (not (eq (dds.qos:qos-acknowledgment-kind q) :protocol))
+               (not (dds.qos:duration-infinite-p (dds.qos:qos-acknowledgment-deadline q))))
+      (%deadline-period-units (dds.qos:qos-acknowledgment-deadline q)))))
+
+(defun* %app-ack-deadline-arm (dw)
+    (function (data-writer) t)
+  "(Re)arm DW's ACKNOWLEDGMENT_DEADLINE watchdog on write (ADR 0090 A4). A no-op — and 0-alloc, no monitor
+   interaction — unless the writer is under an APPLICATION acknowledgment kind with a finite deadline, so
+   the default write path is byte-identical. The timer is PER WRITER, keyed by the sentinel :app-ack."
+  (let ((period (%app-ack-deadline-period dw)))
+    (when period (%deadline-arm-or-rearm dw :app-ack period :app-ack)))
+  t)
+
+(defun* %app-ack-deadline-disarm (dw)
+    (function (data-writer) t)
+  "Disarm DW's acknowledgment watchdog — called when the application-level backlog reaches ZERO, because
+   there is then nothing overdue and a still-armed timer would fire on an empty writer."
+  (%deadline-disarm-instance dw :app-ack)
+  t)
+
+(defun* %fire-application-acknowledgment-overdue (dw)
+    (function (data-writer) t)
+  "APPLICATION_ACKNOWLEDGMENT_OVERDUE (ADR 0090 A4): DW's ACKNOWLEDGMENT_DEADLINE elapsed with samples
+   still un-application-acknowledged. Fired from the deadline monitor thread.
+
+   THE ENGINE STATE IS PULLED, not carried, and that is what makes this callback different from every
+   other status in this stack: it fires because NOTHING arrived, so there is no inbound event to carry a
+   count. dds.disc:node-writer-app-unacked is the one pull-shaped accessor, and it exists so dds.dcps
+   never resolves an rtps-writer itself.
+
+   A BACKLOG OF ZERO FIRES NOTHING. The timer is disarmed when the backlog drains, but a drain racing an
+   expiry is ordinary, and reporting 'overdue: 0 samples' would be a false alarm on a healthy writer."
+  (let ((node (dp-node (pub-participant (dw-publisher dw)))))
+    (multiple-value-bind (unacked oldest laggard)
+        (dds.disc:node-writer-app-unacked node (dw-entity-id dw))
+      (when (plusp unacked)
+        (%notify-status dw +status-application-acknowledgment-overdue+ :application-acknowledgment-overdue
+         (lambda ()
+           (let ((s (dw-app-ack-overdue dw)))
+             (incf (application-acknowledgment-overdue-status-total-count s))
+             (incf (application-acknowledgment-overdue-status-total-count-change s))
+             (setf (application-acknowledgment-overdue-status-last-subscription-handle s)
+                   (and (typep laggard '(array (unsigned-byte 8) (*))) laggard)
+                   (application-acknowledgment-overdue-status-oldest-unacknowledged-sequence-number s) oldest
+                   (application-acknowledgment-overdue-status-app-unacked-sample-count s) unacked)
+             ;; (values CHANGED-P SNAPSHOT RESET-THUNK) — the contract A3c learned the hard way by
+             ;; returning the snapshot alone and firing a callback that carried NIL.
+             (values t
+                     (copy-application-acknowledgment-overdue-status s)
+                     (lambda () (setf (application-acknowledgment-overdue-status-total-count-change s) 0)))))))))
+  t)
+
+(defun* get-application-acknowledgment-overdue-status (dw)
+    (function (data-writer) application-acknowledgment-overdue-status)
+  "DataWriter::get_application_acknowledgment_overdue_status (VENDOR EXTENSION, ADR 0090 A4) — a snapshot of
+   how many times DW's ACKNOWLEDGMENT_DEADLINE has elapsed with an un-acknowledged backlog, which reader is
+   furthest behind, the oldest unconfirmed sequence number, and the backlog size. The read-reset clears the
+   *_change delta (DDS 1.4 §2.2.2.1.9)."
+  (dds.pal:with-lock ((%entity-status-lock dw))
+    (let ((s (dw-app-ack-overdue dw)))
+      (prog1 (copy-application-acknowledgment-overdue-status s)
+        (setf (application-acknowledgment-overdue-status-total-count-change s) 0)
+        (%clear-status-changed dw +status-application-acknowledgment-overdue+)))))
 
 (defun* get-reliable-reader-activity-changed-status (dw)
     (function (data-writer) reliable-reader-activity-changed-status)

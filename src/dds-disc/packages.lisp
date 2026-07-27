@@ -47,6 +47,9 @@
            ;; as evidence that anything acted on an acknowledgment.
            #:node-send-app-ack #:disc-node-app-acks-received #:disc-node-app-ack-confs-received
            #:node-send-app-ack-conf #:disc-node-on-app-ack
+           ;; ADR 0090 A4: the PULL accessor the acknowledgment watchdog needs — it fires when nothing has
+           ;; arrived, so no inbound event can carry the state to DCPS. See its docstring.
+           #:node-writer-app-unacked
            #:flow-token-bucket #:flow-token-bucket-p #:make-flow-token-bucket
            #:flow-token-bucket-tokens #:flow-token-bucket-max-burst
            #:flow-controller #:flow-controller-p #:make-flow-controller #:destroy-flow-controller

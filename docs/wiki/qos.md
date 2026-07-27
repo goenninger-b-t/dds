@@ -384,6 +384,27 @@ The writer answers each `APP_ACK` with an `APP_ACK_CONF` (0x1d) echoing its coun
 (dds.dcps:get-application-acknowledgment-status dw)
 ```
 
+### `ACKNOWLEDGMENT_DEADLINE` — so a stall is never silent
+
+A writer under an APPLICATION acknowledgment kind retains until the subscriber's application confirms. If
+that application *stops* confirming, nothing in DDS notices: `on_reliable_reader_activity_changed` still
+reports the reader ACTIVE, because its RTPS layer is acknowledging perfectly well. The history grows until
+`RESOURCE_LIMITS`, at which point `write()` starts failing for a reason nobody can see.
+
+| Symbol | Description |
+|---|---|
+| `dds.qos:qos-acknowledgment-deadline` | DataWriter-scoped vendor duration (not RxO, not in SEDP). **Finite by default: 60 s.** Set `+duration-infinite+` to accept unbounded silent retention explicitly. |
+| `dds.dcps:on-application-acknowledgment-overdue` | Fires when the deadline elapses with an un-acknowledged backlog. |
+| `dds.dcps:get-application-acknowledgment-overdue-status` | Snapshot: `-total-count` (+ `-change`), `-last-subscription-handle` (the **laggard**), `-oldest-unacknowledged-sequence-number`, `-app-unacked-sample-count`. |
+
+**Finite by default is deliberate**, and it inverts the ADR 0089 watermarks: those default to disabled
+because a backpressure status should be silent when there is nothing wrong. Here *silence is the defect*, so
+unbounded retention has to be asked for.
+
+⚠️ **It reports and never purges.** Releasing the retained samples on expiry would discard data no
+application ever processed — the false ack this policy exists to prevent. The deadline buys visibility; what
+to do about it is the application's decision.
+
 ⚠️ **`app-unacked-sample-count` is not `RELIABLE_WRITER_CACHE_CHANGED`'s `unacked-sample-count`**, and the
 difference is the point: the protocol window can be **empty** while the application window is full, because
 the RTPS layer acknowledges on receipt and the application acknowledges on processing. A writer using an

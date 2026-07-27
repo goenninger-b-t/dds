@@ -85,6 +85,24 @@
    Placed at bit 28, NOT 27 — bit 27 is RESERVED (see below) and recycling it would silently change the
    meaning of any persisted or logged status mask.")
 
+(defconstant +status-application-acknowledgment-overdue+ (ash 1 29)
+  "VENDOR-EXTENSION StatusKind bit APPLICATION_ACKNOWLEDGMENT_OVERDUE — NOT an OMG status. A sample has gone
+   un-application-acknowledged for longer than the writer's ACKNOWLEDGMENT_DEADLINE (ADR 0090 A4).
+
+   ⭐ IT EXISTS SO A STALL IS NEVER SILENT. Under an APPLICATION acknowledgment kind a writer retains until
+   the subscriber's application confirms; if that application stops confirming, the history grows with no
+   event of any kind — RELIABLE_READER_ACTIVITY_CHANGED still reports the reader as active, because its RTPS
+   layer is acknowledging normally. Nothing else in DDS or in this stack can distinguish 'processing slowly'
+   from 'stopped processing', and the difference is invisible until RESOURCE_LIMITS is already hit.
+
+   ⚠️ IT REPORTS AND NEVER PURGES. Releasing the samples on expiry would be a FALSE ACK — the writer would
+   discard data no application ever processed, which is the one outcome ADR 0090 forbids outright. The
+   deadline buys VISIBILITY, not a way out; the application decides what to do with the knowledge.
+
+   DISTINCT FROM APPLICATION_ACKNOWLEDGMENT (bit 28), which reports an acknowledgment that ARRIVED. Folding
+   the two into one callback would make a listener inspect fields to tell 'progress' from 'no progress' —
+   the familiar-name-different-meaning trap of ADR 0089 §5.")
+
 ;;; Bit 27 is RESERVED, not free. It carried a SAMPLE_REMOVED status that was withdrawn before this
 ;;; slice landed (ADR 0089 §Rejected): our only firing reason was ':acked', which RTI reports under no
 ;;; such name, and its two loss reasons are reported elsewhere — a KEEP_LAST overwrite of unacked data by
@@ -117,7 +135,8 @@
         (cons :unaddressable-peer +status-unaddressable-peer+)
         (cons :reliable-writer-cache-changed +status-reliable-writer-cache-changed+)
         (cons :reliable-reader-activity-changed +status-reliable-reader-activity-changed+)
-        (cons :application-acknowledgment +status-application-acknowledgment+))
+        (cons :application-acknowledgment +status-application-acknowledgment+)
+        (cons :application-acknowledgment-overdue +status-application-acknowledgment-overdue+))
   "Maps a DDS communication-status keyword to its StatusKind bit (dds_rtf2_dcps.idl §80-92 for the OMG
    statuses; bits 24+ are this implementation's vendor extensions), shared by %notify-status callers and
    the StatusCondition trigger predicate.")
@@ -358,6 +377,25 @@
   (total-count-change 0 :type integer)
   (last-subscription-handle nil :type (or null (array (unsigned-byte 8) (*))))
   (last-sequence-number 0 :type integer)
+  (app-unacked-sample-count 0 :type integer))
+
+(defstruct* (application-acknowledgment-overdue-status
+             (:constructor make-application-acknowledgment-overdue-status)
+             (:copier copy-application-acknowledgment-overdue-status))
+  "DataWriter APPLICATION_ACKNOWLEDGMENT_OVERDUE status (VENDOR EXTENSION, ADR 0090 A4). TOTAL-COUNT is how
+   many times this writer's ACKNOWLEDGMENT_DEADLINE has elapsed with samples still un-application-
+   acknowledged; TOTAL-COUNT-CHANGE is the delta since the status was last read. LAST-SUBSCRIPTION-HANDLE
+   names the LAGGARD — the matched reader whose application watermark is lowest, i.e. the one holding the
+   history back — and OLDEST-UNACKNOWLEDGED-SEQUENCE-NUMBER is the first sequence number nobody has
+   confirmed. APP-UNACKED-SAMPLE-COUNT is the backlog at the moment the deadline elapsed.
+
+   THE HANDLE AND THE SEQUENCE NUMBER ARE WHY THIS IS ACTIONABLE. A bare count says there is a problem; a
+   reader GUID and a sequence number say WHERE it is and HOW FAR BACK it reaches. A status an operator
+   cannot act on is the inert-status trap ADR 0089 was written against."
+  (total-count 0 :type integer)
+  (total-count-change 0 :type integer)
+  (last-subscription-handle nil :type (or null (array (unsigned-byte 8) (*))))
+  (oldest-unacknowledged-sequence-number 0 :type integer)
   (app-unacked-sample-count 0 :type integer))
 
 (defstruct* (inconsistent-topic-status (:constructor make-inconsistent-topic-status)

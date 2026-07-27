@@ -13014,3 +13014,80 @@
                      "a MATCHED-but-UNROUTED writer's sample must not reach the application either")))
       (dds.dcps:delete-participant p))
     t))
+
+(defmethod dds.dcps:on-application-acknowledgment-overdue ((l capturing-writer-listener) writer status)
+  (declare (ignore writer))
+  (dds.pal:with-lock ((cap-lock l)) (push (cons :app-ack-overdue status) (cap-hits l))))
+
+(defun* run-app-ack-overdue-test ()
+    (function () t)
+  "ADR 0090 slice A4: a writer under an APPLICATION acknowledgment kind whose peer STOPS acknowledging must
+   say so — owner directive, verbatim: a writer must NEVER stall silently.
+
+   THE CONDITION IS INVISIBLE WITHOUT THIS. The reader here matches, receives and TAKES every sample, and
+   simply never calls acknowledge-sample. Its RTPS layer keeps ACKNACKing perfectly, so
+   RELIABLE_READER_ACTIVITY_CHANGED (ADR 0089) still reports it ACTIVE; PUBLICATION_MATCHED still reports it
+   matched. Nothing in DDS distinguishes 'processing slowly' from 'stopped processing', and the writer's
+   history grows until RESOURCE_LIMITS — at which point write() starts failing for a reason nobody can see.
+
+   ⚠️ IT REPORTS AND NEVER PURGES. Releasing the retained samples on expiry would discard data no
+   application ever processed — the false ack ADR 0090 forbids outright. The deadline buys VISIBILITY only,
+   which is why :aao-not-purged is asserted alongside the notification.
+
+   THE PAYLOAD IS ASSERTED, NOT JUST THE FIRING — the A3c lesson: a callback that fires is not a callback
+   that carries anything, and a status naming no reader and no sequence number cannot be acted on.
+
+   FALSIFIED: set the deadline INFINITE and :aao-fired goes red (the explicit opt-out into unbounded silent
+   retention still works); purge on expiry and :aao-not-purged goes red."
+  (let* ((ts (dds.types:find-type-support "dcps-msg"))
+         (dom (test-domain +td-app-ack+))
+         (aq (list :reliability :reliable :history-kind :keep-all
+                   :acknowledgment-kind :application-explicit))
+         (pw (dds.dcps:create-participant :domain dom))
+         (pr (dds.dcps:create-participant :domain dom))
+         (wl (make-instance 'capturing-writer-listener)))
+    (unwind-protect
+         (let* ((tw (dds.dcps:create-topic pw "OverdueTopic" "dcps-msg" ts))
+                (tr (dds.dcps:create-topic pr "OverdueTopic" "dcps-msg" ts))
+                (dw (dds.dcps:create-datawriter
+                     (dds.dcps:create-publisher pw) tw
+                     :qos (apply #'dds.qos:make-writer-qos
+                                 :acknowledgment-deadline (dds.qos:make-qos-duration 1 0) aq)))
+                (dr (dds.dcps:create-datareader (dds.dcps:create-subscriber pr) tr
+                                                :qos (apply #'dds.qos:make-reader-qos aq)))
+                (node-w (dds.dcps::dp-node pw)))
+           (dds.dcps:set-writer-listener dw wl '(:application-acknowledgment-overdue))
+           (loop repeat 250 until (plusp (dds.dcps:matched-count pw))
+                 do (dds.dcps:spin pw) (dds.dcps:spin pr) (sleep 0.02))
+           (%check :aao-matched (plusp (dds.dcps:matched-count pw)) "the pair must match")
+           (dds.dcps:write-sample dw (make-dcps-msg :id 1 :text "overdue"))
+           ;; the reader ACCESSES the sample and deliberately never acknowledges it
+           (loop repeat 200 until (dds.dcps:take-samples dr) do (dds.dcps:spin pr) (sleep 0.02))
+           (loop repeat 200 until (assoc :app-ack-overdue (cap-snapshot wl))
+                 do (dds.dcps:spin pw) (sleep 0.02))
+           (%check :aao-fired (and (assoc :app-ack-overdue (cap-snapshot wl)) t)
+                   "⚠️ the acknowledgment watchdog must FIRE — a peer that stops acknowledging must never be silent")
+           (let ((s (cdr (assoc :app-ack-overdue (cap-snapshot wl)))))
+             (%check :aao-names-laggard
+                     (and s (dds.dcps:application-acknowledgment-overdue-status-last-subscription-handle s)
+                          (equalp (subseq (dds.dcps:application-acknowledgment-overdue-status-last-subscription-handle s) 0 12)
+                                  (dds.dcps:participant-guid-prefix pr)))
+                     "the status must NAME the laggard reader — a bare count says there is a problem, a GUID says where it is")
+             (%check :aao-oldest-sn
+                     (and s (= 1 (dds.dcps:application-acknowledgment-overdue-status-oldest-unacknowledged-sequence-number s)))
+                     "the status must carry the OLDEST unconfirmed sequence number — how far back the backlog reaches")
+             (%check :aao-backlog
+                     (and s (plusp (dds.dcps:application-acknowledgment-overdue-status-app-unacked-sample-count s)))
+                     "the status must carry the backlog size"))
+           (%check :aao-snapshot
+                   (plusp (dds.dcps:application-acknowledgment-overdue-status-total-count
+                           (dds.dcps:get-application-acknowledgment-overdue-status dw)))
+                   "get_application_acknowledgment_overdue_status must report it too — a listener without a readable snapshot is half a status")
+           ;; ⚠️ REPORTS, NEVER PURGES.
+           (let ((w (dds.disc::%user-writer-for node-w (dds.dcps::dw-entity-id dw))))
+             (%check :aao-not-purged
+                     (= 1 (dds.rtps.history:hc-change-count (dds.rtps.reliable:rtps-writer-hc w)))
+                     "⚠️ the sample must STILL BE RETAINED after the deadline elapsed — purging on expiry would discard data no application processed, which is the false ack this whole ADR forbids")))
+      (dds.dcps:delete-participant pw)
+      (dds.dcps:delete-participant pr))
+    t))
