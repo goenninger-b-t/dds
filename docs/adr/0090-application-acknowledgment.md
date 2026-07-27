@@ -290,9 +290,43 @@ writer's own GUID satisfies the ordinary case.
   - Inbound 0x1c/0x1d are **recognised and counted** under a VendorId that gives them this meaning (RTI's,
     or ours for what we emit), so the ours↔ours test can prove the datagram landed. Recognised is **not**
     processed — no watermark, no listener, no APP_ACK_CONF.
-- **Slice A3c — the writer side.** The APPLICATION watermark beside ADR 0089's acked-watermark (a change is
-  not purgeable until app-acked), APP_ACK_CONF, and `on-application-acknowledgment` with **all three
-  registrations** (ADR 0089 §2), covered automatically by the completeness test.
+- **Slice A3c — the writer side. ✅ DONE.**
+  - **The APPLICATION watermark**, a *second* watermark on each `ReaderProxy` beside ADR 0089's
+    acked-base, and the purge gated on `min` of the two. **This is the slice that makes the feature real**:
+    without it the reader emits APP_ACKs, the writer reports an end-to-end guarantee, and it still purges
+    on protocol acknowledgments alone — a writer reporting a guarantee it is not honouring, which is
+    exactly the silent data loss §4 refuses to match on. Gated on the writer's own advertised QoS, so the
+    `:protocol` default is byte-identical.
+  - **Only the contiguous prefix advances it.** An APP_ACK may name disjoint ranges; a watermark means
+    "everything below this". Taking the highest named sequence number would declare every hole beneath it
+    acknowledged — **a false ack manufactured by the writer** rather than by the reader. A gap stops the
+    advance; a later cumulative APP_ACK closes it. Monotonic, so a stale or reordered message cannot
+    un-acknowledge anything.
+  - **APP_ACK_CONF**, unicast back to the acknowledging reader, echoing the count.
+  - **`on-application-acknowledgment`** + `application-acknowledgment-status` at StatusKind **bit 28**
+    (27 stays reserved), with all three registrations. RTI's `DDS_AcknowledgmentInfo` fields
+    `response_data` / `valid_response_data` are **deliberately absent** — nothing emits or parses response
+    data yet, so they would be permanently NIL under names that promise otherwise (the ADR 0089 §5
+    inert-field trap). They arrive with the slice that puts response data on the wire.
+  - **T10 gated.** A forged plain APP_ACK from a keyed-rtps peer would advance an application watermark
+    and let the writer purge samples no application processed — the same permanent-data-loss shape the
+    ACKNACK gate exists to stop, and worse here because the loss is silent by construction.
+
+### 6.2 ⚠️ A FOURTH SILENT FAILURE MODE IN THE STATUS MACHINERY, found by A3c
+
+ADR 0089 established that a status needs **three registrations** and that each omission fails silently in
+its own way. A3c found a fourth, *underneath* all three: **the callback fired and carried nothing.**
+
+`%notify-status`'s `apply-fn` contract is `(values CHANGED-P SNAPSHOT RESET-THUNK)`. The first cut returned
+the snapshot alone — so it became the `CHANGED-P` value (truthy, so the notification proceeded), `SNAPSHOT`
+defaulted to `NIL`, and the listener was invoked with a **null status**. All three registrations were
+present and correct; the ADR 0089 completeness test passed, because it checks that the registrations exist,
+not that the payload arrives.
+
+**What caught it was asserting on the status CONTENT rather than on the callback firing.** The integration
+test's "did `on_application_acknowledgment` fire?" assertion passed; "does the status name the acknowledging
+reader?" failed. **Generalise it: a test that only asks whether a callback fired cannot distinguish a
+working notification from an empty one** — assert on what the notification carries.
 - **`APPLICATION_ORDERED` stays out of scope** until its semantics can be sourced. No published explanation
   was found, and inventing one under RTI's name is what ADR 0089 §5 forbade.
 

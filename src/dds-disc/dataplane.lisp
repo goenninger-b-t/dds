@@ -3587,6 +3587,100 @@
          (%send-msg-buf node (disc-node-tx-msg node) #'%build-app-ack (car dest) (cdr dest) prefix))
        1))))
 
+(defun* %local-writer-app-ack-p (node &optional writer-id)
+    (function (disc-node &optional (or null (unsigned-byte 32))) t)
+  "T iff NODE's local user writer WRITER-ID offers an APPLICATION acknowledgment kind (ADR 0090), read
+   from its advertised endpoint-data QoS — the same QoS SEDP advertises and RxO-matches, so what gates the
+   purge here is exactly what the peer agreed to. The application-acknowledgment twin of
+   %LOCAL-WRITER-DURABILITY, and resolved the same way: a specific writer by EntityId, else the head
+   local writer, else NIL when there is no local writer (the discovery-less value-level path).
+
+   NIL keeps writer-purge-acked byte-identical, which is what makes this feature cost nothing for the
+   :PROTOCOL default: the second watermark exists on every ReaderProxy but is consulted only here."
+  (let ((w (or (and writer-id
+                    (find writer-id (disc-node-local-writers node)
+                          :key (lambda (ep) (%guid-entityid (dds.rtps.discovery:endpoint-data-guid ep)))
+                          :test #'eql))
+               (first (disc-node-local-writers node)))))
+    (and w
+         (not (eq (dds.qos:qos-acknowledgment-kind (dds.rtps.discovery:endpoint-data-qos w))
+                  :protocol)))))
+
+(defun* node-send-app-ack-conf (node writer-entity-id reader-guid count)
+    (function (disc-node (unsigned-byte 32) (simple-array (unsigned-byte 8) (16)) (unsigned-byte 32))
+              (integer 0))
+  "Writer side: emit one RTI-format APP_ACK_CONF (0x1d) back to the reader named by READER-GUID, echoing
+   the COUNT of the APP_ACK being confirmed (ADR 0090 A3c). Returns the number of datagrams sent — 1, or 0
+   when the reader's participant is undiscovered. Runs on the RECEIVER thread (it answers an inbound
+   APP_ACK), hence the rx-tx-msg scratch buffer.
+
+   Unicast to the acknowledging reader's participant alone, for the same reason node-send-app-ack is: the
+   submessage names a readerId, and two readers in different participants routinely share an EntityId
+   (RTPS 2.5 §8.3.5.4). A confirmation delivered to the wrong reader is less dangerous than a false ack —
+   it confirms nothing that reader claimed — but it is still a message asserting something untrue, and the
+   correct destination is already known from the GUID that arrived."
+  (let* ((prefix (subseq reader-guid 0 12))
+         (rid (logior (ash (aref reader-guid 12) 24) (ash (aref reader-guid 13) 16)
+                      (ash (aref reader-guid 14) 8) (aref reader-guid 15)))
+         (dest (%prefix-user-destination node prefix)))
+    (cond
+      ((null dest) 0)
+      (t
+       ;; The virtual-writer GUID is OUR writer's own GUID — the degenerate virtual writer (ADR 0090 §3.1).
+       (let ((vw (%source-guid (disc-node-guid-prefix node) writer-entity-id)))
+         (flet ((%build-conf (mc)
+                  (dds.rtps.message:write-app-ack-conf mc rid writer-entity-id vw count)))
+           (declare (dynamic-extent #'%build-conf))
+           (%send-msg-buf node (disc-node-rx-tx-msg node) #'%build-conf (car dest) (cdr dest) prefix)))
+       1))))
+
+(defun* %on-user-app-ack (node c flags src-prefix)
+    (function (disc-node dds.core.buffer:cursor (unsigned-byte 8) (simple-array (unsigned-byte 8) (12))) t)
+  "Writer side: apply an inbound APP_ACK (0x1c) from a matched reader (ADR 0090 A3c) — advance the
+   addressed writer's APPLICATION watermark past the acknowledged contiguous run, confirm it with an
+   APP_ACK_CONF echoing its count, and report it to the DCPS APPLICATION_ACKNOWLEDGMENT hook.
+
+   ⚠️ THE CALLER MUST HAVE ESTABLISHED THE VENDORID (see %handle-datagram): 0x1c lives in the OMG
+   PROTOCOL-reserved range 0x00-0x7f, so it means 'application acknowledgment' only under a VendorId that
+   says so — RTI's, or our own for the messages this stack emits.
+
+   THE INTERVALS ARE COLLECTED BEFORE ANYTHING IS APPLIED, because parse-app-ack-body is a VISITOR and may
+   still REJECT the body after it has visited some intervals (a short tail, an over-cap count). Applying as
+   we visit would advance a watermark from a message we then discard — accepting part of a rejected
+   acknowledgment, which under APP-ACK semantics is exactly the partial accept ADR 0090 forbids. Nothing is
+   applied unless the whole body parsed.
+
+   intervalFlags is IGNORED here, not interpreted. Its encoding is still unpinned (two observed values), and
+   the reader's cumulative picture is safe to apply whole: every interval it names is one its application
+   acknowledged, whichever state the flags claim. Treating one flag value as 'not really acknowledged' would
+   be guessing, and guessing in the un-acknowledging direction only ever stalls — but guessing the other way
+   would purge. Neither guess is made."
+  (let ((ivs '()))
+    (multiple-value-bind (rid wid vw-count count)
+        (dds.rtps.message:parse-app-ack-body
+         c flags
+         (lambda (v goff first last iflags poff plen)
+           (declare (ignore v goff iflags poff plen))
+           (push (cons first last) ivs)))
+      (declare (ignore vw-count))
+      (when (and rid (%user-writer-entityid-p wid))
+        (let ((w (%user-writer-for node wid)))
+          (when w
+            (let* ((reader-guid (dds.rtps.reliable:writer-lookup-key w src-prefix rid))
+                   (base (dds.rtps.reliable:writer-on-app-ack w reader-guid ivs)))
+              ;; The purge is re-run so the newly-advanced APPLICATION watermark can actually free history:
+              ;; an APP_ACK is the ONLY event that moves it, so without this the writer would retain
+              ;; everything until the next ACKNACK happened to arrive.
+              (dds.rtps.reliable:writer-purge-acked
+               w (%matched-reader-keys node) (%local-writer-durability node wid)
+               (%local-writer-app-ack-p node wid))
+              (node-send-app-ack-conf node wid reader-guid count)
+              (let ((hook (disc-node-on-app-ack node)))
+                (when hook
+                  (funcall hook wid reader-guid (1- base)
+                           (dds.rtps.reliable:writer-app-unacked-count w (%matched-reader-keys node)))))))))))
+  t)
+
 (defun* %on-user-gap (node c flags src-prefix)
     (function (disc-node dds.core.buffer:cursor (unsigned-byte 8) (simple-array (unsigned-byte 8) (12))) t)
   "Reader side: a GAP from a matched remote writer marks the SNs it declares irrelevant — the half-open range
@@ -3671,9 +3765,15 @@
           ;; changes are not fully acked, so they are never purged. A TRANSIENT_LOCAL writer (DDS 1.4
           ;; §2.2.3.4) RETAINS its acked history for late-joiners — the durability arg makes the purge a
           ;; no-op for it (HISTORY-bounded, not ACK-bounded); a VOLATILE writer purges as before.
+          ;; ADR 0090 A3c: under an APPLICATION acknowledgment kind the ACKNACK purge must ALSO respect the
+          ;; application watermark. This is THE site that makes the feature real — the ACKNACK is what
+          ;; normally frees history, so leaving it ungated would purge on protocol acks alone and the
+          ;; application watermark would be decorative: a writer reporting an end-to-end guarantee it was
+          ;; not honouring, which is the exact silent-data-loss failure ADR 0090 §4 refuses to match on.
           (dds.rtps.reliable:writer-purge-acked
            w (%matched-reader-keys node)
-           (%local-writer-durability node (dds.rtps.reliable:rtps-writer-entityid w)))
+           (%local-writer-durability node (dds.rtps.reliable:rtps-writer-entityid w))
+           (%local-writer-app-ack-p node (dds.rtps.reliable:rtps-writer-entityid w)))
           ;; ADR 0089: the ACKNACK is BOTH vendor reliability facts at once — it is the only evidence that
           ;; this reader is still acknowledging, and the purge it drives is what lowers the send window.
           ;; Reporting from here (not from the engine) is what keeps dds.rtps free of DCPS.
@@ -4178,6 +4278,9 @@
   (when (disc-node-crypto-transform node)
     (%ensure-secured-payload-pool node (disc-node-user-writer node)))
   (setf (disc-node-on-acknack node) (lambda (c flags src-prefix) (%on-user-acknack node c flags src-prefix)))
+  ;; ADR 0090 A3c: the inbound APP_ACK handler, installed alongside ACKNACK because it is the same kind of
+  ;; thing — a reader submessage that advances a writer-side watermark and can free HistoryCache.
+  (setf (disc-node-on-app-ack-submsg node) (lambda (c flags src-prefix) (%on-user-app-ack node c flags src-prefix)))
   (setf (disc-node-on-nack-frag node) (lambda (c flags) (%on-user-nack-frag node c flags)))
   node)
 

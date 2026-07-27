@@ -3093,3 +3093,87 @@
             (not (nth-value 0 (dds.dcps::%qos-consistent-p peer)))
             "a LOCAL endpoint must not be creatable with :UNSUPPORTED — offering a guarantee with no implementation behind it is the silent stall this policy exists to prevent"))
   t)
+
+(defun* run-app-ack-watermark-test ()
+    (function () t)
+  "ADR 0090 slice A3c: the writer-side APPLICATION watermark. THIS IS THE TEST THAT MAKES THE FEATURE REAL —
+   everything else in ADR 0090 moves bytes; this is the one asserting that a writer under an APPLICATION
+   acknowledgment kind DOES NOT PURGE a sample until the subscribing application has said it processed it.
+
+   Without it the whole feature is decorative: the reader would emit APP_ACKs, the writer would report an
+   end-to-end guarantee, and it would still purge on protocol acknowledgments alone — a writer reporting a
+   guarantee it is not honouring, which is precisely the silent data loss ADR 0090 §4 refuses to match on.
+
+   ⚠️ AND THE WRITER MUST NOT MANUFACTURE A FALSE ACK EITHER. An APP_ACK may name disjoint ranges, because
+   the reader's application is free to acknowledge out of order. A watermark is 'everything below this', so
+   taking the highest named sequence number would declare every hole beneath it acknowledged and purge
+   samples nobody processed — the same defect as a false ack, produced by the writer instead of the reader.
+   Only the CONTIGUOUS prefix may advance it.
+
+   FALSIFIED: drop the APPLICATION-ACK argument at the purge site and :aaw-protocol-ack-does-not-purge goes
+   red; advance the watermark to the max named SN instead of the contiguous run and :aaw-gap-stops-advance
+   goes red."
+  (flet ((mk () (dds.rtps.reliable:make-rtps-writer
+                 :hc (dds.rtps.history:make-history-cache :keep-all 1 nil nil)))
+         (pl (k) (map '(simple-array (unsigned-byte 8) (*)) #'char-code (format nil "m~d" k)))
+         (ack (w rid base) (dds.rtps.reliable:writer-on-acknack
+                            w rid base 0 (make-array 1 :element-type '(unsigned-byte 32) :initial-element 0))))
+    ;; (1) ⭐ THE CORE PROPERTY. A full PROTOCOL acknowledgment must purge NOTHING while the application
+    ;;     has acknowledged nothing — and the very same call without the gate must purge everything, so the
+    ;;     assertion cannot pass for some unrelated reason.
+    (let ((w (mk)) (r 10))
+      (dotimes (k 5) (dds.rtps.reliable:writer-write w (pl (1+ k))))   ; SN 1..5
+      (ack w r 6)   ; the RTPS layer has acknowledged everything
+      (%check :aaw-protocol-ack-does-not-purge
+              (and (zerop (dds.rtps.reliable:writer-purge-acked w (list r) :volatile t))
+                   (= 5 (dds.rtps.history:hc-change-count (dds.rtps.reliable:rtps-writer-hc w))))
+              "⚠️ a fully PROTOCOL-acknowledged sample must NOT be purged while the application has acknowledged nothing — this is the entire point of application acknowledgment")
+      (%check :aaw-app-unacked-count
+              (= 5 (dds.rtps.reliable:writer-app-unacked-count w (list r)))
+              "the application-level send window must be all 5 samples, even though the protocol window is empty — the two counts diverging IS the feature")
+      ;; the application acknowledges 1..3
+      (dds.rtps.reliable:writer-on-app-ack w r (list (cons 1 3)))
+      (%check :aaw-app-ack-purges
+              (= 3 (dds.rtps.reliable:writer-purge-acked w (list r) :volatile t))
+              "once the application acknowledges SN 1..3, exactly those three become purgeable")
+      (%check :aaw-remainder-kept
+              (= 2 (dds.rtps.history:hc-change-count (dds.rtps.reliable:rtps-writer-hc w)))
+              "SN 4 and 5, acknowledged by the protocol but not by the application, must still be retained")
+      (%check :aaw-app-unacked-drops
+              (= 2 (dds.rtps.reliable:writer-app-unacked-count w (list r)))
+              "the application-level send window must fall to the 2 samples still unprocessed"))
+    ;; (2) ⭐ A GAP STOPS THE ADVANCE. Acknowledging 1,2 and 5,6 must NOT declare 3 and 4 acknowledged.
+    (let ((w (mk)) (r 10))
+      (dotimes (k 6) (dds.rtps.reliable:writer-write w (pl (1+ k))))   ; SN 1..6
+      (ack w r 7)
+      (dds.rtps.reliable:writer-on-app-ack w r (list (cons 1 2) (cons 5 6)))
+      (%check :aaw-gap-stops-advance
+              (= 3 (dds.rtps.reliable:reader-proxy-app-acked-base
+                    (dds.rtps.reliable:get-reader-proxy w r)))
+              "⚠️ the watermark must stop at the hole (base 3), NOT jump to the highest acknowledged SN — advancing past SN 3 and 4 would purge samples the application never processed, a false ack manufactured by the writer")
+      (%check :aaw-gap-purges-only-prefix
+              (= 2 (dds.rtps.reliable:writer-purge-acked w (list r) :volatile t))
+              "only SN 1..2 may be purged; the acknowledged 5..6 sit above an unacknowledged hole and stay")
+      ;; a later APP_ACK closing the hole releases the whole run at once (the reader re-reports cumulatively)
+      (dds.rtps.reliable:writer-on-app-ack w r (list (cons 1 6)))
+      (%check :aaw-hole-closed
+              (= 4 (dds.rtps.reliable:writer-purge-acked w (list r) :volatile t))
+              "closing the hole releases the remaining SN 3..6 in one step"))
+    ;; (3) MONOTONIC: a stale or reordered APP_ACK must never retreat the watermark.
+    (let ((w (mk)) (r 10))
+      (dotimes (k 4) (dds.rtps.reliable:writer-write w (pl (1+ k))))
+      (dds.rtps.reliable:writer-on-app-ack w r (list (cons 1 4)))
+      (dds.rtps.reliable:writer-on-app-ack w r (list (cons 1 1)))   ; a stale duplicate
+      (%check :aaw-monotonic
+              (= 5 (dds.rtps.reliable:reader-proxy-app-acked-base
+                    (dds.rtps.reliable:get-reader-proxy w r)))
+              "a stale or reordered APP_ACK must not retreat the watermark — un-acknowledging a sample would make the writer retain forever, and re-acknowledging one it already released is unrecoverable")
+      ;; (4) THE DEFAULT IS UNTOUCHED: without the gate the purge behaves exactly as it always did.
+      (let ((w2 (mk)) (r2 10))
+        (dotimes (k 3) (dds.rtps.reliable:writer-write w2 (pl (1+ k))))
+        (dds.rtps.reliable:writer-on-acknack
+         w2 r2 4 0 (make-array 1 :element-type '(unsigned-byte 32) :initial-element 0))
+        (%check :aaw-protocol-default-unchanged
+                (= 3 (dds.rtps.reliable:writer-purge-acked w2 (list r2)))
+                "a :PROTOCOL writer (the default, no APPLICATION-ACK argument) must purge on the protocol ack exactly as before — this feature costs the default path nothing"))))
+  t)

@@ -46,6 +46,7 @@
            ;; The counters are RECOGNISED-not-processed — see the slot docstrings before reading them
            ;; as evidence that anything acted on an acknowledgment.
            #:node-send-app-ack #:disc-node-app-acks-received #:disc-node-app-ack-confs-received
+           #:node-send-app-ack-conf #:disc-node-on-app-ack
            #:flow-token-bucket #:flow-token-bucket-p #:make-flow-token-bucket
            #:flow-token-bucket-tokens #:flow-token-bucket-max-burst
            #:flow-controller #:flow-controller-p #:make-flow-controller #:destroy-flow-controller

@@ -143,6 +143,19 @@
    acknowledging nothing.")
   (:method ((listener listener) writer status) (declare (ignore writer status)) nil))
 
+(defgeneric on-application-acknowledgment (listener writer status)
+  (:documentation "VENDOR EXTENSION (not DDS 1.4): a matched remote reader's APPLICATION has acknowledged
+   one or more of WRITER's samples (ADR 0090; RTI's on_application_acknowledgment). STATUS is an
+   APPLICATION-ACKNOWLEDGMENT-STATUS snapshot naming the acknowledging reader, the highest sequence number
+   it acknowledged, and the writer's remaining application-level send window.
+
+   THIS IS THE ONLY CALLBACK THAT REPORTS 'the application has processed it'. on_publication_matched says
+   a reader exists; on_reliable_reader_activity_changed says its RTPS layer is still acknowledging; both
+   can be true while the subscribing application has consumed nothing. Effective only when
+   ACKNOWLEDGMENT_KIND is an APPLICATION kind — under :PROTOCOL nothing ever sends an APP_ACK, so this
+   never fires, which is correct rather than inert.")
+  (:method ((listener listener) writer status) (declare (ignore writer status)) nil))
+
 ;;;; NOT DEFINED HERE, deliberately (ADR 0089 §Rejected):
 ;;;;
 ;;;;   on_destination_unreachable — DOES NOT EXIST in the Connext 7.3 DataWriterListener. It was carried

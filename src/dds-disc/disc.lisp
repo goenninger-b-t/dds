@@ -188,6 +188,7 @@
   ;; UNADDRESSABLE-COUNT counts distinct refused remotes for diagnostics.
   (on-unaddressable nil :type t)
   (on-writer-cache nil :type t)      ; ADR 0089: (lambda (writer-entityid unacked replaced-unacked) ...) — the DCPS hook for RELIABLE_WRITER_CACHE_CHANGED. Fired from BOTH sites where the send window moves: the WRITE path (it rises) and the ACKNACK purge (it falls). Firing only on ACKNACK would miss every high-watermark crossing of a writer under real backpressure, whose reader by definition is not ACKing. Engine state is read HERE and passed in, so dds.dcps never resolves an rtps-writer. NIL = nobody is listening (the default, zero cost)
+  (on-app-ack nil :type t)           ; ADR 0090 A3c: (lambda (writer-entityid reader-guid last-sn app-unacked) ...) — the DCPS hook for APPLICATION_ACKNOWLEDGMENT, fired from %on-user-app-ack once the writer's application watermark has advanced. Engine state is read at the fire site and passed in, so dds.dcps never resolves an rtps-writer. NIL = nobody is listening (the default, one slot read)
   (on-reader-activity nil :type t)   ; ADR 0089: (lambda (writer-entityid reader-guid activep) ...) — the DCPS hook for RELIABLE_READER_ACTIVITY_CHANGED, fired from the ACKNACK path, which IS the evidence that a matched reader is acknowledging. NIL = nobody is listening
   (unaddressable-count 0 :type (integer 0))
   (unaddressable-reported (make-hash-table :test 'equalp) :type hash-table)
@@ -395,6 +396,7 @@
   (on-lifecycle-event nil :type (or null function)) ; DCPS-facing: fired after a dispose/unregister is classified (S2)
   (on-heartbeat nil :type (or null function))
   (on-acknack nil :type (or null function))
+  (on-app-ack-submsg nil :type (or null function))   ; ADR 0090 A3c: (lambda (cursor flags src-prefix) ...) — the DATA-PLANE handler for an inbound APP_ACK (%on-user-app-ack), installed alongside on-acknack. Distinct from ON-APP-ACK below, which is the DCPS STATUS hook; keeping them separate is what lets the engine be driven with no DCPS participant at all (the value-level tests)
   (on-gap nil :type (or null function))
   (on-data-frag nil :type (or null function))
   (on-heartbeat-frag nil :type (or null function))
@@ -2919,10 +2921,17 @@
           (funcall (disc-node-on-heartbeat-frag node) c flags src-prefix))
          ((and (= id dds.rtps.message:+submsg-nack-frag+) (disc-node-on-nack-frag node) (not enforce-rtps))
           (funcall (disc-node-on-nack-frag node) c flags))
-         ;; ADR 0090 A3b: RTI's vendor APP_ACK / APP_ACK_CONF, RECOGNISED (counted) but NOT PROCESSED —
-         ;; the writer-side APPLICATION watermark and on-application-acknowledgment are slice A3c. The
-         ;; counters exist so an ours<->ours test can prove an emitted APP_ACK actually ARRIVED; nothing
-         ;; downstream reads them, so a sample's fate never turns on an unprocessed message.
+         ;; ADR 0090 A3b/A3c: RTI's vendor APP_ACK / APP_ACK_CONF. The counters (A3b) remain as ARRIVAL
+         ;; EVIDENCE — they are what an ours<->ours test asserts against — and A3c adds the processing:
+         ;; APP_ACK advances the addressed writer's APPLICATION watermark, is confirmed with an
+         ;; APP_ACK_CONF, and is reported to the DCPS APPLICATION_ACKNOWLEDGMENT hook. APP_ACK_CONF is
+         ;; still COUNTED ONLY: the reader emits its picture cumulatively and re-reports anything a lost
+         ;; confirmation would have covered, so nothing on the reader depends on receiving one.
+         ;;
+         ;; The T10 rtps_protection gate applies to the APP_ACK arm exactly as it does to ACKNACK: a
+         ;; forged plain APP_ACK from a keyed-rtps peer would advance an application watermark and let the
+         ;; writer PURGE samples no application ever processed — the same permanent-data-loss shape the
+         ;; ACKNACK gate exists to stop, and worse here, because the loss is silent by construction.
          ;;
          ;; THE VENDORID GATE IS MANDATORY, NOT DEFENSIVE. 0x1c/0x1d live in the OMG PROTOCOL-reserved
          ;; range 0x00-0x7f (RTPS 2.5 §9.4.5.1.1) — space the OMG may still assign — so these ids mean
@@ -2938,9 +2947,13 @@
                (let ((vendor (%source-vendor-id buf)))
                  (or (= vendor dds.rtps.message:+vendor-id-rti+)
                      (= vendor dds.rtps.message:*vendor-id*))))
-          (if (= id dds.rtps.message:+submsg-app-ack+)
-              (incf (disc-node-app-acks-received node))
-              (incf (disc-node-app-ack-confs-received node)))))))
+          (cond
+            ((= id dds.rtps.message:+submsg-app-ack-conf+)
+             (incf (disc-node-app-ack-confs-received node)))
+            (t
+             (incf (disc-node-app-acks-received node))
+             (when (and (disc-node-on-app-ack-submsg node) (not enforce-rtps))
+               (funcall (disc-node-on-app-ack-submsg node) c flags src-prefix))))))))
        (declare (dynamic-extent #'%rx-dispatch-submsg))
        (dds.rtps.message:dispatch-message cursor #'%rx-dispatch-submsg size)))
     t))

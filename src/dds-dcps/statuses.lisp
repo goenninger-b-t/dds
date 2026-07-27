@@ -71,6 +71,20 @@
    evidence LIVELINESS uses). Distinct from PUBLICATION_MATCHED, which reports discovery-level
    matching: a reader can stay matched while ceasing to acknowledge anything.")
 
+(defconstant +status-application-acknowledgment+  (ash 1 28)
+  "VENDOR-EXTENSION StatusKind bit APPLICATION_ACKNOWLEDGMENT — NOT an OMG status. A matched remote
+   reader's APPLICATION has acknowledged one or more of this writer's samples (ADR 0090; RTI's
+   on_application_acknowledgment). DDS 1.4 defines no application acknowledgment at all, so there is no
+   standard status to conform to.
+
+   ⭐ IT IS THE ONLY EVIDENCE THAT DISTINGUISHES 'the middleware has it' FROM 'the application has
+   processed it'. PUBLICATION_MATCHED says a reader exists; RELIABLE_READER_ACTIVITY_CHANGED (ADR 0089)
+   says the reader's RTPS layer is still acknowledging; both can be true while the subscribing application
+   has consumed nothing. This fires only when that application said so.
+
+   Placed at bit 28, NOT 27 — bit 27 is RESERVED (see below) and recycling it would silently change the
+   meaning of any persisted or logged status mask.")
+
 ;;; Bit 27 is RESERVED, not free. It carried a SAMPLE_REMOVED status that was withdrawn before this
 ;;; slice landed (ADR 0089 §Rejected): our only firing reason was ':acked', which RTI reports under no
 ;;; such name, and its two loss reasons are reported elsewhere — a KEEP_LAST overwrite of unacked data by
@@ -102,7 +116,8 @@
         ;; listener + get_*_status" (ADR 0089).
         (cons :unaddressable-peer +status-unaddressable-peer+)
         (cons :reliable-writer-cache-changed +status-reliable-writer-cache-changed+)
-        (cons :reliable-reader-activity-changed +status-reliable-reader-activity-changed+))
+        (cons :reliable-reader-activity-changed +status-reliable-reader-activity-changed+)
+        (cons :application-acknowledgment +status-application-acknowledgment+))
   "Maps a DDS communication-status keyword to its StatusKind bit (dds_rtf2_dcps.idl §80-92 for the OMG
    statuses; bits 24+ are this implementation's vendor extensions), shared by %notify-status callers and
    the StatusCondition trigger predicate.")
@@ -317,6 +332,33 @@
   (inactive-count 0 :type integer)
   (inactive-count-change 0 :type integer)
   (last-instance-handle nil :type (or null (array (unsigned-byte 8) (*)))))
+
+(defstruct* (application-acknowledgment-status
+             (:constructor make-application-acknowledgment-status)
+             (:copier copy-application-acknowledgment-status))
+  "DataWriter APPLICATION_ACKNOWLEDGMENT status (VENDOR EXTENSION, ADR 0090). TOTAL-COUNT is the
+   cumulative number of application acknowledgments this writer has received; TOTAL-COUNT-CHANGE is the
+   delta since the status was last read. LAST-SUBSCRIPTION-HANDLE is the 16-octet GUID of the DataReader
+   that sent the most recent one and LAST-SEQUENCE-NUMBER the highest sequence number it acknowledged;
+   APP-UNACKED-SAMPLE-COUNT is the writer's CURRENT application-level send window — the samples written
+   but not yet acknowledged by every matched reader's application.
+
+   ⚠️ APP-UNACKED-SAMPLE-COUNT IS NOT RELIABLE_WRITER_CACHE_CHANGED's UNACKED-SAMPLE-COUNT, and the
+   difference is the whole point of the feature: the protocol window can be EMPTY while this one is full,
+   because the RTPS layer acknowledges on receipt and the application acknowledges on processing. A writer
+   under an APPLICATION acknowledgment kind that watches only the ADR 0089 count will believe it has no
+   backlog while its history grows.
+
+   RTI'S DDS_AcknowledgmentInfo CARRIES TWO FIELDS THIS DOES NOT, AND THEY ARE OMITTED DELIBERATELY:
+   response_data (an application payload the acknowledging reader attaches) and valid_response_data (false
+   once a retention duration has elapsed). Nothing in this stack emits or parses response data yet, so a
+   field here would be permanently NIL under a name that promises otherwise — the inert-field trap ADR 0089
+   §5 was written to prevent. They arrive with the slice that puts response data on the wire."
+  (total-count 0 :type integer)
+  (total-count-change 0 :type integer)
+  (last-subscription-handle nil :type (or null (array (unsigned-byte 8) (*))))
+  (last-sequence-number 0 :type integer)
+  (app-unacked-sample-count 0 :type integer))
 
 (defstruct* (inconsistent-topic-status (:constructor make-inconsistent-topic-status)
                                       (:copier copy-inconsistent-topic-status))

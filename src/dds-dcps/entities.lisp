@@ -122,6 +122,7 @@
    ;; ADR 0089 vendor-extension reliability statuses (bits 25-26). Writer-side, like the DDS statuses above.
    (rw-cache-changed :initform (make-reliable-writer-cache-changed-status) :accessor dw-rw-cache-changed)
    (rr-activity :initform (make-reliable-reader-activity-changed-status) :accessor dw-rr-activity)
+   (app-ack :initform (make-application-acknowledgment-status) :accessor dw-app-ack) ; ADR 0090 A3c: APPLICATION_ACKNOWLEDGMENT — fires only when a matched reader's APPLICATION acknowledges, which under :PROTOCOL never happens (nothing sends an APP_ACK), so a default writer's status stays at zero without any gate
    (rw-last-unacked :initform 0 :accessor dw-rw-last-unacked) ; ADR 0089: the last send-window level this writer reported, so the per-write notification can decide "no threshold crossed" from two integer reads and return before building anything (the ADR 0088 lesson: a closure allocates on every call, misses and hits alike)
    (rw-armed :initform nil :accessor dw-rw-armed) ; ADR 0089: T while a BACKPRESSURE EPISODE is open — set when the send window rises to the high watermark, cleared when it falls back to the low one. Without it the low and empty transitions fire on ordinary traffic (a 1-deep exchange drains to zero on every sample), which is the flood the watermarks exist to prevent
    (active-readers :initform (make-hash-table :test 'equalp) :accessor dw-active-readers) ; remote reader GUID -> T while it is acknowledging; the SET is the truth, so a repeated ACKNACK cannot inflate active-count
@@ -302,7 +303,9 @@
         (cons :reliable-writer-cache-changed
               (lambda (l e s) (on-reliable-writer-cache-changed l e s)))
         (cons :reliable-reader-activity-changed
-              (lambda (l e s) (on-reliable-reader-activity-changed l e s))))
+              (lambda (l e s) (on-reliable-reader-activity-changed l e s)))
+        (cons :application-acknowledgment
+              (lambda (l e s) (on-application-acknowledgment l e s))))
   "Maps a communication-status keyword to the closure invoking its on_<status> listener callback
    (listener entity snapshot). The status-generic seam the %notify-status propagation walk uses to
    deliver a status to whichever listener in the containment chain handles it (DDS 1.4 §2.2.4.1).")
@@ -865,6 +868,10 @@
                 (lambda (wid reader-guid activep)
                   (let ((dw (%participant-writer-by-entity-id p wid)))
                     (when dw (%notify-reader-activity dw reader-guid activep)))))
+          (setf (dds.disc:disc-node-on-app-ack node)   ; ADR 0090 A3c: APPLICATION_ACKNOWLEDGMENT
+                (lambda (wid reader-guid last-sn app-unacked)
+                  (let ((dw (%participant-writer-by-entity-id p wid)))
+                    (when dw (%notify-application-acknowledgment dw reader-guid last-sn app-unacked)))))
           (%install-type-gate p)   ; FR-TYPE-4 assignability gate (type-gate.lisp)
           (when identity           ; DDS-Security §8.7 auth manager — only for a security-enabled participant
             ;; pass the configured signed Permissions octets so the handshake emits c.perm (§9.3.2.1, T6)
@@ -4159,6 +4166,54 @@
               (reliable-writer-cache-changed-status-low-watermark-count-change s) 0
               (reliable-writer-cache-changed-status-high-watermark-count-change s) 0)
         (%clear-status-changed dw +status-reliable-writer-cache-changed+)))))
+
+(defun* %notify-application-acknowledgment (dw reader-guid last-sn app-unacked)
+    (function (data-writer t integer (integer 0)) t)
+  "APPLICATION_ACKNOWLEDGMENT (VENDOR EXTENSION, ADR 0090 A3c): the matched remote reader named by
+   READER-GUID has acknowledged DW's samples up to LAST-SN on its APPLICATION's behalf, leaving APP-UNACKED
+   samples in the application-level send window.
+
+   NOT edge-triggered and NOT episode-gated, unlike ADR 0089's cache status — deliberately. That status
+   reports a LEVEL that moves twice per sample in ordinary traffic, so it needed thresholds to become an
+   event. This one reports an EVENT: an application acknowledgment is something the peer application did
+   explicitly, it happens at most once per sample and typically far less, and suppressing any of them would
+   hide the very thing the callback exists to report. The frequency is the peer's to choose.
+
+   READER-GUID is RETAINED in the status snapshot, so it must be an object nothing mutates. The caller
+   passes the writer's WRITER-LOOKUP-KEY cache entry, which is written once and never modified (ADR 0088)
+   — safe by construction, the same guarantee %notify-reader-activity relies on."
+  (%notify-status dw +status-application-acknowledgment+ :application-acknowledgment
+   (lambda ()
+     (let ((s (dw-app-ack dw)))
+       (incf (application-acknowledgment-status-total-count s))
+       (incf (application-acknowledgment-status-total-count-change s))
+       (setf (application-acknowledgment-status-last-subscription-handle s)
+             (and (typep reader-guid '(array (unsigned-byte 8) (*))) reader-guid)
+             (application-acknowledgment-status-last-sequence-number s) last-sn
+             (application-acknowledgment-status-app-unacked-sample-count s) app-unacked)
+       ;; %notify-status's apply-fn contract is (values CHANGED-P SNAPSHOT RESET-THUNK) — returning the
+       ;; snapshot alone makes it the CHANGED-P value and hands the listener NIL, which is how the first
+       ;; cut of this fired a callback carrying no status at all. Always CHANGED: an application
+       ;; acknowledgment is an event, not a level, so there is no "nothing happened" case to suppress.
+       (values t
+               (copy-application-acknowledgment-status s)
+               (lambda () (setf (application-acknowledgment-status-total-count-change s) 0))))))
+  t)
+
+(defun* get-application-acknowledgment-status (dw)
+    (function (data-writer) application-acknowledgment-status)
+  "DataWriter::get_application_acknowledgment_status (VENDOR EXTENSION, ADR 0090) — a snapshot of how many
+   application acknowledgments DW has received, which reader sent the last one and up to which sequence
+   number, and how many samples remain un-acknowledged BY THE APPLICATION. Mirrors the
+   read-communication-status reset (DDS 1.4 §2.2.2.1.9): the *_change field is cleared on read.
+
+   Under ACKNOWLEDGMENT_KIND :PROTOCOL this reads all zeros forever, because nothing ever sends an APP_ACK.
+   That is the honest answer, not an inert status: the writer genuinely has no application-level knowledge."
+  (dds.pal:with-lock ((%entity-status-lock dw))
+    (let ((s (dw-app-ack dw)))
+      (prog1 (copy-application-acknowledgment-status s)
+        (setf (application-acknowledgment-status-total-count-change s) 0)
+        (%clear-status-changed dw +status-application-acknowledgment+)))))
 
 (defun* get-reliable-reader-activity-changed-status (dw)
     (function (data-writer) reliable-reader-activity-changed-status)

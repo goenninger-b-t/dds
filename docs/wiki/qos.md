@@ -353,9 +353,42 @@ Three things worth knowing before you rely on it:
 
 The acknowledgment travels as an RTI-format `APP_ACK` (0x1c) **unicast to the acknowledged writer's
 participant alone** — never fanned out, because the submessage names a `writerId` and two writers in
-different participants routinely share an EntityId. The writer-side effect (a sample is not purgeable until
-app-acked) and the `on-application-acknowledgment` listener are a later slice; see
-[ADR 0090](../adr/0090-application-acknowledgment.md) §6.
+different participants routinely share an EntityId.
+
+### What the writer does with it
+
+**A sample is not purgeable until the application has acknowledged it.** Each matched reader carries a
+*second* watermark beside the RTPS one, and the writer's history purge takes the **minimum of the two** —
+so a fully protocol-acknowledged sample stays in the HistoryCache until the subscribing application says it
+processed it. Without this the whole policy would be decorative: the reader would send acknowledgments, the
+writer would report an end-to-end guarantee, and it would purge on protocol acknowledgments regardless.
+
+**Only a contiguous run advances the watermark.** An application may acknowledge out of order, so an
+`APP_ACK` can name disjoint ranges. A watermark means "everything below this", so a gap **stops** the
+advance — taking the highest acknowledged sequence number instead would declare every hole beneath it
+acknowledged and purge samples nobody processed. A later cumulative acknowledgment closes the hole and
+releases the whole run at once.
+
+The writer answers each `APP_ACK` with an `APP_ACK_CONF` (0x1d) echoing its count, and fires
+`on-application-acknowledgment`:
+
+```lisp
+(defmethod dds.dcps:on-application-acknowledgment ((l my-listener) writer status)
+  (format t "~&reader ~a processed up to SN ~d; ~d still unprocessed~%"
+          (dds.dcps:application-acknowledgment-status-last-subscription-handle status)
+          (dds.dcps:application-acknowledgment-status-last-sequence-number status)
+          (dds.dcps:application-acknowledgment-status-app-unacked-sample-count status)))
+
+(dds.dcps:set-writer-listener dw (make-instance 'my-listener) '(:application-acknowledgment))
+;; …or poll it
+(dds.dcps:get-application-acknowledgment-status dw)
+```
+
+⚠️ **`app-unacked-sample-count` is not `RELIABLE_WRITER_CACHE_CHANGED`'s `unacked-sample-count`**, and the
+difference is the point: the protocol window can be **empty** while the application window is full, because
+the RTPS layer acknowledges on receipt and the application acknowledges on processing. A writer using an
+APPLICATION acknowledgment kind that watches only the ADR 0089 count will believe it has no backlog while
+its history grows. See [ADR 0090](../adr/0090-application-acknowledgment.md) §6.
 
 ## Examples
 

@@ -102,12 +102,23 @@ application calls `dds.dcps:acknowledge-sample` / `acknowledge-all` — see [qos
 **unicast to the acknowledged writer's participant alone**, never fanned out: the submessage names a
 `writerId`, and two writers in different participants routinely share an EntityId (§8.3.5.4), so a
 broadcast would tell a same-EntityId writer elsewhere that its sample was acknowledged by an application
-that never saw it. Inbound 0x1c/0x1d are **recognised and counted** (`dds.disc:disc-node-app-acks-received`
-/ `-app-ack-confs-received`) under a VendorId that gives them this meaning — RTI's, or ours for what we
-emit — and are otherwise unprocessed: the writer-side APPLICATION watermark, `on-application-acknowledgment`
-and APP_ACK_CONF emission are slice A3c. Under any other VendorId they are skipped by construction, because
+that never saw it.
+
+**Inbound 0x1c is PROCESSED** (slice A3c) under a VendorId that gives it this meaning — RTI's, or ours for
+what we emit: it advances the addressed writer's **APPLICATION watermark**, is answered with an
+`APP_ACK_CONF`, and fires `on-application-acknowledgment` (see [dcps](dcps.md)). Inbound 0x1d is **counted
+only** — the reader re-reports its acknowledged set cumulatively, so nothing on the reader depends on
+receiving a confirmation. Both arrivals are counted (`dds.disc:disc-node-app-acks-received` /
+`-app-ack-confs-received`). Under any other VendorId both are skipped by construction, because
 `dispatch-message` repositions unconditionally to `body-start + body-len` for every submessage (RTPS 2.5
 §8.3.3.2 rule 3).
+
+The APP_ACK arm is **T10-gated exactly as ACKNACK is**: a forged plain APP_ACK from a keyed-rtps peer would
+advance an application watermark and let the writer purge samples no application ever processed — the same
+permanent-data-loss shape the ACKNACK gate exists to stop, and worse here because that loss is silent by
+construction. The intervals are collected **before** anything is applied, because `parse-app-ack-body` is a
+visitor that may still reject the body after visiting some of them; applying as it visits would accept part
+of a message we then discard, which under APP-ACK semantics is the partial accept ADR 0090 forbids.
 
 **We emit them under OUR VendorId, not RTI's.** Claiming RTI's would make every other submessage in the
 datagram interpretable under RTI's rules and would be a lie about who sent it; a peer that does not

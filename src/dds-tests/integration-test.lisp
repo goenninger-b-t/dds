@@ -2063,6 +2063,10 @@
 (defmethod dds.dcps:on-offered-incompatible-qos ((l capturing-writer-listener) writer status)
   (declare (ignore writer))
   (dds.pal:with-lock ((cap-lock l)) (push (cons :off-incompat status) (cap-hits l))))
+;; ADR 0090 A3c: the only callback that reports "the application has processed it".
+(defmethod dds.dcps:on-application-acknowledgment ((l capturing-writer-listener) writer status)
+  (declare (ignore writer))
+  (dds.pal:with-lock ((cap-lock l)) (push (cons :app-ack status) (cap-hits l))))
 
 (defun* cap-snapshot (l)
     (function (capture-mixin) list)
@@ -12850,7 +12854,8 @@
          (aq (list :reliability :reliable :acknowledgment-kind :application-explicit))
          (pw (dds.dcps:create-participant :domain dom))    ; the writer that is acknowledged
          (px (dds.dcps:create-participant :domain dom))    ; the DECOY: same topic, same QoS, writes nothing
-         (pr (dds.dcps:create-participant :domain dom)))   ; the reader
+         (pr (dds.dcps:create-participant :domain dom))    ; the reader
+         (wl (make-instance 'capturing-writer-listener)))  ; A3c: captures on_application_acknowledgment
     (unwind-protect
          (let* ((tw (dds.dcps:create-topic pw "AppAckTopic" "dcps-msg" ts))
                 (tx (dds.dcps:create-topic px "AppAckTopic" "dcps-msg" ts))
@@ -12864,6 +12869,7 @@
                 (node-w (dds.dcps::dp-node pw))
                 (node-x (dds.dcps::dp-node px)))
            (declare (ignorable dx))
+           (dds.dcps:set-writer-listener dw wl '(:application-acknowledgment))
            ;; The reader must match BOTH writers, or the decoy proves nothing.
            (loop repeat 250
                  until (>= (dds.dcps:matched-count pr) 2)
@@ -12897,6 +12903,29 @@
                  (%check :aae-decoy-silent
                          (zerop (dds.disc:disc-node-app-acks-received node-x))
                          "⚠️ the DECOY participant must have received NO APP_ACK: fanning this message out would tell a same-EntityId writer elsewhere that its sample was acknowledged by an application that never saw it, and it may then purge it — the false ack ADR 0090 is written around")
+                 ;; ---- ADR 0090 slice A3c: what the writer DOES with the acknowledgment ----
+                 (%check :aae-conf-returned
+                         (plusp (dds.disc:disc-node-app-ack-confs-received (dds.dcps::dp-node pr)))
+                         "the writer must answer with an APP_ACK_CONF, and it must reach the acknowledging reader's participant")
+                 (%check :aae-listener-fired
+                         (and (assoc :app-ack (cap-snapshot wl)) t)
+                         "on_application_acknowledgment must fire on the writer — the ONLY callback that reports the application has processed a sample, and one that needs all THREE registrations to arrive at all")
+                 (let ((s (cdr (assoc :app-ack (cap-snapshot wl)))))
+                   (%check :aae-listener-names-reader
+                           (and s (equalp (subseq (dds.dcps:application-acknowledgment-status-last-subscription-handle s) 0 12)
+                                          (dds.dcps:participant-guid-prefix pr)))
+                           "the status must name the ACKNOWLEDGING reader's participant, not just report a count")
+                   (%check :aae-listener-names-sn
+                           (and s (= 1 (dds.dcps:application-acknowledgment-status-last-sequence-number s)))
+                           "the status must carry the sequence number acknowledged"))
+                 (%check :aae-status-snapshot
+                         (plusp (dds.dcps:application-acknowledgment-status-total-count
+                                 (dds.dcps:get-application-acknowledgment-status dw)))
+                         "get_application_acknowledgment_status must report the acknowledgment too — a listener without a readable snapshot is half a status")
+                 (%check :aae-decoy-writer-silent
+                         (zerop (dds.dcps:application-acknowledgment-status-total-count
+                                 (dds.dcps:get-application-acknowledgment-status dx)))
+                         "⚠️ the DECOY writer must report ZERO application acknowledgments: it wrote nothing and nobody acknowledged it, so a non-zero count would mean the watermark advanced on a message meant for a different writer")
                  (let ((before (dds.disc:disc-node-app-acks-received node-w)))
                    (%check :aae-idempotent
                            (eq dds.dcps:+retcode-ok+ (dds.dcps:acknowledge-sample dr info))

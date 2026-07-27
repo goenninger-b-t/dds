@@ -119,6 +119,8 @@
            #:writer-lookup-key
            #:init-reader-proxy-base #:writer-finalize-durability #:rtps-writer-finalized #:writer-unmatch-reader
            #:reader-proxy #:reader-proxy-acked-base #:reader-proxy-unsent-base
+           ;; ADR 0090 A3c: the writer-side APPLICATION watermark, INDEPENDENT of the protocol one
+           #:reader-proxy-app-acked-base #:writer-on-app-ack #:writer-app-unacked-count
            #:rtps-reader #:make-rtps-reader #:reader-on-data #:reader-on-heartbeat
            #:reader-acknack #:reader-on-gap #:reader-suppress-sn #:reader-complete-p #:init-writer-proxy-durability
            #:reader-dedup-accept-p #:rtps-reader-dedup-map

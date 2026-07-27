@@ -168,6 +168,16 @@
            #:on-reliable-writer-cache-changed #:on-reliable-reader-activity-changed
            #:get-reliable-writer-cache-changed-status #:get-reliable-reader-activity-changed-status
            #:+status-reliable-writer-cache-changed+ #:+status-reliable-reader-activity-changed+
+           ;; ADR 0090 A3c: APPLICATION_ACKNOWLEDGMENT (bit 28 — 27 is RESERVED, see statuses.lisp).
+           ;; The only callback that reports "the application has processed it" rather than "it arrived".
+           #:on-application-acknowledgment #:get-application-acknowledgment-status
+           #:+status-application-acknowledgment+
+           #:application-acknowledgment-status #:make-application-acknowledgment-status
+           #:application-acknowledgment-status-total-count
+           #:application-acknowledgment-status-total-count-change
+           #:application-acknowledgment-status-last-subscription-handle
+           #:application-acknowledgment-status-last-sequence-number
+           #:application-acknowledgment-status-app-unacked-sample-count
            #:reliable-writer-cache-changed-status
            #:reliable-writer-cache-changed-status-empty-count
            #:reliable-writer-cache-changed-status-empty-count-change

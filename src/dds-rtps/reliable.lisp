@@ -70,7 +70,14 @@
    change at UNSENT-BASE once, then advances it). Push pacing keys off UNSENT-BASE;
    ACKNACK-driven repair (requested_changes) is independent of it."
   (acked-base 1 :type integer)             ; reader has acknowledged all SN < acked-base
-  (unsent-base 1 :type integer))           ; 1 + highestSentChangeSN; changes >= this are unsent
+  (unsent-base 1 :type integer)            ; 1 + highestSentChangeSN; changes >= this are unsent
+  ;; ADR 0090 A3c: the APPLICATION watermark — the reader's application has acknowledged all SN <
+  ;; APP-ACKED-BASE. INDEPENDENT of ACKED-BASE and never derived from it (ADR 0090 §7 Q1): a sample can be
+  ;; protocol-acked and not yet app-acked, NEVER the reverse, so the two must be tracked separately and the
+  ;; purge takes the MINIMUM. Advanced only by writer-on-app-ack, i.e. only by an APP_ACK the reader sent.
+  ;; It stays at 1 for a reader that never app-acks, which is what pins a purge that is gated on it — the
+  ;; whole point of the feature, and why the gate is per-writer QoS rather than unconditional.
+  (app-acked-base 1 :type integer))
 
 (defstruct* (rtps-writer (:constructor make-rtps-writer))
   "Stateful reliable RTPS writer (RTPS 2.5 §8.4.2): a HistoryCache, the last SN
@@ -630,8 +637,8 @@
                 (push sn gaps)))))
       (values (nreverse resends) (nreverse gaps)))))
 
-(defun* writer-purge-acked (writer reader-keys &optional (durability :volatile))
-    (function (rtps-writer list &optional (member :volatile :transient-local :transient :persistent))
+(defun* writer-purge-acked (writer reader-keys &optional (durability :volatile) (application-ack nil))
+    (function (rtps-writer list &optional (member :volatile :transient-local :transient :persistent) t)
               (integer 0))
   "Drop from the writer's HistoryCache every change that EVERY matched reader has acknowledged — SN below
    the minimum acked-base over READER-KEYS' proxies (RTPS 2.5 §8.4.1: VOLATILE writer history is bounded
@@ -669,17 +676,78 @@
   (if (null reader-keys)
       0
       (let ((purged (%with-writer-lock (writer)
-                      (let ((base (loop for k in reader-keys
-                                        minimize (reader-proxy-acked-base (get-reader-proxy writer k)))))
+                      (let* ((base (loop for k in reader-keys
+                                         minimize (reader-proxy-acked-base (get-reader-proxy writer k))))
+                             ;; ADR 0090 A3c: under an APPLICATION acknowledgment kind a change is purgeable
+                             ;; only once BOTH watermarks have passed it. The MIN of the two is taken rather
+                             ;; than the application one alone: they are independent by design (§7 Q1 — a
+                             ;; sample can be protocol-acked and not yet app-acked, never the reverse), and
+                             ;; min() is correct under either ordering, so nothing here depends on an
+                             ;; invariant a remote peer could violate. NIL (the :PROTOCOL default and every
+                             ;; pre-existing caller) leaves PURGE-BASE = BASE, byte-identical.
+                             ;;
+                             ;; ⚠️ IT IS A SEPARATE BINDING FROM BASE ON PURPOSE. ADR 0089's acked-watermark
+                             ;; below is the PROTOCOL send window, and RELIABLE_WRITER_CACHE_CHANGED reports
+                             ;; it; folding the application watermark into it would silently redefine that
+                             ;; status to mean something else for exactly the writers that enabled app-ack.
+                             ;; The application-level occupancy has its own accessor, writer-app-unacked-count.
+                             (purge-base (if application-ack
+                                             (loop for k in reader-keys
+                                                   for p = (get-reader-proxy writer k)
+                                                   minimize (min (reader-proxy-acked-base p)
+                                                                 (reader-proxy-app-acked-base p)))
+                                             base)))
                         ;; ADR 0089: record the watermark BEFORE the durability gate. It is what makes the
                         ;; unacked count and the replaced-unacked count true for a TRANSIENT_LOCAL writer,
                         ;; which retains its whole history and so purges nothing to derive them from.
                         (setf (rtps-writer-acked-watermark writer) base)
                         (if (and (not (eq durability :volatile)) (not (rtps-writer-finalized writer)))
                             0
-                            (dds.rtps.history:hc-purge-below (rtps-writer-hc writer) base))))))
+                            (dds.rtps.history:hc-purge-below (rtps-writer-hc writer) purge-base))))))
         (when (plusp purged) (%writer-signal-space writer))   ; the cache shrank: wake any blocked writer-write
         purged)))
+
+(defun* writer-on-app-ack (writer reader-key intervals)
+    (function (rtps-writer t list) integer)
+  "Apply an APP_ACK from the reader keyed by READER-KEY (ADR 0090 A3c): advance that ReaderProxy's
+   APPLICATION watermark to just past the CONTIGUOUS acknowledged run starting at 1. INTERVALS is the
+   decoded list of (FIRST-SN . LAST-SN) conses the message named. Returns the proxy's new APP-ACKED-BASE.
+
+   ⚠️ ONLY THE CONTIGUOUS PREFIX ADVANCES THE WATERMARK, AND THAT IS THE SAFETY PROPERTY. An APP_ACK may
+   name disjoint ranges — the reader's application is free to acknowledge out of order — but a watermark is
+   by definition 'everything below this'. Taking the maximum named sequence number instead would declare
+   every hole beneath it acknowledged, and the writer would then purge samples the application never
+   processed: THE FALSE ACK ADR 0090 IS WRITTEN AROUND, manufactured by the writer rather than the reader.
+   So a gap stops the advance, the samples above it stay retained, and a later APP_ACK naming the missing
+   run closes it (the reader re-reports cumulatively, which is exactly what the capture shows RTI doing).
+
+   MONOTONIC: the watermark never retreats, so a stale, duplicated or reordered APP_ACK cannot un-acknowledge
+   anything. Lock-guarded — this runs on a receiver thread while the caller thread publishes."
+  (%with-writer-lock (writer)
+    (let ((proxy (get-reader-proxy writer reader-key)))
+      (let ((base (reader-proxy-app-acked-base proxy)))
+        ;; Sweep repeatedly: the intervals are not required to arrive sorted, so one pass could stop at a
+        ;; gap a later interval fills. Bounded by the interval count (itself capped by the parser).
+        (loop for advanced = nil
+              do (dolist (iv intervals)
+                   (when (and (<= (car iv) base) (>= (cdr iv) base))
+                     (setf base (1+ (cdr iv)) advanced t)))
+              while advanced)
+        (setf (reader-proxy-app-acked-base proxy) (max base (reader-proxy-app-acked-base proxy)))))))
+
+(defun* writer-app-unacked-count (writer reader-keys)
+    (function (rtps-writer list) (integer 0))
+  "The number of changes WRITER has written that are not yet APPLICATION-acknowledged by every matched
+   reader in READER-KEYS — last-SN minus the minimum APP-ACKED-BASE, clamped at 0. The application-level
+   twin of WRITER-UNACKED-COUNT, and it is the number that matters under an APPLICATION acknowledgment
+   kind: the protocol count can be zero while the application has processed nothing. Returns 0 when no
+   reader is matched (nothing is owed to nobody)."
+  (if (null reader-keys)
+      0
+      (%with-writer-lock (writer)
+        (let ((base (loop for k in reader-keys
+                          minimize (reader-proxy-app-acked-base (get-reader-proxy writer k)))))
+          (max 0 (- (rtps-writer-last-sn writer) base -1))))))
 
 (defun* writer-unacked-count (writer)
     (function (rtps-writer) (integer 0))

@@ -4062,6 +4062,7 @@
                  ("app-ack-state"            . run-app-ack-state-test)      ; ADR 0090 A3b
                  ("acknowledgment-kind-wire" . run-acknowledgment-kind-wire-test) ; ADR 0090 A3b
                  ("app-ack-emit"             . run-app-ack-emit-test)       ; ADR 0090 A3b
+                 ("app-ack-watermark"        . run-app-ack-watermark-test)  ; ADR 0090 A3c
                  ("property-based"           . run-pbt-tests)
                  ("udp-loopback"             . run-udp-loopback-test)
                  ("rtps-discovery-spdp"      . dds.rtps.discovery:run-discovery-test)
