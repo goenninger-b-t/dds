@@ -997,7 +997,7 @@
                (%check :dstl-opt-in
                        (dds.disc:disc-node-secured-loan-capable node)
                        "a SECURED reader must be secured-loan-capable after create-datareader (the opt-in)")
-               (record-synthetic-match node src wid)   ; the injection must name a MATCHED writer
+               (record-synthetic-match node src wid (dds.dcps::dr-entity-id dr))   ; the injection must name a MATCHED writer
                (dds.disc::%deliver-user-sample node wid 1 secured src (dds.disc::%source-guid src wid) 1)
                (multiple-value-bind (data loans) (dds.dcps:take-loaned dr)
                  (%check :dstl-take-one (and (= 1 (length data)) (= 1 (length loans)))
@@ -1039,7 +1039,7 @@
              (let* ((sub (dds.dcps:create-subscriber p2))
                     (topic (dds.dcps:create-topic p2 "SweepSquare" "shape-type" ts))
                     (dr (dds.dcps:create-datareader sub topic)))
-               (record-synthetic-match node src wid)   ; the injection must name a MATCHED writer
+               (record-synthetic-match node src wid (dds.dcps::dr-entity-id dr))   ; the injection must name a MATCHED writer
                (dds.disc::%deliver-user-sample node wid 1 secured src (dds.disc::%source-guid src wid) 1)
                (multiple-value-bind (data loans) (dds.dcps:take-loaned dr)
                  (declare (ignore data loans))   ; drained + registered, but DELIBERATELY not returned
@@ -1068,7 +1068,7 @@
                ;; take-samples arm: 10 sequential deliveries (>> capacity 3); each take releases its loan
                (dotimes (i 10)
                  (let ((sn (+ 1 i)))
-                   (record-synthetic-match node src wid)   ; the injection must name a MATCHED writer
+                   (record-synthetic-match node src wid (dds.dcps::dr-entity-id dr))   ; the injection must name a MATCHED writer
                    (dds.disc::%deliver-user-sample node wid sn secured src (dds.disc::%source-guid src wid) sn)
                    (let ((got (dds.dcps:take-samples dr)))
                      (%check :dstl-copy-take-one
@@ -1083,7 +1083,7 @@
                        (zerop (dds.disc:disc-node-decode-pool-rejects node))
                        "10 take-samples on a capacity-3 pool caused ZERO SAMPLE_REJECTED (release-after-copy fixes the auto-opt-in regression)")
                ;; read-samples arm: read is non-destructive but also releases the loan (data struct is independent + stays readable)
-               (record-synthetic-match node src wid)   ; the injection must name a MATCHED writer
+               (record-synthetic-match node src wid (dds.dcps::dr-entity-id dr))   ; the injection must name a MATCHED writer
                (dds.disc::%deliver-user-sample node wid 11 secured src (dds.disc::%source-guid src wid) 11)
                (let ((got (dds.dcps:read-samples dr)))
                  (%check :dstl-copy-read-one

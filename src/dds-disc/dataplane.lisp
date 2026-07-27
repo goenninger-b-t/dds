@@ -2532,16 +2532,23 @@
                            ;; A bare dds.disc node (the low-level value-level tests, the shapes runners)
                            ;; never arms the flag by design, so it keeps the fallback byte-identical.
                            ;;
-                           ;; ⚠️ THE PREDICATE IS "NOT MATCHED", NOT "NO ROUTE", AND THE DIFFERENCE IS LOAD-
-                           ;; BEARING. A first cut refused the fallback whenever the route was empty and the
-                           ;; DCPS layer was active; the suite turned :liv-not-alive-listener RED on both
-                           ;; implementations, because MATCHED-BUT-UNROUTED IS A REAL STATE — %record-match
-                           ;; records a match without route-adding, and this resolver serves the LIVELINESS
-                           ;; status dispatch (%participant-readers-for-writer-guid) as well as delivery, so
-                           ;; refusing it silently dropped a status for a legitimately matched writer.
-                           ;; Refusing only an UNMATCHED writer refuses exactly the defect and nothing else.
-                           ((and (disc-node-durability-gate-active node)
-                                 (not (%guid-matched-p node writer-guid)))
+                           ;; ⚠️ ONCE THE DCPS LAYER OWNS MATCHING THERE IS NO FALLBACK AT ALL — an empty
+                           ;; route means NO READER, whether the writer is unmatched or "matched but
+                           ;; unrouted". The second state was tolerated for one commit (falling back to the
+                           ;; primary) and it is now REFUSED and COUNTED, because it CANNOT LEGITIMATELY
+                           ;; OCCUR: %match-remote-endpoint route-adds every RxO-compatible local reader for
+                           ;; a remote writer IMMEDIATELY BEFORE recording the match, both under the node
+                           ;; lock, so the two cannot drift. Tolerating it left exactly the ambiguity that
+                           ;; made "empty route" mean two different things — the ambiguity this whole fix
+                           ;; exists to remove, and the one that made the first cut of it wrong.
+                           ;;
+                           ;; UNROUTED-MATCH-DROPS MUST STAY 0. It is the loud signal, in the same idiom as
+                           ;; hb-unarmed-drops: fail-safe now (deliver nothing to a reader that was never
+                           ;; routed), and a non-zero count says a WP separated route-add from record-match.
+                           ((disc-node-durability-gate-active node)
+                            (when (%guid-matched-p node writer-guid)
+                              (dds.pal:with-lock ((disc-node-lock node))
+                                (incf (disc-node-unrouted-match-drops node))))
                             nil)
                            (t (let ((r (disc-node-user-reader node)))
                                 (and r (list (cons (disc-node-user-reader-id node) r))))))))

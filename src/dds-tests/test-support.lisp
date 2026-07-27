@@ -184,8 +184,8 @@
    the whole point of the test, and it only proves anything if no foreign participant shares the domain:
    the assertion is that the reader's APP_ACK reaches the writer it names and NOTHING ELSE.")
 
-(defun* record-synthetic-match (node src wid)
-    (function (t (simple-array (unsigned-byte 8) (12)) (unsigned-byte 32)) t)
+(defun* record-synthetic-match (node src wid &rest reader-eids)
+    (function (t (simple-array (unsigned-byte 8) (12)) (unsigned-byte 32) &rest (unsigned-byte 32)) t)
   "Record the synthetic remote writer (SRC prefix + WID EntityId) as MATCHED on NODE — the setup a test
    needs before injecting a sample with %deliver-user-sample against a DCPS participant.
 
@@ -199,7 +199,14 @@
    Only the GUID is consulted — %record-match keys the match table by the 16-octet GUID alone — so no
    topic or type name is invented here. IDEMPOTENT (%record-match returns NIL on a re-record), so calling
    it before every injection is safe."
-  (dds.disc::%record-match
-   node (dds.rtps.discovery:make-endpoint-data
-         :guid (dds.disc::%source-guid src wid) :role :writer))
+  (let ((guid (dds.disc::%source-guid src wid)))
+    (dds.disc::%record-match
+     node (dds.rtps.discovery:make-endpoint-data :guid guid :role :writer))
+    ;; BOTH, because production does BOTH: %match-remote-endpoint route-adds every RxO-compatible local
+    ;; reader for a remote writer IMMEDIATELY BEFORE recording the match. Recording only the match leaves
+    ;; MATCHED-BUT-UNROUTED, a state that cannot occur in production and that %reader-routes-for now
+    ;; refuses and counts (disc-node-unrouted-match-drops). READER-EIDS may be empty for a test that only
+    ;; needs the match recorded (a HEARTBEAT gate, a lease sweep) and never expects delivery.
+    (dolist (eid reader-eids)
+      (dds.disc::%reader-route-add node guid eid)))
   t)

@@ -12050,6 +12050,11 @@
                 (prefix (subseq (dds.rtps.discovery:endpoint-data-guid rw) 0 12)))
            (dds.dcps:set-reader-listener dr rl '(:liveliness-changed))
            (dds.disc::%record-match node rw)
+           ;; A matched remote WRITER is ALWAYS route-added in production (%match-remote-endpoint does both,
+           ;; under the node lock, route-add first). Recording only the match left MATCHED-BUT-UNROUTED, which
+           ;; %reader-routes-for now refuses and counts — so the setup states what production states.
+           (dds.disc::%reader-route-add node (dds.rtps.discovery:endpoint-data-guid rw)
+                                        (dds.dcps::dr-entity-id dr))
            ;; Seed a STALE AUTOMATIC stamp (5s old vs a 1s lease) keyed by the writer's prefix.
            (setf (gethash (cons (copy-seq prefix) dds.rtps.discovery:+pmd-kind-automatic+)
                           (dds.disc::disc-node-remote-liveliness node))
@@ -12988,6 +12993,24 @@
                    "⚠️ an UNMATCHED writer's sample must NOT reach the application — a reader that refuses a writer on RxO and then reads its data makes every RxO verdict advisory")
            (%check :uwnd-no-route
                    (null (dds.disc::%reader-routes-for node wguid))
-                   "the delivery route for an unmatched writer must be EMPTY once the DCPS layer owns matching — the primary-reader fallback is for a node that does no matching at all"))
+                   "the delivery route for an unmatched writer must be EMPTY once the DCPS layer owns matching — the primary-reader fallback is for a node that does no matching at all")
+           ;; MATCHED-BUT-UNROUTED: impossible in production (%match-remote-endpoint route-adds a remote
+           ;; writer's readers immediately BEFORE recording the match, under the node lock), so it is
+           ;; refused AND COUNTED rather than quietly routed to the primary. The counter is asserted to
+           ;; actually move: an unfalsified counter is the "green gate never seen red" pattern.
+           (let ((wguid2 (dds.disc::%source-guid prefix #x00000202))
+                 (before (dds.disc:disc-node-unrouted-match-drops node)))
+             (dds.disc::%record-match
+              node (dds.rtps.discovery:make-endpoint-data :guid wguid2 :role :writer))
+             (%check :uwnd-matched-no-route-empty
+                     (null (dds.disc::%reader-routes-for node wguid2))
+                     "a MATCHED writer with no route must still resolve to NO reader — tolerating it is the ambiguity that made 'empty route' mean two different things")
+             (%check :uwnd-counted
+                     (> (dds.disc:disc-node-unrouted-match-drops node) before)
+                     "the matched-but-unrouted drop must be COUNTED (disc-node-unrouted-match-drops) — it must stay 0 in production, and a silent drop could not say so")
+             (dds.disc::%deliver-user-sample node #x00000202 1 payload prefix wguid2 1)
+             (%check :uwnd-matched-no-route-not-delivered
+                     (null (dds.dcps:take-samples dr))
+                     "a MATCHED-but-UNROUTED writer's sample must not reach the application either")))
       (dds.dcps:delete-participant p))
     t))

@@ -41,7 +41,7 @@
            #:publish-sample #:publish-sample-into #:*plain-payload-max-bytes*
            #:publish-relay-sample #:publish-relay-lifecycle #:flush-batch #:disc-node-batch-max-samples #:enable-async
            #:disc-node-lease-duration-seconds #:disc-node-lease-duration-nanosec
-           #:disc-node-hb-unarmed-drops #:disc-node-durability-gate-active
+           #:disc-node-unrouted-match-drops #:disc-node-hb-unarmed-drops #:disc-node-durability-gate-active
            ;; ADR 0090 A3b: emit an application acknowledgment, and count the ones that arrive.
            ;; The counters are RECOGNISED-not-processed — see the slot docstrings before reading them
            ;; as evidence that anything acted on an acknowledgment.
