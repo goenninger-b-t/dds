@@ -183,3 +183,23 @@
    writer on the same topic in a DIFFERENT participant, and the reader — on their own domain. The decoy is
    the whole point of the test, and it only proves anything if no foreign participant shares the domain:
    the assertion is that the reader's APP_ACK reaches the writer it names and NOTHING ELSE.")
+
+(defun* record-synthetic-match (node src wid)
+    (function (t (simple-array (unsigned-byte 8) (12)) (unsigned-byte 32)) t)
+  "Record the synthetic remote writer (SRC prefix + WID EntityId) as MATCHED on NODE — the setup a test
+   needs before injecting a sample with %deliver-user-sample against a DCPS participant.
+
+   WHY IT EXISTS. Those tests used to inject without matching anything, and the sample still reached the
+   reader through the WP-N-ENDPOINT-S2 primary-reader fallback. That fallback is exactly what made an RxO
+   refusal ADVISORY — a DataReader could refuse a writer, raise REQUESTED_INCOMPATIBLE_QOS, and read its
+   data anyway (measured against live Connext: interop/connext/appack/captures/a2live-results.txt, leg 3).
+   It now applies only to a node that does no matching at all, so a DCPS-driven injection has to say what
+   it means: this writer is matched.
+
+   Only the GUID is consulted — %record-match keys the match table by the 16-octet GUID alone — so no
+   topic or type name is invented here. IDEMPOTENT (%record-match returns NIL on a re-record), so calling
+   it before every injection is safe."
+  (dds.disc::%record-match
+   node (dds.rtps.discovery:make-endpoint-data
+         :guid (dds.disc::%source-guid src wid) :role :writer))
+  t)

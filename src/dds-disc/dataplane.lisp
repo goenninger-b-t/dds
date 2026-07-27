@@ -2513,12 +2513,38 @@
            (dds.pal:with-lock ((disc-node-lock node))
              (values (copy-list (gethash writer-guid (disc-node-reader-routes node)))
                      (disc-node-reader-routes-generation node)))
-         (let ((resolved (if ids
-                             (loop for rid in ids
-                                   for r = (%user-reader-for node rid)
-                                   when r collect (cons rid r))
-                             (let ((r (disc-node-user-reader node)))
-                               (and r (list (cons (disc-node-user-reader-id node) r)))))))
+         (let ((resolved (cond
+                           (ids (loop for rid in ids
+                                      for r = (%user-reader-for node rid)
+                                      when r collect (cons rid r)))
+                           ;; ⚠️ THE PRIMARY-READER FALLBACK IS FOR A NODE THAT DOES NO MATCHING AT ALL,
+                           ;; AND ONLY THAT. Once the DCPS layer owns matching (durability-gate-active, set
+                           ;; at create-datareader — the same flag the ADR 0059 HEARTBEAT guard keys off),
+                           ;; an EMPTY route does not mean "N=1, route not built yet": it means THIS WRITER
+                           ;; IS NOT MATCHED. Falling back then hands the primary reader the samples of a
+                           ;; writer the RxO gate REFUSED — measured: a Connext APPLICATION_EXPLICIT writer
+                           ;; refused by a :protocol reader still had all five samples delivered
+                           ;; (interop/connext/appack/captures/a2live-results.txt, leg 3). That makes every
+                           ;; RxO verdict ADVISORY rather than binding, for EVERY policy, not just
+                           ;; ACKNOWLEDGMENT_KIND — application acknowledgment merely made it visible,
+                           ;; being the first policy whose refusal is meant to be absolute.
+                           ;;
+                           ;; A bare dds.disc node (the low-level value-level tests, the shapes runners)
+                           ;; never arms the flag by design, so it keeps the fallback byte-identical.
+                           ;;
+                           ;; ⚠️ THE PREDICATE IS "NOT MATCHED", NOT "NO ROUTE", AND THE DIFFERENCE IS LOAD-
+                           ;; BEARING. A first cut refused the fallback whenever the route was empty and the
+                           ;; DCPS layer was active; the suite turned :liv-not-alive-listener RED on both
+                           ;; implementations, because MATCHED-BUT-UNROUTED IS A REAL STATE — %record-match
+                           ;; records a match without route-adding, and this resolver serves the LIVELINESS
+                           ;; status dispatch (%participant-readers-for-writer-guid) as well as delivery, so
+                           ;; refusing it silently dropped a status for a legitimately matched writer.
+                           ;; Refusing only an UNMATCHED writer refuses exactly the defect and nothing else.
+                           ((and (disc-node-durability-gate-active node)
+                                 (not (%guid-matched-p node writer-guid)))
+                            nil)
+                           (t (let ((r (disc-node-user-reader node)))
+                                (and r (list (cons (disc-node-user-reader-id node) r))))))))
            (dds.pal:with-lock ((disc-node-lock node))
              ;; STORE ONLY IF THE ROUTES DID NOT CHANGE UNDER US. %user-reader-for runs outside the lock
              ;; (it may take it), so an unmatch/prune can land mid-resolve; caching that result would make

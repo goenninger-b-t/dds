@@ -4063,6 +4063,7 @@
                  ("acknowledgment-kind-wire" . run-acknowledgment-kind-wire-test) ; ADR 0090 A3b
                  ("app-ack-emit"             . run-app-ack-emit-test)       ; ADR 0090 A3b
                  ("app-ack-watermark"        . run-app-ack-watermark-test)  ; ADR 0090 A3c
+                 ("unmatched-writer-not-delivered" . run-unmatched-writer-not-delivered-test)
                  ("property-based"           . run-pbt-tests)
                  ("udp-loopback"             . run-udp-loopback-test)
                  ("rtps-discovery-spdp"      . dds.rtps.discovery:run-discovery-test)

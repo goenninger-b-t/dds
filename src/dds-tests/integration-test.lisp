@@ -12946,3 +12946,48 @@
       (dds.dcps:delete-participant px)
       (dds.dcps:delete-participant pr))
     t))
+
+(defun* run-unmatched-writer-not-delivered-test ()
+    (function () t)
+  "⚠️ AN RxO VERDICT MUST BE BINDING, NOT ADVISORY: a remote writer this participant never matched must
+   not have its samples delivered to the application.
+
+   FOUND BY MEASUREMENT, NOT REVIEW (interop/connext/appack/captures/a2live-results.txt, leg 3). A live
+   Connext APPLICATION_EXPLICIT writer was REFUSED by our :protocol reader — matched_count stayed 0, the
+   refusal correctly raised REQUESTED_INCOMPATIBLE_QOS naming :acknowledgment-kind — AND ALL FIVE OF ITS
+   SAMPLES WERE STILL DELIVERED. The reader refused the writer and read its data anyway.
+
+   THE CAUSE was the WP-N-ENDPOINT-S2 primary-reader fallback in %reader-routes-for: an EMPTY route fell
+   back to the primary reader, and 'empty' covers BOTH 'this node does no matching' AND 'this writer was
+   refused'. The fallback exists for the first (a bare dds.disc node — the value-level tests, the shapes
+   runners — never matches anything) and must not apply to the second. It is now gated on
+   disc-node-durability-gate-active, the flag create-datareader sets to mean 'the DCPS layer owns
+   matching' — the same flag the ADR 0059 HEARTBEAT guard keys off.
+
+   THE SCOPE IS EVERY POLICY, NOT ACKNOWLEDGMENT_KIND. Any RxO refusal — DURABILITY, RELIABILITY,
+   DEADLINE — was equally advisory. Application acknowledgment merely made it visible, being the first
+   policy whose refusal is meant to be absolute rather than a downgrade.
+
+   FALSIFIED: restore the unconditional fallback and this goes red on its first assertion."
+  (let* ((ts (dds.types:find-type-support "shape-type"))
+         (p (dds.dcps:create-participant :domain (test-domain +td-app-ack+))))
+    (unwind-protect
+         (let* ((tp (dds.dcps:create-topic p "UnmatchedTopic" "ShapeType" ts))
+                (dr (dds.dcps:create-datareader (dds.dcps:create-subscriber p) tp
+                                                :qos (dds.qos:make-reader-qos :reliability :reliable)))
+                (node (dds.dcps::dp-node p))
+                (prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element #x77))
+                (wid #x00000102)
+                (wguid (dds.disc::%source-guid prefix wid))
+                (payload (%serialize-shape (make-shape-type :color "X" :x 1 :y 2 :shapesize 3))))
+           (%check :uwnd-not-matched (not (dds.disc::%guid-matched-p node wguid))
+                   "the synthetic remote writer must be UNMATCHED, or the test proves nothing")
+           (dds.disc::%deliver-user-sample node wid 1 payload prefix wguid 1)
+           (%check :uwnd-nothing-delivered
+                   (null (dds.dcps:take-samples dr))
+                   "⚠️ an UNMATCHED writer's sample must NOT reach the application — a reader that refuses a writer on RxO and then reads its data makes every RxO verdict advisory")
+           (%check :uwnd-no-route
+                   (null (dds.disc::%reader-routes-for node wguid))
+                   "the delivery route for an unmatched writer must be EMPTY once the DCPS layer owns matching — the primary-reader fallback is for a node that does no matching at all"))
+      (dds.dcps:delete-participant p))
+    t))
