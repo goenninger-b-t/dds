@@ -2825,3 +2825,59 @@
     (%check :aa-fuzz-safe t
             (format nil "2000 random bodies parsed without OOB or hang (~d structurally acceptable)" accepted)))
   t)
+
+(defun* run-acknowledgment-kind-rxo-test ()
+    (function () t)
+  "ADR 0090 slice A3: ACKNOWLEDGMENT_KIND is RxO-checked BY EQUALITY, and only between RELIABLE endpoints.
+
+   WHY EQUALITY AND NOT RANK — this is the whole point of the test. Every other ordered QoS has a safe
+   direction, where a stronger offer satisfies a weaker request. This policy has NONE, because the two
+   mismatches fail in OPPOSITE ways and neither announces itself:
+
+     writer :PROTOCOL  <- reader :APPLICATION-*   the writer purges on protocol acks alone, so the reader
+                                                  believes it holds an end-to-end guarantee it does not.
+                                                  SILENT DATA LOSS.
+     writer :APPLICATION-* <- reader :PROTOCOL    the writer waits for acknowledgments that reader will
+                                                  never send; its history grows until RESOURCE_LIMITS
+                                                  blocks or rejects. SILENT STALL.
+
+   So both are refused at MATCH time and reported as INCOMPATIBLE_QOS — the one outcome an operator can
+   see and act on. That is the ADR 0057 lesson: matched-but-undeliverable is the worst state to be in.
+
+   THE RELIABILITY GATE MATTERS TOO. A BEST_EFFORT pair acknowledges nothing whatever either side asked
+   for, so refusing that match would block endpoints that cannot possibly disagree.
+
+   FALSIFIED: make the check a rank comparison instead of equality and :rxo-ack-protocol-writer passes
+   when it must not; drop the reliability gate and :rxo-ack-best-effort-ignored fails."
+  (flet ((compat (ok rk wk)
+           (nth-value 0 (dds.qos:qos-rxo-compatible
+                         (dds.qos:make-writer-qos :reliability ok :acknowledgment-kind wk)
+                         (dds.qos:make-reader-qos :reliability ok :acknowledgment-kind rk))))
+         (why (ok rk wk)
+           (nth-value 1 (dds.qos:qos-rxo-compatible
+                         (dds.qos:make-writer-qos :reliability ok :acknowledgment-kind wk)
+                         (dds.qos:make-reader-qos :reliability ok :acknowledgment-kind rk)))))
+    (%check :rxo-ack-default-matches (compat :reliable :protocol :protocol)
+            "the default (:protocol both sides) must match — this policy must not break existing endpoints")
+    (%check :rxo-ack-equal-matches (compat :reliable :application-explicit :application-explicit)
+            "equal APPLICATION kinds must match")
+    (%check :rxo-ack-protocol-writer
+            (not (compat :reliable :application-explicit :protocol))
+            "a :PROTOCOL writer must NOT match an APPLICATION reader — it would purge on protocol acks while the reader believed it had an end-to-end guarantee (silent data loss)")
+    (%check :rxo-ack-protocol-reader
+            (not (compat :reliable :protocol :application-explicit))
+            "an APPLICATION writer must NOT match a :PROTOCOL reader — it would wait forever for acknowledgments that reader never sends (silent stall)")
+    (%check :rxo-ack-auto-vs-explicit
+            (not (compat :reliable :application-auto :application-explicit))
+            "two DIFFERENT application kinds must not match either: when a sample becomes acknowledged is precisely what they disagree about")
+    (%check :rxo-ack-names-the-policy
+            (member :acknowledgment-kind (why :reliable :protocol :application-explicit))
+            "the incompatibility must NAME acknowledgment-kind, or an operator cannot tell which policy refused the match")
+    (%check :rxo-ack-best-effort-ignored
+            (compat :best-effort :protocol :application-explicit)
+            "a BEST_EFFORT pair must match regardless: nothing is acknowledged either way, so there is nothing to disagree about")
+    ;; the vendor policy carries no OMG QosPolicyId_t and must not invent one
+    (%check :rxo-ack-policy-id-invalid
+            (= (dds.dcps:rxo-policy-id :acknowledgment-kind) dds.dcps:+qos-policy-id-invalid+)
+            "a vendor policy must report +qos-policy-id-invalid+, never an invented id that could collide with a future OMG assignment"))
+  t)

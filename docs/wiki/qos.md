@@ -62,6 +62,7 @@ a package-qualified accessor.
 | `dds.qos:qos-resource-max-samples-per-instance` | RESOURCE_LIMITS `max_samples_per_instance` (`-1` = `LENGTH_UNLIMITED`) | `-1` |
 | `dds.qos:qos-type-consistency` | TYPE_CONSISTENCY_ENFORCEMENT policy (a `type-consistency-enforcement`, reader-only, not RxO) | `(make-type-consistency-enforcement)` |
 | `dds.qos:qos-writer-cache-high-watermark` / `-low-watermark` | RELIABLE_WRITER_CACHE watermarks (**vendor extension**, ADR 0089; writer-only, not RxO, not in SEDP) — unacknowledged-sample thresholds that open and close a backpressure episode; see below | `nil` (disabled) |
+| `dds.qos:qos-acknowledgment-kind` | ACKNOWLEDGMENT_KIND (**vendor extension**, ADR 0090) — `:protocol` / `:application-auto` / `:application-explicit`; **RxO-checked by EQUALITY** between RELIABLE endpoints; see below | `:protocol` |
 
 ### Endpoint-flavoured constructors
 
@@ -257,6 +258,50 @@ levels, so `get-reliable-writer-cache-changed-status` stays useful at all times.
          :reliability :reliable :history-kind :keep-all
          :writer-cache-high-watermark 500
          :writer-cache-low-watermark  50))
+```
+
+### ACKNOWLEDGMENT_KIND (vendor extension, ADR 0090) — and why it is RxO-checked by EQUALITY
+
+The third vendor extension, and the **only one of the three that participates in RxO**. DDS 1.4 defines
+no application acknowledgment at all — an exhaustive search of RTPS 2.5 finds nothing, and the DCPS IDL
+has only `wait_for_acknowledgments`, which is protocol-level — so this mirrors RTI's
+`DDS_ReliabilityQosPolicy.acknowledgment_kind`. It is effective only when RELIABILITY is `:reliable`.
+
+| `dds.qos:qos-acknowledgment-kind` | when a sample counts as acknowledged |
+|---|---|
+| `:protocol` *(default)* | by the RTPS protocol — today's behaviour, unchanged |
+| `:application-auto` | when the subscribing application **accesses** it (`read`/`take`) |
+| `:application-explicit` | only on an explicit `acknowledge-sample` / `acknowledge-all` |
+
+**Every other ordered policy has a safe direction** — a stronger offer satisfies a weaker request. This
+one has **none**, because the two mismatches fail in *opposite* ways and neither announces itself:
+
+| mismatch | what happens |
+|---|---|
+| writer `:protocol` ← reader `:application-*` | the writer purges on protocol acks alone, so the reader believes it holds an end-to-end guarantee it does not have — **silent data loss** |
+| writer `:application-*` ← reader `:protocol` | the writer waits for acknowledgments that reader will never send; its history grows until RESOURCE_LIMITS blocks or rejects — **silent stall** |
+
+Neither is recoverable at runtime, so a mismatch is **refused at match time** and reported as
+`INCOMPATIBLE_QOS` — the one outcome an operator can see and act on. (OWNERSHIP is checked by equality
+for the same structural reason.) Two *different* application kinds do not match either: when a sample
+becomes acknowledged is precisely what they disagree about.
+
+**Best-effort endpoints are exempt.** A BEST_EFFORT pair acknowledges nothing whatever either side asked
+for, so refusing that match would block endpoints that cannot possibly disagree.
+
+Being a vendor policy it carries **no OMG `QosPolicyId_t`**, so the incompatible-QoS status reports
+`+qos-policy-id-invalid+` rather than an invented id that could collide with a future OMG assignment —
+the same convention DISCOVERY_CONFIG and the watermarks follow. The failing policy is still named in
+keyword form, so it is identifiable.
+
+```lisp
+;; both sides must agree, or they will not match
+(dds.dcps:create-datawriter pub topic
+  :qos (dds.qos:make-writer-qos :reliability :reliable
+                                :acknowledgment-kind :application-explicit))
+(dds.dcps:create-datareader sub topic
+  :qos (dds.qos:make-reader-qos :reliability :reliable
+                                :acknowledgment-kind :application-explicit))
 ```
 
 ## Examples

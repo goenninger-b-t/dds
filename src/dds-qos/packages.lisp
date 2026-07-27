@@ -32,6 +32,8 @@
            #:qos-discovery-announce-period #:qos-discovery-lease-duration
            ;; ADR 0089: the RELIABLE_WRITER_CACHE watermarks (VENDOR EXTENSION, writer-scoped, not RxO)
            #:qos-writer-cache-low-watermark #:qos-writer-cache-high-watermark
+           ;; ADR 0090: ACKNOWLEDGMENT_KIND (VENDOR EXTENSION) — RxO-checked BY EQUALITY between RELIABLE endpoints
+           #:qos-acknowledgment-kind
            ;; TYPE_CONSISTENCY_ENFORCEMENT policy (XTypes, reader-only; FR-TYPE-4)
            #:type-consistency-enforcement #:make-type-consistency-enforcement
            #:copy-type-consistency-enforcement

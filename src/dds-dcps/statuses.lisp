@@ -172,7 +172,13 @@
         (cons :presentation +qos-policy-id-presentation+)
         (cons :data-representation +qos-policy-id-data-representation+))
   "Maps an RxO incompatible-policy keyword (dds.qos:qos-rxo-compatible's second value)
-   to its DDS QosPolicyId_t for the (OFFERED|REQUESTED)_INCOMPATIBLE_QOS status.")
+   to its DDS QosPolicyId_t for the (OFFERED|REQUESTED)_INCOMPATIBLE_QOS status.
+
+   :ACKNOWLEDGMENT-KIND is DELIBERATELY ABSENT (ADR 0090). It is a vendor extension with no OMG
+   QosPolicyId_t, so rxo-policy-id's fallback reports +qos-policy-id-invalid+ for it — the same
+   convention DISCOVERY_CONFIG and the RELIABLE_WRITER_CACHE watermarks follow. Inventing an id would
+   collide with whatever the OMG assigns next; omitting it is the honest answer, and the status still
+   fires and still names the offending policy in its keyword form.")
 
 (defun* rxo-policy-id (keyword)
     (function (keyword) integer)

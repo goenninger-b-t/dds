@@ -162,7 +162,28 @@
    So: disabled by default, and the status then reports the FULL transition (an absolute condition needing
    no episode) and keeps its levels — unacked count, peak, replaced-unacked — continuously readable through
    get-reliable-writer-cache-changed-status at no cost. Set HIGH to a depth at which YOUR writer is in
-   trouble to be told when it gets there, and LOW below it to be told when it recovers."
+   trouble to be told when it gets there, and LOW below it to be told when it recovers.
+
+   ACKNOWLEDGMENT-KIND is a third VENDOR EXTENSION (ADR 0090), and the only one of the three that IS
+   RxO-checked. DDS 1.4 defines no application acknowledgment at all — an exhaustive search of RTPS 2.5
+   finds nothing, and the DCPS IDL has only wait_for_acknowledgments, which is protocol-level — so this
+   mirrors RTI's DDS_ReliabilityQosPolicy.acknowledgment_kind. Effective only when RELIABILITY is
+   :RELIABLE; on a best-effort endpoint there are no acknowledgments to speak of and it is ignored.
+
+     :PROTOCOL (default)     acknowledged by the RTPS protocol — today's behaviour, unchanged.
+     :APPLICATION-AUTO       acknowledged when the subscribing application ACCESSES it (read/take).
+     :APPLICATION-EXPLICIT   acknowledged only on an explicit acknowledge-sample / acknowledge-all.
+
+   ⚠️ RxO IS BY EQUALITY, NOT BY RANK, and that is the safety-critical part of this policy. Every other
+   ordered policy has a 'a stronger offer satisfies a weaker request' direction. This one has NO safe
+   direction, because both mismatches fail and they fail in OPPOSITE ways. A writer offering :PROTOCOL to
+   a reader requesting an APPLICATION kind purges on protocol acks alone, so the reader believes it holds
+   an end-to-end guarantee it does not have — SILENT DATA LOSS. A writer offering an APPLICATION kind to a
+   :PROTOCOL reader waits for acknowledgments that reader will never send, so its history grows until
+   RESOURCE_LIMITS blocks or rejects — A SILENT STALL. Neither is recoverable at runtime and neither
+   announces itself, so a mismatch is refused at match time and reported as INCOMPATIBLE_QOS — the one
+   outcome an operator can actually see and act on (the ADR 0057 lesson: matched-but-undeliverable is the
+   worst state to leave a system in). OWNERSHIP is checked by equality for the same structural reason."
   (reliability :best-effort :type (member :best-effort :reliable))
   (reliability-max-blocking (make-qos-duration 0 100000000) :type qos-duration) ; 100 ms
   (durability :volatile :type (member :volatile :transient-local :transient :persistent))
@@ -208,7 +229,10 @@
   (discovery-lease-duration (make-qos-duration 100 0) :type qos-duration)
   ;; RELIABLE_WRITER_CACHE watermarks (VENDOR EXTENSION, writer-scoped, not RxO, not in SEDP) — see above.
   (writer-cache-low-watermark nil :type (or null (integer 0)))
-  (writer-cache-high-watermark nil :type (or null (integer 1))))
+  (writer-cache-high-watermark nil :type (or null (integer 1)))
+  ;; ACKNOWLEDGMENT_KIND (VENDOR EXTENSION, ADR 0090) — RxO-checked by EQUALITY; see the docstring.
+  (acknowledgment-kind :protocol
+                       :type (member :protocol :application-auto :application-explicit)))
 
 (defun* make-writer-qos (&rest args)
     (function (&rest t) qos)
@@ -246,6 +270,15 @@
       (push :latency-budget bad))
     (unless (eq (qos-ownership offered) (qos-ownership requested))
       (push :ownership bad))
+    ;; ACKNOWLEDGMENT_KIND (VENDOR EXTENSION, ADR 0090): equality, and only between RELIABLE endpoints.
+    ;; Gated on reliability because the policy is meaningless without acknowledgments — a BEST_EFFORT pair
+    ;; acknowledges nothing whatever either side asked for, so refusing that match would block endpoints
+    ;; that cannot possibly disagree. Equality rather than rank: see the qos docstring — BOTH mismatch
+    ;; directions fail, one as silent data loss and the other as a silent stall.
+    (when (and (eq (qos-reliability offered) :reliable)
+               (eq (qos-reliability requested) :reliable)
+               (not (eq (qos-acknowledgment-kind offered) (qos-acknowledgment-kind requested))))
+      (push :acknowledgment-kind bad))
     (when (or (< (liveliness-rank (qos-liveliness offered))
                  (liveliness-rank (qos-liveliness requested)))
               (not (duration<= (qos-liveliness-lease offered) (qos-liveliness-lease requested))))

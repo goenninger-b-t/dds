@@ -4058,6 +4058,7 @@
                  ("rtps-reliable-multiwriter" . run-reliable-multiwriter-test)
                  ("rtps-proxy-key-retention" . run-proxy-key-retention-test)   ; ADR 0088
                  ("app-ack-hostile"          . run-app-ack-hostile-test)     ; ADR 0090
+                 ("acknowledgment-kind-rxo"  . run-acknowledgment-kind-rxo-test) ; ADR 0090
                  ("property-based"           . run-pbt-tests)
                  ("udp-loopback"             . run-udp-loopback-test)
                  ("rtps-discovery-spdp"      . dds.rtps.discovery:run-discovery-test)
