@@ -2736,3 +2736,92 @@
           (%check :dedup-origin-cap-counted (= refused 3)
                   (format nil "refusals must be COUNTED and readable (expected 3, got ~d)" refused)))))
     t))
+
+(defun* %app-ack-body (vw-count intervals &key (trailing-count 7))
+    (function (integer list &key (:trailing-count integer))
+              (simple-array (unsigned-byte 8) (*)))
+  "Build an APP_ACK body (ADR 0090 layout) with VW-COUNT declared and INTERVALS actually written, each
+   (first last flags payload-len). Declaring a count that disagrees with what follows is the POINT: it is
+   how a hostile peer drives the parser's loops past the end of the buffer."
+  (let* ((buf (make-array 4096 :element-type '(unsigned-byte 8) :initial-element 0))
+         (ob (dds.core.buffer:octet-buffer-over buf))
+         (c (dds.core.buffer:cursor ob :endianness :little)))
+    (dolist (b '(#x80 #x00 #x00 #x07 #x80 #x00 #x00 #x02)) (dds.core.buffer:put-u8 c b))
+    (dds.core.buffer:put-u32 c (ldb (byte 32 0) vw-count))
+    (when intervals
+      (dotimes (i 16) (declare (ignorable i)) (dds.core.buffer:put-u8 c #xAA))   ; virtualWriterGuid
+      (dds.core.buffer:put-u16 c (ldb (byte 16 0) (length intervals)))        ; intervalCount
+      (dds.core.buffer:put-u16 c 0)                                          ; octetsToNextVirtualWriter
+      (dolist (iv intervals)
+        (destructuring-bind (first last flags plen) iv
+          (dds.core.buffer:put-u32 c 0) (dds.core.buffer:put-u32 c first)
+          (dds.core.buffer:put-u32 c 0) (dds.core.buffer:put-u32 c last)
+          (dds.core.buffer:put-u16 c (ldb (byte 16 0) flags))
+          (dds.core.buffer:put-u16 c (ldb (byte 16 0) plen)))))
+    (dds.core.buffer:put-u32 c (ldb (byte 32 0) trailing-count))
+    (subseq buf 0 (dds.core.buffer:cursor-position c))))
+
+(defun* %parse-app-ack-octets (octets)
+    (function ((array (unsigned-byte 8) (*))) t)
+  "Run PARSE-APP-ACK-BODY over OCTETS. Returns the reader-id (non-NIL = accepted) or NIL (rejected)."
+  (let* ((ob (dds.core.buffer:octet-buffer-over (coerce octets '(simple-array (unsigned-byte 8) (*)))))
+         (c (dds.core.buffer:cursor ob :endianness :little)))
+    (dds.rtps.message:parse-app-ack-body c 0 (lambda (&rest r) (declare (ignore r)) nil))))
+
+(defun* run-app-ack-hostile-test ()
+    (function () t)
+  "ADR 0090 / NFR-SEC-POSTURE: PARSE-APP-ACK-BODY faces the NETWORK, so a malformed or hostile APP_ACK
+   must yield NIL — never an out-of-bounds read, never an unbounded walk, never a partial accept.
+
+   THE STRUCTURAL HAZARD IS THAT THIS SUBMESSAGE CARRIES ITS OWN LOOP BOUNDS. virtualWriterCount and
+   intervalCount come straight off the wire and drive nested loops, so a peer that sends 0x7fffffff
+   dictates how long we spin. That is remotely-drivable CPU, in the same family as the relay-dedup defect
+   fixed at 65d87fe. Both counts are also SIGNED in RTI's layout, so reading them unsigned would turn a
+   negative into an enormous bound — which is why the parser uses %read-i32/%read-i16 and rejects on
+   MINUSP rather than trusting the value.
+
+   A partially-parsed acknowledgment is worse than none at all: under APP-ACK semantics a writer that
+   believes a sample acknowledged may purge it, so a truncated body that yielded 'some intervals' would
+   be silent data loss. Every rejection below is therefore total.
+
+   FALSIFIED: remove either count guard in parse-app-ack-body and the corresponding check hangs or fails."
+  ;; the shapes a real peer sends still parse
+  (%check :aa-good-single
+          (%parse-app-ack-octets (%app-ack-body 1 '((1 1 #x0000 0))))
+          "a well-formed single-interval APP_ACK must parse")
+  (%check :aa-good-multi
+          (%parse-app-ack-octets (%app-ack-body 1 '((1 1 #x0100 0) (2 2 #x0000 0))))
+          "a well-formed two-interval APP_ACK must parse")
+  ;; wire-supplied loop bounds
+  (%check :aa-huge-vw-count
+          (null (%parse-app-ack-octets (%app-ack-body #x7fffffff '((1 1 0 0)))))
+          "an absurd virtualWriterCount must be REJECTED, not walked — it is remotely-drivable CPU")
+  (%check :aa-negative-vw-count
+          (null (%parse-app-ack-octets (%app-ack-body #xffffffff '((1 1 0 0)))))
+          "a NEGATIVE virtualWriterCount (0xffffffff read signed) must be rejected; read unsigned it would be ~4 billion iterations")
+  (%check :aa-huge-interval-count
+          (null (%parse-app-ack-octets
+                 (let ((b (%app-ack-body 1 '((1 1 0 0)))))
+                   (setf (aref b 28) #xff (aref b 29) #x7f)   ; intervalCount := 0x7fff
+                   b)))
+          "an intervalCount far beyond the body must be rejected")
+  ;; truncation at every length
+  (let ((full (%app-ack-body 1 '((1 1 #x0100 0) (2 2 #x0000 0)))) (survived 0))
+    (dotimes (n (length full))
+      (when (%parse-app-ack-octets (subseq full 0 n)) (incf survived)))
+    (%check :aa-truncation
+            (zerop survived)
+            (format nil "every TRUNCATION of a valid body must be rejected (~d prefix(es) were accepted)" survived)))
+  ;; a payload length that runs off the end
+  (%check :aa-payload-overrun
+          (null (%parse-app-ack-octets (%app-ack-body 1 '((1 1 #x0000 4096)))))
+          "an intervalPayloadLength beyond the buffer must be rejected, not read past the end")
+  ;; random octets: never a crash, never a partial accept that reads OOB
+  (let ((accepted 0))
+    (dotimes (i 2000)
+      (let ((v (make-array (+ 12 (mod i 90)) :element-type '(unsigned-byte 8))))
+        (dotimes (j (length v)) (setf (aref v j) (random 256)))
+        (when (%parse-app-ack-octets v) (incf accepted))))
+    (%check :aa-fuzz-safe t
+            (format nil "2000 random bodies parsed without OOB or hang (~d structurally acceptable)" accepted)))
+  t)

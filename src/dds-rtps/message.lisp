@@ -62,6 +62,39 @@
 (defconstant +submsg-data-frag+      #x16
   "SubmessageKind DATA_FRAG (RTPS 2.5 §9.4.5.1.1).")
 
+;;;; RTI VENDOR-EXTENSION submessage ids (ADR 0090). NOT in RTPS 2.5 — its SubmessageKind enumeration
+;;;; (§9.4.5.1.1) defines only the ids above. These two are read from an RTI Connext 7.3.1 capture
+;;;; (interop/connext/appack/captures/) and named from the Wireshark dissector's own id table.
+;;;;
+;;;; ⚠️ THEY SIT IN THE OMG PROTOCOL-RESERVED RANGE 0x00-0x7f, NOT the vendor range 0x80-0xff that
+;;;; §9.4.5.1.1 sets aside for exactly this purpose ("Submessages with ID's 0x80 to 0xff (inclusive) are
+;;;; vendor-specific; they will not be defined by future versions of the protocol"). A future RTPS minor
+;;;; version may therefore assign 0x1c/0x1d to something else. CONSEQUENCE, and it is not optional: these
+;;;; ids may only ever be interpreted when the CURRENT VendorId says RTI — §9.4.5.1.1 makes the meaning
+;;;; "dependent on the vendorId that is current when the Submessage is encountered", and §8.3.3.2 rule 3
+;;;; requires ignoring vendor-range ids from an unknown vendor. We emit NEITHER of these.
+(defconstant +submsg-app-ack+        #x1c
+  "RTI VENDOR EXTENSION APP_ACK (ADR 0090) — application acknowledgment from reader to writer. NOT an
+   RTPS 2.5 SubmessageKind; interpret ONLY under VendorId RTI (see the block comment above).")
+(defconstant +submsg-app-ack-conf+   #x1d
+  "RTI VENDOR EXTENSION APP_ACK_CONF (ADR 0090) — the writer's confirmation of an APP_ACK, echoing its
+   COUNT. NOT an RTPS 2.5 SubmessageKind; interpret ONLY under VendorId RTI.")
+
+(defconstant +vendor-id-rti+ #x0101
+  "RTI Connext's VendorId, observed on every APP_ACK/APP_ACK_CONF in the ADR 0090 capture. The gate for
+   interpreting the vendor-extension submessage ids above; RTPS 2.5 §9.4.5.1.1 makes a vendor submessage's
+   meaning dependent on the VendorId current when it is encountered.")
+
+;;;; Resource-exhaustion guards for the APP_ACK walk (NFR-SEC-POSTURE). Both counts below are read
+;;;; STRAIGHT OFF THE WIRE and drive loops, so an unbounded value is remotely-drivable CPU. The caps are
+;;;; deliberately generous relative to anything observed (the capture shows 1 virtual writer and <= 2
+;;;; intervals) and exist to bound the walk, not to model RTI's limits — a body that exceeds them is
+;;;; REJECTED rather than truncated, because a partially-parsed acknowledgment is worse than none.
+(defconstant +app-ack-max-virtual-writers+ 256
+  "Maximum virtualWriterCount this parser will walk before rejecting an APP_ACK body (NFR-SEC-POSTURE).")
+(defconstant +app-ack-max-intervals+ 1024
+  "Maximum intervalCount per virtual writer this parser will walk before rejecting (NFR-SEC-POSTURE).")
+
 (defconstant +flag-endianness+ #x01
   "Submessage E (EndiannessFlag), bit 0; 1 = little-endian (RTPS 2.5 §9.4.5.1.2).")
 
@@ -77,6 +110,24 @@
   "Octets between CURSOR's current position and its buffer capacity (bytes still available)."
   (- (dds.core.buffer:octet-buffer-capacity (dds.core.buffer:cursor-buffer cursor))
      (dds.core.buffer:cursor-position cursor)))
+
+;;; SIGNED reads. The RTPS 2.5 submessages in this file carry only unsigned counts, so the buffer layer
+;;; offers no signed getter — but the RTI vendor extensions (ADR 0090) declare their counts SIGNED
+;;; (virtualWriterCount i32, intervalCount i16), and reading a signed field as unsigned is how a negative
+;;; wire value becomes a gigantic loop bound. These sign-extend so the parser's `minusp` rejections can
+;;; actually fire. Endianness follows the cursor, as everywhere else.
+(declaim (inline %read-i16 %read-i32))
+(defun* %read-i16 (cursor)
+    (function (dds.core.buffer:cursor) fixnum)
+  "Read a 16-bit SIGNED integer at CURSOR (two's complement, cursor endianness)."
+  (let ((u (dds.core.buffer:get-u16 cursor)))
+    (if (>= u #x8000) (- u #x10000) u)))
+
+(defun* %read-i32 (cursor)
+    (function (dds.core.buffer:cursor) (signed-byte 32))
+  "Read a 32-bit SIGNED integer at CURSOR (two's complement, cursor endianness)."
+  (let ((u (dds.core.buffer:get-u32 cursor)))
+    (if (>= u #x80000000) (- u #x100000000) u)))
 
 ;;; ---- RTPS Message Header (§9.4.4): magic + version + vendorId + guidPrefix ----
 
@@ -456,6 +507,98 @@
     (multiple-value-bind (base numbits bitmap) (read-sequence-number-set cursor)
       (when (null base) (return-from parse-gap-body nil))
       (values reader-id writer-id gap-start base numbits bitmap))))
+
+;;; ---- APP_ACK / APP_ACK_CONF (RTI VENDOR EXTENSION, ADR 0090). DECODE ONLY — nothing here emits.
+;;;
+;;; THERE IS NO SPEC CLAUSE FOR THIS. Application acknowledgment appears nowhere in RTPS 2.5 (an
+;;; exhaustive search of the PDF and the XMI returns zero occurrences) and the DCPS IDL has only
+;;; wait_for_acknowledgments, which is protocol-level. So unlike every other parser in this file, the
+;;; citations below are to a CAPTURE, not to a clause: interop/connext/appack/captures/, RTI Connext
+;;; 7.3.1, whose committed decode this layout reproduces exactly on 10/10 bodies.
+
+(defun* parse-app-ack-body (cursor flags interval-fn)
+    (function (dds.core.buffer:cursor (unsigned-byte 8) function) t)
+  "Parse an RTI APP_ACK body (VENDOR EXTENSION, ADR 0090). Returns
+   (values reader-id writer-id virtual-writer-count count) or NIL on a short, hostile or
+   structurally-invalid body. Bounds-checked at every read (NFR-SEC-POSTURE).
+
+   Layout, from the ADR 0090 capture rather than from any clause:
+
+     readerId 4 · writerId 4 · virtualWriterCount i32
+       per virtual writer: guid 16 · intervalCount i16 · octetsToNextVirtualWriter i16
+         per interval: firstSN 8 · lastSN 8 · intervalFlags i16 · intervalPayloadLength i16 · payload
+     count i32
+
+   INTERVAL-FN is called once per interval as
+   (vw-index guid-offset first-sn last-sn interval-flags payload-offset payload-len),
+   passing OFFSETS into the cursor's buffer rather than freshly-built octet vectors. That is why this is a
+   visitor and not a value-returning parser: the structure is nested and variable-length, so returning it
+   would mean allocating a list per acknowledgment — and this file is hot-path-gated (NFR-MEM) on a
+   message that arrives about once per sample. A caller that needs the GUID copies it; one that only
+   matches against a known writer compares in place.
+
+   ⚠️ INTERVAL-FLAGS IS PASSED THROUGH UNINTERPRETED. Only two values have been observed (0x0000 on the
+   newly acknowledged sequence number, 0x0100 on the coalesced run of previously reported ones) and its
+   encoding is NOT pinned. Deciding what it means from two samples is exactly the kind of guess ADR 0089
+   §5 was written to prevent, so this parser reports it and refuses to interpret it.
+
+   THE CALLER MUST HAVE ESTABLISHED VendorId = +vendor-id-rti+ (RTPS 2.5 §9.4.5.1.1: a vendor
+   submessage's meaning depends on the current VendorId). This function does not check that — it cannot,
+   the VendorId lives in the message header — and a caller that skips it is misreading a submessage id
+   the OMG may one day assign to something else entirely."
+  (declare (ignore flags))
+  (when (< (%remaining cursor) 12) (return-from parse-app-ack-body nil))
+  (let* ((reader-id (read-entity-id cursor))
+         (writer-id (read-entity-id cursor))
+         (vw-count (%read-i32 cursor)))
+    ;; A negative or absurd count is wire-supplied loop control: reject, never clamp-and-continue.
+    (when (or (minusp vw-count) (> vw-count +app-ack-max-virtual-writers+))
+      (return-from parse-app-ack-body nil))
+    (dotimes (v vw-count)
+      (when (< (%remaining cursor) 20) (return-from parse-app-ack-body nil))
+      (let ((guid-offset (dds.core.buffer:cursor-position cursor)))
+        (dds.core.buffer:cursor-set-position cursor (+ guid-offset 16))
+        (let ((interval-count (%read-i16 cursor))
+              (octets-to-next (%read-i16 cursor)))
+          (declare (ignorable octets-to-next))
+          (when (or (minusp interval-count) (> interval-count +app-ack-max-intervals+))
+            (return-from parse-app-ack-body nil))
+          (dotimes (i interval-count)
+            (when (< (%remaining cursor) 20) (return-from parse-app-ack-body nil))
+            (let* ((first-sn (read-sequence-number cursor))
+                   (last-sn (read-sequence-number cursor))
+                   (interval-flags (%read-i16 cursor))
+                   (payload-len (%read-i16 cursor)))
+              (when (minusp payload-len) (return-from parse-app-ack-body nil))
+              (when (> payload-len (%remaining cursor)) (return-from parse-app-ack-body nil))
+              (let ((payload-offset (dds.core.buffer:cursor-position cursor)))
+                (funcall interval-fn v guid-offset first-sn last-sn interval-flags
+                         payload-offset payload-len)
+                (dds.core.buffer:cursor-set-position cursor (+ payload-offset payload-len))))))))
+    (when (< (%remaining cursor) 4) (return-from parse-app-ack-body nil))
+    (values reader-id writer-id vw-count (%read-i32 cursor))))
+
+(defun* parse-app-ack-conf-body (cursor flags)
+    (function (dds.core.buffer:cursor (unsigned-byte 8)) t)
+  "Parse an RTI APP_ACK_CONF body (VENDOR EXTENSION, ADR 0090) — the writer's confirmation of an APP_ACK,
+   echoing its COUNT. Returns (values reader-id writer-id virtual-writer-count count) or NIL on a short or
+   hostile body. Bounds-checked at every read (NFR-SEC-POSTURE).
+
+   Layout (ADR 0090 capture): readerId 4 · writerId 4 · virtualWriterCount i32 ·
+   {virtualWriterGuid 16} × count · count i32. The GUIDs are WALKED, not returned: this submessage is a
+   confirmation keyed by COUNT, and a caller that needs to know which writers were named can re-walk the
+   buffer. Same VendorId precondition as PARSE-APP-ACK-BODY."
+  (declare (ignore flags))
+  (when (< (%remaining cursor) 12) (return-from parse-app-ack-conf-body nil))
+  (let* ((reader-id (read-entity-id cursor))
+         (writer-id (read-entity-id cursor))
+         (vw-count (%read-i32 cursor)))
+    (when (or (minusp vw-count) (> vw-count +app-ack-max-virtual-writers+))
+      (return-from parse-app-ack-conf-body nil))
+    (when (< (%remaining cursor) (+ (* 16 vw-count) 4)) (return-from parse-app-ack-conf-body nil))
+    (dds.core.buffer:cursor-set-position cursor (+ (dds.core.buffer:cursor-position cursor)
+                                                   (* 16 vw-count)))
+    (values reader-id writer-id vw-count (%read-i32 cursor))))
 
 ;;; ---- INFO_TIMESTAMP submessage (§9.4.5.9 / §8.3.7.9): a source Timestamp applied to the SUBSEQUENT
 ;;; entity submessages (DATA/DATA_FRAG) in the same datagram, until the next INFO_TS. Body (I flag clear)

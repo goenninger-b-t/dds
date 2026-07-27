@@ -61,6 +61,10 @@
            #:write-heartbeat #:parse-heartbeat-body
            #:write-acknack #:parse-acknack-body
            #:write-gap #:parse-gap-body
+           ;; ADR 0090: RTI vendor-extension APP_ACK / APP_ACK_CONF — DECODE ONLY, and only ever
+           ;; interpretable under VendorId RTI (RTPS 2.5 §9.4.5.1.1). Nothing here emits them.
+           #:+submsg-app-ack+ #:+submsg-app-ack-conf+ #:+vendor-id-rti+
+           #:parse-app-ack-body #:parse-app-ack-conf-body
            #:write-info-ts #:parse-info-ts #:+info-ts-flag-invalidate+
            #:write-heartbeat-frag #:parse-heartbeat-frag-body
            #:write-nack-frag #:parse-nack-frag-body

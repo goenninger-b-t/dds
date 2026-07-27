@@ -26,6 +26,16 @@
   "Directory holding the byte-exact XCDR2 reference vectors + their manifest (FR-CDR-8). One .bin per case,
    each the SerializedPayload RTI Connext put ON THE WIRE for a known PerfData sample.")
 
+(defparameter *rtps-corpus-dir* "corpus/rtps/"
+  "Directory holding captured RTPS SUBMESSAGE vectors — a different kind of artefact from *corpus-dir*,
+   which holds SerializedPayloads. Each .bin is a COMPLETE submessage (4-octet header + body) exactly as
+   RTI Connext 7.3.1 emitted it (ADR 0090, captured by interop/connext/appack/).
+
+   These exist because the RTI vendor extensions have NO OMG clause to check against: for XCDR the spec is
+   the oracle and the vector is the check, whereas here the vector IS the oracle. Verified by
+   %rtps-corpus-verify, which DECODES each one — nothing in this stack emits APP_ACK, so a byte-exact
+   ENCODE comparison would be verifying an encoder that deliberately does not exist.")
+
 (defun* %corpus-payload (len)
     (function ((integer 0)) (simple-array (unsigned-byte 8) (*)))
   "The corpus payload of LEN octets: byte i = i mod 256. Fixed by RULE so a vector's expected CONTENT is
@@ -340,6 +350,87 @@
                +mutable-corpus-file+ (length expect) (length got) (%hex expect) (%hex got))
        1))))
 
+(defun* %rtps-corpus-expect (name)
+    (function (string) list)
+  "The expected decode of RTPS corpus vector NAME, as
+   (submessage-id reader-id writer-id virtual-writer-count count intervals), where each interval is
+   (first-sn last-sn interval-flags payload-len) — transcribed from the committed capture decode
+   (interop/connext/appack/captures/appack-decoded.txt), NOT from our parser.
+
+   ⚠️ THE EXPECTATION IS WRITTEN OUT BY HAND ON PURPOSE. Deriving it by running our own parser would make
+   this gate compare the parser with itself, which is the exact failure ADR 0061 shipped through: our
+   encoder, our decoder and our echo test all agreed while the wire bytes were wrong. An external encoder
+   — here, RTI's — is the only thing that can falsify us."
+  (cond
+    ((string= name "appack-connext-1interval.bin")
+     (list dds.rtps.message:+submsg-app-ack+ #x80000007 #x80000002 1 1
+           '((1 1 #x0000 0))))
+    ((string= name "appack-connext-2intervals.bin")
+     (list dds.rtps.message:+submsg-app-ack+ #x80000007 #x80000002 1 2
+           '((1 1 #x0100 0) (2 2 #x0000 0))))
+    ((string= name "appackconf-connext.bin")
+     (list dds.rtps.message:+submsg-app-ack-conf+ #x80000007 #x80000002 1 1 nil))
+    (t nil)))
+
+(defun* %rtps-corpus-verify-one (path)
+    (function (t) (integer 0))
+  "Decode one captured RTPS submessage vector and compare against its hand-transcribed expectation.
+   Returns 1 on mismatch, 0 on match."
+  (let* ((name (file-namestring path))
+         (expect (%rtps-corpus-expect name)))
+    (when (null expect)
+      (format t "~&  FAIL ~a: unrecognised RTPS corpus vector — this gate verifies nothing for it.~%~
+                    Add an arm to %rtps-corpus-expect naming what it should decode to.~%" name)
+      (return-from %rtps-corpus-verify-one 1))
+    (let* ((raw (with-open-file (in path :element-type '(unsigned-byte 8))
+                  (let ((v (make-array (file-length in) :element-type '(unsigned-byte 8))))
+                    (read-sequence v in) v)))
+           (buf (dds.core.buffer:octet-buffer-over raw))
+           (cur (dds.core.buffer:cursor buf :endianness :little))
+           (sid (aref raw 0))
+           (flags (aref raw 1))
+           (intervals '()))
+      (destructuring-bind (xid xrid xwid xvw xcount xintervals) expect
+        (unless (= sid xid)
+          (format t "~&  FAIL ~a: submessage id 0x~2,'0x, expected 0x~2,'0x~%" name sid xid)
+          (return-from %rtps-corpus-verify-one 1))
+        ;; skip the 4-octet submessage header; the parsers take a cursor positioned at the body
+        (dds.core.buffer:cursor-set-position cur 4)
+        (multiple-value-bind (rid wid vw count)
+            (if (= sid dds.rtps.message:+submsg-app-ack+)
+                (dds.rtps.message:parse-app-ack-body
+                 cur flags
+                 (lambda (v goff first last iflags poff plen)
+                   (declare (ignore v goff poff))
+                   (push (list first last iflags plen) intervals)))
+                (dds.rtps.message:parse-app-ack-conf-body cur flags))
+          (setf intervals (nreverse intervals))
+          (cond
+            ((null rid)
+             (format t "~&  FAIL ~a: parser REJECTED a vector RTI actually emitted~%" name) 1)
+            ((not (and (= rid xrid) (= wid xwid) (= vw xvw) (= count xcount)
+                       (equal intervals xintervals)))
+             (format t "~&  FAIL ~a~%    expected reader=~8,'0x writer=~8,'0x vw=~d count=~d intervals=~s~%~
+                          ~&    got      reader=~8,'0x writer=~8,'0x vw=~d count=~d intervals=~s~%"
+                     name xrid xwid xvw xcount xintervals rid wid vw count intervals)
+             1)
+            (t (format t "~&  ok   ~a (~d octets, ~d interval(s))~%" name (length raw) (length intervals))
+               0)))))))
+
+(defun* %rtps-corpus-verify ()
+    (function () (integer 0))
+  "Verify every captured RTPS submessage vector in *rtps-corpus-dir*. Returns the mismatch count.
+   An EMPTY directory is a FAILURE, not a pass: a gate whose corpus silently vanished reads green while
+   verifying nothing, which is the shape make corpus was already burned by once (ADR 0086)."
+  (let ((files (sort (directory (merge-pathnames "*.bin" *rtps-corpus-dir*)) #'string< :key #'namestring))
+        (bad 0))
+    (when (null files)
+      (format t "~&corpus: NO RTPS VECTORS in ~a — the APP_ACK decode (ADR 0090) is unverified~%"
+              *rtps-corpus-dir*)
+      (return-from %rtps-corpus-verify 1))
+    (dolist (f files) (incf bad (%rtps-corpus-verify-one f)))
+    bad))
+
 (defun* corpus-verify ()
     (function () (integer 0))
   "THE GATE (`make corpus`): for every committed reference vector, serialize the SAME sample with OUR codec
@@ -399,8 +490,12 @@
                  (format t "~&  FAIL ~a: expected ~d octets, got ~d~%    connext: ~a~%    ours:    ~a~%"
                          name (length expect) (length got)
                          (%hex expect) (%hex got)))))))))
-    (format t "~&corpus: ~d vector(s) verified here, ~d deferred, ~d file(s) total, ~d mismatch(es) — ~a~%"
-            n (length *corpus-verified-elsewhere*) (length files) bad (if (zerop bad) "PASS" "FAIL"))
+    ;; ADR 0090: the captured RTI submessage vectors are a SEPARATE corpus (different artefact, decode-
+    ;; verified rather than byte-compared), folded into the same gate so there is one command to trust.
+    (let ((rtps-bad (%rtps-corpus-verify)))
+      (incf bad rtps-bad)
+      (format t "~&corpus: ~d vector(s) verified here, ~d deferred, ~d file(s) total, ~d mismatch(es) — ~a~%"
+              n (length *corpus-verified-elsewhere*) (length files) bad (if (zerop bad) "PASS" "FAIL")))
     bad))
 
 (defun* %corpus-parse-name (name)

@@ -89,6 +89,45 @@ Filtered (F) extensions are not emitted or parsed in v1.
 - ACKNACK flag: `+acknack-flag-final+` (F).
 - GAP flags: `+gap-flag-group-info+` (G), `+gap-flag-filtered+` (F; not parsed in v1).
 
+### APP_ACK / APP_ACK_CONF — an RTI vendor extension, DECODE ONLY (ADR 0090)
+
+**Application acknowledgment has no OMG clause.** An exhaustive search of `docs/specs/rtps-2_5.pdf` and
+`rtps-2_5-xmi.xml` returns zero occurrences in any phrasing, and the DCPS IDL has only
+`wait_for_acknowledgments`, which is protocol-level and says nothing about the subscribing *application*
+having consumed anything. So unlike every other entry on this page, the reference below is a **capture**
+(`interop/connext/appack/captures/`, RTI Connext 7.3.1), not a clause.
+
+**Nothing in this stack emits these.** The parsers exist so a Connext APP_ACK can be *read* and verified
+byte-exactly before any behaviour is built on it; inbound 0x1c/0x1d were already skipped safely before
+this landed, because `dispatch-message` repositions unconditionally to `body-start + body-len` for every
+submessage (RTPS 2.5 §8.3.3.2 rule 3, satisfied by construction).
+
+| Symbol | Description |
+|---|---|
+| `dds.rtps.message:+submsg-app-ack+` (0x1c) / `+submsg-app-ack-conf+` (0x1d) | The RTI vendor-extension submessage ids. ⚠️ **They sit in the OMG protocol-reserved range 0x00–0x7f**, not the vendor range 0x80–0xff that §9.4.5.1.1 reserves for extensions, so a future RTPS minor version may assign them elsewhere. |
+| `dds.rtps.message:+vendor-id-rti+` (0x0101) | The gate. §9.4.5.1.1 makes a vendor submessage's meaning *"dependent on the vendorId that is current when the Submessage is encountered"* — these ids may **only** be interpreted under it. |
+| `dds.rtps.message:parse-app-ack-body` *(cursor flags interval-fn)* | Parse an APP_ACK body; returns `(values reader-id writer-id virtual-writer-count count)` or `NIL`. Calls `interval-fn` per interval as *(vw-index guid-offset first-sn last-sn interval-flags payload-offset payload-len)*. |
+| `dds.rtps.message:parse-app-ack-conf-body` *(cursor flags)* | Parse an APP_ACK_CONF body — the writer's confirmation, echoing the APP_ACK's `count`; returns `(values reader-id writer-id virtual-writer-count count)` or `NIL`. |
+
+**Why a visitor and not a value-returning parser.** The body is nested and variable-length (virtual
+writers → intervals → payload), so returning it would mean allocating a list per acknowledgment — and
+this is a hot-path file (NFR-MEM) handling a message that arrives about once per sample. `interval-fn`
+receives **offsets** into the cursor's buffer, so a caller that only matches against a known writer
+compares in place and one that needs the GUID copies it.
+
+**`intervalFlags` is passed through uninterpreted.** Only two values have been observed (`0x0000` on the
+newly acknowledged sequence number, `0x0100` on the coalesced run of previously reported ones) and its
+encoding is **not pinned**. The parser reports it and refuses to interpret it; deciding what it means from
+two samples is the kind of guess ADR 0089 §5 exists to prevent.
+
+**Resource-exhaustion guards (NFR-SEC-POSTURE).** `virtualWriterCount` and `intervalCount` come straight
+off the wire and drive nested loops, so they are capped by `+app-ack-max-virtual-writers+` (256) and
+`+app-ack-max-intervals+` (1024), and read **signed** — reading them unsigned would turn a negative into
+a four-billion-iteration walk. A body exceeding either is **rejected, never truncated**: under APP-ACK
+semantics a writer that believes a sample acknowledged may purge it, so a partial accept would be silent
+data loss. `make test`'s `app-ack-hostile` covers truncation at every length, payload overrun, hostile
+counts and 2000 random bodies; `make corpus` verifies the captured vectors decode exactly.
+
 ### DATA submessage (`dds.rtps.message`)
 
 `extraFlags + octetsToInlineQos + readerId + writerId + writerSN + [inlineQos if Q] +

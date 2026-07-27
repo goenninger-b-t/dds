@@ -86,4 +86,7 @@ def main(path):
     else:
         print("\n!! NO APP_ACK (0x1c) OR APP_ACK_CONF (0x1d) IN THIS CAPTURE")
 
-main(sys.argv[1])
+# importable: appack_decode.py and the corpus extractor reuse frames()/udp_payload()/submessages(),
+# so the scan must not run merely because the module was imported.
+if __name__ == '__main__':
+    main(sys.argv[1])

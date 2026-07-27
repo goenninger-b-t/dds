@@ -194,11 +194,16 @@ writer's own GUID satisfies the ordinary case.
 - **Slice A0 — the capture. ✅ DONE** (this ADR §3.1). Peers at `interop/connext/appack/`, layout confirmed
   exact on 10/10 bodies. The remaining wire unknown is `intervalFlags`, which needs more provoked cases
   (explicit mode, response data, a gap in the acknowledged range) before any encoder may emit it.
-- **Slice A1 — a byte-exact corpus vector + a decoder.** Commit a captured APP_ACK and APP_ACK_CONF to
-  `corpus/`, and implement `parse-app-ack` / `parse-app-ack-conf` in `DDS.RTPS.MESSAGE` **gated on
-  vendorId = RTI**, verified against the vector under `make corpus`. Decode-only: inbound is already safely
-  ignored today (§3), so this cannot regress anything, and it is the half that can be proven byte-exactly
-  before any behaviour depends on it.
+- **Slice A1 — a byte-exact corpus vector + a decoder. ✅ DONE.** Three captured submessages committed to
+  `corpus/rtps/` (a *new* corpus: these are submessages, not SerializedPayloads, and they are
+  **decode**-verified rather than byte-compared, because nothing here emits them and comparing an encoder
+  that deliberately does not exist would verify nothing). `parse-app-ack-body` /
+  `parse-app-ack-conf-body` in `DDS.RTPS.MESSAGE`, visitor-style so the nested variable-length body needs
+  no allocation in a hot-path-gated file. The corpus expectations are **hand-transcribed from the capture
+  decode, never derived by running our own parser** — otherwise the gate compares the parser with itself,
+  which is precisely how ADR 0061 shipped. Wire-supplied loop bounds are capped and read *signed*
+  (NFR-SEC-POSTURE). Falsified three ways, each seen red: a corrupted vector octet, an emptied corpus
+  directory, and a removed count guard.
 - **Slice A2 — emit.** `write-app-ack` from the reader side, byte-compared against the captured vector.
   Then a live leg: our reader acknowledging a Connext writer.
 - **Slice A3 — the DCPS semantics.** The QoS (`acknowledgment-kind`, RxO-gated — a writer offering
