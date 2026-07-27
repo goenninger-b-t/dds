@@ -65,6 +65,7 @@
            ;; interpretable under VendorId RTI (RTPS 2.5 §9.4.5.1.1). Nothing here emits them.
            #:+submsg-app-ack+ #:+submsg-app-ack-conf+ #:+vendor-id-rti+
            #:parse-app-ack-body #:parse-app-ack-conf-body
+           #:write-app-ack #:write-app-ack-conf
            #:write-info-ts #:parse-info-ts #:+info-ts-flag-invalidate+
            #:write-heartbeat-frag #:parse-heartbeat-frag-body
            #:write-nack-frag #:parse-nack-frag-body

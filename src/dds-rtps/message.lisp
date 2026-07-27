@@ -516,6 +516,76 @@
 ;;; citations below are to a CAPTURE, not to a clause: interop/connext/appack/captures/, RTI Connext
 ;;; 7.3.1, whose committed decode this layout reproduces exactly on 10/10 bodies.
 
+(defun* write-app-ack (cursor reader-id writer-id vw-guid intervals count)
+    (function (dds.core.buffer:cursor (unsigned-byte 32) (unsigned-byte 32)
+               (array (unsigned-byte 8) (*)) list (unsigned-byte 32))
+              fixnum)
+  "Write a complete RTI APP_ACK submessage (VENDOR EXTENSION, ADR 0090) for ONE virtual writer.
+   VW-GUID is its 16-octet GUID; INTERVALS is a list of (first-sn last-sn interval-flags payload), each
+   PAYLOAD an octet vector or NIL. Returns the cursor position, like every other writer here.
+
+   ONE VIRTUAL WRITER, BY CONSTRUCTION, and that is a deliberate limit rather than an oversight. The
+   capture (§ADR 0090 3.1) shows Connext emitting virtualWriterCount = 1 with the virtual writer's GUID
+   equal to the real writer's own — the indirection is degenerate for an ordinary writer, and this stack
+   has no virtual-writer model to populate a second entry from. Emitting a count we cannot mean would be
+   inventing wire.
+
+   INTERVAL-FLAGS IS CALLER-SUPPLIED AND WRITTEN VERBATIM. Its encoding is NOT pinned — only two values
+   have ever been observed — so this function reproduces what it is given and claims to know nothing. That
+   is precisely what lets `make corpus` byte-compare our encoding against RTI's captured bytes without
+   anyone having guessed at a meaning: the test supplies the observed flags, and the octets must match.
+
+   Interpreting these ids requires VendorId = RTI (RTPS 2.5 §9.4.5.1.1); emitting them means asserting
+   OUR VendorId, which is NOT RTI's. See the ADR before wiring this to a real writer."
+  (let ((body (+ 12                                        ; readerId + writerId + virtualWriterCount
+                 16 2 2                                    ; guid + intervalCount + octetsToNextVirtualWriter
+                 (let ((n 0))
+                   (dolist (iv intervals n)
+                     (incf n (+ 20 (length (the (or null (array (unsigned-byte 8) (*)))
+                                                (fourth iv)))))))
+                 4)))                                      ; count
+    (write-submessage-header cursor +submsg-app-ack+ (%e-flag cursor) body))
+  (write-entity-id cursor reader-id)
+  (write-entity-id cursor writer-id)
+  (dds.core.buffer:put-u32 cursor 1)                       ; virtualWriterCount
+  (dotimes (i 16) (dds.core.buffer:put-u8 cursor (aref vw-guid i)))
+  (dds.core.buffer:put-u16 cursor (logand (length intervals) #xFFFF))
+  ;; octetsToNextVirtualWriter is measured from the START of intervalCount, so it INCLUDES intervalCount
+  ;; and itself (4 octets) as well as the interval block: the capture shows 24 for one payload-less
+  ;; 20-octet interval and 44 for two. That is what makes it a usable skip — a reader that does not care
+  ;; about this virtual writer jumps this many octets from just after the GUID and lands on the next one.
+  ;; THE DECODER NEVER LEARNED THIS: it declares the field ignorable, so decode-verification passed while
+  ;; the meaning was still unknown. Only writing the bytes back and comparing them to RTI's forced it out.
+  (dds.core.buffer:put-u16 cursor
+                           (logand (+ 4 (let ((n 0))
+                                          (dolist (iv intervals n)
+                                            (incf n (+ 20 (length (the (or null (array (unsigned-byte 8) (*)))
+                                                                       (fourth iv))))))))
+                                   #xFFFF))
+  (dolist (iv intervals)
+    (destructuring-bind (first-sn last-sn interval-flags payload) iv
+      (write-sequence-number cursor first-sn)
+      (write-sequence-number cursor last-sn)
+      (dds.core.buffer:put-u16 cursor (logand interval-flags #xFFFF))
+      (dds.core.buffer:put-u16 cursor (logand (length payload) #xFFFF))
+      (when payload (dotimes (i (length payload)) (dds.core.buffer:put-u8 cursor (aref payload i))))))
+  (dds.core.buffer:put-u32 cursor (logand count #xFFFFFFFF))
+  (dds.core.buffer:cursor-position cursor))
+
+(defun* write-app-ack-conf (cursor reader-id writer-id vw-guid count)
+    (function (dds.core.buffer:cursor (unsigned-byte 32) (unsigned-byte 32)
+               (array (unsigned-byte 8) (*)) (unsigned-byte 32))
+              fixnum)
+  "Write a complete RTI APP_ACK_CONF submessage (VENDOR EXTENSION, ADR 0090) — the writer's confirmation
+   of an APP_ACK, echoing its COUNT — for ONE virtual writer (see WRITE-APP-ACK on why one)."
+  (write-submessage-header cursor +submsg-app-ack-conf+ (%e-flag cursor) (+ 12 16 4))
+  (write-entity-id cursor reader-id)
+  (write-entity-id cursor writer-id)
+  (dds.core.buffer:put-u32 cursor 1)                       ; virtualWriterCount
+  (dotimes (i 16) (dds.core.buffer:put-u8 cursor (aref vw-guid i)))
+  (dds.core.buffer:put-u32 cursor (logand count #xFFFFFFFF))
+  (dds.core.buffer:cursor-position cursor))
+
 (defun* parse-app-ack-body (cursor flags interval-fn)
     (function (dds.core.buffer:cursor (unsigned-byte 8) function) t)
   "Parse an RTI APP_ACK body (VENDOR EXTENSION, ADR 0090). Returns

@@ -178,13 +178,20 @@ tooling and a Connext APP-ACK peer at all.
 **Option A was chosen.** §3.1 then showed A to be cheaper than this ADR had argued, so the decision stands
 on firmer ground than the advice it overrode.
 
-**Left open, honestly:** the second question was phrased *"if the first slice is ours↔ours (Option B), is
-Connext interop still required later?"* and was answered **"defer — decide after slice 1."** With A chosen,
-that premise does not hold, so the answer is ambiguous between two readings: (a) it was answering a
-question that no longer applies, or (b) start Connext-first but re-evaluate scope once the first slice
-lands. **Nothing in §6 depends on resolving it yet** — the capture, the corpus vector and the codec are
-required under either reading — so the work proceeds and the question is carried here rather than guessed
-at. It must be settled before the DCPS-semantics slices are scoped.
+**The second question and how it was settled.** It had been phrased *"if the first slice is ours↔ours
+(Option B), is Connext interop still required later?"* and answered **"defer — decide after slice 1."**
+With A chosen its premise did not hold, so it was carried rather than guessed at while A0 and A1 were
+built — both were required under either reading.
+
+**Resolved 2026-07-27, once slice 1 had produced the information the deferral was waiting for.** The
+tension largely dissolved on facts rather than needing a choice: the Connext-facing work under A was
+A0 + A1 + A2; A0 and A1 landed, and §3.1 showed A2 to be small. What actually remained open was never
+about Connext at all — it was whether **A3, the vendor-neutral DCPS semantics and the bulk of the
+work, gets built**. Answered: **yes — the full application-visible feature.** APP-ACK's whole value is
+the distinction between *"the middleware has it"* and *"the application has processed it"*, which a
+wire-only codec cannot express, and it is the prerequisite for the agreed item (3), DDS-RPC. The
+expensive, uncertain part — an undocumented wire — turned out to be the cheap part, and it is already
+committed.
 
 ## 6. The slice plan AS ACCEPTED — Option A, Connext-facing first (VSD, thinnest end-to-end first)
 
@@ -204,8 +211,14 @@ writer's own GUID satisfies the ordinary case.
   which is precisely how ADR 0061 shipped. Wire-supplied loop bounds are capped and read *signed*
   (NFR-SEC-POSTURE). Falsified three ways, each seen red: a corrupted vector octet, an emptied corpus
   directory, and a removed count guard.
-- **Slice A2 — emit.** `write-app-ack` from the reader side, byte-compared against the captured vector.
-  Then a live leg: our reader acknowledging a Connext writer.
+- **Slice A2 — emit. ✅ DONE (codec half).** `write-app-ack` / `write-app-ack-conf`, and the corpus gate
+  upgraded from decode-verify to a **byte-exact round trip** against RTI's own octets — all three vectors
+  reproduce exactly. **The round trip earned its keep immediately, finding two things decode could not:**
+  a wrong GUID offset in the gate, and the true meaning of `octetsToNextVirtualWriter`, which is measured
+  from the start of `intervalCount` and so includes that field and itself (24 for one 20-octet interval,
+  44 for two). The **decoder ignores that field**, so its meaning had never had to be understood — decode
+  verification cannot test what it does not read. Still outstanding for A2: the *live* leg (our reader
+  acknowledging a Connext writer), which needs the A3 QoS before there is anything to drive it.
 - **Slice A3 — the DCPS semantics.** The QoS (`acknowledgment-kind`, RxO-gated — a writer offering
   application acks must not match a reader that will never send them; that is a silent stall, the ADR 0057
   shape), the reader API, the writer-side application watermark beside ADR 0089's acked-watermark, and

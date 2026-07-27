@@ -97,10 +97,10 @@ Filtered (F) extensions are not emitted or parsed in v1.
 having consumed anything. So unlike every other entry on this page, the reference below is a **capture**
 (`interop/connext/appack/captures/`, RTI Connext 7.3.1), not a clause.
 
-**Nothing in this stack emits these.** The parsers exist so a Connext APP_ACK can be *read* and verified
-byte-exactly before any behaviour is built on it; inbound 0x1c/0x1d were already skipped safely before
-this landed, because `dispatch-message` repositions unconditionally to `body-start + body-len` for every
-submessage (RTPS 2.5 §8.3.3.2 rule 3, satisfied by construction).
+**Nothing on the live data path emits these yet** — the writers exist so `make corpus` can round-trip the
+captured vectors byte-exactly, which is a far stronger check than decoding them. Inbound 0x1c/0x1d were
+already skipped safely before any of this landed, because `dispatch-message` repositions unconditionally
+to `body-start + body-len` for every submessage (RTPS 2.5 §8.3.3.2 rule 3, satisfied by construction).
 
 | Symbol | Description |
 |---|---|
@@ -108,6 +108,20 @@ submessage (RTPS 2.5 §8.3.3.2 rule 3, satisfied by construction).
 | `dds.rtps.message:+vendor-id-rti+` (0x0101) | The gate. §9.4.5.1.1 makes a vendor submessage's meaning *"dependent on the vendorId that is current when the Submessage is encountered"* — these ids may **only** be interpreted under it. |
 | `dds.rtps.message:parse-app-ack-body` *(cursor flags interval-fn)* | Parse an APP_ACK body; returns `(values reader-id writer-id virtual-writer-count count)` or `NIL`. Calls `interval-fn` per interval as *(vw-index guid-offset first-sn last-sn interval-flags payload-offset payload-len)*. |
 | `dds.rtps.message:parse-app-ack-conf-body` *(cursor flags)* | Parse an APP_ACK_CONF body — the writer's confirmation, echoing the APP_ACK's `count`; returns `(values reader-id writer-id virtual-writer-count count)` or `NIL`. |
+| `dds.rtps.message:write-app-ack` *(cursor reader-id writer-id vw-guid intervals count)* | Write a complete APP_ACK for **one** virtual writer. `intervals` is a list of *(first-sn last-sn interval-flags payload)*. |
+| `dds.rtps.message:write-app-ack-conf` *(cursor reader-id writer-id vw-guid count)* | Write a complete APP_ACK_CONF for one virtual writer. |
+
+**One virtual writer, by construction.** The capture shows Connext emitting `virtualWriterCount = 1` with
+the virtual writer's GUID equal to the real writer's own — the indirection is degenerate for an ordinary
+writer, and this stack has no virtual-writer model to populate a second entry from. Emitting a count we
+cannot mean would be inventing wire.
+
+**`octetsToNextVirtualWriter` is measured from the start of `intervalCount`,** so it includes that field
+and itself (4 octets) as well as the interval block — 24 for one payload-less 20-octet interval, 44 for
+two. That is what makes it a usable skip: a reader uninterested in this virtual writer jumps that many
+octets from just after the GUID. Worth knowing how this was learned: the **decoder ignores the field**, so
+decode-verification passed while its meaning was still unknown. Only re-encoding and byte-comparing
+against RTI forced it out — along with a wrong GUID offset in the gate itself.
 
 **Why a visitor and not a value-returning parser.** The body is nested and variable-length (virtual
 writers → intervals → payload), so returning it would mean allocating a list per acknowledgment — and

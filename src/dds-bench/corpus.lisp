@@ -32,9 +32,13 @@
    RTI Connext 7.3.1 emitted it (ADR 0090, captured by interop/connext/appack/).
 
    These exist because the RTI vendor extensions have NO OMG clause to check against: for XCDR the spec is
-   the oracle and the vector is the check, whereas here the vector IS the oracle. Verified by
-   %rtps-corpus-verify, which DECODES each one — nothing in this stack emits APP_ACK, so a byte-exact
-   ENCODE comparison would be verifying an encoder that deliberately does not exist.")
+   the oracle and the vector is the check, whereas here the vector IS the oracle.
+
+   %rtps-corpus-verify DECODES each vector against a hand-transcribed expectation and then RE-ENCODES it
+   and requires the octets to be IDENTICAL to RTI's (ADR 0090 slice A2; slice A1 could only decode,
+   because no encoder existed yet). The round trip is not ceremony — it caught two defects the decode
+   could not, on its first run: a wrong GUID offset in this file, and the true meaning of
+   octetsToNextVirtualWriter, a field the DECODER IGNORES and had therefore never had to understand.")
 
 (defun* %corpus-payload (len)
     (function ((integer 0)) (simple-array (unsigned-byte 8) (*)))
@@ -414,8 +418,58 @@
                           ~&    got      reader=~8,'0x writer=~8,'0x vw=~d count=~d intervals=~s~%"
                      name xrid xwid xvw xcount xintervals rid wid vw count intervals)
              1)
-            (t (format t "~&  ok   ~a (~d octets, ~d interval(s))~%" name (length raw) (length intervals))
-               0)))))))
+            (t
+             ;; ADR 0090 slice A2: now that an ENCODER exists, decode-verification is no longer the
+             ;; strongest thing available — re-encode what we decoded and require the octets to be
+             ;; IDENTICAL to RTI's. This is the check that would catch a field we read correctly but
+             ;; write wrongly, which decode alone cannot see.
+             (let ((round (%rtps-corpus-reencode sid rid wid raw intervals count)))
+               (cond
+                 ((null round)
+                  (format t "~&  ok   ~a (~d octets, ~d interval(s); decode-only — no encoder arm)~%"
+                          name (length raw) (length intervals))
+                  0)
+                 ((and (= (length round) (length raw)) (every #'= round raw))
+                  (format t "~&  ok   ~a (~d octets, ~d interval(s), BYTE-EXACT re-encode)~%"
+                          name (length raw) (length intervals))
+                  0)
+                 (t
+                  (format t "~&  FAIL ~a: re-encode differs from RTI's bytes~%    connext: ~a~%    ours:    ~a~%"
+                          name (%hex raw) (%hex round))
+                  1))))))))))
+
+(defun* %rtps-corpus-reencode (sid reader-id writer-id raw intervals count)
+    (function ((unsigned-byte 8) (unsigned-byte 32) (unsigned-byte 32)
+               (array (unsigned-byte 8) (*)) list integer)
+              (or null (simple-array (unsigned-byte 8) (*))))
+  "Re-encode a decoded APP_ACK/APP_ACK_CONF and return the octets, or NIL if there is no encoder for SID.
+
+   The virtual-writer GUID is taken STRAIGHT OUT OF THE CAPTURED BYTES rather than reconstructed: this
+   gate asks whether our ENCODER lays out the wire the way RTI does, and feeding it a GUID we invented
+   would change the question. It begins at offset 16 — submessage header 4 + readerId 4 + writerId 4 +
+   virtualWriterCount 4 — and the first cut of this function said 12, which fed the encoder the COUNT
+   plus twelve octets of GUID. The byte-compare caught it on its very first run; the decode-only gate it
+   replaced could not have, because nothing was wrong with the decoder."
+  (let ((guid (subseq raw 16 32))
+        (out (make-array 512 :element-type '(unsigned-byte 8) :initial-element 0)))
+    (let* ((ob (dds.core.buffer:octet-buffer-over out))
+           (c (dds.core.buffer:cursor ob :endianness :little)))
+      (cond
+        ((= sid dds.rtps.message:+submsg-app-ack+)
+         (dds.rtps.message:write-app-ack
+          c reader-id writer-id guid
+          (mapcar (lambda (iv)
+                    (destructuring-bind (first last flags plen) iv
+                      (list first last flags
+                            (when (plusp plen)
+                              (make-array plen :element-type '(unsigned-byte 8) :initial-element 0)))))
+                  intervals)
+          count)
+         (subseq out 0 (dds.core.buffer:cursor-position c)))
+        ((= sid dds.rtps.message:+submsg-app-ack-conf+)
+         (dds.rtps.message:write-app-ack-conf c reader-id writer-id guid count)
+         (subseq out 0 (dds.core.buffer:cursor-position c)))
+        (t nil)))))
 
 (defun* %rtps-corpus-verify ()
     (function () (integer 0))
