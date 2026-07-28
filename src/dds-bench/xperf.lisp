@@ -224,14 +224,22 @@
                                  :advertise-address advertise-address :peers peers :label label
                                  :data-representation data-representation)))
 
-(defun* mem-per-sample (&key (domain 7) (samples 60000) (warmup 500) (payload-bytes 0))
+(defun* mem-per-sample (&key (domain 7) (samples 60000) (warmup 500) (payload-bytes 0)
+                             (return-loans nil))
     (function (&key (:domain (integer 0)) (:samples (integer 1)) (:warmup (integer 0))
-                    (:payload-bytes (integer 0)))
+                    (:payload-bytes (integer 0)) (:return-loans t))
               double-float)
   "END-TO-END steady-state heap allocation, in BYTES PER SAMPLE, for the DCPS path a real application
    uses: write-sample -> the engine/transport -> the receiver thread -> take-samples. This is the number
    NFR-MEM (0 bytes/sample) actually constrains, and the one that drives the peer's GC pause — the ~10 ms
    latency tail is a GC in the PEER, caused by exactly this garbage (ADR 0062).
+
+   RETURN-LOANS (ADR 0093) makes the measured cycle RETURN-LOAN each taken sample, i.e. measures an
+   application that honours the loan contract rather than one that drops its samples on the floor. ⚠️ IT
+   CHANGES THE WORKLOAD, so a number measured with it is NOT comparable to one measured without — treat a
+   flip of this default as a ratchet re-baseline of BOTH arch rows and say so in bench/mem-ceiling.txt.
+   It exists so the slice-1 wrapper pooling can be sized honestly: with it NIL nothing is ever returned, so
+   no wrapper can be recycled and the pooling is measurably a no-op by construction.
 
    It is deliberately NOT what `run-mem-test` measures. That measures the CODEC in isolation
    (serialize/deserialize/AEAD) and correctly reports ~0 B/iter — which is why `make mem` was green while
@@ -289,7 +297,12 @@
                     (sleep 0.05))
            (flet ((cycle ()
                     (dds.dcps:write-sample dw sample)
-                    (loop repeat 200 until (dds.dcps:take-samples dr) do (sleep 0.0002))))
+                    (loop repeat 200
+                          for got = (dds.dcps:take-samples dr)
+                          until got
+                          do (sleep 0.0002)
+                          finally (when (and return-loans (listp got))   ; ADR 0093: an application that honours the loan contract
+                                    (dds.dcps:return-loan dr got)))))
              (dotimes (i warmup) (cycle))
              (let ((before (dds.pal:bytes-consed)))
                (dotimes (i samples) (cycle))

@@ -13091,3 +13091,157 @@
       (dds.dcps:delete-participant pw)
       (dds.dcps:delete-participant pr))
     t))
+
+;;; ADR 0093 slice 1 — the copy path's wrapper pooling. The falsifier for the recycle contract: that a
+;;; returned sample's wrappers come back, that a recycled SampleInfo carries NOTHING of its predecessor,
+;;; and that returning is optional (an application that never returns sees the pre-slice behaviour).
+
+(defun* %adr93-poison-sample-info (si)
+    (function (t) t)
+  "Write a DISTINCTIVE sentinel into every one of SampleInfo SI's 13 slots. Used on a struct parked in the
+   reader's freelist: whatever survives the next delivery is a slot %ACQUIRE-SAMPLE-INFO failed to
+   reinitialise, i.e. a field of the PREVIOUS sample leaking into the next one. Every sentinel is chosen so
+   it cannot occur naturally in the test's traffic."
+  (setf (dds.dcps:sample-info-sample-state si) :read
+        (dds.dcps:sample-info-view-state si) :not-new
+        (dds.dcps:sample-info-instance-state si) :not-alive-disposed
+        (dds.dcps:sample-info-source-timestamp si) 424242424242
+        (dds.dcps:sample-info-instance-handle si) (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xEE)
+        (dds.dcps:sample-info-publication-handle si) (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xDD)
+        (dds.dcps:sample-info-disposed-generation-count si) 7777
+        (dds.dcps:sample-info-no-writers-generation-count si) 8888
+        (dds.dcps:sample-info-sample-rank si) 9999
+        (dds.dcps:sample-info-generation-rank si) 1111
+        (dds.dcps:sample-info-absolute-generation-rank si) 2222
+        (dds.dcps:sample-info-valid-data si) nil
+        (dds.dcps:sample-info-sequence-number si) 333333)
+  t)
+
+(defun* %adr93-write-and-take (dw dr id text)
+    (function (t t integer string) t)
+  "Write ONE dcps-msg and take it back, returning the cached-sample (or NIL if it never arrived)."
+  (dds.dcps:write-sample dw (make-dcps-msg :id id :text text))
+  (let ((got nil))
+    (loop repeat 200 until got
+          do (let ((s (dds.dcps:take-samples dr)))
+               (when s (setf got (first s))))
+             (sleep 0.02))
+    got))
+
+(defun* %adr93-write-and-drain (dw dr id text)
+    (function (t t integer string) t)
+  "Write ONE dcps-msg and DRAIN it into the reader cache WITHOUT selecting it, returning its cached-sample.
+
+   ⚠️ WHY NOT JUST TAKE IT. read/take legitimately RE-STAMP sample_state, view_state and instance_state at
+   SELECTION time (%SELECT-SAMPLES; DDS 1.4 §2.2.2.5.4 requires the instance-level states to be computed
+   when the samples are returned, not frozen at delivery). So a drain-time sentinel in those three slots is
+   overwritten before any take could observe it — testing through take would silently cover only 10 of the
+   13 slots while appearing to cover all of them. Draining directly observes the SampleInfo exactly as
+   %ACQUIRE-SAMPLE-INFO left it."
+  (dds.dcps:write-sample dw (make-dcps-msg :id id :text text))
+  (let ((got nil))
+    (loop repeat 200 until got
+          do (dds.dcps::%drain dr)
+             (setf got (first (dds.dcps::dr-cache dr)))
+             (unless got (sleep 0.02)))
+    got))
+
+(defun* run-rx-wrapper-pool-test ()
+    (function () t)
+  "Test: ADR 0093 slice 1 — returning a taken sample RECYCLES its wrappers, and a recycled SampleInfo
+   carries nothing of the sample before it.
+
+   (1) THE RECYCLE HAPPENS. After return-loan the wrapper and its SampleInfo are on the reader's
+       freelists, and the NEXT delivered sample is handed back THE SAME OBJECTS (asserted by identity —
+       a bytes-based check could not tell reuse from a fresh allocation).
+   (2) ⭐ THE REINIT IS COMPLETE — the leg that matters. Every one of the parked SampleInfo's 13 slots is
+       POISONED with a sentinel before the next delivery; none may survive. A partial reinit is otherwise
+       SILENT: it hands the application a previous sample's timestamp, publication_handle or
+       sequence_number, and no allocation gate can see it because the byte count is identical either way.
+   (3) RETURNING IS OPTIONAL. With pooling OFF the same traffic delivers correctly and recycles nothing,
+       so an application that ignores return-loan gets exactly the pre-slice behaviour — the graceful
+       degradation ADR 0093 §6 promises, not a failure mode.
+   (4) A RETURNED SAMPLE IS GONE, never stale-readable — the rule the ZC arm already sets."
+  (let* ((ts (dds.types:find-type-support "dcps-msg"))
+         (p1 (dds.dcps:create-participant :domain (test-domain)))
+         (p2 (dds.dcps:create-participant :domain (test-domain))))
+    (unwind-protect
+         (let* ((tw (dds.dcps:create-topic p1 "Adr93Topic" "dcps-msg" ts))
+                (tr (dds.dcps:create-topic p2 "Adr93Topic" "dcps-msg" ts))
+                (dw (dds.dcps:create-datawriter (dds.dcps:create-publisher p1) tw))
+                (dr (dds.dcps:create-datareader (dds.dcps:create-subscriber p2) tr)))
+           (loop repeat 150
+                 until (and (plusp (dds.dcps:matched-count p1)) (plusp (dds.dcps:matched-count p2)))
+                 do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+           (%check :adr93-matched (plusp (dds.dcps:matched-count p1)) "writer/reader never matched")
+           ;; --- (1) + (2): recycle, then prove the reinit erases a poisoned predecessor ---
+           (let ((cs1 (%adr93-write-and-take dw dr 1 "first")))
+             (%check :adr93-first-arrived (and cs1 t) "the first sample never arrived")
+             (let ((si1 (dds.dcps:cached-sample-info cs1)))
+               (dds.dcps:return-loan dr (list cs1))
+               (%check :adr93-parked-cs (plusp (dds.dcps::dr-wrapper-pool-top dr))
+                       "return-loan did not park the wrapper on the reader's pool")
+               (%check :adr93-parked-si (eq si1 (dds.dcps:cached-sample-info cs1))
+                       "a parked wrapper lost its SampleInfo — the pair must be pooled as ONE object")
+               (%check :adr93-cleared (null (dds.dcps:cached-sample-data cs1))
+                       "a parked wrapper still pins its deserialized sample (a retention leak)")
+               (%adr93-poison-sample-info si1)
+               (let ((cs2 (%adr93-write-and-drain dw dr 2 "second")))
+                 (%check :adr93-second-arrived (and cs2 t) "the second sample never arrived")
+                 (%check :adr93-reused (eq cs2 cs1)
+                         "the second delivery did NOT reuse the returned wrapper — no recycling happened")
+                 (let ((si2 (dds.dcps:cached-sample-info cs2)))
+                   (%check :adr93-reused-info (eq si2 si1)
+                           "the second delivery did NOT reuse the returned SampleInfo")
+                   ;; every sentinel must be gone: this is the whole point of the test. Observed at DRAIN
+                   ;; time, before %select-samples re-stamps the three state slots (see %adr93-write-and-drain).
+                   (%check :adr93-no-stale-state
+                           (and (eq :not-read (dds.dcps:sample-info-sample-state si2))
+                                (eq :new (dds.dcps:sample-info-view-state si2))
+                                (eq :alive (dds.dcps:sample-info-instance-state si2)))
+                           "a recycled SampleInfo kept a stale state field")
+                   (%check :adr93-no-stale-timestamp
+                           (/= 424242424242 (or (dds.dcps:sample-info-source-timestamp si2) 0))
+                           "a recycled SampleInfo kept the PREVIOUS sample's source_timestamp")
+                   (%check :adr93-no-stale-handles
+                           (and (/= #xEE (aref (dds.dcps:sample-info-instance-handle si2) 0))
+                                (/= #xDD (aref (dds.dcps:sample-info-publication-handle si2) 0)))
+                           "a recycled SampleInfo kept a stale instance_handle / publication_handle")
+                   (%check :adr93-no-stale-counts
+                           (and (= 0 (dds.dcps:sample-info-disposed-generation-count si2))
+                                (= 0 (dds.dcps:sample-info-no-writers-generation-count si2))
+                                (= 0 (dds.dcps:sample-info-sample-rank si2))
+                                (= 0 (dds.dcps:sample-info-generation-rank si2))
+                                (= 0 (dds.dcps:sample-info-absolute-generation-rank si2)))
+                           "a recycled SampleInfo kept a stale generation count / rank")
+                   (%check :adr93-no-stale-valid (dds.dcps:sample-info-valid-data si2)
+                           "a recycled SampleInfo kept valid_data NIL from its predecessor")
+                   (%check :adr93-no-stale-sn (/= 333333 (dds.dcps:sample-info-sequence-number si2))
+                           "a recycled SampleInfo kept the PREVIOUS sample's sequence_number"))
+                 (%check :adr93-second-data
+                         (and (= 2 (dcps-msg-id (dds.dcps:cached-sample-data cs2)))
+                              (string= "second" (dcps-msg-text (dds.dcps:cached-sample-data cs2))))
+                         "the recycled wrapper delivered the WRONG sample's data")
+                 ;; --- (4) a returned sample is gone from the cache, not stale-readable ---
+                 (dds.dcps:return-loan dr (list cs2))
+                 (%check :adr93-gone (not (member cs2 (dds.dcps::dr-cache dr)))
+                         "a returned sample is still in the reader cache (stale-readable)"))))
+           ;; --- (3) pooling OFF: identical delivery, and nothing is recycled ---
+           (setf dds.dcps:*rx-wrapper-pool-enabled* nil)   ; GLOBAL, never LET — the drain runs on other threads
+           (unwind-protect
+                (let* ((before (dds.dcps::dr-wrapper-pool-top dr))
+                       (cs3 (%adr93-write-and-take dw dr 3 "third")))
+                  (%check :adr93-off-arrived (and cs3 t) "pooling OFF: the sample never arrived")
+                  (%check :adr93-off-data
+                          (and (= 3 (dcps-msg-id (dds.dcps:cached-sample-data cs3)))
+                               (string= "third" (dcps-msg-text (dds.dcps:cached-sample-data cs3))))
+                          "pooling OFF: delivery differs from pooling ON")
+                  (%check :adr93-off-not-drawn (= before (dds.dcps::dr-wrapper-pool-top dr))
+                          "pooling OFF still drew a wrapper from the pool")
+                  (dds.dcps:return-loan dr (list cs3))
+                  (%check :adr93-off-not-parked (= before (dds.dcps::dr-wrapper-pool-top dr))
+                          "pooling OFF still PARKED a returned wrapper — the lever must be a no-op on BOTH ends, or it leaks onto a pool nothing draws from (measured +33.5 B/sample before this was guarded)"))
+             (setf dds.dcps:*rx-wrapper-pool-enabled* t)))
+      (dds.dcps:delete-participant p1)
+      (dds.dcps:delete-participant p2))
+    t))

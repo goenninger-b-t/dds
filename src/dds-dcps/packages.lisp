@@ -38,6 +38,9 @@
            #:read-next-sample #:take-next-sample
            ;; WP-FLATDATA-ZC-LOAN literal-0-copy loan API (FR-PF-3/4, R6, ADR 0017)
            #:take-loaned #:read-loaned #:return-loan #:return-all-loans
+           ;; ADR 0093 slice 1: the RX copy path's wrapper pooling A/B lever (NFR-MEM). Returning a taken
+           ;; sample via return-loan recycles its wrapper; NIL restores a fresh wrapper pair per sample.
+           #:*rx-wrapper-pool-enabled*
            ;; ADR 0090 A3b: application acknowledgment (VENDOR EXTENSION — DDS 1.4 and RTPS 2.5 define
            ;; none). Effective only under ACKNOWLEDGMENT_KIND :APPLICATION-EXPLICIT.
            #:acknowledge-sample #:acknowledge-all

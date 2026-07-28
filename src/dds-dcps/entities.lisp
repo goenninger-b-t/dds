@@ -171,6 +171,8 @@
    (secured-loans :initform '() :accessor dr-secured-loans) ; WP-DCPS-SECURED-TAKE-LOAN (ADR 0038 (i)): outstanding secured decode-loan handles — SEPARATE registry from dr-loans (the type-clean two-registry discipline); return-loan / reader-close node-return-loan them
    (secured-scratch :initform nil :accessor dr-secured-scratch) ; WP-DCPS-SECURED-TAKE-LOAN: reusable octet-buffer wrapper (repointed per drain) for the in-place [0,len) secured-plaintext deserialize — created once, zero per-sample cons (NFR-MEM)
    (deser-scratch :initform nil :accessor dr-deser-scratch) ; RX-POOLING Phase A (ADR 0073): reusable octet-buffer wrapper repointed at the stored bytes per COPY-path drain, so %deserialize-sample decodes IN PLACE with no per-sample make-octet-buffer / replace / free-static (NFR-MEM)
+   (wrapper-pool :initform nil :accessor dr-wrapper-pool)   ; ADR 0093 slice 1: a simple-vector STACK of recycled cached-sample wrappers, each still carrying its SampleInfo. Lazily carved on the first return, so a reader that never returns pays nothing. A VECTOR, not a list: a list freelist churns two conses per sample (32 B measured), which is most of what the pooling was meant to save
+   (wrapper-pool-top :initform 0 :accessor dr-wrapper-pool-top)   ; stack pointer into WRAPPER-POOL
    (keyhash-scratch :initform nil :accessor dr-keyhash-scratch) ; RX-POOLING (ADR 0075): reusable :big cursor over a 256-octet buffer for the per-sample instance-handle key serialization — created once, zero per-sample make-octet-buffer/cursor/free-static; single-threaded per reader (the drain runs on the user thread, take is single-threaded-per-reader) (NFR-MEM)
    (keyhash-out :initform nil :accessor dr-keyhash-out) ; RX-POOLING (ADR 0076): reusable 16-octet RESULT array for the drain's TRANSIENT instance-handle — the handle is used only for the instance-rec lookup, then the STABLE handle is read off the rec; created once, zero per-sample make-array on a known instance (NFR-MEM)
    (status-lock :initform (dds.pal:make-lock "dr-status") :accessor dr-status-lock))
@@ -429,6 +431,110 @@
   (data nil :type t)
   (loan nil :type t)
   (info nil :type (or null sample-info)))
+
+(defparameter *rx-wrapper-pool-enabled* t
+  "ADR 0093 slice 1 — the RX copy path's WRAPPER pooling (cached-sample + sample-info), on by default.
+   NIL restores the pre-slice behaviour: a fresh wrapper pair per delivered sample.
+
+   This is the A/B lever ADR 0062 requires for sizing an allocation change against `make gate-mem`, and the
+   escape hatch if a recycled wrapper is ever suspected of aliasing. ⚠️ SET IT GLOBALLY (SETF), never with
+   LET: the drain runs on the receiver and user threads, so a thread-local binding is invisible there and
+   the A/B reads as a no-op 'dud' — the trap that produced two false negatives in the allocation campaign.
+   Delivered behaviour is IDENTICAL either way; only the allocation differs.")
+
+(defparameter *rx-wrapper-pool-capacity* 64
+  "How many returned delivery wrappers ONE DataReader parks for reuse (ADR 0093 slice 1). Read once, when
+   a reader's pool is lazily carved on its first RETURN-LOAN.
+
+   It is a CAP, not a budget: steady state needs ONE (take, return, reuse). The depth only matters for a
+   burst — an application that takes N samples and returns them together — and beyond it a returned wrapper
+   is simply dropped for the GC rather than parked. Bounded on purpose: an unbounded freelist would let an
+   application that returns far more than it takes grow the pool without limit, which is a leak wearing an
+   optimisation's clothes.")
+
+(defun* %acquire-delivery (dr data instance-state instance-handle sequence-number publication-handle
+                           source-timestamp disposed-gen no-writers-gen)
+    (function (t t t (or null (array (unsigned-byte 8) (*))) integer
+               (or null (array (unsigned-byte 8) (*))) (or null integer) integer integer)
+              cached-sample)
+  "Return a fully-initialised cached-sample + SampleInfo for a freshly delivered sample — popped from DR's
+   wrapper pool when ADR 0093 slice-1 pooling is on and one is parked, otherwise freshly allocated (the
+   pool NEVER blocks delivery: an empty pool allocates, so an application that does not RETURN-LOAN simply
+   gets the pre-slice behaviour rather than a failure).
+
+   THE PAIR IS POOLED AS ONE OBJECT. A parked wrapper keeps its SampleInfo attached, so one pop yields
+   both — which is why there is one pool and not two, and why nothing is consed to link them.
+
+   ⚠️ THERE IS EXACTLY ONE INITIALISATION PATH, AND THAT IS THE POINT. A recycled SampleInfo is reused
+   UNINITIALISED and every one of its 13 slots is then assigned unconditionally — including the three ranks
+   nothing else writes. Had the fresh case used MAKE-SAMPLE-INFO with keywords and the recycled case a
+   separate SETF block, the two field lists would drift the first time a slot is added, and the failure
+   would be a PREVIOUS sample's value surfacing in this one: silent, application-visible, and invisible to
+   every allocation gate (gate-mem measures bytes, not correctness). ADDING A SLOT TO SAMPLE-INFO REQUIRES
+   ADDING IT HERE. The wrapper's own LOAN slot is cleared for the same reason — a stale loan would make
+   RETURN-LOAN release a loan this sample never held."
+  (let* ((cs (or (and *rx-wrapper-pool-enabled* (%rx-wrapper-pop dr))
+                 (make-cached-sample)))
+         (si (or (cached-sample-info cs) (make-sample-info))))
+    (setf (sample-info-sample-state si) :not-read
+          (sample-info-view-state si) :new
+          (sample-info-instance-state si) instance-state
+          (sample-info-source-timestamp si) source-timestamp
+          (sample-info-instance-handle si) instance-handle
+          (sample-info-publication-handle si) publication-handle   ; ALIASED, never copied — see the slot docstring
+          (sample-info-disposed-generation-count si) disposed-gen
+          (sample-info-no-writers-generation-count si) no-writers-gen
+          (sample-info-sample-rank si) 0
+          (sample-info-generation-rank si) 0
+          (sample-info-absolute-generation-rank si) 0
+          (sample-info-valid-data si) t
+          (sample-info-sequence-number si) sequence-number)
+    (setf (cached-sample-data cs) data
+          (cached-sample-loan cs) nil
+          (cached-sample-info cs) si)
+    cs))
+
+(defun* %rx-wrapper-pop (dr)
+    (function (t) (or null cached-sample))
+  "Pop a parked delivery wrapper off DR's pool, or NIL when the pool is empty or not yet carved."
+  (let ((pool (dr-wrapper-pool dr))
+        (top (dr-wrapper-pool-top dr)))
+    (when (and pool (plusp top))
+      (let ((nt (1- top)))
+        (setf (dr-wrapper-pool-top dr) nt)
+        (let ((cs (svref pool nt)))
+          (setf (svref pool nt) nil)   ; drop the pool's reference so a parked wrapper is never double-held
+          cs)))))
+
+(defun* %recycle-delivery (dr cs)
+    (function (t cached-sample) t)
+  "Park CS (with its SampleInfo attached) on DR's wrapper pool for reuse (ADR 0093 slice 1). Called ONLY
+   from RETURN-LOAN — i.e. only once the application has explicitly given the sample back.
+
+   ⚠️ IT IS NEVER CALLED ON CACHE EVICTION, AND THAT IS DELIBERATE. A KEEP_LAST drop removes a sample from
+   DR-CACHE, but READ is non-destructive — the application may still hold that very wrapper from an earlier
+   read. Recycling it there would hand its struct to the next sample while the application is still reading
+   it: a wrong-bytes aliasing bug, the copy-path twin of the loan use-after-free
+   %READER-KEEPLAST-DROP-OLDEST-LOAN exists to prevent. An explicit return is the only proof we have that
+   the application is done, so it is the only trigger. DATA is NOT recycled here — that is ADR 0093 slice 4,
+   which needs the get_key_value key-sample carve-out.
+
+   ⚠️ IT ALSO RESPECTS *RX-WRAPPER-POOL-ENABLED*. Parking while the acquire side is disabled would push onto
+   a pool nothing ever draws from — an unbounded leak, and it measured +33.5 B/sample in the slice's own A/B
+   before this guard existed. The lever must be a true no-op on BOTH ends or it is not an A/B.
+
+   DATA and LOAN are cleared before parking, so a pooled wrapper never pins a deserialized sample."
+  (when *rx-wrapper-pool-enabled*
+    (setf (cached-sample-data cs) nil
+          (cached-sample-loan cs) nil)   ; INFO stays attached — the pair is pooled as one object
+    (let ((pool (or (dr-wrapper-pool dr)
+                    (setf (dr-wrapper-pool dr)
+                          (make-array *rx-wrapper-pool-capacity* :initial-element nil))))   ; HOTPATH-ALLOC(COLD): once per reader, on its first return
+          (top (dr-wrapper-pool-top dr)))
+      (when (< top (length pool))   ; beyond the cap the wrapper is simply dropped for the GC — a cap, not a budget
+        (setf (svref pool top) cs
+              (dr-wrapper-pool-top dr) (1+ top)))))
+  t)
 
 (defstruct* (instance-rec (:constructor make-instance-rec))
   "The reader's per-instance lifecycle record (DDS 1.4 §2.2.2.5.1.3/.5): STATE is the
@@ -2858,7 +2964,18 @@
    buffer NIL -> no-op) make a double-return / a return-then-close a safe no-op — no double-free. The cache entry is
    invalidated (by cached-sample-loan) BEFORE the disc-node recycles the pooled buffer, so a subsequent in-place
    read can never race a pool recycle (no UAF; the deserialized struct in DATA is an independent copy, so it stays
-   valid regardless)."
+   valid regardless).
+
+   ADR 0093 slice 1 — THE COPY PATH IS NOW A LOAN TOO. A third dispatch arm accepts the CACHED-SAMPLE
+   wrappers that TAKE-SAMPLES returns: it releases whatever backs the wrapper (delegating to the two arms
+   above, so each loan kind keeps exactly one release path), drops the cache entry, and recycles the
+   wrapper + its SampleInfo to the per-reader freelists. ⚠️ RETURNING IS WHAT MAKES THE PATH ZERO-ALLOC,
+   AND NOT RETURNING IS SAFE: an unreturned wrapper is simply never recycled, so the next delivery
+   allocates a fresh one and the application sees exactly the pre-slice behaviour. There is no failure mode
+   for a caller that ignores this — only a missed optimisation. Idempotent for the same reason as the other
+   arms: a wrapper already returned is no longer in the cache and its backing release is a validated no-op.
+   The DATA struct is NOT recycled here — that is ADR 0093 slice 4, which needs the get_key_value
+   key-sample carve-out."
   (dolist (v loans)
     (cond
       ((and (dds.types:flatdata-view-p v) (member v (dr-loans dr)))       ; FlatData ZC loan (ADR 0017) -> %zc-release, exactly once
@@ -2871,7 +2988,20 @@
       ((and (dds.disc:secured-loan-handle-p v) (member v (dr-secured-loans dr)))   ; secured decode loan (ADR 0038 (i)) -> node-return-loan, NEVER %zc-release (strict type dispatch)
        (setf (dr-cache dr) (delete v (dr-cache dr) :key #'cached-sample-loan))     ; invalidate the cache entry BEFORE the disc-node recycles the pooled buffer (no dangling in-place read)
        (dds.disc:node-return-loan (dp-node (sub-participant (dr-subscriber dr))) v) ; the disc-node is the single owner + idempotent (reg-index<0 & buffer NIL -> no-op): frees the pooled buffer + purges the store entry
-       (setf (dr-secured-loans dr) (delete v (dr-secured-loans dr))))))
+       (setf (dr-secured-loans dr) (delete v (dr-secured-loans dr))))
+      ((cached-sample-p v)   ; ADR 0093 slice 1: the COPY-path wrapper itself, returned by take-samples
+       ;; ⚠️ RELEASE WHAT BACKS IT FIRST. A cached-sample may WRAP a loan — a FlatData ZC view is its DATA,
+       ;; a secured decode handle is its LOAN — and recycling the wrapper without releasing that backing
+       ;; would strand the loan permanently (a pinned ZC slot / an unreturned decode buffer). Delegating to
+       ;; the arms above keeps ONE release path per loan kind; both are idempotent, so a wrapper whose
+       ;; backing was already released (the ordinary copy-path case, and the secured case that
+       ;; %select-samples already released at selection) costs one predicate test.
+       (let ((backing (or (cached-sample-loan v)
+                          (let ((d (cached-sample-data v)))
+                            (and (dds.types:flatdata-view-p d) d)))))
+         (when backing (return-loan dr (list backing))))   ; HOTPATH-ALLOC(COLD): loan-backed samples only; the copy path never conses here
+       (setf (dr-cache dr) (delete v (dr-cache dr)))   ; a RETURNED sample is GONE from the cache, never stale-readable (the rule the ZC arm sets)
+       (%recycle-delivery dr v))))
   t)
 
 (defun* return-all-loans (dr)
@@ -2966,18 +3096,16 @@
                   (unless (instance-rec-key-sample rec) (setf (instance-rec-key-sample rec) data))   ; S5.T1: retain the key holder for get_key_value
                   (%deadline-touch dr handle)   ; WP-DCPS-API-COMPLETION S4: (re)arm this instance's requested DEADLINE on delivery (no-op + 0-alloc when INFINITE)
                   (when depth (%reader-keeplast-drop-oldest dr handle depth))   ; KEEP_LAST per-instance drop (DDS 1.4 §2.2.3.18) before append
+                  ;; ADR 0093 slice 1: both wrappers come from DR's freelists when the application returns
+                  ;; its taken samples, else are freshly allocated — delivery is identical either way.
                   (setf (dr-cache dr)
                         (nconc (dr-cache dr)
-                               (list (make-cached-sample
-                                      :data data
-                                      :info (make-sample-info
-                                             :sample-state :not-read :view-state :new
-                                             :instance-state (instance-rec-state rec) :valid-data t
-                                             :instance-handle handle :sequence-number sn
-                                             :publication-handle sguid   ; DDS 1.4 §2.2.2.5.4; ALIASED, never copied — see the slot docstring
-                                             :source-timestamp (dds.disc:node-sample-timestamp node key)   ; S5.T4
-                                             :disposed-generation-count (instance-rec-disposed-gen-count rec)
-                                             :no-writers-generation-count (instance-rec-no-writers-gen-count rec))))))))))))))
+                               (list (%acquire-delivery
+                                      dr data (instance-rec-state rec) handle sn
+                                      sguid   ; DDS 1.4 §2.2.2.5.4; ALIASED, never copied — see the slot docstring
+                                      (dds.disc:node-sample-timestamp node key)   ; S5.T4
+                                      (instance-rec-disposed-gen-count rec)
+                                      (instance-rec-no-writers-gen-count rec)))))))))))))
     (when (and sguid advance)
       (%reader-advance-drained dr sguid sn)
       ;; WP-PERF: the sample has been COPIED OUT (%deserialize-sample built an independent struct), so its bytes

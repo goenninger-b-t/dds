@@ -154,6 +154,15 @@ CPU. **A timed-out wait is never treated as success:** these joins exist so a su
 leaks* rather than risking a use-after-free on a live thread. `dds.pal:stuck-teardown-joins` must read 0
 after a healthy run.
 
+**Allocation: `take` is a loan** ([ADR 0093](docs/adr/0093-the-copy-path-becomes-a-loan.md)). NFR-MEM's
+target is **zero bytes per sample**, and the FlatData/Zero-Copy read path already reaches it literally. The
+ordinary *copy* path could not, for a semantic reason rather than a missing optimisation: it hands the
+application a retained struct, and **you cannot pool an object whose lifetime the application controls**.
+So `take-samples` now returns *loans* — give them back with `return-loan` and the reader recycles them
+(**−171 B/sample** measured, `bench/report/2026-07-28-…`). It is a **`should`, not a `must`**: an
+unreturned sample is simply never recycled, so existing code keeps working and only forgoes the win.
+Current position: **1739 B/sample** on the measured DCPS path (arm64), **1568** with returns.
+
 ### ASDF systems
 
 | System | Layer | Package | Responsibility |
