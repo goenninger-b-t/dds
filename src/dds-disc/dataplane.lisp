@@ -513,8 +513,11 @@
    and send it to HOST:PORT. BUF selects the thread's scratch message buffer. DEST-PREFIX
    (default NIL) is the 12-octet destination GUID-prefix on the USER-DATA path; non-NIL engages
    T10 whole-RTPS-message protection at %send-raw-buf when that dest is :keyed (NIL = plain,
-   byte-identical — every builtin/discovery/bootstrap caller leaves it NIL)."
-  (let ((mc (dds.core.buffer:cursor buf :endianness :little)))
+   byte-identical — every builtin/discovery/bootstrap caller leaves it NIL).
+   NFR-MEM: the build cursor comes from the calling receiver thread's own reply-cursor slot (%rx-tx-cursor
+   over *rx-context*) — this runs once per inbound HEARTBEAT to answer with an ACKNACK, and a fresh cursor
+   is 48 B. Off a receiver thread *rx-context* is NIL and it allocates exactly as before."
+  (let ((mc (%rx-tx-cursor *rx-context* buf)))
     (dds.rtps.message:write-header mc (disc-node-guid-prefix node))
     (funcall build-fn mc)
     (%send-raw-buf node buf (dds.core.buffer:cursor-position mc) host port nil dest-prefix)))

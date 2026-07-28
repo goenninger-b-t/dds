@@ -2692,6 +2692,10 @@
    means 'no scratch' and restores the per-datagram allocation, which is what non-receiver callers (tests)
    get."
   (cursor nil :type (or null dds.core.buffer:cursor))
+  ;; DISTINCT from CURSOR and that is not an optimisation detail: a reply is built WHILE the inbound
+  ;; datagram is being dispatched (%on-user-heartbeat answers a HEARTBEAT with an ACKNACK from inside the
+  ;; dispatch), so the inbound cursor is LIVE at that moment and sharing one would corrupt the parse.
+  (tx-cursor nil :type (or null dds.core.buffer:cursor))
   (prefixes (make-array +rx-prefix-slots+ :initial-element nil) :type simple-vector)
   (guids (make-array +rx-prefix-slots+ :initial-element nil) :type simple-vector))
 
@@ -2703,6 +2707,17 @@
 
    Read by %SOURCE-GUID-CACHED. NIL means 'no scratch' and restores the per-call allocation, so every
    non-receiver caller — the durability replay, the value-level tests — is byte-identical.")
+
+(declaim (inline %cursor-reuse))
+(defun* %cursor-reuse (c buf)
+    (function ((or null dds.core.buffer:cursor) dds.core.buffer:octet-buffer) dds.core.buffer:cursor)
+  "C reset for reuse when it already reads BUF, else a fresh cursor over BUF (NFR-MEM). The ONE definition
+   of cursor reuse, shared by the inbound (%RX-CURSOR) and reply-building (%RX-TX-CURSOR) paths."
+  (cond ((and c (eq (dds.core.buffer:cursor-buffer c) buf))
+         (dds.core.buffer:cursor-reset c)
+         (dds.core.buffer:cursor-set-endianness c :little)
+         c)
+        (t (dds.core.buffer:cursor buf :endianness :little))))
 
 (declaim (inline %rx-cursor))
 (defun* %rx-cursor (ctx buf)
@@ -2720,14 +2735,26 @@
 
    Measured: the fresh cursor was 48 B (a 6-word struct) on EVERY datagram, 2.05 datagrams/sample =
    101 B/sample of the receive pipeline's 688."
-  (let ((c (and ctx (rx-context-cursor ctx))))
-    (cond ((and c (eq (dds.core.buffer:cursor-buffer c) buf))
-           (dds.core.buffer:cursor-reset c)
-           (dds.core.buffer:cursor-set-endianness c :little)
-           c)
-          (t (let ((fresh (dds.core.buffer:cursor buf :endianness :little)))
-               (when ctx (setf (rx-context-cursor ctx) fresh))
-               fresh)))))
+  (let ((fresh (%cursor-reuse (and ctx (rx-context-cursor ctx)) buf)))
+    (when ctx (setf (rx-context-cursor ctx) fresh))
+    fresh))
+
+(defun* %rx-tx-cursor (ctx buf)
+    (function ((or null rx-context) dds.core.buffer:octet-buffer) dds.core.buffer:cursor)
+  "The REPLY-building cursor for BUF on the calling receiver thread — the send twin of %RX-CURSOR, over
+   CTX's own SECOND cursor slot (NFR-MEM).
+
+   A receiver thread answers from inside dispatch: a HEARTBEAT is answered with an ACKNACK, an ACKNACK
+   with retransmits, all through %send-msg-buf over the node's rx-tx-msg buffer. Each of those built a
+   fresh 48 B cursor. It must NOT share CTX's inbound cursor, which is live at that moment — hence a
+   distinct slot rather than a cleverer reuse of one.
+
+   The EQ test carries the same weight as in %RX-CURSOR: whatever buffer a caller supplies, a mismatch
+   costs the pre-existing allocation and never a wrong parse. Off the receiver thread CTX is NIL and this
+   allocates exactly as before."
+  (let ((fresh (%cursor-reuse (and ctx (rx-context-tx-cursor ctx)) buf)))
+    (when ctx (setf (rx-context-tx-cursor ctx) fresh))
+    fresh))
 
 (declaim (inline %prefix-equal-header-p))
 (defun* %prefix-equal-header-p (p vec)

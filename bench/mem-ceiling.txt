@@ -128,6 +128,13 @@
 #   arm64 COPY    927.8 /  926.7 /  928.4   -> LOWERED 1090 -> 960
 #   arm64 RETURN  724.1 /  721.9 /  721.9   -> LOWERED  880 -> 755
 #
+# LOWERED 2026-07-28 (%send-msg-buf takes its build cursor from the receiver thread's own REPLY-cursor slot
+# instead of consing one per send — a receiver answers every inbound HEARTBEAT with an ACKNACK from inside
+# dispatch, so this ran ~once per sample at 48 B. It needs a slot DISTINCT from the inbound cursor, which is
+# live at that moment. Predicted ~49 B/sample, measured -47.3 / -50.3:
+#   arm64 COPY    880.5 /  879.3 /  882.3   -> LOWERED 960 -> 915
+#   arm64 RETURN  673.8 /  676.0 /  674.9   -> LOWERED 755 -> 706
+#
 # ⚠️ MEASURE WITH NOTHING ELSE RUNNING. A gate-mem run taken while the test suites were running in the
 # background read COPY 1710.8 and FAILED — a 160 B phantom regression from participant + CPU contention,
 # not from code. A benchmark is an instrument; give it the machine.
@@ -135,5 +142,5 @@
 # x86_64 is NOT re-measured here; its COPY row stays 1740 and will simply not bite until someone measures
 # it on that arch. Never derive it from arm64.
 #   x86_64 not measured here — the dash is honest, not lazy.
-arm64  960 755
+arm64  915 706
 x86_64 1740 -
