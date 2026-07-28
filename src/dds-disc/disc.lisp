@@ -2683,7 +2683,17 @@
    means 'no scratch' and restores the per-datagram allocation, which is what non-receiver callers (tests)
    get."
   (cursor nil :type (or null dds.core.buffer:cursor))
-  (prefixes (make-array +rx-prefix-slots+ :initial-element nil) :type simple-vector))
+  (prefixes (make-array +rx-prefix-slots+ :initial-element nil) :type simple-vector)
+  (guids (make-array +rx-prefix-slots+ :initial-element nil) :type simple-vector))
+
+(defvar *rx-context* nil
+  "The receive scratch of the receiver thread currently inside %handle-datagram (an RX-CONTEXT), or NIL on
+   any other thread. Bound per datagram by %handle-datagram — the same mechanism, and the same dynamic
+   extent, as *RX-SOURCE-TIMESTAMP*: a dynamic binding is per-thread by construction, costs no heap, and
+   reaches the delivery path without threading an argument through every data-plane hook signature.
+
+   Read by %SOURCE-GUID-CACHED. NIL means 'no scratch' and restores the per-call allocation, so every
+   non-receiver caller — the durability replay, the value-level tests — is byte-identical.")
 
 (declaim (inline %rx-cursor))
 (defun* %rx-cursor (ctx buf)
@@ -2840,7 +2850,8 @@
                       (replace vec stream :start1 20)
                       (%handle-datagram node buf (+ 20 (length stream)) t rx-ctx)))))))
         (return-from %handle-datagram t)))   ; SRTPS datagram: decoded+re-dispatched, or dropped (fail-closed)
-    (let ((*rx-source-timestamp* nil))   ; S5.T4: per-datagram INFO_TS source_timestamp (ns), set by the INFO_TS clause + read at the store (%deliver-user-sample); reset each datagram
+    (let ((*rx-source-timestamp* nil)    ; S5.T4: per-datagram INFO_TS source_timestamp (ns), set by the INFO_TS clause + read at the store (%deliver-user-sample); reset each datagram
+          (*rx-context* rx-ctx))         ; NFR-MEM: this receiver thread's GUID cache, reachable from the data-plane hooks without widening their signatures
      ;; flet + dynamic-extent: dispatch-message is a downward funarg, so this closure stack-allocates (ADR 0068)
      (flet ((%rx-dispatch-submsg (id flags c body-len)
        (cond

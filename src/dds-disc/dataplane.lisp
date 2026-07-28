@@ -2505,6 +2505,56 @@
           (aref g 14) (ldb (byte 8 8) writer-id) (aref g 15) (ldb (byte 8 0) writer-id))
     g))
 
+(declaim (inline %guid-names-p))
+(defun* %guid-names-p (g src-prefix writer-id)
+    (function ((simple-array (unsigned-byte 8) (16)) (simple-array (unsigned-byte 8) (12))
+               (unsigned-byte 32))
+              t)
+  "T when the 16-octet GUID G is exactly (SRC-PREFIX, WRITER-ID) — the EntityId first, because that is
+   what differs between two endpoints of one peer and so rejects a wrong slot in four comparisons."
+  (and (= (aref g 15) (ldb (byte 8 0) writer-id))
+       (= (aref g 14) (ldb (byte 8 8) writer-id))
+       (= (aref g 13) (ldb (byte 8 16) writer-id))
+       (= (aref g 12) (ldb (byte 8 24) writer-id))
+       (dotimes (i 12 t) (unless (= (aref g i) (aref src-prefix i)) (return nil)))))
+
+(defun* %source-guid-cached (src-prefix writer-id)
+    (function ((simple-array (unsigned-byte 8) (12)) (unsigned-byte 32))
+              (simple-array (unsigned-byte 8) (16)))
+  "%SOURCE-GUID, served from the calling receiver thread's write-once GUID cache (*RX-CONTEXT*) when this
+   (peer, endpoint) pair has been seen before. Off the receiver thread *RX-CONTEXT* is NIL and this IS
+   %source-guid, allocation for allocation.
+
+   THE RX COMPLEMENT OF ADR 0088. That ADR removed the same defect on the writer's control path — a GUID
+   built per ACKNACK purely to index a table — and settled the safety question on principle: the cached
+   key is WRITTEN ONCE AND NEVER MUTATED, so anything may retain it. The receive path had the identical
+   defect at greater volume: a fresh 16-octet GUID (32 B) per sample in %on-user-data, ANOTHER for the
+   same (prefix, writer) in %deliver-user-sample, and a third per HEARTBEAT in %on-user-heartbeat.
+
+   Retention here is not incidental, it is the design: the GUID becomes the reliable reader-proxy key, the
+   outer key of the two-level (source-GUID -> SN) sample store, the dedup gate's logical-origin key, the ZC
+   loan handle, and — since ADR 0090 A3b — SampleInfo.publication_handle, which ALIASES it into the
+   application. So this is a CACHE with the write-once invariant, never a reused scratch buffer: a slot is
+   only ever REPLACED, never written into, and an evicted peer's next datagram mints a new equal array.
+   Two samples from one writer now SHARE one GUID object where they used to hold equal copies, which is
+   sound for exactly the same reason and is what makes the redundant second build disappear on its own.
+
+   16 direct-mapped slots per receiver thread, indexed by the EntityId folded against the prefix's last
+   octet. A collision re-allocates, which is what every call did before."
+  (let ((ctx *rx-context*))
+    (if (null ctx)
+        (%source-guid src-prefix writer-id)
+        (let* ((slots (rx-context-guids ctx))
+               (i (logand (logxor writer-id (ash writer-id -8) (aref src-prefix 11))
+                          (1- +rx-prefix-slots+))))
+          (let ((hit (svref slots i)))
+            (declare (type (or null (simple-array (unsigned-byte 8) (16))) hit))   ; a slot holds only what the miss arm below put there
+            (if (and hit (%guid-names-p hit src-prefix writer-id))
+                hit
+                (let ((fresh (%source-guid src-prefix writer-id)))
+                  (setf (svref slots i) fresh)
+                  fresh)))))))
+
 (defun* %reader-routes-for (node writer-guid)
     (function (disc-node (simple-array (unsigned-byte 8) (16))) list)
   "WP-N-ENDPOINT-S2/2C1 (ADR 0048): the local user readers matched to remote writer WRITER-GUID, as a list of
@@ -2597,7 +2647,7 @@
    DCPS-facing lifecycle-event callback OUTSIDE the node lock (mirrors %deliver-user-sample). Gated on
    a matched user writer EntityId."
   (when (and (disc-node-user-reader node) (%user-writer-entityid-p writer-id))
-    (let* ((guid (%source-guid src-prefix writer-id))
+    (let* ((guid (%source-guid-cached src-prefix writer-id))
            (routes (%reader-routes-for node guid)))   ; WP-N-ENDPOINT-S2: drive the CANONICAL reader matched to this writer (not unconditionally the primary)
       (when routes
         (dds.rtps.reliable:reader-on-data (cdr (first routes)) guid sn
@@ -2875,7 +2925,7 @@
    a marker stored before a joiner joined is <= its watermark (skipped AND excluded from ELIGIBLE) and one stored after
    has it in this snapshot (counted iff it will drain) — no drain-an-unbumped-marker window. ELIGIBLE <= 1 / route
    length <= 1 (N=1 / different-topic S4) -> no bump, byte-identical. NOT cleared for ship — pending counsel (R6)."
-  (let* ((guid (%source-guid src-prefix writer-id))
+  (let* ((guid (%source-guid-cached src-prefix writer-id))
          (routes (%reader-routes-for node guid))     ; WP-N-ENDPOINT-S4: the ZC reader(s) matched to this writer (mirrors %deliver-user-sample's demux)
          (canon (and routes (cdr (first routes)))))   ; the CANONICAL engine reader (N=1/pre-match -> primary, byte-identical to the old primary-only path)
     (when canon
@@ -3355,7 +3405,7 @@
    drawn only for a node with NO crypto-transform; should a live handshake have installed one since, the decode
    below needs the EXACT ciphertext extent, so the buffer is returned and the exact-length vector materialised
    (the pre-pool path, byte-identical). NIL (the default, and always on the secured path) changes nothing."
-  (let* ((guid (%source-guid src-prefix writer-id))   ; ONE source GUID: km-resolve + reliable proxy + the three inner tables + the loan handle
+  (let* ((guid (%source-guid-cached src-prefix writer-id))   ; ONE source GUID: km-resolve + reliable proxy + the three inner tables + the loan handle
          (routes (%reader-routes-for node guid))       ; WP-N-ENDPOINT-S2/S4: the reader(s) matched to this writer — resolved ONCE (tier + delivery, DRY)
          (canon (and routes (cdr (first routes))))     ; the CANONICAL engine reader (single reliability truth for this writer)
          (rid (if routes (car (first routes)) (disc-node-user-reader-id node)))   ; WP-N-ENDPOINT-S4: the target reader's EntityId (route id; N=1/pre-match -> primary id)
@@ -3514,7 +3564,7 @@
    NIL otherwise. The effective logical-origin (orig-guid or wire-guid, orig-sn or wire-sn) is computed here and
    threaded into %deliver-user-sample/%deliver-user-marker for the dedup gate."
   ;; effective-guid/sn: relay path uses PID values; direct path uses the wire writer GUID + SN
-  (let* ((eff-guid (or orig-guid (%source-guid src-prefix writer-id)))
+  (let* ((eff-guid (or orig-guid (%source-guid-cached src-prefix writer-id)))
          (eff-sn   (or orig-sn sn)))
     (multiple-value-bind (zc overlay)
         (cond
@@ -3573,7 +3623,7 @@
       (dds.rtps.message:parse-heartbeat-body c flags)
     (declare (ignore rid count finalp livep))
     (when (and (disc-node-user-reader node) (%user-writer-entityid-p wid))
-      (let ((wguid (%source-guid src-prefix wid)))
+      (let ((wguid (%source-guid-cached src-prefix wid)))
         ;; ADR 0043 RESIDUAL -> now FAIL-SAFE, not merely documented (ADR 0059). The match gate below admits a
         ;; MATCHED writer's HEARTBEAT; the reader-side durability baseline is armed just AFTER %record-match
         ;; (%fire-match -> %reader-durability-init -> init-writer-proxy-durability, which CREATES the WriterProxy).
@@ -3728,7 +3778,7 @@
       ((null dest) 0)
       (t
        ;; The virtual-writer GUID is OUR writer's own GUID — the degenerate virtual writer (ADR 0090 §3.1).
-       (let ((vw (%source-guid (disc-node-guid-prefix node) writer-entity-id)))
+       (let ((vw (%source-guid-cached (disc-node-guid-prefix node) writer-entity-id)))
          (flet ((%build-conf (mc)
                   (dds.rtps.message:write-app-ack-conf mc rid writer-entity-id vw count)))
            (declare (dynamic-extent #'%build-conf))
@@ -3795,7 +3845,7 @@
    writer EntityId; mirrors %on-user-heartbeat."
   (multiple-value-bind (rid wid gap-start base numbits bitmap) (dds.rtps.message:parse-gap-body c flags)
     (when (and base (disc-node-user-reader node) (%user-writer-entityid-p wid))
-      (let* ((routes (%reader-routes-for node (%source-guid src-prefix wid)))   ; WP-N-ENDPOINT-S2: the readers matched to this writer
+      (let* ((routes (%reader-routes-for node (%source-guid-cached src-prefix wid)))   ; WP-N-ENDPOINT-S2: the readers matched to this writer
              ;; RTPS 2.5 §8.3.7.4: readerGUID = { Receiver.destGuidPrefix, Gap.readerId }, and "the Gap
              ;; readerId can be ENTITYID_UNKNOWN, in which case the Gap applies to ALL Readers of that
              ;; writerGUID within the Participant" — so a NON-unknown readerId addresses exactly ONE reader.
@@ -3808,7 +3858,7 @@
                           routes
                           (remove-if-not (lambda (rr) (= (car rr) rid)) routes))))
         (when targets
-          (let ((lost (dds.rtps.reliable:reader-on-gap (cdr (first targets)) (%source-guid src-prefix wid)
+          (let ((lost (dds.rtps.reliable:reader-on-gap (cdr (first targets)) (%source-guid-cached src-prefix wid)
                                                        gap-start base numbits bitmap)))
             ;; WP-DCPS-API-COMPLETION S4: a GAP that declares never-received SNs permanently gone raises
             ;; SAMPLE_LOST on the matched DataReader(s) (DDS 1.4 §2.2.4.1); N=1 -> the canonical route's id.
@@ -3914,7 +3964,7 @@
     (declare (ignore rdr keyp))
     (when (and (disc-node-user-reader node) (%user-writer-entityid-p wtr))
       (let* ((region (make-array plen :element-type '(unsigned-byte 8)))
-             (wguid (%source-guid src-prefix wtr))
+             (wguid (%source-guid-cached src-prefix wtr))
              (routes (%reader-routes-for node wguid)))   ; WP-N-ENDPOINT-S2: reassemble on the CANONICAL reader matched to this writer (same reader %on-user-heartbeat-frag NACK_FRAGs from)
         (when routes
           (replace region (dds.core.buffer:octet-buffer-vec buf) :start2 poff :end2 (+ poff plen))
@@ -3934,14 +3984,14 @@
   (multiple-value-bind (rid wid sn lastfrag count) (dds.rtps.message:parse-heartbeat-frag-body c flags)
     (declare (ignore rid lastfrag count))
     (when (and (disc-node-user-reader node) (%user-writer-entityid-p wid)
-               (%guid-matched-p node (%source-guid src-prefix wid)))
+               (%guid-matched-p node (%source-guid-cached src-prefix wid)))
       ;; WP-N-ENDPOINT-S2/2C1 (ADR 0048): NACK_FRAG from the CANONICAL reader (its reassembly proxy, same one
       ;; %on-user-data-frag fed), stamped with EACH matched local reader's EntityId (correct wire reader id). The
       ;; dolist FANS OUT one NACK_FRAG per reader-id when the route holds N same-topic readers (route-add-all, 2C1).
-      (let ((routes (%reader-routes-for node (%source-guid src-prefix wid))))
+      (let ((routes (%reader-routes-for node (%source-guid-cached src-prefix wid))))
         (when routes
           (multiple-value-bind (base numbits bitmap)
-              (dds.rtps.reliable:reader-frag-acknack (cdr (first routes)) (%source-guid src-prefix wid) sn)
+              (dds.rtps.reliable:reader-frag-acknack (cdr (first routes)) (%source-guid-cached src-prefix wid) sn)
             (when base
               (dolist (rr routes)
                 (let ((cnt (incf (disc-node-ack-count node))))
