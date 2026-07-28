@@ -101,17 +101,25 @@
             (if st (values nil st) svc))))))
 
 (defun* %stop-process-service (svc)
-    (function (durability-service) (eql t))
-  "Stop a :PROCESS-mode proxy service: clear the running flag, join the monitor thread.
-   The underlying subprocess will exit when its collect loop detects the parent gone or is killed."
-  (let ((th nil))
+    (function (durability-service) (values (eql t) (or null keyword)))
+  "Stop a :PROCESS-mode proxy service: clear the running flag, join the monitor thread — BOUNDED.
+   The underlying subprocess will exit when its collect loop detects the parent gone or is killed.
+   Returns (values T NIL), or (values T :TIMEOUT) if the monitor could not be proven stopped.
+
+   The timeout is REPORTED and the caller PROCEEDS (ADR 0092): unlike the collect threads, this monitor
+   only polls UIOP:PROCESS-ALIVE-P on a subprocess — it owns no store, no node and no static buffer, so
+   there is nothing here whose free a live monitor could corrupt. Bounding it still matters: an unbounded
+   join on a wedged monitor hangs runner teardown exactly as the UDP receiver hung stop-node."
+  (let ((th nil) (status nil))
     (dds.pal:with-lock ((durability-service-lock svc))
       (setf (durability-service-running svc) nil)
       (setf th (durability-service-thread svc))
       (setf (durability-service-thread svc) nil))
     (when th
-      (ignore-errors (dds.pal:join th))))
-  t)
+      (multiple-value-bind (r st) (dds.pal:join-bounded th :durability-process-service-monitor)
+        (declare (ignore r))
+        (setf status st)))
+    (values t status)))
 
 (defun* runner-start (runner)
     (function (service-runner) (values service-runner (or null keyword)))

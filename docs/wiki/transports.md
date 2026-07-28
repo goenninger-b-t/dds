@@ -306,7 +306,12 @@ unlike the `open(2)` flags these need no reader conditional.
 | Symbol | Kind | Description |
 |---|---|---|
 | `dds.pal:spawn` | function | `(fn &key name)` — spawn a thread running `fn` (default name `"dds"`); returns the thread. |
-| `dds.pal:join` | function | `(thread)` — block until `thread` finishes; return its result. |
+| `dds.pal:join` | function | `(thread)` — block until `thread` finishes; return its result. **Unbounded — do not use it in a teardown path**; see *Bounded teardown* below. |
+| `dds.pal:join-bounded` | function | `(thread &optional site timeout)` — join `thread`, but give up after `timeout` seconds (default `*join-timeout-seconds*`): `(values result nil)` if it finished, `(values nil :timeout)` if it did not. `site` is a keyword naming the call site; on `:timeout` this calls `note-stuck-teardown` itself, so a caller that ignores the status **still cannot** make the failure silent. A `nil` timeout degrades to an unbounded `join`. Portable by polling `thread-alive-p`, so it carries no reader conditional (ADR 0091 / 0092). |
+| `dds.pal:*join-timeout-seconds*` | special variable | Default `5`. The deadline for a teardown join. `nil` waits forever — the pre-fix behaviour, kept as the A/B lever that reproduces the hang on demand. |
+| `dds.pal:note-stuck-teardown` | function | `(site)` — record one wait at `site` that hit its deadline. Called by `join-bounded`; called **directly** by the bounded waits that are not joins (the flow-controller per-node emit barrier), so every deadline in the stack reports through one counter. |
+| `dds.pal:stuck-teardown-joins` | function | `()` — `(values total alist)`: the number of waits that hit their deadline process-wide, and a fresh per-`site` `(site . count)` breakdown. **Must read 0 after a healthy run.** The queryable-snapshot form the operating contract requires (errors are reported, never printed), like `dds.log:logger-shed-counts`. |
+| `dds.pal:reset-stuck-teardown-joins` | function | `()` — clear the report, so a later snapshot measures only what follows. For tests that deliberately provoke a deadline, and for a long-lived service that has consumed the report. |
 | `dds.pal:make-lock` | function | `(&optional name)` — create a mutex (default name `"dds-lock"`). |
 | `dds.pal:with-lock` | macro | `((lock) &body body)` — evaluate `body` with `lock` held. |
 | `dds.pal:make-condvar` | function | `()` — create a condition variable for use with `condvar-wait` / `condvar-signal`. |
@@ -323,7 +328,9 @@ unlike the `open(2)` flags these need no reader conditional.
 | `dds.pal:*udp-raw-sendto*` | special variable | Default `T`: `udp-send-to` fills a pre-allocated per-thread foreign `struct sockaddr_in` and calls `sendto(2)` directly. `NIL`: the original `sb-bsd-sockets:socket-send` path, which allocates ~360 B per datagram — about 262 B of it re-parsing the dotted-quad destination **string** on every send. **The datagram bytes on the wire are identical either way**; only the syscall wrapper differs. Kept as the A/B lever ADR 0062 requires for sizing an allocation change against `make gate-mem`, and as an escape hatch should a platform's `sockaddr_in` layout differ from the Darwin and Linux ones documented in ADR 0065. `run-udp-loopback-test` asserts byte-exact delivery under **both** arms, which is what makes a wrong layout fail loudly rather than silently drop every datagram. |
 | `dds.pal:udp-recv` | function | `(socket buffer length)` — block until a datagram arrives; return `(values size status)`, with **zero allocation per datagram** (ADR 0066). Used from a dedicated receiver thread. The sender address is **not reported** — nothing in the stack uses it, since RTPS identifies a source by GuidPrefix, never by IP. **`status` is `:closed` when the socket has been closed and the receiver loop must exit**; a *negative size with a NIL status is TRANSIENT* (EINTR from SBCL's GC signals, or Linux reporting a queued ICMP port-unreachable as ECONNREFUSED) and the loop must simply receive again — treating every −1 as "closed" silently kills receiver threads on Linux, which is how the first cut of ADR 0066 failed. Zero is not an exit condition either: a zero-length datagram is legal, and treating it as end-of-stream would let any peer kill a receiver thread. **`buffer` MUST be PAL-static**, as for `udp-send-to`. |
 | `dds.pal:*udp-raw-recvfrom*` | special variable | Default `T`: `udp-recv` calls `recvfrom(2)` directly with `src_addr = NULL`. `NIL`: the original `sb-bsd-sockets:socket-receive` path, which allocates ~305 B per datagram — most of it building a sender sockaddr and converting it to a Lisp address that no caller reads. A/B lever and escape hatch, as `*udp-raw-sendto*` is; `run-udp-loopback-test` asserts byte-exact delivery under both arms. |
-| `dds.pal:udp-close` | function | `(socket)` — close `socket`. |
+| `dds.pal:udp-close` | function | `(socket)` — close `socket`. ⚠️ **Closing does not reliably wake a receiver already parked in `recvfrom(2)`** — not on Linux (`close`), and not on macOS/BSD (`shutdown(2)` fails `ENOTCONN` on an *unconnected* UDP socket and wakes nothing). Signal the receiver to leave **before** closing; see *Bounded teardown* below (ADR 0091). |
+| `dds.pal:udp-set-receive-timeout` | function | `(socket &optional seconds)` — arm `SO_RCVTIMEO` on a datagram socket (default `*udp-receive-timeout-seconds*`), so a blocked `udp-recv` returns instead of parking indefinitely and a receiver loop notices its stop flag within that bound. Armed by `udp-open` on every socket. Delegates to `tcp-set-recv-timeout` — one encoding of `struct timeval`, not two. Returns `(values t nil)` or `(values nil :setsockopt-failed)`. |
+| `dds.pal:*udp-receive-timeout-seconds*` | special variable | Default `0.25`. Read once per socket, at `udp-open`. `0` disables it, restoring the pre-fix teardown race. Costs 4 idle wakeups/second per receiver thread, off the data path. ⚠️ It rescues a **freshly opened** socket; it does **not** rescue one already parked when the fd is released — which is why the stop flag, not this timeout, is the actual fix. |
 | `dds.pal:udp-set-reuse-port` | function | `(socket)` — enable `SO_REUSEPORT` so multiple participants on one host can share the SPDP multicast port. Must be called before bind. Returns `(values t nil)` or `(values nil :setsockopt-failed)`. |
 | `dds.pal:udp-join-multicast` | function | `(socket group)` — join the IPv4 multicast `group` (dotted-quad) on the default interface and enable loopback (RTPS 2.5 §9.6.1.1). The socket must already be bound to the multicast port. Returns `(values t nil)` or `(values nil :setsockopt-failed)` — a node that cannot join the SPDP group discovers nobody, so the caller must surface it rather than proceed deaf. |
 
@@ -353,6 +360,60 @@ unlike the `open(2)` flags these need no reader conditional.
 | Symbol | Kind | Description |
 |---|---|---|
 | `dds.pal:with-hot-optimizations` | macro | `(&body body)` — expand to this build's strongest safe-enough hot-path optimize declarations (M0 baseline keeps `safety` at 1 while manual bounds-checks are established). |
+
+### Bounded teardown — no wait in a shutdown path is unbounded (ADR 0091 / 0092)
+
+**The rule: never call `dds.pal:join` in a teardown path.** Use `join-bounded`. A thread you are waiting for
+may be parked in a syscall that nothing can wake — a UDP receiver inside `recvfrom(2)` on a released fd is
+woken by neither `close(2)`, nor `shutdown(2)` (which fails `ENOTCONN` on an unconnected UDP socket on
+macOS/BSD), nor `SO_RCVTIMEO`. An unbounded join behind such a thread hangs the process **forever at 0%
+CPU**, which is indistinguishable from a deadlock and reports nothing at all.
+
+⚠️ **A wait assembled from bounded waits is not itself bounded.** The flow-controller emit barrier looped
+`while` a predicate held, waiting 0.5 s per turn, and its own comment claimed it therefore could not wedge
+teardown. It could: the loop retried forever. Bound the **loop**, not just the wait inside it.
+
+⚠️ **A timed-out wait is not success — and this is the half that matters.** Almost every teardown join
+exists so that a *subsequent* release is safe: a `free-static`, a `shm-detach`, a `store-close`, a
+`delete-participant`, a socket `close`. If the join cannot prove the thread stopped, **skip that release and
+leak.** A bounded leak beats a use-after-free on a live thread; bounding the wait *without* gating the
+release turns a hang into memory corruption, which is strictly worse because the hang is at least loud.
+
+```lisp
+;; Teardown of something that owns a thread AND a resource that thread touches.
+(defun* stop-my-service (svc)
+    (function (my-service) (values t (or null keyword)))
+  "Stop + JOIN the worker, then release what the join guards. (values T NIL), or (values NIL :TIMEOUT)."
+  (setf (my-service-running svc) nil)                 ; 1. tell it to leave, while its resources are valid
+  (dds.pal:condvar-signal (my-service-cv svc))        ; 2. wake it (under the lock that guards the flag)
+  (multiple-value-bind (result status)
+      (dds.pal:join-bounded (my-service-thread svc) :my-service-worker)   ; 3. BOUNDED, and named
+    (declare (ignore result))
+    (when status
+      (return-from stop-my-service (values nil status)))   ; 4. NOT proven stopped -> release NOTHING
+    (dds.pal:free-static (my-service-buffer svc))          ; 5. only now is this safe
+    (setf (my-service-thread svc) nil                      ;    slot left set on timeout -> retryable
+          (my-service-buffer svc) nil)
+    (values t nil)))
+```
+
+Then check the report — it is queryable, never printed:
+
+```lisp
+(multiple-value-bind (total by-site) (dds.pal:stuck-teardown-joins)
+  (when (plusp total)
+    ;; e.g. total=1, by-site=((:SHMEM-RECEIVER . 1)) — a segment was deliberately leaked rather than
+    ;; destroyed under a receiver still parked on a condvar inside it.
+    (report-to-your-own-health-endpoint total by-site)))
+```
+
+`total` **must be 0 after a healthy run.** Non-zero means teardown could not prove a thread had stopped, so
+it leaked on purpose. Per-participant, the same event also shows up as
+`dds.disc:disc-node-stuck-receiver-teardowns` and `dds.disc:disc-node-teardown-leaked`.
+
+The `teardown-deadline` test (`make test-sbcl`) is the falsifier: it asserts a clean join reports *nothing*,
+a wedged thread reports `:timeout` **under its own site keyword**, and the emit barrier *terminates* —
+asserted on elapsed time, not merely on the return value.
 
 ## Examples
 

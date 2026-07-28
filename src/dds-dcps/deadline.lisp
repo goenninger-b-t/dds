@@ -200,21 +200,31 @@
   t)
 
 (defun* %deadline-monitor-stop (p)
-    (function (domain-participant) t)
+    (function (domain-participant) (values t (or null keyword)))
   "Stop + JOIN participant P's DEADLINE monitor thread (on delete-participant), then forget it — the
    clean-shutdown discipline (no strand, no use-after-free: the thread is joined BEFORE the node/
    buffers are torn down). Sets RUNNING NIL and signals the CV UNDER the monitor lock (so a thread
-   about to wait sees the flag — no lost wakeup), then joins. Null-safe + idempotent (a participant
-   that never armed a DEADLINE has no monitor)."
+   about to wait sees the flag — no lost wakeup), then joins BOUNDED. Null-safe + idempotent (a
+   participant that never armed a DEADLINE has no monitor).
+
+   Returns (values T NIL) when the monitor is provably gone, (values NIL :TIMEOUT) when it is not.
+   ⚠️ THE STATUS GATES DELETE-PARTICIPANT'S TEARDOWN (ADR 0092). The monitor fires misses through
+   %NOTIFY-STATUS, which takes entity status locks and invokes APPLICATION listener callbacks — and an
+   on_offered_deadline_missed callback may legitimately WRITE, reaching the node's send buffers. So a
+   monitor that cannot be proven stopped must not have those buffers freed under it. On :TIMEOUT the
+   monitor slot is NOT cleared, so a later delete re-attempts the join rather than forgetting the thread."
   (let ((mon (dp-deadline-monitor p)))
     (when mon
       (dds.pal:with-lock ((deadline-monitor-lock mon))
         (setf (deadline-monitor-running mon) nil)
         (dds.pal:condvar-signal (deadline-monitor-cv mon)))
       (let ((th (deadline-monitor-thread mon)))
-        (when th (dds.pal:join th)))
+        (when th
+          (multiple-value-bind (r status) (dds.pal:join-bounded th :dcps-deadline-monitor)
+            (declare (ignore r))
+            (when status (return-from %deadline-monitor-stop (values nil status))))))
       (setf (dp-deadline-monitor p) nil)))
-  t)
+  (values t nil))
 
 ;;; ---- the monitor loop + the misses (background thread) ----
 

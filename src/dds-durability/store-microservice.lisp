@@ -1740,8 +1740,11 @@
     srv))
 
 (defun* microservice-server-stop (srv)
-    (function (microservice-server) (eql t))
-  "Stop SRV cleanly and idempotently (WP-DURABILITY-MS-MULTICLIENT, ADR 0050 §4.7; §4.8 clean-wake): set the
+    (function (microservice-server) (values (eql t) (or null keyword)))
+  "Returns (values T NIL), or (values T :TIMEOUT) if the accept loop or any serve thread could not be
+   proven stopped — in which case the listener fd and/or the inner store are DELIBERATELY LEAKED rather
+   than closed under a live thread (ADR 0092; see the gates at the end of the body).
+   Stop SRV cleanly and idempotently (WP-DURABILITY-MS-MULTICLIENT, ADR 0050 §4.7; §4.8 clean-wake): set the
    stop flag, wake the blocked accept with a throwaway self-connection, JOIN the accept-loop thread (so no
    new connection is registered after), DRAIN the connection registry — SHUT DOWN every live connection
    (tcp-shutdown, waking any serve thread parked in recv) and JOIN every per-connection serve thread — close
@@ -1771,15 +1774,19 @@
    deadlock (shutdown-under-lock → release → join-outside-lock → listener + inner LAST). The outer LOCK only
    guards double-stop; the accept/serve threads never take it, so holding it across the joins is
    deadlock-free."
-  (dds.pal:with-lock ((microservice-server-lock srv))
+  (let ((accept-stuck nil) (serve-stuck nil))
+   (dds.pal:with-lock ((microservice-server-lock srv))
     (unless (car (microservice-server-stop-cell srv))
       (setf (car (microservice-server-stop-cell srv)) t)
       ;; wake the accept loop parked in accept via a throwaway self-connection
       (ignore-errors
        (let ((waker (dds.pal:tcp-connect (microservice-server-host srv) (microservice-server-port srv))))
          (when waker (dds.pal:tcp-close waker))))
-      ;; join the ACCEPT-LOOP thread first, so no new connection slot is registered after this point
-      (ignore-errors (dds.pal:join (microservice-server-thread srv)))
+      ;; join the ACCEPT-LOOP thread first, so no new connection slot is registered after this point.
+      ;; BOUNDED (ADR 0092): it parks in accept(2) on the listener, the same shape as the UDP receiver that
+      ;; hung stop-node forever — and its status gates the listener close + store close below.
+      (setf accept-stuck
+            (nth-value 1 (dds.pal:join-bounded (microservice-server-thread srv) :microservice-accept-loop)))
       ;; drain the registry: UNDER REG-LOCK grab the live slots, clear the registry, AND tcp-shutdown every
       ;; drained socket to WAKE its parked serve thread — all in ONE critical section; then RELEASE the lock
       ;; and JOIN every serve thread OUTSIDE it for a clean exit. tcp-shutdown (not tcp-close) is the WAKE
@@ -1801,10 +1808,20 @@
                        live))))
         (dolist (slot slots)
           (let ((th (ms-conn-slot-thread slot)))
-            (when th (ignore-errors (dds.pal:join th))))))
-      (ignore-errors (dds.pal:tcp-close (microservice-server-listener srv)))
-      (ignore-errors (store-close (microservice-server-inner srv)))))
-  t)
+            (when th
+              (multiple-value-bind (r st) (dds.pal:join-bounded th :microservice-serve)
+                (declare (ignore r))
+                (when st (setf serve-stuck t)))))))
+      ;; ⚠️ BOTH CLOSES ARE GATED (ADR 0092). Closing the LISTENER under an accept loop still parked in
+      ;; accept(2) frees an fd a live thread is blocked on — and a reused fd number is then accepted on by
+      ;; the wrong socket. Closing the INNER STORE under a live serve thread hands it a closed store
+      ;; mid-request (for the DARE tiers, zeroized epoch DEKs). On a timeout both are SKIPPED: the fd and
+      ;; the store leak until process exit, which is bounded and reported (dds.pal:stuck-teardown-joins).
+      (unless accept-stuck
+        (ignore-errors (dds.pal:tcp-close (microservice-server-listener srv))))
+      (unless (or accept-stuck serve-stuck)
+        (ignore-errors (store-close (microservice-server-inner srv))))))
+   (values t (if (or accept-stuck serve-stuck) :timeout nil))))
 
 ;;; ---- DARE-wrapping store factory (Slice 2 — ADR 0021 cap 6 x cap 7 compose) ----
 

@@ -97,8 +97,8 @@
         (dds.pal:udp-close rx-socket)
         (dds.pal:udp-close tx-socket)))))
 
-(defun* start-udp-receiver (socket on-datagram)
-    (function (t function) t)
+(defun* start-udp-receiver (socket on-datagram &optional stop-fn)
+    (function (t function &optional (or null function)) t)
   "Spawn a thread that blocks on SOCKET, receiving each datagram into a 64 KiB
    octet-buffer and calling (ON-DATAGRAM buffer size). The thread exits when the socket is closed —
    dds.pal:udp-close SHUTS THE SOCKET DOWN before closing it, which is what actually wakes this thread:
@@ -110,6 +110,13 @@
      (let ((buf (dds.core.buffer:make-octet-buffer 65507)))
        (unwind-protect
             (loop
+              ;; ⚠️ EXIT ON THE FLAG, NOT ON THE SOCKET DYING. A receiver already parked in recvfrom(2)
+              ;; when its fd is closed is woken by NOTHING on macOS — not close(2), not shutdown(2)
+              ;; (ENOTCONN on an unconnected UDP socket), not SO_RCVTIMEO (which rescues a fresh socket
+              ;; but not one already parked; all three observed directly). So teardown sets this flag and
+              ;; lets the thread leave on its own — it wakes within the receive timeout — BEFORE the fd is
+              ;; released. That way the unreachable state is never entered rather than merely survived.
+              (when (and stop-fn (funcall stop-fn)) (return))
               (multiple-value-bind (size status)
                   (handler-case (dds.pal:udp-recv socket
                                                   (dds.core.buffer:octet-buffer-vec buf) 65507)

@@ -59,8 +59,11 @@
    ;; clock + process identity
    #:monotonic-ns #:realtime-ns #:process-id
    ;; UDPv4 sockets (native, FR-XPORT-1)
-   #:udp-open #:udp-local-port #:udp-send-to #:udp-recv #:udp-close
+   #:udp-open #:udp-local-port #:udp-send-to #:udp-recv #:udp-close #:udp-set-receive-timeout #:join-bounded #:*join-timeout-seconds*
    #:udp-set-reuse-port #:udp-join-multicast
+   ;; Bounded-teardown REPORT (ADR 0092): every wait that hits its deadline is counted where it is
+   ;; DETECTED, so a caller that ignores the status value still cannot make the failure silent.
+   #:note-stuck-teardown #:stuck-teardown-joins #:reset-stuck-teardown-joins
    ;; The zero-allocation raw sendto(2)/recvfrom(2) datagram paths (NFR-MEM, ADR 0065/0066):
    ;; the A/B levers + escape hatches
    #:*udp-raw-sendto* #:*udp-raw-recvfrom*

@@ -296,6 +296,9 @@
   (sample-writers (make-hash-table :test 'equalp) :type hash-table) ; src GUID -> SN -> writer EntityId (reader-side instance writers-set, DDS 1.4 §2.2.2.5.1.3)
   (sample-writer-guids (make-hash-table :test 'equalp) :type hash-table) ; src GUID -> SN -> 16-octet source GUID (EXCLUSIVE ownership arbitration, DDS 1.4 §2.2.3.9.2)
   (durability-gate-active nil :type boolean)   ; ADR 0059: T once the DCPS layer owns the reader-side durability baseline (create-datareader / %reader-durability-init arm a WriterProxy per matched writer). ONLY then does "matched but no proxy" mean the ADR 0043 window — a bare dds.disc node (the low-level tests, the shapes runners) never arms by design, so the HEARTBEAT guard must not fire there.
+  (rx-stopping nil :type boolean)   ; set by stop-node BEFORE any socket is closed: the receiver loops check it and leave on their own, so a thread is never parked in recvfrom(2) on a released fd (the state nothing on macOS can wake)
+  (stuck-receiver-teardowns 0 :type (integer 0))   ; stop-node joins that TIMED OUT: a receiver thread still parked in recvfrom(2) on a closed fd. MUST STAY 0 in a healthy run. Non-zero means teardown could not prove the receiver had stopped, so the buffer frees were SKIPPED (a bounded leak) rather than risked as a use-after-free — see stop-node and dds.pal:join-bounded
+  (teardown-leaked nil :type boolean)              ; T once any join above timed out: this node's send/receive scratch buffers were deliberately NOT freed
   (unrouted-match-drops 0 :type (integer 0))   ; A remote WRITER that is MATCHED (disc-node-matches) but has NO reader route, seen by %reader-routes-for once the DCPS layer owns matching. MUST STAY 0: %match-remote-endpoint route-adds every RxO-compatible local reader for a writer IMMEDIATELY BEFORE it records the match (both under the node lock), so the two cannot legitimately drift. A non-zero value means a WP has separated them, and the drop keeps it fail-SAFE — nothing is delivered to a reader that was never routed — rather than falling back to the primary reader, which is how an RxO refusal came to be advisory in the first place (see %reader-routes-for)
   (hb-unarmed-drops 0 :type (integer 0))   ; ADR 0043 residual / ADR 0059: user HEARTBEATs dropped because the writer was MATCHED but its reader-side durability baseline was not yet ARMED. MUST stay 0: the window is unreachable while SEDP + user HEARTBEATs share the one unicast rx thread. A non-zero value means a WP reopened it (user-data multicast / split metatraffic) and MUST arm the baseline atomically with %record-match — the drop keeps it fail-SAFE (no silent DURABILITY violation) but the writer's history request is delayed a HEARTBEAT period until then.
   (app-acks-received 0 :type (integer 0))   ; ADR 0090 A3b: inbound APP_ACK (0x1c) submessages RECOGNISED — i.e. that arrived under a VendorId giving 0x1c this meaning (RTI's, or our own for what we emit). RECOGNISED IS NOT PROCESSED: this slice emits application acknowledgments and counts arrivals so an ours<->ours test can prove the datagram landed; the writer-side APPLICATION watermark, on-application-acknowledgment and APP_ACK_CONF are slice A3c and DO NOT EXIST YET. Nothing reads this counter to decide anything about a sample's fate — a writer that purged on it would be purging on an unprocessed message
@@ -2968,12 +2971,14 @@
   (setf (disc-node-rx-thread node)
         (dds.xport.udp:start-udp-receiver
          (disc-node-socket node)
-         (lambda (buf size) (%handle-datagram node buf size))))
+         (lambda (buf size) (%handle-datagram node buf size))
+         (lambda () (disc-node-rx-stopping node))))
   (when (disc-node-mcast-socket node)
     (setf (disc-node-mcast-rx-thread node)
           (dds.xport.udp:start-udp-receiver
            (disc-node-mcast-socket node)
-           (lambda (buf size) (%handle-datagram node buf size)))))
+           (lambda (buf size) (%handle-datagram node buf size))
+           (lambda () (disc-node-rx-stopping node)))))
   (when (disc-node-shmem node)
     (dds.xport.shmem:start-shmem-receiver
      (disc-node-shmem node)
@@ -3035,31 +3040,82 @@
    leaseDuration. Best-effort and non-fatal: a failure here must never block teardown."
   (ignore-errors (announce-participant-dispose node))   ; say goodbye while the sockets are still up
   (when (disc-node-flow-controller node)   ; WP-ASYNC-FLOW: unregister from any flow-controller BEFORE the frees below — unregister is a PER-NODE EMIT BARRIER (it removes NODE from the writers list, then BLOCKS until the SHARED scheduler is not mid-emit on NODE), so the subsequent udp-close/shmem-close/free-static never race a live scheduler send on NODE (no use-after-free). A bare unregister-without-join would NOT be safe; the barrier is what makes it safe (ADR 0016 §Teardown)
-    (flow-controller-unregister (disc-node-flow-controller node) node))
+    ;; ⚠️ THE BARRIER IS BOUNDED NOW AND ITS STATUS IS LOAD-BEARING (ADR 0092). It used to be an UNBOUNDED
+    ;; loop around a bounded wait, so a scheduler that never cleared CURRENT-EMIT-NODE hung teardown here
+    ;; forever. An expired barrier means the SHARED scheduler may STILL hold live references to this node's
+    ;; socket and buffers — so free NOTHING, mark the node leaked, and leave it retryable.
+    (multiple-value-bind (ok status) (flow-controller-unregister (disc-node-flow-controller node) node)
+      (declare (ignore ok))
+      (when status
+        (incf (disc-node-stuck-receiver-teardowns node))
+        (setf (disc-node-teardown-leaked node) t)
+        (return-from stop-node t))))
   (cond
     ((disc-node-async-thread node)       ; WP-ASYNC: stop + drain + JOIN the sender BEFORE closing the socket
      (dds.pal:with-lock ((disc-node-async-lock node))
        (setf (disc-node-async-stop node) t (disc-node-async-pending node) t)
        (dds.pal:condvar-signal (disc-node-async-cv node)))
-     (dds.pal:join (disc-node-async-thread node))
-     (setf (disc-node-async-thread node) nil)
-     (when (disc-node-async-tx-msg node)
-       (dds.pal:free-static (dds.core.buffer:octet-buffer-vec (disc-node-async-tx-msg node)))
-       (setf (disc-node-async-tx-msg node) nil)))
+     ;; BOUNDED: the async sender builds into ASYNC-TX-MSG and sends on this node's socket, so a stop that
+     ;; cannot be PROVEN must not free that buffer — same ranking as a stuck receiver, leak and report
+     (multiple-value-bind (r status)
+         (dds.pal:join-bounded (disc-node-async-thread node) :disc-async-sender)
+       (declare (ignore r))
+       (cond (status
+              (incf (disc-node-stuck-receiver-teardowns node))
+              (setf (disc-node-teardown-leaked node) t))
+             (t
+              (setf (disc-node-async-thread node) nil)
+              (when (disc-node-async-tx-msg node)
+                (dds.pal:free-static (dds.core.buffer:octet-buffer-vec (disc-node-async-tx-msg node)))
+                (setf (disc-node-async-tx-msg node) nil))))))
     ((disc-node-user-writer node) (flush-batch node)))   ; WP-BATCH: drain a pending batch before closing the socket
+  ;; ⚠️ FLAG FIRST, THEN JOIN, THEN CLOSE — the ordering IS the fix. Closing first left a receiver parked
+  ;; in recvfrom(2) on a released fd, a state nothing on macOS wakes (see start-udp-receiver), so the join
+  ;; hung forever. Setting the flag lets each receiver wake on its own receive timeout and leave while its
+  ;; fd is still valid; the bounded join is then a backstop that should never fire, not the mechanism.
+  (setf (disc-node-rx-stopping node) t)
+  (let ((stuck nil))
+    (when (disc-node-rx-thread node)
+      (multiple-value-bind (r st) (dds.pal:join-bounded (disc-node-rx-thread node) :disc-unicast-rx)
+        (declare (ignore r))
+        (if (eq st :timeout) (setf stuck t) (setf (disc-node-rx-thread node) nil))))
+    (when (disc-node-mcast-rx-thread node)
+      (multiple-value-bind (r st) (dds.pal:join-bounded (disc-node-mcast-rx-thread node) :disc-multicast-rx)
+        (declare (ignore r))
+        (if (eq st :timeout) (setf stuck t) (setf (disc-node-mcast-rx-thread node) nil))))
+    (when stuck
+      (incf (disc-node-stuck-receiver-teardowns node))
+      (setf (disc-node-teardown-leaked node) t)))
   (dds.pal:udp-close (disc-node-socket node))
   (when (disc-node-mcast-socket node)
     (dds.pal:udp-close (disc-node-mcast-socket node))
     (setf (disc-node-mcast-socket node) nil))
-  (when (disc-node-rx-thread node)
-    (dds.pal:join (disc-node-rx-thread node))
-    (setf (disc-node-rx-thread node) nil))
-  (when (disc-node-mcast-rx-thread node)
-    (dds.pal:join (disc-node-mcast-rx-thread node))
-    (setf (disc-node-mcast-rx-thread node) nil))
+  ;; ⚠️ BOUNDED joins. A receiver already parked in recvfrom(2) when its fd is closed is NOT woken —
+  ;; not by close(2), not by shutdown(2) (ENOTCONN on an unconnected UDP socket on macOS), and NOT by
+  ;; SO_RCVTIMEO, which rescues a fresh socket but not one already parked (all three observed directly;
+  ;; see dds.pal:join-bounded). An unbounded join here therefore hangs teardown FOREVER at 0% CPU, which
+  ;; is exactly what it did: delete-participant never returned and the whole suite stopped.
+  ;;
+  ;; ON TIMEOUT WE LEAK RATHER THAN FREE. The joins guard the frees below (an in-flight %handle-datagram
+  ;; writes into buffers this function releases), so a timed-out join must NOT be treated as success —
+  ;; the node is marked STUCK, the frees are skipped, and the count is reported. A bounded leak beats a
+  ;; use-after-free on a live receiver thread, the same ranking the ZC refcount path already applies.
   (when (disc-node-shmem node)         ; FR-XPORT-2: JOIN the SHMEM receiver (it feeds %handle-datagram -> rx-tx-msg) BEFORE the frees
-    (dds.xport.shmem:shmem-transport-close (disc-node-shmem node))
-    (setf (disc-node-shmem node) nil))
+    ;; ⚠️ A stuck SHMEM receiver is WORSE than a stuck UDP one: it parks on a condvar INSIDE the segment,
+    ;; so shmem-transport-close leaves the segment mapped rather than destroying an object it is blocked in.
+    ;; Its status feeds the SAME leak-don't-free decision as the receiver joins above.
+    (multiple-value-bind (ok status) (dds.xport.shmem:shmem-transport-close (disc-node-shmem node))
+      (declare (ignore ok))
+      (cond (status
+             (incf (disc-node-stuck-receiver-teardowns node))
+             (setf (disc-node-teardown-leaked node) t))
+            (t (setf (disc-node-shmem node) nil)))))
+  ;; ⚠️ EVERYTHING BELOW FREES MEMORY A RECEIVER THREAD MAY STILL BE WRITING INTO, which is why the joins
+  ;; above precede it. If a join TIMED OUT we could not prove the receiver stopped, so the whole tail is
+  ;; SKIPPED: the node leaks its scratch buffers and pools rather than risk a use-after-free on a live
+  ;; thread. Bounded, reported (disc-node-stuck-receiver-teardowns), and strictly the lesser failure.
+  (when (disc-node-teardown-leaked node)
+    (return-from stop-node t))   ; T, not NODE: the declaimed ftype is (eql t) and a caller may be compiled against it
   ;; WP-ZEROCOPY teardown (FR-PF-3, ADR 0014) AFTER the receiver join (UAF rule: %handle-datagram may
   ;; %zc-resolve against an attached pool on a receiver thread): detach every reader-side attached pool,
   ;; then destroy the writer pool's mutex + detach + unlink its segment.

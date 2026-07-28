@@ -87,21 +87,31 @@
   t)
 
 (defun* %stop-auto-announcer (p)
-    (function (domain-participant) t)
+    (function (domain-participant) (values t (or null keyword)))
   "Stop + JOIN P's autonomous announcer thread (on delete-participant), BEFORE the node/buffers are torn
    down — the clean-shutdown discipline (no strand, no use-after-free: the thread is joined while the node
    + its announce buffers are still live). Sets RUNNING NIL and signals the CV UNDER the announcer lock (so
-   a thread about to wait sees the flag — no lost wakeup), then joins. Null-safe + idempotent (a
-   non-autonomous participant has no announcer)."
+   a thread about to wait sees the flag — no lost wakeup), then joins BOUNDED. Null-safe + idempotent (a
+   non-autonomous participant has no announcer).
+
+   Returns (values T NIL) when the announcer is provably gone, (values NIL :TIMEOUT) when it is not.
+   ⚠️ THE STATUS GATES DELETE-PARTICIPANT'S TEARDOWN (ADR 0092). This thread's %SPIN-ONCE builds and SENDS
+   SPDP/SEDP announcements THROUGH THE NODE'S announce buffers, so an unproven stop followed by STOP-NODE's
+   FREE-STATIC is a use-after-free on static memory by a thread that is still publishing. On :TIMEOUT the
+   caller MUST leave the node standing and leave the participant retryable; the announcer slot is likewise
+   NOT cleared, so a later delete re-attempts the join instead of forgetting the thread exists."
   (let ((a (dp-announcer p)))
     (when a
       (dds.pal:with-lock ((auto-announcer-lock a))
         (setf (auto-announcer-running a) nil)
         (dds.pal:condvar-signal (auto-announcer-cv a)))
       (let ((th (auto-announcer-thread a)))
-        (when th (dds.pal:join th)))
+        (when th
+          (multiple-value-bind (r status) (dds.pal:join-bounded th :dcps-auto-announcer)
+            (declare (ignore r))
+            (when status (return-from %stop-auto-announcer (values nil status))))))
       (setf (dp-announcer p) nil)))
-  t)
+  (values t nil))
 
 (defun* %auto-announcer-loop (a p)
     (function (auto-announcer domain-participant) t)

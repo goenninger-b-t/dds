@@ -1532,7 +1532,9 @@
                                                  (dotimes (i iters) (%rtps-feed-datagram node-b mdg))
                                                  (dds.pal:with-lock (clock) (incf total-mismatch (cdr *za2-rx-ctx*))))))
                                            :name "za2-concur"))))
-               (dolist (th threads) (dds.pal:join th)))
+               ;; generously bounded: enough that a healthy CPU-bound fan-out never trips it, but a wedged
+               ;; one fails the mismatch assertion below instead of hanging the whole suite
+               (dolist (th threads) (dds.pal:join-bounded th :za2-concur 60)))
              (assert (zerop total-mismatch) ()
                      "ZA-2 concurrency: ~d cross-thread RX-buffer contaminations over ~d threads x ~d SRTPS-ENCRYPT decodes — concurrent receiver threads must NOT share a mutable decode sink" total-mismatch nthreads iters))
            ;; (f) ZERO-ALLOC (RX): a steady-state pooled RX borrow + decode-rtps-message-into over the reused SRTPS

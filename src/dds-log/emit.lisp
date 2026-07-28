@@ -145,19 +145,27 @@
   t)
 
 (defun* %logger-stop-worker (logger)
-    (function (logger) t)
+    (function (logger) (values t (or null keyword)))
   "Stop + JOIN the async worker (idempotent; a no-op for a sync logger with no worker): clear RUNNING
    and signal the condvar under the lock (so a waiting worker wakes and sees the flag), then join the
-   thread. After this the ring is quiescent and no worker touches the participant — so close-logger may
-   delete it safely."
+   thread BOUNDED. After this the ring is quiescent and no worker touches the participant — so
+   close-logger may delete it safely.
+
+   Returns (values T NIL) when the worker is provably gone, (values NIL :TIMEOUT) when it is not.
+   ⚠️ 'SO CLOSE-LOGGER MAY DELETE IT SAFELY' IS EXACTLY WHAT THE STATUS CERTIFIES (ADR 0092). The worker
+   loop SPINS the participant and WRITES samples through it, so deleting that participant under an
+   unproven worker frees the node and its buffers beneath a live writer. On :TIMEOUT close-logger MUST
+   skip the delete; the WORKER slot is not cleared, so a later close re-attempts the join."
   (let ((w (logger-worker logger)))
     (when w
       (dds.pal:with-lock ((logger-lock logger))
         (setf (logger-running logger) nil)
         (dds.pal:condvar-signal (logger-condvar logger)))
-      (dds.pal:join w)
+      (multiple-value-bind (r status) (dds.pal:join-bounded w :log-async-worker)
+        (declare (ignore r))
+        (when status (return-from %logger-stop-worker (values nil status))))
       (setf (logger-worker logger) nil)))
-  t)
+  (values t nil))
 
 (defun* logger-shed-counts (logger)
     (function (logger) (simple-array (unsigned-byte 64) (9)))
@@ -327,8 +335,14 @@
   "Release LOGGER. In ASYNC mode first STOPS + JOINS the worker (which drains the ring's remaining
    events on the way out), so no worker thread touches the participant during teardown. Then deletes the
    participant ONLY if the logger created it (a borrowed participant is the app's to delete). Deleting
-   the participant stops its engine and joins its threads, so a process can exit cleanly."
-  (%logger-stop-worker logger)   ; no-op for a sync logger (no worker)
-  (when (logger-owns-participant logger)
-    (dds.dcps:delete-participant (logger-participant logger)))
+   the participant stops its engine and joins its threads, so a process can exit cleanly.
+
+   ⚠️ THE DELETE IS GATED ON THE WORKER JOIN (ADR 0092): a worker that cannot be proven stopped is still
+   spinning and writing through that participant, so deleting it would free the node under a live writer.
+   On a timeout the participant is LEFT ALIVE (reported via dds.pal:stuck-teardown-joins) and the logger
+   stays retryable — a leaked participant is bounded, a use-after-free is not."
+  (multiple-value-bind (ok status) (%logger-stop-worker logger)   ; no-op for a sync logger (no worker)
+    (declare (ignore ok))
+    (when (and (null status) (logger-owns-participant logger))
+      (dds.dcps:delete-participant (logger-participant logger))))
   t)

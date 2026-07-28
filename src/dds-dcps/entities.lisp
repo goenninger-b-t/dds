@@ -901,8 +901,18 @@
    ZC pool mapping — so no held refcount pins the writer's pool (no leak) and the final %zc-release runs while
    the views' SAP is still mapped (no use-after-free at teardown). A no-op for readers with no loans (the common
    case: ZC off / non-FlatData)."
-  (%stop-auto-announcer p)     ; WP-DCPS-API-COMPLETION S7: stop + JOIN the autonomous announcer thread BEFORE node teardown (no strand; it uses the node's announce buffers)
-  (%deadline-monitor-stop p)   ; WP-DCPS-API-COMPLETION S4: stop + JOIN the deadline monitor thread BEFORE tearing the node down (no strand, no UAF)
+  ;; ⚠️ BOTH STOPS ARE BOUNDED, AND THEIR STATUS GATES EVERYTHING BELOW (ADR 0092). The announcer SENDS
+  ;; SPDP/SEDP through the node's announce buffers, and the deadline monitor can reach an application
+  ;; listener that writes — so a thread that cannot be PROVEN stopped must not have the node freed under
+  ;; it. Both are attempted (each is signal-then-join, so trying the second is strictly useful even when
+  ;; the first timed out); if either could not be proven, the participant is left INTACT and RETRYABLE
+  ;; rather than half-deleted, and the timeout is reported via dds.pal:stuck-teardown-joins.
+  (multiple-value-bind (announcer-ok announcer-status) (%stop-auto-announcer p)   ; S7: stop + JOIN the autonomous announcer thread BEFORE node teardown
+    (declare (ignore announcer-ok))
+    (multiple-value-bind (monitor-ok monitor-status) (%deadline-monitor-stop p)   ; S4: stop + JOIN the deadline monitor thread BEFORE tearing the node down
+      (declare (ignore monitor-ok))
+      (when (or announcer-status monitor-status)
+        (return-from delete-participant t))))
   (dolist (dr (%participant-readers p)) (return-all-loans dr))
   (%factory-unregister-participant (get-participant-factory) p)   ; S2.T1: the free-fn is the factory delete_participant shim (DDS 1.4 §2.2.2.2.2)
   (dds.disc:stop-node (dp-node p))

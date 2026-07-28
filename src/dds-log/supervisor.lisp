@@ -92,12 +92,24 @@
   sup)
 
 (defun* log-supervisor-stop (sup)
-    (function (log-supervisor) (eql t))
-  "Stop SUP: clear RUNNING and JOIN the monitor FIRST (so no restart is in flight), then stop the runner
-   (join drain threads + close collectors). This ordering guarantees no thread is restarted while the
-   runner tears its collectors down. Idempotent."
+    (function (log-supervisor) (values (eql t) (or null keyword)))
+  "Stop SUP: clear RUNNING and JOIN the monitor FIRST — BOUNDED — (so no restart is in flight), then stop
+   the runner (join drain threads + close collectors). This ordering guarantees no thread is restarted
+   while the runner tears its collectors down. Idempotent.
+
+   Returns (values T NIL), or (values T :TIMEOUT) if the monitor or any drain thread could not be proven
+   stopped. ⚠️ THE RUNNER STOP IS GATED ON THE MONITOR JOIN (ADR 0092): 'this ordering guarantees no thread
+   is restarted while the runner tears its collectors down' holds ONLY once the monitor is provably gone. A
+   monitor still running can RESPAWN a drain thread onto a collector the runner is closing — so on a
+   monitor timeout the runner is left ALONE, its collectors stay open, and the timeout is reported via
+   dds.pal:stuck-teardown-joins. Tearing down under a live restarter is worse than not tearing down."
   (setf (log-supervisor-running sup) nil)
   (let ((m (log-supervisor-monitor sup)))
-    (when m (dds.pal:join m) (setf (log-supervisor-monitor sup) nil)))
-  (log-runner-stop (log-supervisor-runner sup))
-  t)
+    (when m
+      (multiple-value-bind (r status) (dds.pal:join-bounded m :log-supervisor-monitor)
+        (declare (ignore r))
+        (when status (return-from log-supervisor-stop (values t status)))
+        (setf (log-supervisor-monitor sup) nil))))
+  (multiple-value-bind (ok status) (log-runner-stop (log-supervisor-runner sup))
+    (declare (ignore ok))
+    (values t status)))

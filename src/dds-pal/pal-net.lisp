@@ -262,6 +262,120 @@
   (try (%setsockopt socket +sol-socket+ +so-reuseport+ '(1 0 0 0)))
   (values t nil))
 
+;; tcp-set-recv-timeout is defined below (same sb-bsd-sockets substrate); forward-declared so the UDP
+;; receive timeout can delegate to it rather than re-encode struct timeval a second time (DRY).
+(declaim (ftype (function (t (real 0)) (values t (or null keyword))) tcp-set-recv-timeout))
+
+(defparameter *join-timeout-seconds* 5
+  "Deadline for a TEARDOWN join (dds.pal:join-bounded). NIL waits forever — the pre-fix behaviour.")
+
+(defvar *stuck-teardown-lock* (make-lock "dds-stuck-teardown")
+  "Guards *STUCK-TEARDOWN-JOINS*. Teardown-cold — never taken on a per-sample path, so a plain mutex here
+   costs the hot path nothing (NFR-MEM/FR-LANG-0 are unaffected).")
+
+(defvar *stuck-teardown-joins* nil
+  "THE REPORT: every teardown wait that hit its deadline, as an alist of (SITE . COUNT) keyed by the SITE
+   keyword its waiter passed. Read it with DDS.PAL:STUCK-TEARDOWN-JOINS — never directly, the read must
+   take *STUCK-TEARDOWN-LOCK*.
+
+   ⚠️ IT MUST BE EMPTY AFTER A HEALTHY RUN. A non-NIL entry means a thread outlived its deadline, so
+   whatever that wait GUARDED — a FREE-STATIC, a SHM-DETACH, a STORE-CLOSE, a DELETE-PARTICIPANT — was
+   deliberately SKIPPED and the resource LEAKED. That is the intended outcome (a bounded leak beats a
+   use-after-free on a live thread), but it is a defect report, not a normal condition. This is the
+   REPORTED-not-printed form the operating contract requires: a queryable snapshot, like
+   DDS.LOG:LOGGER-SHED-COUNTS and DDS.DISC:DISC-NODE-STUCK-RECEIVER-TEARDOWNS.")
+
+(defun* note-stuck-teardown (site)
+    (function (keyword) (eql t))
+  "Record ONE teardown wait at SITE that hit its deadline, incrementing SITE's count in
+   *STUCK-TEARDOWN-JOINS*. Called by JOIN-BOUNDED on :TIMEOUT, and directly by the bounded waits that are
+   NOT joins — the flow-controller per-node EMIT BARRIER — so every deadline in the codebase reports
+   through ONE counter and no call site can forget to. Returns T."
+  (with-lock (*stuck-teardown-lock*)
+    (let ((cell (assoc site *stuck-teardown-joins* :test #'eq)))
+      (if cell
+          (setf (cdr cell) (1+ (cdr cell)))
+          (push (cons site 1) *stuck-teardown-joins*))))
+  t)
+
+(defun* stuck-teardown-joins ()
+    (function () (values (integer 0) list))
+  "SNAPSHOT of the teardown-deadline report: (VALUES TOTAL ALIST), where TOTAL is the number of waits that
+   hit their deadline across the whole process and ALIST is a FRESH copy of the per-SITE (SITE . COUNT)
+   breakdown. TOTAL is 0 and ALIST NIL in a healthy run — a non-zero TOTAL means a resource was leaked on
+   purpose rather than freed under a still-live thread (see *STUCK-TEARDOWN-JOINS*). Copied under the lock
+   so a concurrent teardown's increment cannot tear the read."
+  (with-lock (*stuck-teardown-lock*)
+    (let ((snap (copy-alist *stuck-teardown-joins*)))
+      (values (reduce #'+ snap :key #'cdr :initial-value 0) snap))))
+
+(defun* reset-stuck-teardown-joins ()
+    (function () (eql t))
+  "Clear the teardown-deadline report so a subsequent STUCK-TEARDOWN-JOINS measures only what follows.
+   For tests that deliberately provoke a deadline (the falsification of JOIN-BOUNDED) and for a long-lived
+   service that has consumed the report; production teardown never calls it."
+  (with-lock (*stuck-teardown-lock*) (setf *stuck-teardown-joins* nil))
+  t)
+
+(defun* join-bounded (thread &optional (site :unspecified) (timeout *join-timeout-seconds*))
+    (function (t &optional keyword (or null (real 0))) (values t (or null keyword)))
+  "JOIN THREAD, but give up after TIMEOUT seconds: (values result NIL) if it finished, (values NIL :TIMEOUT)
+   if it did not. NIL TIMEOUT is an unbounded join (dds.pal:join). SITE names the call site for the
+   deadline REPORT — on :TIMEOUT this calls NOTE-STUCK-TEARDOWN, so the failure is counted where it is
+   DETECTED and a caller cannot silently drop it by ignoring the status value. SITE precedes TIMEOUT in the
+   lambda list because every teardown supplies a site name and almost none overrides the deadline.
+
+   ⚠️ WHY A BOUNDED JOIN IS NECESSARY AND A BOUNDED RECEIVE IS NOT SUFFICIENT. A UDP receiver already parked
+   in recvfrom(2) when another thread closes its fd is NOT rescued by SO_RCVTIMEO — observed directly:
+   `#<INET-SOCKET fd: -1>` still inside UDP-RECV minutes later, while a freshly-opened socket with the same
+   option returns in 0.256 s. shutdown(2) does not rescue it either on macOS (ENOTCONN on an unconnected
+   UDP socket). So teardown CANNOT be made to depend on the receiver noticing anything: the only thing that
+   terminates it unconditionally is refusing to wait forever.
+
+   ⚠️ A TIMED-OUT JOIN MUST NOT BE TREATED AS SUCCESS. The joins in stop-node exist to guarantee no receiver
+   is still touching a buffer before it is freed. On :TIMEOUT the caller MUST skip those frees and LEAK —
+   a leaked buffer is bounded and harmless, a use-after-free on a live receiver thread is neither. This is
+   the same ranking the ZC refcount code already applies (an under-count is worse than a leak).
+
+   Portable by polling THREAD-ALIVE-P rather than an impl-specific timed join, so it carries no reader
+   conditional (NFR-PORT)."
+  (if (null timeout)
+      (values (join thread) nil)
+      (let ((deadline (+ (get-internal-real-time)
+                         (* timeout internal-time-units-per-second))))
+        (loop
+          (unless (bordeaux-threads:thread-alive-p thread)
+            (return (values (ignore-errors (join thread)) nil)))
+          (when (> (get-internal-real-time) deadline)
+            (note-stuck-teardown site)   ; REPORT at the point of DETECTION — a caller cannot drop it
+            (return (values nil :timeout)))
+          (sleep 0.005)))))
+
+(defparameter *udp-receive-timeout-seconds* 0.25
+  "Receive timeout armed on every UDP socket so a parked recvfrom(2) cannot outlive its socket.
+   0 disables it (restoring the pre-fix teardown race). Read once per socket, at udp-open.")
+
+(defun* udp-set-receive-timeout (socket &optional (seconds *udp-receive-timeout-seconds*))
+    (function (t &optional (real 0)) (values t (or null keyword)))
+  "Arm SO_RCVTIMEO on datagram SOCKET (delegates to TCP-SET-RECV-TIMEOUT — same option, same portable
+   struct timeval encoding, so this adds no second copy of that reasoning).
+
+   ⚠️ THIS IS WHAT MAKES TEARDOWN TERMINATE, and it replaces a per-OS syscall side-effect with something
+   that does not vary. UDP-CLOSE shuts the socket down before closing it and its docstring claimed the
+   receiver 'exits when the socket is closed — TRUE ON DARWIN'. THAT CLAIM IS FALSE: shutdown(2) on an
+   UNCONNECTED UDP socket fails ENOTCONN on macOS/BSD and wakes nothing (the ignore-errors swallows it), so
+   a receiver already inside recvfrom when close lands stays parked FOREVER on a closed fd — observed as
+   `#<INET-SOCKET fd: -1>` in a live backtrace, with STOP-NODE's unbounded join blocked behind it at 0.0%
+   CPU and the whole suite hung. INTERMITTENT, because it needs the thread to be inside the syscall at that
+   moment.
+
+   With a bounded receive the loop wakes within SECONDS, calls udp-recv again on the now-closed fd, and
+   takes the ordinary closed-socket exit — termination no longer depends on whether shutdown(2) happens to
+   work for this OS and socket kind. Cost: 1/SECONDS idle wakeups per receiver thread, off the data path (a
+   datagram still returns immediately). A timeout surfaces as a negative size, which START-UDP-RECEIVER
+   already treats as transient and retries, so no caller changes."
+  (tcp-set-recv-timeout socket seconds))
+
 (defun* udp-open (&key (host "0.0.0.0") (port 0) reuse-port)
     (function (&key (:host string) (:port (integer 0 65535)) (:reuse-port t)) (values t (or null keyword)))
   "Open a UDPv4 socket bound to HOST:PORT (port 0 = ephemeral). REUSE-PORT enables SO_REUSEPORT before
@@ -277,6 +391,9 @@
           (sb-bsd-sockets:socket-close s)
           (bail status))))
     (sb-bsd-sockets:socket-bind s (%parse-ipv4 host) port)
+    ;; Bounded receive so a parked recvfrom cannot outlive the socket — see udp-set-receive-timeout.
+    ;; Best-effort: a platform refusing SO_RCVTIMEO still works, it just reverts to the old teardown race.
+    (multiple-value-bind (ok status) (udp-set-receive-timeout s) (declare (ignore ok status)) nil)
     (values s nil)))
 
 (defun* udp-local-port (socket)
@@ -518,6 +635,14 @@
    So stop-node closed the sockets and then JOINED the receiver threads, which were still blocked in
    recvfrom, and the join NEVER RETURNED: delete-participant hung, and THE STACK COULD NOT SHUT DOWN ON
    LINUX AT ALL — the platform the operating contract calls primary (§9).
+
+   ⚠️ CORRECTED 2026-07-27 — THE 'TRUE ON DARWIN' ABOVE IS FALSE, and believing it cost an investigation.
+   shutdown(2) on an UNCONNECTED UDP socket fails ENOTCONN on macOS/BSD and wakes NOTHING; the ignore-errors
+   below swallows that. A receiver already inside recvfrom when close lands stays parked FOREVER on a closed
+   fd — caught in a live backtrace as `#<INET-SOCKET fd: -1>` with stop-node's join blocked behind it at
+   0.0% CPU. Darwin is RACY here, not correct. Termination no longer relies on this at all: every UDP socket
+   is opened with a bounded receive (udp-set-receive-timeout), so the loop wakes and exits regardless of
+   what shutdown(2) did. The shutdown stays because it IS the fast path on Linux.
 
    shutdown(2) DOES wake a blocked recv, portably, on both Darwin and Linux. THIS REPO ALREADY KNEW THAT and
    says so in tcp-shutdown's own docstring, added for the durability microservice server — the UDP path

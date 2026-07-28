@@ -46,3 +46,75 @@
             (dds.pal:udp-close tx)))
       (dds.pal:udp-close rx))
     t))
+
+;;; Bounded teardown (ADR 0092). Every teardown wait in the stack is bounded and reports where it
+;;; expired; this is the falsifier for that work — each leg below either hangs forever or reports a
+;;; false positive if its bound or its gate is removed.
+
+(defun* run-teardown-deadline-test ()
+    (function () t)
+  "Test: every teardown wait is BOUNDED and REPORTED — and reports NOTHING when the teardown is clean.
+
+   (1) NO FALSE POSITIVE. A thread that exits promptly is joined without touching the report. A bound
+       that counted every join would make the counter worthless as a defect signal.
+   (2) THE BOUND FIRES. A thread that never exits yields (values NIL :TIMEOUT) instead of blocking, and
+       is counted under ITS OWN site keyword — the report must say WHICH wait failed, not merely that
+       one did. Asserting the SITE is what proves the report is diagnostic rather than decorative.
+   (3) THE EMIT BARRIER TERMINATES. CURRENT-EMIT-NODE is pinned with no scheduler able to clear it (the
+       controller has no registered writers, so the scheduler never enters the arming branch). Before
+       this fix that was an UNBOUNDED loop around a bounded CONDVAR-WAIT and this leg ran FOREVER at
+       ~2 wakes/second at 0% CPU. Asserting the ELAPSED time — not just the status — is what proves the
+       loop terminates rather than that the return value happens to be right.
+   (4) A REAL TEARDOWN IS CLEAN. A participant create+delete stops its receiver threads through the very
+       paths this work bounded; the report must not move by a single count. This is the leg that would
+       catch a bound set so tight that healthy teardown trips it."
+  (let ((before (dds.pal:stuck-teardown-joins)))
+    ;; (1) a healthy join reports nothing
+    (let ((th (dds.pal:spawn (lambda () t) :name "teardown-healthy-probe")))
+      (multiple-value-bind (r status) (dds.pal:join-bounded th :test-healthy-join 5)
+        (declare (ignore r))
+        (%check :teardown-healthy-status (null status)
+                (format nil "a thread that exits must join cleanly, got status ~s" status))))
+    (%check :teardown-healthy-silent (= before (dds.pal:stuck-teardown-joins))
+            "a clean join must not touch the teardown report")
+    ;; (2) a wedged thread is bounded, and named
+    (let* ((release (list nil))
+           (th (dds.pal:spawn (lambda () (loop until (car release) do (sleep 0.01)))
+                              :name "teardown-wedged-probe")))
+      (multiple-value-bind (r status) (dds.pal:join-bounded th :test-wedged-join 0.3)
+        (declare (ignore r))
+        (%check :teardown-wedged-status (eq status :timeout)
+                (format nil "a thread that never exits must yield :TIMEOUT, got ~s" status)))
+      (multiple-value-bind (total alist) (dds.pal:stuck-teardown-joins)
+        (%check :teardown-wedged-counted (= total (1+ before))
+                (format nil "the wedged join must add exactly one to the report (~d -> ~d)" before total))
+        (%check :teardown-wedged-site (eql 1 (cdr (assoc :test-wedged-join alist)))
+                (format nil "the report must name the SITE that expired; alist=~s" alist)))
+      (setf (car release) t)
+      (dds.pal:join-bounded th :test-wedged-release 5))
+    ;; (3) the flow-controller emit barrier terminates instead of spinning forever
+    (let ((fc (dds.disc:make-flow-controller :tokens-per-period 10000 :period 100000000 :max-burst 10000))
+          (pinned (list :not-a-real-node))   ; %flow-emit-barrier types NODE as T, so a sentinel is enough
+          (start (get-internal-real-time))
+          (status nil))
+      (unwind-protect
+           (let ((dds.pal:*join-timeout-seconds* 1))
+             (dds.pal:with-lock ((dds.disc::flow-controller-lock fc))
+               (setf (dds.disc::flow-controller-current-emit-node fc) pinned)
+               (setf status (nth-value 1 (dds.disc::%flow-emit-barrier fc pinned :test-emit-barrier)))))
+        (setf (dds.disc::flow-controller-current-emit-node fc) nil)
+        (dds.disc:destroy-flow-controller fc))
+      (let ((elapsed (/ (float (- (get-internal-real-time) start))
+                        internal-time-units-per-second)))
+        (%check :teardown-barrier-status (eq status :timeout)
+                (format nil "a pinned emit barrier must yield :TIMEOUT, got ~s" status))
+        (%check :teardown-barrier-terminates (< elapsed 10)
+                (format nil "the emit barrier must TERMINATE, not spin: took ~,2fs" elapsed))))
+    ;; (4) a real participant lifecycle adds nothing to the report
+    (let ((mark (dds.pal:stuck-teardown-joins))
+          (p (dds.dcps:create-participant :domain (test-domain))))
+      (dds.dcps:delete-participant p)
+      (%check :teardown-participant-clean (= mark (dds.pal:stuck-teardown-joins))
+              (format nil "a healthy participant teardown must report NOTHING (~d -> ~d)"
+                      mark (dds.pal:stuck-teardown-joins)))))
+  t)

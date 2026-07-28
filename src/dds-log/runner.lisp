@@ -74,13 +74,31 @@
   runner)
 
 (defun* log-runner-stop (runner)
-    (function (log-service-runner) (eql t))
-  "Stop all drain threads (clear RUNNING, then JOIN each — the CURRENT threads, including any the
+    (function (log-service-runner) (values (eql t) (or null keyword)))
+  "Stop all drain threads (clear RUNNING, then JOIN each — BOUNDED, the CURRENT threads, including any the
    supervisor restarted), then close every collector (releasing its sinks + participant). Idempotent. A
-   supervisor must stop its monitor BEFORE calling this, so no restart races the join/close."
+   supervisor must stop its monitor BEFORE calling this, so no restart races the join/close.
+
+   Returns (values T NIL), or (values T :TIMEOUT) if any drain thread could not be proven stopped.
+   ⚠️ THE CLOSE IS PER-INDEX AND GATED ON THAT INDEX'S JOIN (ADR 0092). CLOSE-LOG-COLLECTOR releases the
+   collector's sinks and DELETES its participant; doing that while its drain thread is still reading from
+   the collector tears state out from under a live reader. Because COLLECTORS and THREADS are PARALLEL
+   vectors, a stuck thread costs only ITS OWN collector — every other collector still closes, so one
+   wedged drain cannot leak the whole runner. THREADS is left INTACT when anything is stuck so a later
+   stop re-attempts those joins (an already-finished thread re-joins instantly) instead of forgetting them."
   (dds.pal:with-lock ((log-service-runner-lock runner))
     (setf (log-service-runner-running runner) nil))
-  (loop for th across (log-service-runner-threads runner) do (dds.pal:join th))
-  (setf (log-service-runner-threads runner) #())
-  (loop for c across (log-service-runner-collectors runner) do (close-log-collector c))
-  t)
+  (let* ((threads (log-service-runner-threads runner))
+         (collectors (log-service-runner-collectors runner))
+         (nthreads (length threads))
+         (any-stuck nil))
+    (dotimes (i nthreads)
+      (multiple-value-bind (r status) (dds.pal:join-bounded (svref threads i) :log-runner-drain)
+        (declare (ignore r))
+        (if status
+            (setf any-stuck t)
+            (when (< i (length collectors)) (close-log-collector (svref collectors i))))))
+    (loop for i from nthreads below (length collectors)   ; collectors with no drain thread (never started) close unconditionally
+          do (close-log-collector (svref collectors i)))
+    (unless any-stuck (setf (log-service-runner-threads runner) #()))
+    (values t (if any-stuck :timeout nil))))

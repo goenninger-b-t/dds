@@ -318,17 +318,29 @@
       (%lane-drain sap i (shmem-transport-capacity st) (shmem-transport-sink st) on-datagram))))
 
 (defun* shmem-transport-close (st)
-    (function (shmem-transport) t)
-  "Stop the receiver (if any), destroy the pshared objects, detach all attached + own segments, unlink own."
-  (stop-shmem-receiver st)
-  (let ((sap (dds.pal:shm-sap (shmem-transport-segment st))))
-    (dds.pal:pshared-destroy sap +mutex-off+ +cond-off+))
-  (maphash (lambda (k v) (declare (ignore k)) (ignore-errors (dds.pal:shm-detach (shmem-dest-segment v))))
-           (shmem-transport-attach-cache st))
-  (clrhash (shmem-transport-attach-cache st))
-  (dds.pal:shm-detach (shmem-transport-segment st))
-  (dds.pal:shm-destroy (shmem-transport-name st))
-  t)
+    (function (shmem-transport) (values t (or null keyword)))
+  "Stop the receiver (if any), destroy the pshared objects, detach all attached + own segments, unlink own.
+   Returns (values T NIL) on a complete teardown, (values NIL :TIMEOUT) when the receiver could not be
+   proven stopped — in which case the OWN segment is DELIBERATELY LEAKED, see below.
+
+   ⚠️ THE OWN-SEGMENT TEARDOWN IS GATED ON THE RECEIVER JOIN. The receiver parks in PSHARED-COND-WAIT on a
+   mutex+condvar that live INSIDE this segment, so PSHARED-DESTROY + SHM-DETACH + SHM-DESTROY under a still-
+   parked receiver destroy a synchronisation object a live thread is blocked inside and unmap its stack's
+   view of it — a SIGSEGV in foreign code, not a recoverable error. On :TIMEOUT those three steps are
+   SKIPPED and the segment leaks (bounded, reported via dds.pal:stuck-teardown-joins). The ATTACH-CACHE
+   detaches still run: those are the SENDER-side destination segments of OTHER participants, which this
+   transport's receive loop never touches (it drains only its OWN segment), so releasing them races nothing."
+  (multiple-value-bind (ok status) (stop-shmem-receiver st)
+    (declare (ignore ok))
+    (maphash (lambda (k v) (declare (ignore k)) (ignore-errors (dds.pal:shm-detach (shmem-dest-segment v))))
+             (shmem-transport-attach-cache st))
+    (clrhash (shmem-transport-attach-cache st))
+    (when status (return-from shmem-transport-close (values nil status)))
+    (let ((sap (dds.pal:shm-sap (shmem-transport-segment st))))
+      (dds.pal:pshared-destroy sap +mutex-off+ +cond-off+))
+    (dds.pal:shm-detach (shmem-transport-segment st))
+    (dds.pal:shm-destroy (shmem-transport-name st)))
+  (values t nil))
 
 (defun* shm-attach-by-name-reliable-p ()
     (function () t)
@@ -562,17 +574,32 @@
            :name "dds-shmem-rx"))))
 
 (defun* stop-shmem-receiver (st)
-    (function (shmem-transport) t)
-  "Signal the receive thread to exit and JOIN it before any segment teardown (no UAF)."
+    (function (shmem-transport) (values t (or null keyword)))
+  "Signal the receive thread to exit and JOIN it — BOUNDED — before any segment teardown (no UAF).
+   Returns (values T NIL) when the receiver is PROVABLY gone, (values NIL :TIMEOUT) when it is not.
+
+   ⚠️ THE STATUS IS LOAD-BEARING, NOT ADVISORY. This receiver parks in PSHARED-COND-WAIT on a condvar that
+   lives INSIDE the shared-memory segment. If it is still parked, SHMEM-TRANSPORT-CLOSE's PSHARED-DESTROY /
+   SHM-DETACH / SHM-DESTROY unmap the very memory it is blocked on — not a leak but a SIGSEGV in a foreign
+   wait, and on Linux an unlinked segment other processes still need. So on :TIMEOUT the caller MUST skip
+   that teardown and LEAK the segment. Same ranking as STOP-NODE (ADR 0091): a bounded leak beats
+   destroying an object a live thread is blocked inside.
+
+   The stop protocol below (store stop=1, lock, broadcast, unlock) LOOKS sufficient — but so did UDP's
+   close-then-join, which hung forever on a receiver already inside the syscall. A wait that cannot be
+   proven to terminate is bounded and REPORTED (dds.pal:stuck-teardown-joins), never trusted."
   (when (shmem-transport-rx-thread st)
     (let ((sap (dds.pal:shm-sap (shmem-transport-segment st))))
       (dds.pal:store-sap-u64 sap +stop-off+ 1)
       (dds.pal:pshared-lock sap +mutex-off+)
       (dds.pal:pshared-cond-broadcast sap +cond-off+)
       (dds.pal:pshared-unlock sap +mutex-off+))
-    (dds.pal:join (shmem-transport-rx-thread st))
-    (setf (shmem-transport-rx-thread st) nil))
-  t)
+    (multiple-value-bind (r status)
+        (dds.pal:join-bounded (shmem-transport-rx-thread st) :shmem-receiver)
+      (declare (ignore r))
+      (when status (return-from stop-shmem-receiver (values nil status)))
+      (setf (shmem-transport-rx-thread st) nil)))
+  (values t nil))
 
 (defun* run-shmem-receiver-test ()
     (function () (eql t))
@@ -645,7 +672,9 @@
                                  collect (dds.pal:spawn
                                           (let ((tx tx)) (lambda () (%stress-send-all tx loc per-sender deadline)))
                                           :name "shmem-stress-tx"))))
-             (dolist (th threads) (dds.pal:join th))
+             ;; the senders bound themselves by DEADLINE-SECONDS, so the join deadline must exceed it — a
+             ;; blanket 5 s bound here would fail a HEALTHY run rather than catch a hung one
+             (dolist (th threads) (dds.pal:join-bounded th :shmem-stress-tx (+ deadline-seconds 30)))
              (loop until (or (>= (dds.pal:with-lock (count-lock) delivered) total)
                              (> (dds.pal:monotonic-ns) deadline))
                    do (sleep 0.005))

@@ -145,6 +145,15 @@ L1  Core runtime       static arena, off-heap octet buffers + cursors, pools, MD
 L0  PAL (per-impl)     raw memory/SAP, threads, sockets, GC control — the ONLY place with #+sbcl/#+clasp
 ```
 
+**A cross-cutting invariant: no wait in a teardown path is unbounded** ([ADR 0091](docs/adr/0091-teardown-must-not-depend-on-waking-a-parked-receiver.md),
+[ADR 0092](docs/adr/0092-every-teardown-wait-is-bounded-and-reports.md)). Every shutdown join, from the L0
+PAL up through the L8 durability service, goes through `dds.pal:join-bounded` and reports its call site if
+it expires — a thread parked in a syscall nothing can wake would otherwise stop the process forever at 0%
+CPU. **A timed-out wait is never treated as success:** these joins exist so a subsequent `free-static`,
+`shm-detach`, `store-close` or `delete-participant` is safe, so an unproven stop *skips that release and
+leaks* rather than risking a use-after-free on a live thread. `dds.pal:stuck-teardown-joins` must read 0
+after a healthy run.
+
 ### ASDF systems
 
 | System | Layer | Package | Responsibility |

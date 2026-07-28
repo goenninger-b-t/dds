@@ -217,16 +217,27 @@
   supervisor)
 
 (defun* supervisor-stop (supervisor)
-    (function (supervisor) (eql t))
-  "Signal the watcher thread to stop and join it. Idempotent."
-  (let ((th nil))
+    (function (supervisor) (values (eql t) (or null keyword)))
+  "Signal the watcher thread to stop and join it — BOUNDED. Idempotent. Returns (values T NIL), or
+   (values T :TIMEOUT) if the watcher could not be proven stopped.
+
+   ⚠️ THIS TIMEOUT IS REPORTED BUT NOT ACTED ON, AND THAT IS A DELIBERATE CHOICE (ADR 0092). The watcher
+   RESTARTS services, so a live one can race the subsequent RUNNER-STOP and strand a freshly-started
+   service. The alternative — refusing to stop the runner — would skip every SERVICE-STOP and therefore
+   every STORE-CLOSE, losing the fsync of durable state. Data integrity outranks a stranded thread here,
+   and the memory-safety argument does not apply: SERVICE-STOP gates its own store-close on its own collect
+   joins, so nothing is freed under a live thread either way. The caller proceeds; the count is queryable
+   via dds.pal:stuck-teardown-joins."
+  (let ((th nil) (status nil))
     (dds.pal:with-lock ((supervisor-lock supervisor))
       (setf (supervisor-running supervisor) nil)
       (setf th (supervisor-thread supervisor))
       (setf (supervisor-thread supervisor) nil))
     (when th
-      (ignore-errors (dds.pal:join th))))
-  t)
+      (multiple-value-bind (r st) (dds.pal:join-bounded th :durability-supervisor-watch)
+        (declare (ignore r))
+        (setf status st)))
+    (values t status)))
 
 (defun* supervisor-shed-p (supervisor name)
     (function (supervisor string) boolean)

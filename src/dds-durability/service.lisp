@@ -520,8 +520,10 @@
 ;;; --- service-stop ---
 
 (defun* service-stop (service)
-    (function (durability-service) (eql t))
-  "Signal all collect loops to stop; for each node: JOIN its collect thread THEN stop-node.
+    (function (durability-service) (values (eql t) (or null keyword)))
+  "Signal all collect loops to stop; for each node: JOIN its collect thread (BOUNDED) THEN stop-node.
+   Returns (values T NIL), or (values T :TIMEOUT) if any thread could not be proven stopped — in which
+   case that thread's node is left standing and the STORE IS LEFT OPEN (ADR 0092; see the gates below).
    The join precedes stop-node per node so each loop has fully exited before its socket is
    closed (avoids getsockname EBADF on a final in-flight poll). Idempotent.
    Also handles the process-mode proxy case (single thread in the legacy THREAD slot).
@@ -537,7 +539,7 @@
    service-start re-registers its start-list names, so the fixed-set case is byte-identical after the
    next start (same topic-names contents); runtime additions are re-done on restart (:auto-discover
    re-discovers + re-adds; the explicit API caller must re-add — the correct 'stop discards runtime state')."
-  (let ((node-pairs nil) (legacy-th nil) (disc-node nil) (disc-th nil))
+  (let ((node-pairs nil) (legacy-th nil) (disc-node nil) (disc-th nil) (any-stuck nil))
     (dds.pal:with-lock ((durability-service-lock service))
       (setf (durability-service-running service) nil)
       ;; grab + clear the discovery slots under the same lock that flips RUNNING
@@ -546,9 +548,14 @@
       (setf (durability-service-discovery-node   service) nil)
       (setf (durability-service-discovery-thread service) nil))
     ;; join the poll thread FIRST (it reads RUNNING each tick -> exits), so no further service-add-topic
-    ;; fires; only then is the collect-node list stable to snapshot below
-    (when disc-th   (ignore-errors (dds.pal:join disc-th)))
-    (when disc-node (ignore-errors (dds.disc:stop-node disc-node)))
+    ;; fires; only then is the collect-node list stable to snapshot below. BOUNDED (ADR 0092): the poll
+    ;; thread drives discovery THROUGH DISC-NODE, so an unproven stop must not have that node torn down.
+    (let ((disc-stuck nil))
+      (when disc-th
+        (multiple-value-bind (r st) (dds.pal:join-bounded disc-th :durability-discovery-poll)
+          (declare (ignore r))
+          (when st (setf disc-stuck t any-stuck t))))
+      (when (and disc-node (not disc-stuck)) (ignore-errors (dds.disc:stop-node disc-node))))
     (dds.pal:with-lock ((durability-service-lock service))
       (setf node-pairs (durability-service-nodes service))
       (setf (durability-service-nodes service) nil)
@@ -557,24 +564,36 @@
         (setf legacy-th (durability-service-thread service))
         (setf (durability-service-thread service) nil)))
     (if node-pairs
-        ;; thread-mode: join+stop per node pair in order
+        ;; thread-mode: join+stop per node pair in order. BOUNDED and PER-PAIR (ADR 0092) — a collect
+        ;; thread that cannot be proven stopped keeps ITS OWN node standing; every other node still stops.
         (dolist (pair node-pairs)
           (let ((th   (cdr pair))
-                (node (car pair)))
-            (when th   (ignore-errors (dds.pal:join th)))
-            (when node (ignore-errors (dds.disc:stop-node node)))))
+                (node (car pair))
+                (stuck nil))
+            (when th
+              (multiple-value-bind (r st) (dds.pal:join-bounded th :durability-collect)
+                (declare (ignore r))
+                (when st (setf stuck t any-stuck t))))
+            (when (and node (not stuck)) (ignore-errors (dds.disc:stop-node node)))))
         ;; process-mode proxy: just join the monitor thread
         (when legacy-th
-          (ignore-errors (dds.pal:join legacy-th))))
+          (multiple-value-bind (r st) (dds.pal:join-bounded legacy-th :durability-process-monitor)
+            (declare (ignore r))
+            (when st (setf any-stuck t)))))
     (dds.pal:with-lock ((durability-service-lock service))
       (setf (durability-service-thread service) nil)
       ;; discard running topic registry: start rebuilds from the spec (fixed start-list re-registers ->
       ;; byte-identical after the next start; runtime adds are re-done). Prevents a stale entry making a
       ;; post-restart re-add a no-op with a serves-topic-p false-positive (no rebuilt collect node).
       (clrhash (durability-service-topic-names service)))
-    ;; close the store: for file-backed tiers this fsyncs logs + frees epoch DEKs
-    (ignore-errors (store-close (durability-service-store service))))
-  t)
+    ;; close the store: for file-backed tiers this fsyncs logs + frees epoch DEKs.
+    ;; ⚠️ GATED (ADR 0092): the collect loops READ AND WRITE this store, so closing it while any of them
+    ;; could not be proven stopped hands a live thread a closed store (and, for the DARE tiers, zeroized
+    ;; epoch DEKs). On a timeout the store is left OPEN — reported via dds.pal:stuck-teardown-joins — which
+    ;; leaks a file handle but cannot corrupt a write that is still in flight.
+    (unless any-stuck
+      (ignore-errors (store-close (durability-service-store service))))
+    (values t (if any-stuck :timeout nil))))
 
 ;;; --- service-alive-p ---
 

@@ -534,8 +534,39 @@
       (%flow-add-writer-locked controller node w)))
   controller)
 
+(defun* %flow-emit-barrier (controller node site)
+    (function (flow-controller t keyword) (values t (or null keyword)))
+  "THE PER-NODE EMIT BARRIER, in ONE place (FR-PF-2, ADR 0016 §Teardown; ADR 0091). Block until the
+   scheduler is provably not — and never again will be — mid-emit on NODE, then return (values T NIL); give
+   up after DDS.PAL:*JOIN-TIMEOUT-SECONDS* and return (values NIL :TIMEOUT), reporting SITE.
+
+   ⚠️ CALLER MUST HOLD THE CONTROLLER LOCK (CONDVAR-WAIT releases and re-takes it, which is exactly what
+   lets the scheduler re-take the lock to clear CURRENT-EMIT-NODE and signal).
+
+   ⚠️ WHY THIS IS BOUNDED NOW. Both copies of this loop carried the comment 'bounded: re-check on wake,
+   teardown can't wedge' and the docstring claim 'the wait is bounded + re-checked so a logic error cannot
+   wedge teardown forever'. THAT WAS FALSE. Only the individual CONDVAR-WAIT was bounded (0.5 s); the LOOP
+   WHILE around it retried forever, so a CURRENT-EMIT-NODE that never clears — a scheduler wedged in a send,
+   or killed between arming the barrier and running its UNWIND-PROTECT — hangs teardown permanently at
+   ~2 wakes/second, at 0% CPU, indistinguishable from the UDP receiver hang of ADR 0091. A wait assembled
+   from bounded waits is not itself bounded.
+
+   ⚠️ A TIMEOUT IS NOT SUCCESS. The barrier is what makes the CALLER's subsequent frees safe (stop-node's
+   udp-close/shmem-close/free-static, or the per-writer step-ref release). On :TIMEOUT the caller MUST skip
+   them and leak — the scheduler may still hold a live reference to NODE's socket and buffers."
+  (let ((deadline (and dds.pal:*join-timeout-seconds*
+                       (+ (get-internal-real-time)
+                          (* dds.pal:*join-timeout-seconds* internal-time-units-per-second)))))
+    (loop while (eq (flow-controller-current-emit-node controller) node)
+          do (when (and deadline (> (get-internal-real-time) deadline))
+               (dds.pal:note-stuck-teardown site)
+               (return-from %flow-emit-barrier (values nil :timeout)))
+             (dds.pal:condvar-wait (flow-controller-emit-done-cv controller)
+                                   (flow-controller-lock controller) 0.5)))
+  (values t nil))
+
 (defun* flow-controller-unregister (controller node)
-    (function (flow-controller dds.disc::disc-node) t)
+    (function (flow-controller dds.disc::disc-node) (values t (or null keyword)))
   "Remove writer NODE from CONTROLLER and BLOCK until the scheduler is provably not (and never again will be)
    emitting on NODE — the PER-NODE EMIT BARRIER (FR-PF-2, ADR 0016 §Teardown). Under the controller LOCK,
    FIRST drop NODE from WRITERS + clear its FLOW-CONTROLLER + FLOW-PENDING (so the round-robin policy can
@@ -555,43 +586,63 @@
    per-writer MID-DRAIN send-refs (%FLOW-RELEASE-STEP-REFS per writer-state) so a SHARED controller that keeps
    running never leaks NODE's captured CacheChanges until stop-node — the per-writer analogue of the
    destroy-path %FLOW-FLUSH-ALL release, but WITHOUT emitting (unregister must not send on a node about to be
-   freed). A no-op (returns at once) if NODE is not registered here. Idempotent (NIL refs release nothing)."
-  (dds.pal:with-lock ((flow-controller-lock controller))
-    (setf (flow-controller-writers controller)   ; WP-N-ENDPOINT-S1B: drop ALL of NODE's per-writer selection entries
-          (remove-if (lambda (ws) (eq (dds.disc::flow-writer-state-node ws) node))   ; HOTPATH-ALLOC(COLD): teardown (flow-controller-unregister)
-                     (flow-controller-writers controller)))
-    (dolist (cell (dds.disc::disc-node-flow-writer-states node))   ; clear each writer's pending so RR/EDF/priority can never newly pick it
-      (setf (dds.disc::flow-writer-state-pending (cdr cell)) nil))
-    (when (eq (dds.disc::disc-node-flow-controller node) controller)
-      (setf (dds.disc::disc-node-flow-controller node) nil))
-    (loop while (eq (flow-controller-current-emit-node controller) node)   ; block on any in-flight emit on NODE
-          do (dds.pal:condvar-wait (flow-controller-emit-done-cv controller)
-                                   (flow-controller-lock controller) 0.5))   ; bounded: re-check on wake, teardown can't wedge
-    ;; WP-N-ENDPOINT-S1B (adversarial-review FIX-1): release each unregistered writer's MID-DRAIN send-refs so a
-    ;; SHARED controller that keeps running (other nodes still associated, destroy NOT called) never leaks this
-    ;; node's captured CacheChanges (they pin a pooled payload) until stop-node. Runs AFTER the barrier (the
-    ;; scheduler is provably not — and never again will be — mid-emit on NODE, since NODE is already removed from
-    ;; WRITERS, so the single-mutator discipline of step-state/step-refs holds and this release races nothing).
-    ;; Idempotent: a writer with no in-progress plan has NIL refs -> %flow-release-step-refs is a no-op. Mirrors the
-    ;; "teardown releases all" invariant %flow-flush-all provides on the destroy path, but WITHOUT emitting —
-    ;; unregister must not send on a node whose socket/buffers the caller (stop-node) is about to free.
-    (dolist (cell (dds.disc::disc-node-flow-writer-states node))
-      (dds.disc::%flow-release-step-refs (cdr cell))))
-  (%flow-unblock-writer node)   ; wake any publish blocked on a full bounded cache (ADR 0016 §Backpressure / §Teardown): paced drain stops, so it must reach its TIMEOUT
-  t)
+   freed). A no-op (returns at once) if NODE is not registered here. Idempotent (NIL refs release nothing).
+
+   RETURNS (values T NIL) when the barrier was satisfied, (values NIL :TIMEOUT) when it was not. ⚠️ THE
+   CALLER MUST ACT ON THAT STATUS: on :TIMEOUT the scheduler may STILL be emitting on NODE, so STOP-NODE
+   must skip its closes and frees and mark the node leaked. The step-ref release is likewise SKIPPED (it is
+   safe only once the barrier proves the single-mutator discipline holds), so those CacheChanges leak —
+   bounded and reported (dds.pal:stuck-teardown-joins), which is the lesser failure. The previous claim
+   here that the wait 'is bounded + re-checked so a logic error cannot wedge teardown forever' was FALSE;
+   see %FLOW-EMIT-BARRIER."
+  (let ((barrier-status
+          (dds.pal:with-lock ((flow-controller-lock controller))
+            (setf (flow-controller-writers controller)   ; WP-N-ENDPOINT-S1B: drop ALL of NODE's per-writer selection entries
+                  (remove-if (lambda (ws) (eq (dds.disc::flow-writer-state-node ws) node))   ; HOTPATH-ALLOC(COLD): teardown (flow-controller-unregister)
+                             (flow-controller-writers controller)))
+            (dolist (cell (dds.disc::disc-node-flow-writer-states node))   ; clear each writer's pending so RR/EDF/priority can never newly pick it
+              (setf (dds.disc::flow-writer-state-pending (cdr cell)) nil))
+            (when (eq (dds.disc::disc-node-flow-controller node) controller)
+              (setf (dds.disc::disc-node-flow-controller node) nil))
+            ;; WP-N-ENDPOINT-S1B (adversarial-review FIX-1): release each unregistered writer's MID-DRAIN send-refs so a
+            ;; SHARED controller that keeps running (other nodes still associated, destroy NOT called) never leaks this
+            ;; node's captured CacheChanges (they pin a pooled payload) until stop-node. Runs AFTER the barrier (the
+            ;; scheduler is provably not — and never again will be — mid-emit on NODE, since NODE is already removed from
+            ;; WRITERS, so the single-mutator discipline of step-state/step-refs holds and this release races nothing).
+            ;; Idempotent: a writer with no in-progress plan has NIL refs -> %flow-release-step-refs is a no-op. Mirrors the
+            ;; "teardown releases all" invariant %flow-flush-all provides on the destroy path, but WITHOUT emitting —
+            ;; unregister must not send on a node whose socket/buffers the caller (stop-node) is about to free.
+            ;; ⚠️ GATED ON THE BARRIER: a TIMED-OUT barrier proves nothing, so the release is SKIPPED and the refs leak.
+            (multiple-value-bind (ok status) (%flow-emit-barrier controller node :flow-unregister)
+              (declare (ignore ok))
+              (unless status
+                (dolist (cell (dds.disc::disc-node-flow-writer-states node))
+                  (dds.disc::%flow-release-step-refs (cdr cell))))
+              status))))
+    ;; ⚠️ OUTSIDE the controller lock — %flow-unblock-writer takes the WRITER lock, and this file's
+    ;; lock-ordering rule (BINARY gate) is that the controller lock and a writer lock are NEVER held together.
+    (%flow-unblock-writer node)   ; wake any publish blocked on a full bounded cache (ADR 0016 §Backpressure / §Teardown): paced drain stops, so it must reach its TIMEOUT — safe on either path, a condvar broadcast races no emit
+    (values (not barrier-status) barrier-status)))
 
 (defun* flow-controller-remove-writer (controller node writer)
-    (function (flow-controller dds.disc::disc-node dds.rtps.reliable:rtps-writer) t)
+    (function (flow-controller dds.disc::disc-node dds.rtps.reliable:rtps-writer) (values t (or null keyword)))
   "Remove ONE local user WRITER of NODE from CONTROLLER — the PER-WRITER analogue of
    flow-controller-unregister (WP-DCPS-API-COMPLETION S2.T4 delete_datawriter; ADR 0016 §Teardown / ADR 0052).
    Under the controller LOCK: drop WRITER's selection entry from WRITERS and its flow-writer-state from NODE's
    registry (so the scheduler can never NEWLY pick it), clear its pending, then BLOCK on the per-NODE emit
-   barrier (LOOP WHILE current-emit-node = NODE, bounded CONDVAR-WAIT on EMIT-DONE-CV) until any in-flight
-   scheduler emit on NODE finishes — so no scheduler send references WRITER after this returns (delete is
-   SYNCHRONOUS for the deleted writer). Finally release WRITER's mid-drain step-refs (no leaked pinned
-   CacheChange). NODE keeps its flow-controller association and its OTHER writers untouched — unlike
-   flow-controller-unregister, which detaches the whole node. A no-op if WRITER is not registered (idempotent)."
-  (let ((weid (dds.rtps.reliable:rtps-writer-entityid writer)))
+   barrier (%FLOW-EMIT-BARRIER) until any in-flight scheduler emit on NODE finishes — so no scheduler send
+   references WRITER after this returns (delete is SYNCHRONOUS for the deleted writer). Finally release
+   WRITER's mid-drain step-refs (no leaked pinned CacheChange). NODE keeps its flow-controller association
+   and its OTHER writers untouched — unlike flow-controller-unregister, which detaches the whole node. A
+   no-op if WRITER is not registered (idempotent).
+
+   RETURNS (values T NIL), or (values NIL :TIMEOUT) if the emit barrier expired — in which case the
+   step-ref release is SKIPPED (the scheduler may still be mid-emit on NODE, so mutating WRITER's refs would
+   race it) and those pinned CacheChanges leak until stop-node. Reported via dds.pal:stuck-teardown-joins.
+   Delete is then no longer synchronous for this writer, which is why the status is returned rather than
+   swallowed. The barrier used to be an UNBOUNDED loop around a bounded wait — see %FLOW-EMIT-BARRIER."
+  (let ((weid (dds.rtps.reliable:rtps-writer-entityid writer))
+        (barrier-status nil))
     (dds.pal:with-lock ((flow-controller-lock controller))
       (let ((cell (assoc weid (dds.disc::disc-node-flow-writer-states node) :test #'eql)))
         (when cell
@@ -600,31 +651,42 @@
                   (dds.disc::disc-node-flow-writer-states node)
                   (remove cell (dds.disc::disc-node-flow-writer-states node))
                   (dds.disc::flow-writer-state-pending ws) nil)
-            (loop while (eq (flow-controller-current-emit-node controller) node)   ; block on any in-flight emit on NODE
-                  do (dds.pal:condvar-wait (flow-controller-emit-done-cv controller)
-                                           (flow-controller-lock controller) 0.5))
-            (dds.disc::%flow-release-step-refs ws))))))
-  t)
+            (multiple-value-bind (ok status) (%flow-emit-barrier controller node :flow-remove-writer)
+              (declare (ignore ok))
+              (setf barrier-status status)
+              (unless status (dds.disc::%flow-release-step-refs ws)))))))
+    (values (not barrier-status) barrier-status)))
 
 (defun* destroy-flow-controller (controller)
-    (function (flow-controller) t)
+    (function (flow-controller) (values t (or null keyword)))
   "Tear down CONTROLLER (FR-PF-2, ADR 0016): under the LOCK set STOP + condvar-signal the scheduler, JOIN
-   the scheduler thread (which flushes every registered writer's remaining datagrams IGNORING the bucket on
-   the way out — shutdown never waits on a slow paced drain, and no partial plan is dropped: B1), then free
-   the SCRATCH buffer. Idempotent (a no-op once the thread is already joined). Unblocks any writer blocked in
-   writer-write on a full bounded cache with TIMEOUT (ADR 0016 §Backpressure / §Teardown): the paced drain is
-   gone, so each registered writer's SPACE-CV is broadcast so a blocked publish re-evaluates and reaches its
-   block-up-to-max_blocking_time TIMEOUT promptly (the writers snapshot is taken under the LOCK BEFORE the
-   join — the scheduler will not newly pick them after STOP)."
+   the scheduler thread — BOUNDED — (it flushes every registered writer's remaining datagrams IGNORING the
+   bucket on the way out — shutdown never waits on a slow paced drain, and no partial plan is dropped: B1),
+   then free the SCRATCH buffer. Idempotent (a no-op once the thread is already joined). Unblocks any writer
+   blocked in writer-write on a full bounded cache with TIMEOUT (ADR 0016 §Backpressure / §Teardown): the
+   paced drain is gone, so each registered writer's SPACE-CV is broadcast so a blocked publish re-evaluates
+   and reaches its block-up-to-max_blocking_time TIMEOUT promptly (the writers snapshot is taken under the
+   LOCK BEFORE the join — the scheduler will not newly pick them after STOP).
+
+   RETURNS (values T NIL), or (values NIL :TIMEOUT) if the scheduler could not be proven stopped (ADR 0092).
+   ⚠️ ON :TIMEOUT THE SCRATCH FREE IS SKIPPED and the buffer LEAKS: the scheduler BUILDS each datagram into
+   SCRATCH, so releasing that static buffer under a still-running scheduler is a use-after-free on foreign
+   memory — the worst outcome available here, and strictly worse than the leak. THREAD is likewise left set
+   so the controller is not falsely recorded as destroyed and a later call re-attempts the join. The writer
+   wakes still run on both paths: a condvar broadcast races nothing."
   (when (flow-controller-thread controller)
     (let ((writers (dds.pal:with-lock ((flow-controller-lock controller))
                      (setf (flow-controller-stop controller) t)
                      (dds.pal:condvar-signal (flow-controller-cv controller))
                      (copy-list (flow-controller-writers controller)))))   ; HOTPATH-ALLOC(COLD): teardown (destroy-flow-controller)
-      (dds.pal:join (flow-controller-thread controller))
-      (setf (flow-controller-thread controller) nil)
-      (dolist (ws writers) (%flow-unblock-writer-state ws))   ; WP-N-ENDPOINT-S1B: wake any publish blocked on a full bounded cache -> TIMEOUT (per-writer entries)
-      (when (flow-controller-scratch controller)
-        (dds.pal:free-static (dds.core.buffer:octet-buffer-vec (flow-controller-scratch controller)))
-        (setf (flow-controller-scratch controller) nil))))
-  t)
+      (multiple-value-bind (r status)
+          (dds.pal:join-bounded (flow-controller-thread controller) :flow-scheduler)
+        (declare (ignore r))
+        (dolist (ws writers) (%flow-unblock-writer-state ws))   ; WP-N-ENDPOINT-S1B: wake any publish blocked on a full bounded cache -> TIMEOUT (per-writer entries); a condvar broadcast is safe whether or not the scheduler stopped
+        (when status   ; scheduler NOT proven stopped: it builds datagrams INTO SCRATCH, so freeing it now is a use-after-free on static memory
+          (return-from destroy-flow-controller (values nil status)))
+        (setf (flow-controller-thread controller) nil)   ; cleared only on the proven path, so a retry re-attempts the join
+        (when (flow-controller-scratch controller)
+          (dds.pal:free-static (dds.core.buffer:octet-buffer-vec (flow-controller-scratch controller)))
+          (setf (flow-controller-scratch controller) nil)))))
+  (values t nil))
