@@ -62,7 +62,15 @@
 #
 # RETURN ceilings measured 2026-07-28, each run in its own process on its own domain:
 #   arm64  slice 1 (wrapper pooling): 1569.5 / 1567.2 / 1567.6 -> ceiling was 1600
-#   arm64  slice 4 (data-struct pooling, ADR 0093 §12): 1534.9 / 1534.0 / 1536.3 -> LOWERED to 1570
+#   arm64  slice 4 (data-struct pooling, ADR 0093 §11): 1534.9 / 1534.0 / 1536.3 -> ceiling was 1570
+#
+# LOWERED 2026-07-28 (%ptr+ inlined — BOTH columns, because every pshared operation in the stack paid a
+# boxed system-area-pointer). One `declaim inline` took a PSHARED-LOCK+UNLOCK pair from 31.85 B/iteration
+# to 0.00, and the end-to-end path by -112 B/sample on BOTH arms:
+#   arm64 COPY   1740.7 -> 1628.3 / 1630.5 / 1628.3   -> LOWERED 1775 -> 1660
+#   arm64 RETURN 1534.9 -> 1422.5 / 1423.7 / 1426.3   -> LOWERED 1570 -> 1460
+# x86_64 is NOT re-measured here; its COPY row stays 1740 and will simply not bite until someone measures
+# it on that arch. Never derive it from arm64.
 #   x86_64 not measured here — the dash is honest, not lazy.
-arm64  1775 1570
+arm64  1660 1460
 x86_64 1740 -

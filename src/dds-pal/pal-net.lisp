@@ -1120,9 +1120,18 @@
 ;; and libpthread is already linked (no new dependency).
 (defconstant +pthread-process-shared+ 1)   ; PTHREAD_PROCESS_SHARED, same on macOS + Linux
 
+(declaim (inline %ptr+))   ; MEASURED: without this a lock+unlock pair costs 31.85 B/iteration and a SHMEM sample ~82 B — see below
 (defun* %ptr+ (sap offset)
     (function (t (integer 0)) t)
-  "Foreign pointer at SAP + OFFSET bytes."
+  "Foreign pointer at SAP + OFFSET bytes.
+
+   ⚠️ INLINE IS LOAD-BEARING, NOT A MICRO-OPTIMISATION. Out of line this function must RETURN a foreign
+   pointer, and on SBCL that means BOXING a system-area-pointer — 16 heap bytes on EVERY pshared operation.
+   Measured directly: a PSHARED-LOCK + PSHARED-UNLOCK pair allocated 31.85 B/iteration (two boxes) while a
+   LOAD-SAP-U64 on the same SAP allocated 0.00. Every SHMEM datagram takes at least a lock/unlock pair on
+   the receive side and a lock/signal/unlock on a parked send, which is where the SHMEM transport's measured
+   +82 B/sample over pure UDP came from. Inlined, the pointer arithmetic folds into the foreign call's
+   argument and never materialises a boxed SAP at all."
   (cffi:inc-pointer sap offset))
 
 (defun* pshared-mutex-init (sap offset)
