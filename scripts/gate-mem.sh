@@ -19,8 +19,31 @@
 # silently stops constraining anything — the same slow death as a gate that cannot fail. The ratchet only
 # moves DOWN, and the ceiling file is the record of how far NFR-MEM has actually got.
 #
-# The ceilings live in bench/mem-ceiling.txt — one row PER ARCH ("<arch> <bytes>"). REVIEWABLE IN A DIFF,
-# on purpose: lowering one is a claim about the system, and it should be seen.
+# The ceilings live in bench/mem-ceiling.txt — one row PER ARCH, with TWO ceilings on it:
+# "<arch> <ceiling-COPY> <ceiling-RETURN>". REVIEWABLE IN A DIFF, on purpose: lowering one is a claim
+# about the system, and it should be seen.
+#
+# TWO ARMS SINCE ADR 0093 (2026-07-28), because there are now two honest workloads:
+#
+#   COPY   — the application takes samples and DROPS them. The legacy arm; every historical ceiling row
+#            refers to it, so it stays comparable across the whole campaign.
+#   RETURN — the application RETURN-LOANs each taken sample, honouring the ADR 0093 loan contract, so the
+#            reader recycles its delivery wrappers. THIS IS THE ONLY ARM IN WHICH THE RECYCLING CAN BE
+#            SEEN AT ALL: measuring only COPY would leave the −171 B/sample slice-1 win permanently
+#            unratcheted and free to silently regress. A gate is only as honest as its workload — and
+#            after ADR 0093, "the workload a real application runs" includes giving the sample back.
+#
+# An arch whose RETURN ceiling is `-` (not yet measured there) still gets MEASURED and REPORTED, with the
+# row to paste in — it is simply not ratcheted. That way an unmeasured arch prints the number it needs
+# rather than going red, and nobody is tempted to predict it from the other arch (they diverge: ADR 0087
+# −82.4 vs −125.4, ADR 0088 −27.7 vs −72.9).
+#
+# ⚠️ EACH ARM RUNS IN ITS OWN PROCESS ON ITS OWN DOMAIN, and that is load-bearing, not tidiness. Two arms
+# sharing one image and one domain DISCOVER EACH OTHER: the second arm pays for the first's participants
+# and reads high. Measured directly while developing ADR 0093 slice 1 — three arms on one domain put the
+# pooled arm at 2786 B/sample against a 1739 baseline, a 1000 B "regression" from a change that only
+# REMOVES allocation, and it was diagnosed as a code defect before the harness was suspected. Owner
+# standing order: concurrently running tests MUST use different DDS domain IDs.
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
@@ -39,10 +62,17 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 CEILING_FILE=bench/mem-ceiling.txt
 [[ -r "$CEILING_FILE" ]] || { echo "gate-mem: FAIL — missing $CEILING_FILE" >&2; exit 1; }
 ARCH="$(uname -m)"
-CEILING="$(awk -v a="$ARCH" '$1==a {print $2}' "$CEILING_FILE" | head -1)"
-[[ "$CEILING" =~ ^[0-9]+$ ]] || {
-  echo "gate-mem: FAIL — no ceiling for arch '$ARCH' in $CEILING_FILE." >&2
-  echo "          Add a row: '$ARCH <bytes-per-sample>'. Do NOT reuse another arch's number — they differ." >&2
+ROW="$(awk -v a="$ARCH" '$1==a {print; exit}' "$CEILING_FILE")"
+[[ -n "$ROW" ]] || {
+  echo "gate-mem: FAIL — no ceiling row for arch '$ARCH' in $CEILING_FILE." >&2
+  echo "          Add a row: '$ARCH <copy-bytes> <return-bytes-or-dash>'. Do NOT reuse another arch's" >&2
+  echo "          numbers — they diverge materially and unpredictably." >&2
+  exit 1; }
+CEILING_COPY="$(awk '{print $2}'   <<<"$ROW")"
+CEILING_RETURN="$(awk '{print $3}' <<<"$ROW")"
+[[ -n "$CEILING_RETURN" ]] || CEILING_RETURN="-"     # a legacy two-field row = RETURN not yet measured
+[[ "$CEILING_COPY" =~ ^[0-9]+$ ]] || {
+  echo "gate-mem: FAIL — arch '$ARCH' has no numeric COPY ceiling in $CEILING_FILE (got '$CEILING_COPY')." >&2
   exit 1; }
 
 # SBCL only: dds.pal:bytes-consed returns 0 on Clasp, so a Clasp run would measure NOTHING and "pass"
@@ -54,38 +84,63 @@ case "$LISP" in
            exit 1 ;;
 esac
 
-out="$("$LISP" \
-  --eval '(asdf:load-system :dds-bench)' \
-  --eval '(handler-case
-              (let ((b (dds.bench:mem-per-sample)))
-                (format t "~&MEASURED ~,1f~%" b))
-            (error (e) (format t "~&MEASURE-FAILED ~a~%" e)))' \
-  --eval '(uiop:quit 0)' 2>&1)"
+# One arm = one FRESH PROCESS on its OWN domain (see the header: sharing either lets the arms discover
+# each other and reads high). $1 = :return-loans value, $2 = domain.
+measure_arm () {
+  local ret="$1" dom="$2" out measured
+  out="$("$LISP" \
+    --eval '(asdf:load-system :dds-bench)' \
+    --eval "(handler-case
+                 (format t \"~&MEASURED ~,1f~%\"
+                         (dds.bench:mem-per-sample :domain $dom :return-loans $ret))
+               (error (e) (format t \"~&MEASURE-FAILED ~a~%\" e)))" \
+    --eval '(uiop:quit 0)' 2>&1)"
+  if grep -q "MEASURE-FAILED" <<<"$out"; then
+    grep "MEASURE-FAILED" <<<"$out" >&2
+    return 1
+  fi
+  measured="$(grep -o 'MEASURED [0-9.]*' <<<"$out" | awk '{print $2}')"
+  [[ -n "$measured" ]] || { printf '%s\n' "$out" | tail -5 >&2; return 1; }
+  printf '%s\n' "$measured"
+}
 
-if grep -q "MEASURE-FAILED" <<<"$out"; then
-  grep "MEASURE-FAILED" <<<"$out" >&2
-  echo "gate-mem: FAIL — the measurement itself did not run." >&2
-  exit 1
+# Ratchet one arm. $1 label, $2 measured, $3 ceiling (numeric or "-"), $4 the ceiling-file column name.
+ratchet () {
+  awk -v label="$1" -v m="$2" -v c="$3" -v col="$4" -v a="$ARCH" '
+  BEGIN {
+    if (c == "-") {
+      printf "gate-mem: %-6s allocation = %.1f bytes/sample  (NOT RATCHETED on %s — no %s ceiling yet)\n", label, m, a, col;
+      printf "gate-mem:        ^ to start ratcheting it, put %.0f in the %s column of the %s row.\n", m + 30, col, a;
+      exit 0;
+    }
+    lo = c * 0.90;
+    printf "gate-mem: %-6s allocation = %.1f bytes/sample (ceiling %d, NFR-MEM target 0)\n", label, m, c;
+    if (m > c) {
+      printf "gate-mem: FAIL — %s ALLOCATION REGRESSED on %s. %.1f > ceiling %d.\n", label, a, m, c > "/dev/stderr";
+      print  "          Every byte here feeds the PEER'"'"'s GC, which owns the whole ~10 ms tail (ADR 0062)." > "/dev/stderr";
+      exit 1;
+    }
+    if (m < lo) {
+      printf "gate-mem: FAIL — you IMPROVED %s (%.1f, well under the %d ceiling). LOWER THE CEILING:\n", label, m, c > "/dev/stderr";
+      printf "          Set the %s column of the %s row in bench/mem-ceiling.txt to %.0f and commit it.\n", col, a, m > "/dev/stderr";
+      print  "          A ceiling that is never lowered stops constraining anything. The ratchet only moves DOWN." > "/dev/stderr";
+      exit 1;
+    }
+    exit 0;
+  }'
+}
+
+M_COPY="$(measure_arm nil 7)"   || { echo "gate-mem: FAIL — the COPY measurement itself did not run." >&2; exit 1; }
+M_RETURN="$(measure_arm t 8)"   || { echo "gate-mem: FAIL — the RETURN measurement itself did not run." >&2; exit 1; }
+
+RC=0
+ratchet "COPY"   "$M_COPY"   "$CEILING_COPY"   "copy"   || RC=1
+ratchet "RETURN" "$M_RETURN" "$CEILING_RETURN" "return" || RC=1
+
+if [[ $RC -eq 0 ]]; then
+  awk -v c="$M_COPY" -v r="$M_RETURN" 'BEGIN {
+    printf "gate-mem: PASS — no regression. Returning the loan saves %.1f B/sample; still %.0f above the NFR-MEM target of ZERO.\n",
+           c - r, r;
+  }'
 fi
-MEASURED="$(grep -o 'MEASURED [0-9.]*' <<<"$out" | awk '{print $2}')"
-[[ -n "$MEASURED" ]] || { echo "gate-mem: FAIL — no measurement produced." >&2; printf '%s\n' "$out" | tail -5 >&2; exit 1; }
-
-LOWER_AT="$(awk -v c="$CEILING" 'BEGIN{printf "%.0f", c*0.90}')"
-
-awk -v m="$MEASURED" -v c="$CEILING" -v lo="$LOWER_AT" -v a="$ARCH" '
-BEGIN {
-  printf "gate-mem: end-to-end DCPS allocation = %.1f bytes/sample (ceiling %d, NFR-MEM target 0)\n", m, c;
-  if (m > c) {
-    printf "gate-mem: FAIL — ALLOCATION REGRESSED on %s. %.1f > ceiling %d.\n", a, m, c > "/dev/stderr";
-    print  "          Every byte here feeds the PEER'"'"'s GC, which owns the whole ~10 ms tail (ADR 0062)." > "/dev/stderr";
-    exit 1;
-  }
-  if (m < lo) {
-    printf "gate-mem: FAIL — you IMPROVED it (%.1f, well under the %d ceiling). LOWER THE CEILING:\n", m, c > "/dev/stderr";
-    printf "          Lower the %s row in bench/mem-ceiling.txt to %.0f and commit it.\n", a, m > "/dev/stderr";
-    print  "          A ceiling that is never lowered stops constraining anything. The ratchet only moves DOWN." > "/dev/stderr";
-    exit 1;
-  }
-  printf "gate-mem: PASS — no regression. Still %.0f bytes/sample above the NFR-MEM target of ZERO.\n", m;
-  exit 0;
-}'
+exit $RC

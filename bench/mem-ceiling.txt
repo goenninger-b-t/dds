@@ -44,5 +44,24 @@
 # from the other:
 #   arm64   1769.8 -> 1742.1  (-27.7)
 #   x86_64  1777.4 -> 1704.5  (-72.9)
-arm64  1775
-x86_64 1740
+# ⚠️ TWO CEILINGS PER ARCH SINCE 2026-07-28 (ADR 0093 slice 1). Format:
+#
+#     <arch>  <ceiling-COPY>  <ceiling-RETURN>
+#
+#   COPY   — the legacy workload: the application takes samples and DROPS them. Unchanged, and every
+#            historical row above refers to this column, so it stays comparable across the whole campaign.
+#   RETURN — the application RETURN-LOANs each taken sample, i.e. honours the ADR 0093 loan contract, so
+#            the reader can recycle its delivery wrappers. This is the workload a zero-allocation
+#            application actually runs, and the only one in which the recycling can be seen at all.
+#
+# `-` means NOT YET MEASURED ON THIS ARCH. gate-mem still MEASURES that arm and PRINTS the number (with
+# the row to paste in), but does not ratchet it — so an unmeasured arch reports the figure it needs
+# instead of going red. ⚠️ NEVER fill a `-` from the other arch's number: the two diverge materially and
+# unpredictably (ADR 0087 −82.4 vs −125.4; ADR 0088 −27.7 vs −72.9), and a predicted x86_64 value has
+# already been 58 B wrong once. Measure it on that arch, or leave the dash.
+#
+# RETURN ceilings measured 2026-07-28 (ADR 0093 slice 1, bench/report/2026-07-28-…):
+#   arm64  1569.5 / 1567.2 / 1567.6 over three runs, each in its own process on its own domain
+#   x86_64 not measured here — the dash is honest, not lazy.
+arm64  1775 1600
+x86_64 1740 -

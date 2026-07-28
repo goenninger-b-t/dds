@@ -177,10 +177,24 @@ missed return degrades gracefully, the 50 `take-samples` sites in `dds-tests` / 
 Only `mem-per-sample` was given the return (behind `:return-loans`, default NIL) so the slice could be
 sized. Calling that migration a prerequisite in §6 was wrong.
 
-⚠️ **The win is NOT ratcheted.** `gate-mem`'s default workload does not return loans, so it cannot see this
-win, and flipping that default re-baselines **both** arch rows. Only arm64 was measured; the standing rule
-is that a row may be lowered only on the arch it was measured on (a predicted x86_64 number was 58 B wrong
-once). Flipping `:return-loans` and lowering both rows needs an x86_64 measurement — a follow-up.
+**The win IS ratcheted, on arm64 — `gate-mem` measures BOTH workloads** (owner directive, same day). Rather
+than flipping one default and re-baselining everything, the gate now runs **two arms** and carries **two
+ceilings per arch**:
+
+| arm | workload | arm64 ceiling |
+|---|---|---|
+| **COPY** | the application takes samples and drops them — the legacy arm, so every historical row stays comparable | 1775 |
+| **RETURN** | the application `return-loan`s each sample, i.e. honours this ADR's contract | **1600** |
+
+Measuring only COPY would have left this slice's −171 B permanently unratcheted and free to regress
+silently. **Each arm runs in its own process on its own domain** — sharing either lets the arms discover
+each other and reads high (§9 finding 3). An arch whose RETURN ceiling is `-` is still **measured and
+reported**, with the row to paste in, but not gated: so **x86_64 prints the number it needs instead of
+going red**, and nobody is tempted to predict it from arm64. Filling that dash needs a run on x86_64 —
+the one follow-up that remains.
+
+**The gate is falsified three ways**, each seen red: a RETURN regression fails; a RETURN *improvement*
+fails and demands a lower ceiling; a `-` ceiling reports without failing.
 
 **Correctness gate.** The risk is a partially re-initialised recycled struct handing the application a
 *previous* sample's field: silent, and invisible to any allocation gate. The `rx-wrapper-pool` test poisons

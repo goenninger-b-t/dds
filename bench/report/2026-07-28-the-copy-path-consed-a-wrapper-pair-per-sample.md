@@ -68,10 +68,22 @@ else; making the acquire never recycle turns `:adr93-reused` red.
 ## Gate status
 
 620/620 SBCL and Clasp · gate-build clean-cache PASS both · corpus 13+1, 0 mismatches both ·
-gate-hotpath / types (3184 defuns) / pal / nocond / drivers PASS · **gate-mem unchanged at 1740**.
+gate-hotpath / types (3184 defuns) / pal / nocond / drivers PASS.
 
-**The win is deliberately NOT ratcheted yet.** `gate-mem`'s default workload does not return loans, so it
-cannot see this win, and flipping that default re-baselines **both** arch rows. Only arm64 was measured
-here; the ceiling file's standing rule is that a row may be lowered only on the arch it was measured on,
-and a predicted x86_64 number has already been 58 B wrong once. Flipping `mem-per-sample`'s `:return-loans`
-default and lowering both rows is a follow-up that needs an x86_64 measurement — recorded, not done.
+**`gate-mem` now measures BOTH workloads and ratchets both** (owner directive, same day):
+
+```
+gate-mem: COPY   allocation = 1738.3 bytes/sample (ceiling 1775, NFR-MEM target 0)
+gate-mem: RETURN allocation = 1567.3 bytes/sample (ceiling 1600, NFR-MEM target 0)
+gate-mem: PASS — no regression. Returning the loan saves 171.0 B/sample; still 1567 above the target of ZERO.
+```
+
+Measuring only COPY would have left this win permanently unratcheted and free to regress silently. The
+COPY arm is unchanged, so every historical ceiling row stays comparable. **Each arm runs in its own process
+on its own domain**, for the reason above. Reproducible across four gate runs: 1567.3 / 1568.3 / 1568.4 /
+1568.3.
+
+**Falsified three ways, each seen red:** a RETURN regression fails; a RETURN *improvement* fails and
+demands a lower ceiling; a `-` ceiling (an arch where RETURN has not been measured) reports the row to
+paste in and passes rather than going red. That last path is why **x86_64 needs no prediction** — it will
+print its own number on the next CI run, and a predicted value has already been 58 B wrong once.

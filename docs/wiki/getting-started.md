@@ -46,6 +46,33 @@ Failing on an *improvement* is deliberate: a ceiling that is never lowered drift
 quietly stops constraining anything — the same slow death as a gate that cannot fail. The ratchet only
 moves down, and the ceiling file is the record of how far NFR-MEM has actually got.
 
+**Two arms since ADR 0093**, because there are now two honest workloads — each with its own ceiling on the
+arch's row, and each measured in its **own process on its own domain**:
+
+```
+gate-mem: COPY   allocation = 1738.7 bytes/sample (ceiling 1775, NFR-MEM target 0)
+gate-mem: RETURN allocation = 1567.9 bytes/sample (ceiling 1600, NFR-MEM target 0)
+gate-mem: PASS — no regression. Returning the loan saves 170.8 B/sample; still 1568 above the target of ZERO.
+```
+
+- **COPY** — the application takes samples and drops them. The legacy arm, unchanged, so every historical
+  ceiling row stays comparable.
+- **RETURN** — the application `return-loan`s each taken sample, honouring the [ADR 0093](../adr/0093-the-copy-path-becomes-a-loan.md)
+  loan contract so the reader can recycle its delivery wrappers. **This is the only arm in which the
+  recycling is visible at all**; measuring only COPY would leave that win unratcheted and free to regress
+  silently.
+
+An arch whose RETURN ceiling is `-` in `bench/mem-ceiling.txt` (not yet measured there) is still measured
+and **reported, with the row to paste in** — it is simply not gated, so an unmeasured arch prints the
+number it needs instead of going red. ⚠️ **Never fill a `-` from the other arch's number:** the two diverge
+materially and unpredictably, and a predicted value has already been 58 B wrong once.
+
+⚠️ **Each arm runs in its own process on its own domain, and that is load-bearing.** Two arms sharing an
+image and a domain *discover each other*, so the second pays for the first's participants and reads high —
+measured during ADR 0093 as a 1000 B phantom "regression" that was diagnosed as a code defect before the
+harness was suspected. It is the same rule as the standing order that concurrently running tests must use
+different DDS domain IDs.
+
 ### CI runs the gates now — and it did not before
 
 Until `.github/workflows/gates.yml`, the **only** workflow in this repo was `publish-wiki.yml`. **No build,

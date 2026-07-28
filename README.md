@@ -161,7 +161,8 @@ application a retained struct, and **you cannot pool an object whose lifetime th
 So `take-samples` now returns *loans* — give them back with `return-loan` and the reader recycles them
 (**−171 B/sample** measured, `bench/report/2026-07-28-…`). It is a **`should`, not a `must`**: an
 unreturned sample is simply never recycled, so existing code keeps working and only forgoes the win.
-Current position: **1739 B/sample** on the measured DCPS path (arm64), **1568** with returns.
+Current position: **1739 B/sample** on the measured DCPS path (arm64), **1568** with returns — and
+`make gate-mem` now ratchets **both** workloads, so neither can regress unnoticed.
 
 ### ASDF systems
 
