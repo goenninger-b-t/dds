@@ -85,6 +85,13 @@
 #   arm64 COPY   1452.6 / 1456.6 / 1452.6   -> LOWERED 1585 -> 1490
 #   arm64 RETURN 1244.6 / 1245.7 / 1245.2   -> LOWERED 1375 -> 1280
 #
+# LOWERED 2026-07-28 (the source GUID-prefix is CACHED per receiver thread instead of copied out of the
+# datagram every time — a 12-octet vector, 2.05 datagrams/sample). It is a write-once CACHE, not a reused
+# scratch: the prefix is copied out precisely so callers may RETAIN it. Predicted 65.7 B/sample, measured
+# -63.3 / -62.8 (bench/report/2026-07-28-the-receive-path-copied-the-source-prefix-per-datagram.md):
+#   arm64 COPY   1389.3 / 1389.3 / 1389.1   -> LOWERED 1490 -> 1420
+#   arm64 RETURN 1183.8 / 1181.8 / 1181.6   -> LOWERED 1280 -> 1215
+#
 # ⚠️ MEASURE WITH NOTHING ELSE RUNNING. A gate-mem run taken while the test suites were running in the
 # background read COPY 1710.8 and FAILED — a 160 B phantom regression from participant + CPU contention,
 # not from code. A benchmark is an instrument; give it the machine.
@@ -92,5 +99,5 @@
 # x86_64 is NOT re-measured here; its COPY row stays 1740 and will simply not bite until someone measures
 # it on that arch. Never derive it from arm64.
 #   x86_64 not measured here — the dash is honest, not lazy.
-arm64  1490 1280
+arm64  1420 1215
 x86_64 1740 -

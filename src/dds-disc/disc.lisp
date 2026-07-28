@@ -2657,10 +2657,27 @@
    per datagram in %handle-datagram; NIL (no INFO_TS) stores no timestamp — SampleInfo.source_timestamp
    stays NIL, the pre-S5 reception-order behaviour. Receiver-thread dynamic extent.")
 
+(defconstant +rx-prefix-slots+ 16
+  "Direct-mapped slots in one receiver thread's source-GUID-prefix cache (RX-CONTEXT-PREFIXES). Indexed by
+   the low 4 bits of the XOR of the prefix's last four octets — the participant-discriminating end of the
+   guidPrefix (RTPS 2.5 §9.4.4) — so a handful of peers collide only by accident. A collision is not a
+   fault: the losing peer's next datagram simply re-allocates its prefix, which is what EVERY datagram did
+   before the cache existed.")
+
+(defstruct* (rx-context (:constructor %make-rx-context))
+  "One receiver thread's reusable receive scratch (NFR-MEM / FR-PF-7). Created per RECEIVER, never per
+   node: the unicast, multicast and SHMEM receivers run concurrently over three DIFFERENT buffers, so a
+   shared context would interleave one cursor's position across all three. NIL anywhere this is accepted
+   means 'no scratch' and restores the per-datagram allocation, which is what non-receiver callers (tests)
+   get."
+  (cursor nil :type (or null dds.core.buffer:cursor))
+  (prefixes (make-array +rx-prefix-slots+ :initial-element nil) :type simple-vector))
+
 (declaim (inline %rx-cursor))
-(defun* %rx-cursor (c buf)
-    (function ((or null dds.core.buffer:cursor) dds.core.buffer:octet-buffer) dds.core.buffer:cursor)
-  "The datagram cursor for BUF: C reset for reuse when it already reads BUF, else a fresh one (NFR-MEM).
+(defun* %rx-cursor (ctx buf)
+    (function ((or null rx-context) dds.core.buffer:octet-buffer) dds.core.buffer:cursor)
+  "The datagram cursor for BUF: CTX's own cursor reset for reuse when it already reads BUF, else a fresh
+   one (cached into CTX when there is one). NFR-MEM.
 
    A cursor is pure per-datagram scratch — a position over a buffer whose contents the NEXT datagram
    overwrites — so nothing can validly retain one across datagrams, and reusing it is safe BY
@@ -2672,15 +2689,57 @@
 
    Measured: the fresh cursor was 48 B (a 6-word struct) on EVERY datagram, 2.05 datagrams/sample =
    101 B/sample of the receive pipeline's 688."
-  (cond ((and c (eq (dds.core.buffer:cursor-buffer c) buf))
-         (dds.core.buffer:cursor-reset c)
-         (dds.core.buffer:cursor-set-endianness c :little)
-         c)
-        (t (dds.core.buffer:cursor buf :endianness :little))))
+  (let ((c (and ctx (rx-context-cursor ctx))))
+    (cond ((and c (eq (dds.core.buffer:cursor-buffer c) buf))
+           (dds.core.buffer:cursor-reset c)
+           (dds.core.buffer:cursor-set-endianness c :little)
+           c)
+          (t (let ((fresh (dds.core.buffer:cursor buf :endianness :little)))
+               (when ctx (setf (rx-context-cursor ctx) fresh))
+               fresh)))))
 
-(defun* %handle-datagram (node buf size &optional rtps-unwrapped rx-cursor)
+(declaim (inline %prefix-equal-header-p))
+(defun* %prefix-equal-header-p (p vec)
+    (function ((simple-array (unsigned-byte 8) (12)) (simple-array (unsigned-byte 8) (*))) t)
+  "T when the cached prefix P is octet-for-octet the guidPrefix in the RTPS header at VEC[8,20) (§9.4.4).
+   Twelve AREFs, no allocation — the whole point is to answer 'same peer?' without building the answer."
+  (dotimes (i 12 t)
+    (unless (= (aref p i) (aref vec (+ 8 i))) (return nil))))
+
+(defun* %source-prefix-cached (ctx buf)
+    (function ((or null rx-context) dds.core.buffer:octet-buffer) (simple-array (unsigned-byte 8) (12)))
+  "BUF's 12-octet source GUID prefix (§9.4.4), taken from CTX's per-receiver-thread cache when this peer
+   has been seen before and freshly allocated (and cached) otherwise. NIL CTX = always allocate, which is
+   what %source-prefix did unconditionally and what every non-receiver caller still gets.
+
+   ⚠️ THE RETURNED ARRAY IS WRITE-ONCE AND MAY BE RETAINED — that is the whole reason this is a cache and
+   not a reused scratch buffer. The prefix is copied out of the receive buffer PRECISELY so callers can
+   keep it: writer-lookup-key's proxy key (ADR 0088), (cons src-prefix dest), %record-participant's
+   participant record, the DCPS active-reader set (ADR 0089). A recycled mutable buffer would turn every
+   one of those into a use-after-mutate. A cache entry is written exactly once, at creation, and a slot is
+   only ever REPLACED — never mutated — so a retained reference stays valid for as long as its holder
+   wants it, and an evicted peer's next datagram simply mints a new equal array.
+
+   Identity cannot be depended on either way: before this cache EVERY datagram yielded a fresh array, so
+   no consumer can have been EQ-keying one (it would have missed 100% of the time) — caching can only turn
+   misses into hits. Measured: 32 B (a 12-octet vector) per datagram, 2.05 datagrams/sample = 66 B/sample."
+  (let ((vec (dds.core.buffer:octet-buffer-vec buf)))
+    (if (or (null ctx) (< (length vec) 20))   ; a buffer too short to hold a header: leave the pre-existing behaviour exactly as it was
+        (%source-prefix buf)
+        (let* ((slots (rx-context-prefixes ctx))
+               (i (logand (logxor (aref vec 16) (aref vec 17) (aref vec 18) (aref vec 19))
+                          (1- +rx-prefix-slots+))))
+          (let ((hit (svref slots i)))
+            (declare (type (or null (simple-array (unsigned-byte 8) (12))) hit))   ; a slot holds only what the miss arm below put there
+            (if (and hit (%prefix-equal-header-p hit vec))
+                hit
+                (let ((fresh (%source-prefix buf)))
+                  (setf (svref slots i) fresh)
+                  fresh)))))))
+
+(defun* %handle-datagram (node buf size &optional rtps-unwrapped rx-ctx)
     (function (disc-node dds.core.buffer:octet-buffer (integer 0) &optional t
-               (or null dds.core.buffer:cursor))
+               (or null rx-context))
               t)
   "Dispatch an inbound datagram (bounded by SIZE). DATA is routed by writerId: SPDP
    -> record participant; SEDP publications/subscriptions -> match; any other DATA
@@ -2703,11 +2762,12 @@
    re-dispatch) suppresses the enforcement — the inner plaintext was just authenticated by the SRTPS unwrap, so
    its user submessages are delivered (else the just-decoded sample would be self-dropped). NONE governance /
    security OFF / a not-keyed source -> enforcement off, byte-identical.
-   RX-CURSOR is the calling receiver thread's own reusable datagram cursor (%rx-cursor); NIL allocates one
-   per datagram, which is what every non-receiver caller (tests) gets and what this did unconditionally
-   before (NFR-MEM: 48 B x 2.05 datagrams/sample)."
-  (let* ((cursor (%rx-cursor rx-cursor buf))
-         (src-prefix (%source-prefix buf))
+   RX-CTX is the calling receiver thread's own reusable receive scratch: its datagram cursor (%rx-cursor)
+   and its source-prefix cache (%source-prefix-cached). NIL allocates both per datagram, which is what
+   every non-receiver caller (tests) gets and what this did unconditionally before — together 48 B + 32 B
+   on EVERY datagram, at 2.05 datagrams/sample (NFR-MEM)."
+  (let* ((cursor (%rx-cursor rx-ctx buf))
+         (src-prefix (%source-prefix-cached rx-ctx buf))
          ;; T10 receive enforcement, computed ONCE: when NODE requires rtps_protection from this :keyed source AND
          ;; this datagram is NOT SRTPS-wrapped, drop its plain USER-DATA (forged) — applied by writerId below.
          ;; RTPS-UNWRAPPED (the post-SRTPS-decode re-dispatch) forces it off (the inner plaintext is authenticated).
@@ -2757,7 +2817,7 @@
                                         (+ 20 data-len))))))
                     ;; RTPS-UNWRAPPED t: the inner plaintext is already authenticated by this unwrap, so the
                     ;; re-dispatch must NOT re-apply the plain-user-DATA enforcement (it would self-drop the sample).
-                    (when new-size (%handle-datagram node buf new-size t rx-cursor)))
+                    (when new-size (%handle-datagram node buf new-size t rx-ctx)))
                   ;; the RX pool could not be carved (arena exhausted at first secured receive): the allocating
                   ;; decode-rtps-message — the degrade path (common tier AND origin-auth, its receiver-MAC gate);
                   ;; correct + byte-identical wire (a subseq of the recovered stream), self-heals when the arena
@@ -2766,7 +2826,7 @@
                                                                   :my-receiver-key-id my-rk-id :my-receiver-key my-rk)))
                     (when (and stream (<= (+ 20 (length stream)) cap))
                       (replace vec stream :start1 20)
-                      (%handle-datagram node buf (+ 20 (length stream)) t rx-cursor)))))))
+                      (%handle-datagram node buf (+ 20 (length stream)) t rx-ctx)))))))
         (return-from %handle-datagram t)))   ; SRTPS datagram: decoded+re-dispatched, or dropped (fail-closed)
     (let ((*rx-source-timestamp* nil))   ; S5.T4: per-datagram INFO_TS source_timestamp (ns), set by the INFO_TS clause + read at the store (%deliver-user-sample); reset each datagram
      ;; flet + dynamic-extent: dispatch-message is a downward funarg, so this closure stack-allocates (ADR 0068)
@@ -2996,31 +3056,31 @@
    segment when SHMEM is on (FR-XPORT-2). All feed the SAME %handle-datagram, so the engine is identical
    regardless of which transport carried a datagram. Returns NODE.
 
-   Each receiver closes over its OWN cursor cell (NFR-MEM): the datagram cursor is per-datagram scratch
-   that used to be allocated fresh 2.05 times per sample, and each receiver thread reuses ONE buffer for
-   its whole life, so one cursor per receiver serves every datagram it handles. The cell is per-LAMBDA,
-   never per-node — three receiver threads sharing one cursor would interleave positions over three
-   different buffers. It is filled on the first datagram rather than here because the buffer belongs to
-   the transport (start-udp-receiver allocates it inside the spawned thread); %rx-cursor's EQ test is
-   what keeps that lazy fill correct if a transport ever hands over a different buffer."
+   Each receiver gets its OWN rx-context (NFR-MEM): the datagram cursor and the source-prefix cache are
+   per-datagram scratch that used to be allocated fresh 2.05 times per sample each. The context is
+   per-LAMBDA, never per-node — the three receiver threads run concurrently over three DIFFERENT buffers,
+   so a shared context would interleave one cursor's position across all of them. Its cursor is filled on
+   the first datagram rather than here, because the buffer belongs to the transport (start-udp-receiver
+   allocates it inside the spawned thread); %rx-cursor's EQ test is what keeps that lazy fill correct if a
+   transport ever hands over a different buffer."
   (setf (disc-node-rx-thread node)
-        (let ((cur nil))
+        (let ((ctx (%make-rx-context)))
           (dds.xport.udp:start-udp-receiver
            (disc-node-socket node)
-           (lambda (buf size) (setf cur (%rx-cursor cur buf)) (%handle-datagram node buf size nil cur))
+           (lambda (buf size) (%handle-datagram node buf size nil ctx))
            (lambda () (disc-node-rx-stopping node)))))
   (when (disc-node-mcast-socket node)
     (setf (disc-node-mcast-rx-thread node)
-          (let ((cur nil))
+          (let ((ctx (%make-rx-context)))
             (dds.xport.udp:start-udp-receiver
              (disc-node-mcast-socket node)
-             (lambda (buf size) (setf cur (%rx-cursor cur buf)) (%handle-datagram node buf size nil cur))
+             (lambda (buf size) (%handle-datagram node buf size nil ctx))
              (lambda () (disc-node-rx-stopping node))))))
   (when (disc-node-shmem node)
-    (let ((cur nil))
+    (let ((ctx (%make-rx-context)))
       (dds.xport.shmem:start-shmem-receiver
        (disc-node-shmem node)
-       (lambda (buf size) (setf cur (%rx-cursor cur buf)) (%handle-datagram node buf size nil cur)))))
+       (lambda (buf size) (%handle-datagram node buf size nil ctx)))))
   node)
 
 (defun* %zc-drop-armed (node change)
