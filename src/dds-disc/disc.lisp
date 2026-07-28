@@ -254,6 +254,15 @@
   ;; set. :NONE is the miss sentinel, because NIL (no matched reliable reader) is a legitimate value that
   ;; must be cached too. Node-lock guarded.
   (matched-reader-keys-cache :none :type t)
+  ;; NFR-MEM (ADR 0062): memo of %build-key-hash-iq — the 24-octet PID_KEY_HASH inline-QoS block emitted
+  ;; with every KEYED write (RTPS 2.5 §9.6.4.8). Building it cost three objects per write (a 24-octet
+  ;; vector, an octet-buffer wrapper and a cursor, ~128 B) for a value that is a PURE FUNCTION of the
+  ;; 16-octet key hash — i.e. of the INSTANCE, of which a writer has few and writes many. 16 direct-mapped
+  ;; slots; an entry validates ITSELF, because octets [4,20) of the block ARE the key hash it was built
+  ;; from, so no separate key is stored. Write-once (the block is retained by every CacheChange that
+  ;; carries it, and emitted verbatim on retransmits), so a slot is only ever REPLACED, never written into.
+  ;; A collision or a many-instance writer degrades to the pre-cache allocation, never to a wrong block.
+  (key-hash-iq-cache (make-array +rx-prefix-slots+ :initial-element nil) :type simple-vector)
   ;; NFR-MEM (ADR 0062): memo of %reader-push-targets keyed by the writer's TOPIC (a string, or NIL for the
   ;; discovery-less value path) — the per-destination ((host . port) . matched-reader-GUID-keys) grouping the
   ;; TX push builds on EVERY send (%capture-push-groups). Same inputs (matched endpoints + discovered locators

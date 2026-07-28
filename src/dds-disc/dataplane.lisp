@@ -2272,7 +2272,7 @@
       (dds.xport.zerocopy::%zc-release (disc-node-zc-pool-sap node) zc-slot zc-gen))
     (setf zc-slot nil))
   (let ((iq (when (and key-hash (= 16 (length key-hash)))
-              (%build-key-hash-iq (coerce key-hash '(simple-array (unsigned-byte 8) (16))))))
+              (%key-hash-iq-cached node (coerce key-hash '(simple-array (unsigned-byte 8) (16))))))
         (writer (%resolve-user-writer node writer-id))   ; WP-N-ENDPOINT-S1: write into THIS DataWriter's own HistoryCache/SN space; NIL/unregistered -> primary (N=1 byte-identical)
         (pin-granted nil)          ; ADR 0044: T iff the TX pin was reserved + %zc-pin'd for this write
         ;; T5a: the acquired pool buffer + its TRUE payload length (NIL = non-pooled path). WP-PERF: a caller
@@ -2373,14 +2373,53 @@
     (function ((simple-array (unsigned-byte 8) (16))) (simple-array (unsigned-byte 8) (*)))
   "Build a 24-octet PID_SENTINEL-terminated inline-QoS block carrying PID_KEY_HASH for DATA-with-payload
    (RTPS 2.5 §9.6.4.8): 4 bytes PID header + 16 bytes hash + 4 bytes PID_SENTINEL = 24. Mirrors what
-   Connext 7.3.1 and Fast DDS 3.6.1 emit on every keyed write() call (spike 2026-06-21). Off the hot path —
-   only publish-sample callers that opt in via a non-nil key-hash call this. Control-plane (ADR 0029)."
+   Connext 7.3.1 and Fast DDS 3.6.1 emit on every keyed write() call (spike 2026-06-21). Control-plane
+   (ADR 0029) for an UNKEYED writer, which never calls it — but for a KEYED one it is squarely on the hot
+   path (every write passes a key-hash), which is why publish-sample takes it from a cache
+   (%key-hash-iq-cached) rather than calling this per write. Measured at 128 B/call before that."
   (let* ((scratch (make-array 24 :element-type '(unsigned-byte 8) :initial-element 0))
          (buf (dds.core.buffer:octet-buffer-over scratch))
          (mc (dds.core.buffer:cursor buf :endianness :little)))
     (dds.rtps.message:write-parameter mc dds.rtps.message:+pid-key-hash+ key-hash 0 16)
     (dds.rtps.message:write-parameter-sentinel mc)
     scratch))
+
+(declaim (inline %iq-carries-hash-p))
+(defun* %iq-carries-hash-p (iq key-hash)
+    (function ((simple-array (unsigned-byte 8) (*)) (simple-array (unsigned-byte 8) (16))) t)
+  "T when the cached inline-QoS block IQ was built from KEY-HASH. The block's octets [4,20) ARE the hash
+   (4-octet PID header, then the 16 hash octets, RTPS 2.5 §9.6.4.8), so the entry validates itself and no
+   separate key has to be stored beside it."
+  (dotimes (i 16 t)
+    (unless (= (aref iq (+ 4 i)) (aref key-hash i)) (return nil))))
+
+(defun* %key-hash-iq-cached (node key-hash)
+    (function (disc-node (simple-array (unsigned-byte 8) (16))) (simple-array (unsigned-byte 8) (*)))
+  "%BUILD-KEY-HASH-IQ for KEY-HASH, served from NODE's write-once cache when this INSTANCE has been
+   written before (NFR-MEM, ADR 0062).
+
+   The block is a pure function of the key hash, i.e. of the instance — and a writer has few instances and
+   writes many samples — yet it was rebuilt on EVERY keyed write out of three fresh objects: a 24-octet
+   vector, an octet-buffer wrapper over it, and a cursor. 128 B/call measured, ~131 B/sample.
+
+   Write-once, so it may be shared: the block is RETAINED by every CacheChange that carries it and is
+   emitted verbatim on retransmits, and nothing ever writes into one. Two samples of the same instance now
+   share one block where they held equal copies. A slot is only ever REPLACED. Concurrency needs no lock —
+   a simple-vector slot store is a single word, an entry is validated against the caller's own key hash
+   before use, and two threads racing a miss both produce a correct block.
+
+   A collision, or a writer with more live instances than slots, degrades to the pre-cache allocation —
+   never to a wrong block."
+  (let* ((slots (disc-node-key-hash-iq-cache node))
+         (i (logand (logxor (aref key-hash 15) (aref key-hash 14) (aref key-hash 0))
+                    (1- +rx-prefix-slots+))))
+    (let ((hit (svref slots i)))
+      (declare (type (or null (simple-array (unsigned-byte 8) (*))) hit))   ; a slot holds only what the miss arm below put there
+      (if (and hit (%iq-carries-hash-p hit key-hash))
+          hit
+          (let ((fresh (%build-key-hash-iq key-hash)))
+            (setf (svref slots i) fresh)
+            fresh)))))
 
 (defun* %build-original-writer-info-iq (guid sn)
     (function ((simple-array (unsigned-byte 8) (16)) (integer 0))

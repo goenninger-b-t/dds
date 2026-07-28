@@ -114,6 +114,13 @@
 #   arm64 COPY   1182.7 / 1181.9 / 1182.2   -> LOWERED 1265 -> 1215
 #   arm64 RETURN  976.1 /  975.9 /  975.9   -> LOWERED 1055 -> 1010
 #
+# LOWERED 2026-07-28 (the PID_KEY_HASH inline-QoS block is CACHED per instance instead of rebuilt on every
+# KEYED write out of three fresh objects — a 24-octet vector, an octet-buffer wrapper and a cursor, 128
+# B/call. It is a pure function of the key hash, i.e. of the INSTANCE, and a writer has few instances and
+# writes many samples. The block validates itself: its octets [4,20) ARE the hash. Measured -125.4/-128.1:
+#   arm64 COPY   1057.3 / 1056.3 / 1055.5   -> LOWERED 1215 -> 1090
+#   arm64 RETURN  848.0 /  846.8 /  848.2   -> LOWERED 1010 ->  880
+#
 # ⚠️ MEASURE WITH NOTHING ELSE RUNNING. A gate-mem run taken while the test suites were running in the
 # background read COPY 1710.8 and FAILED — a 160 B phantom regression from participant + CPU contention,
 # not from code. A benchmark is an instrument; give it the machine.
@@ -121,5 +128,5 @@
 # x86_64 is NOT re-measured here; its COPY row stays 1740 and will simply not bite until someone measures
 # it on that arch. Never derive it from arm64.
 #   x86_64 not measured here — the dash is honest, not lazy.
-arm64  1215 1010
+arm64  1090 880
 x86_64 1740 -
