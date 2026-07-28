@@ -92,6 +92,14 @@
 #   arm64 COPY   1389.3 / 1389.3 / 1389.1   -> LOWERED 1490 -> 1420
 #   arm64 RETURN 1183.8 / 1181.8 / 1181.6   -> LOWERED 1280 -> 1215
 #
+# LOWERED 2026-07-28 (%matched-reader-keys is MEMOIZED on the node instead of rebuilt on every inbound
+# ACKNACK — a node-locked list of every matched endpoint, then a copy-seq per reader GUID and a cons per
+# key, for a value that changes only on match/unmatch/prune. It shares the sibling destination memos'
+# invalidation seam, %invalidate-dest-cache. Four hot-path callers, so the win is larger than the ~50 B
+# the single probed call showed:
+#   arm64 COPY   1329.2 / 1329.4 / 1328.1   -> LOWERED 1420 -> 1360
+#   arm64 RETURN 1120.3 / 1117.5 / 1121.7   -> LOWERED 1215 -> 1155
+#
 # ⚠️ MEASURE WITH NOTHING ELSE RUNNING. A gate-mem run taken while the test suites were running in the
 # background read COPY 1710.8 and FAILED — a 160 B phantom regression from participant + CPU contention,
 # not from code. A benchmark is an instrument; give it the machine.
@@ -99,5 +107,5 @@
 # x86_64 is NOT re-measured here; its COPY row stays 1740 and will simply not bite until someone measures
 # it on that arch. Never derive it from arm64.
 #   x86_64 not measured here — the dash is honest, not lazy.
-arm64  1420 1215
+arm64  1360 1155
 x86_64 1740 -

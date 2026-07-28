@@ -737,12 +737,35 @@
    reads acked-base 1 and holds the watermark — nothing purged until it acks). A BEST_EFFORT reader is
    EXCLUDED: it never ACKNACKs (its proxy would pin the watermark at 1 forever, disabling the purge) and
    the writer owes it no retransmit (best-effort = no delivery guarantee, §2.2.3.13), so purging samples
-   it never acked is correct."
-  (loop for remote in (%matched-endpoints node)
-        for guid = (dds.rtps.discovery:endpoint-data-guid remote)
-        for q = (dds.rtps.discovery:endpoint-data-qos remote)
-        when (and (%reader-guid-p guid) q (eq (dds.qos:qos-reliability q) :reliable))
-          collect (copy-seq guid)))
+   it never acked is correct.
+
+   NFR-MEM (ADR 0062): MEMOIZED on the node, because this ran on EVERY inbound ACKNACK — ~once per sample —
+   and rebuilt from scratch a value that changes only on match/unmatch/prune: a node-locked list of every
+   matched endpoint, then a copy-seq per reader GUID and a cons per key, ~50 B/sample. Dropped WHOLESALE by
+   %invalidate-dest-cache, which the matched-endpoint set already invalidates for the sibling destination
+   memos — a STALE KEY SET IS SILENT DATA LOSS OR AN UNBOUNDED HISTORY (a departed reader still pinning the
+   purge watermark, or a live one not holding it), so the invalidation stays coarse on purpose.
+   The returned list is SHARED: callers MUST treat it and its GUIDs as read-only (they only ever loop over
+   it). Handing the same arrays to get-reader-proxy repeatedly is safe by ITS contract — a lookup does not
+   retain the key and a create copies it (%retained-endpoint-key, ADR 0088) — and safe again by this one:
+   an entry is built once per invalidation and never mutated."
+  (multiple-value-bind (cached gen)
+      (dds.pal:with-lock ((disc-node-lock node))
+        (values (disc-node-matched-reader-keys-cache node)
+                (disc-node-match-dest-generation node)))
+    (unless (eq cached :none)
+      (return-from %matched-reader-keys cached))
+    (let ((result (loop for remote in (%matched-endpoints node)
+                        for guid = (dds.rtps.discovery:endpoint-data-guid remote)
+                        for q = (dds.rtps.discovery:endpoint-data-qos remote)
+                        when (and (%reader-guid-p guid) q (eq (dds.qos:qos-reliability q) :reliable))
+                          collect (copy-seq guid))))
+      ;; STORE ONLY IF NO INVALIDATION RACED THE RESOLVE — %matched-endpoints takes the node lock itself, so
+      ;; an unmatch can land between the miss above and here. Mirrors %match-destinations-prefixed exactly.
+      (dds.pal:with-lock ((disc-node-lock node))
+        (when (= gen (disc-node-match-dest-generation node))
+          (setf (disc-node-matched-reader-keys-cache node) result)))
+      result)))
 
 (defun* %matched-endpoints (node)
     (function (disc-node) list)

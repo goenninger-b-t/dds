@@ -244,6 +244,16 @@
   ;; resolving (which takes the lock internally, so an invalidation can land mid-resolve) and stores only if it
   ;; is unchanged.
   (match-dest-generation 0 :type (integer 0))
+  ;; NFR-MEM (ADR 0062): memo of %matched-reader-keys — the 16-octet GUIDs of the matched RELIABLE remote
+  ;; readers, the purge-watermark key set. It was rebuilt on EVERY inbound ACKNACK (~once per sample): a
+  ;; node-locked list of every matched endpoint, then a copy-seq per reader GUID and a cons per key — ~50
+  ;; B/sample — for a value that changes only on match/unmatch/prune. SAME inputs as match-dest-cache
+  ;; (the matched-endpoint set) so it shares %invalidate-dest-cache and its generation guard; the SPDP
+  ;; locator-update invalidation is over-eager for this one value and deliberately not special-cased —
+  ;; discovery events are rare and an under-invalidation here would purge history against a stale reader
+  ;; set. :NONE is the miss sentinel, because NIL (no matched reliable reader) is a legitimate value that
+  ;; must be cached too. Node-lock guarded.
+  (matched-reader-keys-cache :none :type t)
   ;; NFR-MEM (ADR 0062): memo of %reader-push-targets keyed by the writer's TOPIC (a string, or NIL for the
   ;; discovery-less value path) — the per-destination ((host . port) . matched-reader-GUID-keys) grouping the
   ;; TX push builds on EVERY send (%capture-push-groups). Same inputs (matched endpoints + discovered locators
@@ -1941,9 +1951,11 @@
    needless clrhash costs nothing (discovery events are rare, the send path is not). Static PEERS are set once
    at make-disc-node (before the first send) and never mutated at runtime in production, so they need no
    invalidation site. If you add a mutation of %matched-endpoints, a discovered participant's locators, or (in
-   production) disc-node-peers, call this from it. Clears the TX %reader-push-targets memo too — same inputs."
+   production) disc-node-peers, call this from it. Clears the TX %reader-push-targets memo too — same inputs,
+   and the %matched-reader-keys memo, whose input (the matched-endpoint set) is a subset of theirs."
   (clrhash (disc-node-match-dest-cache node))
   (clrhash (disc-node-reader-push-cache node))
+  (setf (disc-node-matched-reader-keys-cache node) :none)
   (incf (disc-node-match-dest-generation node))
   t)
 
