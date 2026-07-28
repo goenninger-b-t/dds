@@ -160,10 +160,15 @@
   t)
 
 (defun* %writer-add-bounded (writer make-change)
-    (function (rtps-writer function) (or integer (eql :timeout)))
+    (function (rtps-writer function) (values (or integer (eql :timeout)) t))
   "Add the change produced by the thunk MAKE-CHANGE (given the freshly-bumped SN) to WRITER's HistoryCache
    under the writer LOCK, applying DDS-standard block-up-to-max_blocking_time backpressure (WP-ASYNC-FLOW,
    FR-PF-2/FR-QOS, ADR 0016 §Backpressure). Shared core of writer-write + writer-lifecycle-change (DRY).
+
+   Returns (values SN CHANGE) — the CHANGE second value only because withholding it was expensive: it was
+   already in hand here, and writer-write got it out through a MUTABLE variable captured by MAKE-CHANGE,
+   which on SBCL costs a heap value cell per write on top of the closure (NFR-MEM). On :timeout both are
+   the timeout sentinel and NIL, as before.
 
    For a BOUNDED cache (KEEP_ALL with a finite max_samples): when full (count >= max_samples) and
    MAX-BLOCKING-NS is set, BLOCK on SPACE-CV — which RELEASES the writer LOCK while waiting, so the purge
@@ -194,13 +199,14 @@
                   do (dds.pal:condvar-wait (rtps-writer-space-cv writer) (rtps-writer-lock writer)
                                            (/ remaining 1000000000.0d0)))))
         (when (>= (dds.rtps.history:hc-change-count hc) max-samples)   ; still full (deadline passed / no blocking): reject, NO SN consumed
-          (return-from %writer-add-bounded :timeout)))
+          (return-from %writer-add-bounded (values :timeout nil))))
       (let* ((sn (incf (rtps-writer-last-sn writer)))                  ; room confirmed (or unlimited / KEEP_LAST)
-             (evicted (nth-value 1 (dds.rtps.history:hc-add-change hc (funcall make-change sn)))))
+             (change (funcall make-change sn))
+             (evicted (nth-value 1 (dds.rtps.history:hc-add-change hc change))))
         ;; ADR 0089: a KEEP_LAST eviction at or above the acked watermark destroyed data no reader has.
         (when (and evicted (>= (the integer evicted) (rtps-writer-acked-watermark writer)))
           (incf (rtps-writer-replaced-unacked writer)))
-        sn))))
+        (values sn change)))))
 
 (defun* %retained-endpoint-key (key)
     (function (t) t)
@@ -374,12 +380,17 @@
    committed slot stays live until the full-ACK purge, and retransmit / non-ZC / extra-ZC sends read it on demand;
    ZC-LEN records the true serialized length so the send-path length reads work without a retained payload. The
    pin hold is released (once) by hc-try-release-pinned at the change-removal choke (ADR 0044 §4)."
-  (let ((change nil))
-    (values (%writer-add-bounded
-             writer (lambda (sn) (setf change (dds.rtps.history:hc-data-change   ; TASK-3 (ADR 0077): draw+fill from the writer's change-freelist (zero per-sample struct alloc once warm), else fresh
-                                               (rtps-writer-hc writer) sn payload key-hash inline-qos
-                                               pooled-buffer pooled-len zc-slot zc-gen zc-pinned zc-len))))
-            change)))
+  ;; NFR-MEM: an flet declared DYNAMIC-EXTENT, not a lambda (ADR 0072). %writer-add-bounded funcalls
+  ;; MAKE-CHANGE once, under the writer lock, and stores it nowhere — a pure downward funarg — so this
+  ;; stack-allocates. As a heap lambda it captured ELEVEN variables (~104 B/write), and the CHANGE it
+  ;; smuggled out was a closed-over MUTABLE variable, which costs a heap value cell of its own on SBCL.
+  ;; %writer-add-bounded now RETURNS the change, so the mutable capture is gone rather than made cheaper.
+  (flet ((%make-data-change (sn)
+           (dds.rtps.history:hc-data-change   ; TASK-3 (ADR 0077): draw+fill from the writer's change-freelist (zero per-sample struct alloc once warm), else fresh
+            (rtps-writer-hc writer) sn payload key-hash inline-qos
+            pooled-buffer pooled-len zc-slot zc-gen zc-pinned zc-len)))
+    (declare (dynamic-extent #'%make-data-change))
+    (%writer-add-bounded writer #'%make-data-change)))
 
 (defun* writer-zc-claim (writer change)
     (function (rtps-writer dds.rtps.history:cache-change) boolean)
@@ -420,10 +431,13 @@
    the instance is identified by its key hash — yet is reliably ordered and ACKNACK-repairable
    like any DATA. For a writer with no finite max_samples this never blocks and never returns
    :timeout (byte-identical to before)."
-  (%writer-add-bounded
-   writer (lambda (sn) (dds.rtps.history:hc-lifecycle-change   ; TASK-3 (ADR 0077): draw+fill from the writer's change-freelist, else fresh
-                        (rtps-writer-hc writer) sn (dds.rtps.message:status-info->kind status-flags)
-                        key-hash status-flags inline-qos source-timestamp))))   ; S5.T4: INFO_TS on dispose/unregister_w_timestamp
+  ;; VALUES truncates %writer-add-bounded's second value (the change): a lifecycle change's SN is this
+  ;; function's whole documented contract, and the caller never wants the change itself.
+  (values
+   (%writer-add-bounded
+    writer (lambda (sn) (dds.rtps.history:hc-lifecycle-change   ; TASK-3 (ADR 0077): draw+fill from the writer's change-freelist, else fresh
+                         (rtps-writer-hc writer) sn (dds.rtps.message:status-info->kind status-flags)
+                         key-hash status-flags inline-qos source-timestamp)))))   ; S5.T4: INFO_TS on dispose/unregister_w_timestamp
 
 (defun* writer-heartbeat (writer)
     (function (rtps-writer) (values integer integer integer))
