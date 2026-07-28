@@ -16,7 +16,7 @@ Same method as the receive-pipeline bisect: `bytes-consed` windows around each p
 
 | block | B/sample |
 |---|---|
-| `%write-key-hash` | 98.3 |
+| `%write-key-hash` | 98.3 — **retracted, see below: really ~32, probably less** |
 | **`publish-sample` → `%build-key-hash-iq`** | **131.1** ← this slice |
 | `publish-sample` → `writer-write` | 173.7 |
 | `publish-sample` → send trigger | 26.2 |
@@ -70,12 +70,32 @@ lowered. Predicted ~131 B/sample; measured **−125.4 / −128.1**.
 
 ## What is next in TX
 
-- **`writer-write` — 173.7 B/sample**, now the largest single item anywhere in the measurement: the
-  CacheChange and its HistoryCache insert.
-- **`%write-key-hash` — 98.3 B/sample.** Its docstring states the residual is ~32 B (the deliberately fresh
-  result array, which is retained on three paths and so cannot be recycled without the ADR 0076 stable-handle
-  indirection). It measures **96**. Either the figure is stale or `%instance-handle` allocates something
-  else; that discrepancy should be understood before it is optimised.
+- **`writer-write` — 173.7 B/sample**, the largest remaining item in the TX table: the CacheChange and its
+  HistoryCache insert. ⚠️ Treat that figure the way the retraction below says to treat any window number.
+
+## ⚠️ RETRACTION: `%write-key-hash`'s 98.3 was an instrument artifact
+
+The table above first read **98.3 B/sample** for `%write-key-hash`, against a docstring stating its
+residual is ~32 B — the deliberately fresh result array, which is retained on three paths (the CacheChange,
+the `dw-instances` key, the deadline-timer key) and so cannot be recycled without ADR 0076's stable-handle
+indirection. That discrepancy was flagged rather than acted on. **Chasing it was right, and the docstring
+won.**
+
+Re-run with five *nested* windows inside `%write-key-hash` — the `keeplast-p` test, both CAS halves, the
+scratch accessor, the `%instance-handle` call — and **every one of them reads 0.00, including the outer
+window that had read 95.91.** The type's key is a single `:i32`, four octets, so the generated key-hash
+takes the ≤16-direct path (`replace out vec`) and never touches `subseq`/`md5`; the only allocation it can
+make is the 32 B result array, and even that is below what this instrument resolves.
+
+The 98.3 was charge that landed in that window because it was **the first probe after a stretch of
+unprobed code** — the benchmark loop and `write-sample`'s entry. `get-bytes-consed` moves in TLAB-sized
+jumps, so a window is charged when the refill lands in it, not when the object is allocated.
+
+**This is the fourth demonstration this session, and the rule has earned its capitals: RANK WITH THE
+WINDOWS, SIZE WITH THE GATE.** Three times a window *under*-reported a win (cursor, prefix, reader-keys);
+here it invented one. The six shipped slices were all sized by `make gate-mem`, which is why every one of
+them landed within a few percent of its prediction — and the predictions themselves came from *reading the
+source* (48 B struct, 32 B vector, 3 objects ≈ 128 B), not from the windows.
 
 ## Session position
 
