@@ -13315,3 +13315,69 @@
       (dds.dcps:delete-participant pw)
       (dds.dcps:delete-participant pr))
     t))
+
+(defun* run-reader-cache-race-test ()
+    (function () t)
+  "Test: ADR 0093 slice 3 — concurrent access to ONE DataReader's cache neither loses nor duplicates a
+   sample.
+
+   The reader-side cache was built on the claim that it is 'never mutated off-thread (S2)'. That claim was
+   FALSE: wait-set-wait drains from whatever thread waits, and the discovery/announcer thread rewrites the
+   same structures through %on-writer-vanished and %autopurge-sweep — none of it synchronised. Two threads
+   concurrently SETF-ing and NCONC-ing one list lose samples outright.
+
+   Two application threads take from one reader while a writer publishes N keyed samples. The UNION of
+   what they take must be exactly the N written, with NO duplicate: a lost sample means an interleaved
+   list rewrite dropped it, a duplicate means both threads selected the same cached-sample before either
+   removed it. Without the cache lock this fails; with it, it holds.
+
+   ⚠️ This is the prerequisite for pooling the data struct (ADR 0093 slice 4). Today the race corrupts
+   GC-managed lists; once wrappers are recycled the SAME race hands one thread a struct another is
+   reading — a use-after-free no correctness test would see."
+  (let* ((n 200)
+         (ts (dds.types:find-type-support "shape-type"))
+         (pw (dds.dcps:create-participant :domain (test-domain +td-reader-cache-race+)))
+         (pr (dds.dcps:create-participant :domain (test-domain +td-reader-cache-race+))))
+    (unwind-protect
+         (let* ((tw (dds.dcps:create-topic pw "Adr93Race" "shape-type" ts))
+                (tr (dds.dcps:create-topic pr "Adr93Race" "shape-type" ts))
+                (dw (dds.dcps:create-datawriter (dds.dcps:create-publisher pw) tw
+                                                :qos (dds.qos:make-writer-qos :reliability :reliable :history-kind :keep-all)))
+                (dr (dds.dcps:create-datareader (dds.dcps:create-subscriber pr) tr
+                                                :qos (dds.qos:make-reader-qos :reliability :reliable :history-kind :keep-all)))
+                (seen '())
+                (seen-lock (dds.pal:make-lock "adr93-race"))
+                (stop nil))
+           (loop repeat 250 until (and (plusp (dds.dcps:matched-count pw)) (plusp (dds.dcps:matched-count pr)))
+                 do (dds.dcps:spin pw) (dds.dcps:spin pr) (sleep 0.02))
+           (%check :adr93r-matched (plusp (dds.dcps:matched-count pr)) "writer/reader never matched")
+           (flet ((taker ()
+                    ;; two of these run concurrently against the SAME reader
+                    (loop until stop
+                          do (let ((got (dds.dcps:take-samples dr)))
+                               (when (listp got)
+                                 (dds.pal:with-lock (seen-lock)
+                                   (dolist (cs got)
+                                     (push (shape-type-x (dds.dcps:cached-sample-data cs)) seen))))
+                               (dds.dcps:return-loan dr (if (listp got) got '()))))))
+             (let ((t1 (dds.pal:spawn #'taker :name "adr93-taker-1"))
+                   (t2 (dds.pal:spawn #'taker :name "adr93-taker-2")))
+               (dotimes (i n)
+                 (dds.dcps:write-sample dw (make-shape-type :color "R" :x i :y 0 :shapesize 1)))
+               (loop repeat 400
+                     until (= n (dds.pal:with-lock (seen-lock) (length seen)))
+                     do (dds.dcps:spin pw) (sleep 0.01))
+               (setf stop t)
+               (dds.pal:join-bounded t1 :adr93-taker 10)
+               (dds.pal:join-bounded t2 :adr93-taker 10)))
+           (let* ((got (dds.pal:with-lock (seen-lock) (copy-list seen)))
+                  (uniq (remove-duplicates got)))
+             (%check :adr93r-no-duplicate (= (length got) (length uniq))
+                     (format nil "two concurrent takers must never both receive the same sample; ~d taken, ~d distinct"
+                             (length got) (length uniq)))
+             (%check :adr93r-no-loss (= n (length uniq))
+                     (format nil "the union of both takers must be exactly the ~d written samples; got ~d distinct (a lost sample = an interleaved cache rewrite)"
+                             n (length uniq)))))
+      (dds.dcps:delete-participant pw)
+      (dds.dcps:delete-participant pr))
+    t))

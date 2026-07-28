@@ -215,3 +215,8 @@
   "ADR 0093 slice 2 isolation offset: ONE writer plus TWO co-located SAME-topic readers, and the assertion is
    about the SIZE OF THE SHARED RECEIVE STORE after each reader drains. Any foreign participant on the domain
    would put its own samples in that store and the count would stop meaning what the test says it means.")
+
+(defconstant +td-reader-cache-race+ 53
+  "ADR 0093 slice 3 isolation offset: TWO application threads taking from ONE DataReader while a writer
+   publishes. The assertion is that the union of what the two threads take is EXACTLY what was written, so
+   a foreign participant's samples on the domain would break the count.")

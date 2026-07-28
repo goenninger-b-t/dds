@@ -194,21 +194,25 @@
   "Drain newly-received samples and count those matching the DDS THREE state masks — sample_state in
    STATES, view_state in VIEW-STATES, instance_state in INSTANCE-STATES (%state-mask-match-p; the mask
    defaults are ANY, so a two-argument call is the pre-three-mask sample-state-only count)."
-  (%drain dr)
-  (count-if (lambda (cs)
-              (%state-mask-match-p dr (cached-sample-info cs) states view-states instance-states))
-            (dr-cache dr)))
+  ;; ADR 0093 slice 3: this runs on whatever thread called WAIT-SET-WAIT — NOT necessarily the taker's —
+  ;; so the drain and the count share the reader cache lock. WS-LOCK does not help: a taker never takes it.
+  (%with-reader-cache (dr)
+   (%drain-unlocked dr)
+   (count-if (lambda (cs)
+               (%state-mask-match-p dr (cached-sample-info cs) states view-states instance-states))
+             (dr-cache dr))))
 
 (defun* %count-matching-query (dr states query-fn &optional (view-states +any-view-states+)
                                                             (instance-states +any-instance-states+))
     (function (data-reader list function &optional list list) (integer 0))
   "Drain newly-received samples and count those matching the DDS three state masks (as %count-matching)
    AND whose data satisfies QUERY-FN (the query-condition trigger predicate)."
-  (%drain dr)
-  (count-if (lambda (cs)
-              (and (%state-mask-match-p dr (cached-sample-info cs) states view-states instance-states)
-                   (funcall query-fn (cached-sample-data cs))))
-            (dr-cache dr)))
+  (%with-reader-cache (dr)
+   (%drain-unlocked dr)
+   (count-if (lambda (cs)
+               (and (%state-mask-match-p dr (cached-sample-info cs) states view-states instance-states)
+                    (funcall query-fn (cached-sample-data cs))))
+             (dr-cache dr))))
 
 (defgeneric condition-trigger-value (c)
   (:documentation "DDS Condition::get_trigger_value — the current trigger state."))

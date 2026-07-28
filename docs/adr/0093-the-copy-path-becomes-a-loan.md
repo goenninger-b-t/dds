@@ -94,7 +94,7 @@ Each **constrains the design**; none is hypothetical.
 | # | hazard | site (verified 2026-07-28) | how it is handled |
 |---|---|---|---|
 | 1 | **read/take aliasing** — `%select-samples` returns the SAME `cached-sample` objects, no defensive copy; `take` removes them from the cache, `read` leaves them | `entities.lisp:3119` | THE reason a loan contract is required at all: the lifetime becomes explicit instead of implied |
-| 2 | **WaitSet drains `dr-cache` on ANOTHER thread** — `wait-set-wait`'s predicate calls `%drain` on whatever thread waits, not the take thread | `conditions.lisp:197, 207` | **Prerequisite: prove safe (or serialise `%drain` per reader) BEFORE the data-struct slice.** Not deferrable — "never mutated off-thread" is asserted today and this violates it |
+| 2 | **`dr-cache` is mutated from THREE thread contexts with no synchronisation whatever** — the application (read/take/samples-available), whatever thread calls `wait-set-wait` (its predicate `%drain`s, and `ws-lock` excludes no taker), and the discovery/announcer thread (`%on-disc-unmatch` → `%on-writer-vanished`; `%spin-once` → `%autopurge-sweep`) | `conditions.lisp:197, 207`; `entities.lisp` `%on-writer-vanished`, `%autopurge-sweep` | ✅ **SLICE 3 — FIXED.** A per-reader cache lock; see §10 |
 | 3 | **`instance-rec-key-sample` retains sample #1 per instance FOREVER** for `get_key_value` | `entities.lisp:454, 1972, 2966` | that one struct is a **retained heap copy, excluded from the pool**. ⭐ It costs **O(instances), not O(samples)** — so it amortises to ~0 per sample in steady state and does **not** block the target |
 | 4 | **N≥2 same-topic readers leak the shared store sample** — purge is gated on `node-sole-consumer-p` | `entities.lisp:2987–2990`, `dataplane.lisp:3038` | a per-sample remaining-consumers refcount (the `%zc-bump` pattern). A real existing bug **and** a prerequisite for correct multi-reader recycling |
 | 5 | **KEEP_LAST loan UAF guard** — never releases an app-held `:read` view | `entities.lisp:2235` | extend the same guard to the pooled copy structs |
@@ -136,7 +136,7 @@ Phase A being done, and per the VSD rule (thinnest end-to-end slice first, throu
   ⚠️ Test-writing trap found here: `samples-available` **drains**, so polling it on the second reader
   consumes that reader's share before the assertion — the first cut reported a leak-fix that had not
   happened.
-- **Slice 3:** **prove hazard 2 safe** (WaitSet cross-thread `%drain`), or serialise it. Gate for slice 4.
+- **Slice 3 — ✅ DONE.** Hazard 2 was **not** safe; serialised. See §10.
 - **Slice 4:** pool the **data struct** via the already-generated `deserialize-into-<name>`, with the
   hazard-3 key-sample carve-out. This is the big one and the bulk of the remaining bytes.
 
@@ -216,7 +216,42 @@ time, because `%select-samples` legitimately re-stamps three of the slots at sel
 Falsified both ways: dropping one slot from the re-init turns `:adr93-no-stale-sn` red and nothing else;
 never recycling turns `:adr93-reused` red.
 
-## 10. Two known-unknowns carried in, not papered over
+## 10. Slice 3 as built (2026-07-28) — hazard 2 was real, and worse than "unproven"
+
+The reader cache was built on `%drain`'s claim that both streams are drained on the user thread "so the
+reader cache + instance-recs are never mutated off-thread (S2)", and on `dr-keyhash-scratch`'s that the
+take path is "single-threaded-per-reader". **Both were false**, and there is no lock anywhere on the
+reader: `dr-cache` is `setf`/`nconc`'d at ~10 sites from the three contexts in §5 hazard 2.
+
+**Fixed with a per-reader cache lock** (`%with-reader-cache`), taken by `%drain`, `%select-samples`,
+`return-loan`, `take-loaned`/`read-loaned`, `samples-available`, the WaitSet predicates
+(`%count-matching`, `%count-matching-query`), `%on-writer-vanished` and `%autopurge-sweep`.
+
+- **Lock order: cache lock OUTER, node lock INNER.** Safe against the discovery path because dds.disc
+  fires `on-unmatch` *outside* the node lock (`%prune-participant-locked` hands its removed matches out
+  first). Nothing takes the node lock and then the cache lock.
+- **Not recursive**, so the two callers that arrive already holding it — the KEEP_LAST loan drop inside
+  `%drain`, and `return-loan` recursing into a wrapper's backing loan — go through
+  `%return-loan-unlocked`.
+- **Drain and select are two separate critical sections, deliberately.** The safety property needed is
+  that no list mutation interleaves with another and that a wrapper handed out is out of the cache before
+  it can be recycled; both hold per-section. Holding one lock across a whole read/take would serialise
+  more for no safety gain. Two concurrent takers may each miss samples the other got — DDS never promised
+  otherwise — but neither corrupts.
+
+⚠️ **This was not only a slice-4 prerequisite: slice 1 had already made it a CRASH.** Before slice 1 the
+race lost or duplicated samples. After it, `%recycle-delivery` clears a returned wrapper's `data`, so a
+concurrent taker holding that wrapper reads `NIL` — falsified exactly so: with the lock removed, the test
+dies with `TYPE-ERROR: NIL is not SHAPE-TYPE` on a taker thread and the process takes a **fatal sig10**.
+So commits `3aed0a1`..`508ae5e` carry a narrow crash window for an application that both takes from two
+threads on one reader **and** returns its loans. Narrow, but real, and introduced here rather than
+inherited.
+
+**Test** `reader-cache-race`: two threads take from one reader while a writer publishes 200 keyed samples;
+the union must be exactly those 200 with no duplicate. Falsified by disabling the lock (process dies).
+622/622 both impls; **gate-mem unchanged** — the lock costs no allocation.
+
+## 11. Two known-unknowns carried in, not papered over
 
 - **A ~65 KB per-run allocation** inside the measured window, 0–3 times per run, still unexplained. At
   60 000 samples it amortises to ~1 B so the gate is not perturbed — but it is a real, possibly leaking,

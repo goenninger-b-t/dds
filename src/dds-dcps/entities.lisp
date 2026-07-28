@@ -175,7 +175,8 @@
    (wrapper-pool-top :initform 0 :accessor dr-wrapper-pool-top)   ; stack pointer into WRAPPER-POOL
    (keyhash-scratch :initform nil :accessor dr-keyhash-scratch) ; RX-POOLING (ADR 0075): reusable :big cursor over a 256-octet buffer for the per-sample instance-handle key serialization — created once, zero per-sample make-octet-buffer/cursor/free-static; single-threaded per reader (the drain runs on the user thread, take is single-threaded-per-reader) (NFR-MEM)
    (keyhash-out :initform nil :accessor dr-keyhash-out) ; RX-POOLING (ADR 0076): reusable 16-octet RESULT array for the drain's TRANSIENT instance-handle — the handle is used only for the instance-rec lookup, then the STABLE handle is read off the rec; created once, zero per-sample make-array on a known instance (NFR-MEM)
-   (status-lock :initform (dds.pal:make-lock "dr-status") :accessor dr-status-lock))
+   (status-lock :initform (dds.pal:make-lock "dr-status") :accessor dr-status-lock)
+   (cache-lock :initform (dds.pal:make-lock "dr-cache") :accessor dr-cache-lock))   ; ADR 0093 slice 3: serialises EVERY mutation of dr-cache / dr-instance-recs / the per-reader scratches. See %WITH-READER-CACHE — the "drained only on the user thread" assumption these structures were built on is FALSE, and this is what makes it true
   (:documentation "DDS DataReader: receives typed samples on a Topic into a read/take
    cache with per-instance SampleInfo, carrying its SUBSCRIPTION_MATCHED,
    REQUESTED_INCOMPATIBLE_QOS and SAMPLE_REJECTED statuses, conditions and listener."))
@@ -441,6 +442,35 @@
    LET: the drain runs on the receiver and user threads, so a thread-local binding is invisible there and
    the A/B reads as a no-op 'dud' — the trap that produced two false negatives in the allocation campaign.
    Delivered behaviour is IDENTICAL either way; only the allocation differs.")
+
+(defmacro %with-reader-cache ((dr) &body body)
+  "Run BODY holding DR's cache lock — the serialisation of the reader-side sample cache (ADR 0093 slice 3).
+
+   ⚠️ THE INVARIANT THIS ENFORCES DID NOT HOLD. %DRAIN's docstring stated that both streams are drained on
+   the user thread 'so the reader cache + instance-recs are never mutated off-thread (S2)', and
+   dr-keyhash-scratch's says the take path is 'single-threaded-per-reader'. Neither was true. THREE
+   independent contexts mutate DR-CACHE with no synchronisation whatever:
+
+     1. the application thread — read/take/samples-available, all of which %DRAIN;
+     2. whatever thread calls WAIT-SET-WAIT — its trigger predicate (%COUNT-MATCHING) %DRAINs too, and
+        WS-LOCK does not exclude a taker, which never acquires it;
+     3. the discovery/announcer thread — %ON-DISC-UNMATCH -> %ON-WRITER-VANISHED and %SPIN-ONCE ->
+        %AUTOPURGE-SWEEP both rewrite DR-CACHE and the instance-recs.
+
+   Concurrently SETF-ing and NCONC-ing one list from two threads loses samples outright. Today that is a
+   data race on GC-managed objects; once the delivery wrappers are POOLED (ADR 0093 slice 4) the same race
+   recycles a struct another thread is reading — a use-after-free no correctness test would see. That is
+   why this is a PREREQUISITE of slice 4 rather than a tidy-up.
+
+   ⚠️ LOCK ORDER: THIS LOCK IS OUTER, THE NODE LOCK IS INNER. %DRAIN takes the node lock inside this one
+   (node-collect-pending-* / node-consume-sample). Nothing may take the node lock and then this: the
+   discovery unmatch hook is safe precisely because %PRUNE-PARTICIPANT-LOCKED hands its removed matches out
+   and fires ON-UNMATCH *outside* the node lock (dds-disc/disc.lisp).
+
+   ⚠️ NOT RECURSIVE. An entry point that already holds it must call the -UNLOCKED variant — %DRAIN reaches
+   RETURN-LOAN through the KEEP_LAST loan drop, and RETURN-LOAN recurses into itself for a wrapper that
+   wraps a loan, so both go through %RETURN-LOAN-UNLOCKED."
+  `(dds.pal:with-lock ((dr-cache-lock ,dr)) ,@body))
 
 (defparameter *rx-wrapper-pool-capacity* 64
   "How many returned delivery wrappers ONE DataReader parks for reuse (ADR 0093 slice 1). Read once, when
@@ -2250,8 +2280,14 @@
    (DDS 1.4 §2.2.2.5.1.3 — the DataReader declares an instance not-alive when it detects no
    live DataWriter writing it) and gets an invalid-data notification (§2.2.2.5.1.4). v1 has one
    user writer per remote participant, so this is the last-writer case. Wakes DATA_AVAILABLE
-   once if any instance transitioned."
-  (let ((changed nil))
+   once if any instance transitioned.
+
+   ⚠️ FIRED FROM THE DISCOVERY UNMATCH HOOK, i.e. NOT the application thread, so it takes the cache lock
+   (ADR 0093 slice 3). Safe against the drain's lock order because dds.disc fires ON-UNMATCH *outside* the
+   node lock (%prune-participant-locked hands its removed matches out first): cache lock OUTER, node lock
+   INNER, never the reverse."
+  (%with-reader-cache (dr)
+   (let ((changed nil))
     (maphash
      (lambda (handle rec)
        (when (member wid (instance-rec-writers rec))
@@ -2263,7 +2299,7 @@
            (%enqueue-instance-notification dr handle rec)
            (setf changed t))))
      (dr-instance-recs dr))
-    (when changed (%wake-reader-data dr)))
+    (when changed (%wake-reader-data dr))))
   t)
 
 (defun* %reader-revive-instance (dr handle wid)
@@ -2368,7 +2404,7 @@
     (when (and (>= count depth) oldest)
       (let ((data (cached-sample-data oldest)))
         (if (dds.types:flatdata-view-p data)
-            (return-loan dr (list data))                                ; ZC loan: full teardown; UAF-safe (oldest is :not-read)
+            (%return-loan-unlocked dr (list data))                      ; ZC loan: full teardown; UAF-safe (oldest is :not-read). UNLOCKED: reached from %drain, which already holds the cache lock
             (setf (dr-cache dr) (delete oldest (dr-cache dr) :test #'eq))))))   ; copy-path fallback sample: plain drop
   t)
 
@@ -2387,7 +2423,7 @@
     (when (and (>= count depth) oldest)
       (let ((loan (cached-sample-loan oldest)))
         (if (dds.disc:secured-loan-handle-p loan)
-            (return-loan dr (list loan))                              ; full teardown, type-dispatched to node-return-loan
+            (%return-loan-unlocked dr (list loan))                    ; full teardown, type-dispatched to node-return-loan. UNLOCKED: reached from %drain
             (setf (dr-cache dr) (delete oldest (dr-cache dr) :test #'eq))))))   ; carve-fail copy sample: lossy bare drop
   t)
 
@@ -2496,16 +2532,22 @@
    NOT_ALIVE instance whose applicable autopurge delay is finite AND has elapsed since the instance went
    not-alive, PURGE it (%autopurge-purge-instance). Both delays default DURATION_INFINITE, so the common
    case is a no-op — no instance is ever purged by default. Run on the DCPS announce cadence (SPIN),
-   beside the writer-liveliness/lease sweeps; mutates dr-cache + instance-recs on the user/spin thread
-   only (the dr-cache owner thread), never the receiver thread (S2 lock discipline). Snapshots the
-   due handles before mutating so the maphash is not modified under iteration."
-  (let ((now (%lease-now)) (due '()))
+   beside the writer-liveliness/lease sweeps. Snapshots the due handles before mutating so the maphash is
+   not modified under iteration.
+
+   ⚠️ IT DOES NOT RUN ON 'THE DR-CACHE OWNER THREAD', WHICH IS WHY IT TAKES THE CACHE LOCK (ADR 0093
+   slice 3). This docstring used to claim it mutated dr-cache 'on the user/spin thread only (the dr-cache
+   owner thread)'. In AUTONOMOUS mode (ADR 0056) SPIN is driven by the participant's announcer thread, so
+   the sweep rewrites dr-cache and the instance-recs concurrently with an application take. There is no
+   owner thread."
+  (%with-reader-cache (dr)
+   (let ((now (%lease-now)) (due '()))
     (maphash
      (lambda (handle rec)
        (when (%autopurge-due-p rec (%autopurge-instance-delay dr rec) now)
          (push handle due)))
      (dr-instance-recs dr))
-    (dolist (handle due) (%autopurge-purge-instance dr handle)))
+    (dolist (handle due) (%autopurge-purge-instance dr handle))))
   t)
 
 (defun* %participant-readers (p)
@@ -2903,8 +2945,11 @@
    (force-reclaim skips refcount>0). The app MUST return-loan the views when done (a leaked loan pins a slot ⇒
    the writer's pool eventually falls back to non-ZC — graceful, never a wedge). NOT cleared for ship — pending
    counsel (R6)."
-  (%drain dr)
-  (let ((data '()) (loans '()) (touched '()))
+  ;; ADR 0093 slice 3: ONE critical section — unlike read/take-samples these mutate dr-cache inline
+  ;; rather than through %select-samples, so the drain and the cache walk share the lock here.
+  (%with-reader-cache (dr)
+   (%drain-unlocked dr)
+   (let ((data '()) (loans '()) (touched '()))
     (dolist (cs (dr-cache dr))
       (let* ((info (cached-sample-info cs)) (d (cached-sample-data cs))
              (handle (sample-info-instance-handle info)))
@@ -2917,7 +2962,7 @@
               ((dds.disc:secured-loan-handle-p (cached-sample-loan cs)) (push (cached-sample-loan cs) loans)))))   ; secured: the pooled-buffer handle (ADR 0038 (i)); NIL otherwise
     (dolist (h touched) (setf (gethash h (dr-instances dr)) t))
     (setf (dr-cache dr) '())                                    ; take removes ALL drained samples
-    (values (nreverse data) (nreverse loans))))
+    (values (nreverse data) (nreverse loans)))))
 
 (defun* read-loaned (dr)
     (function (data-reader) (values list list))
@@ -2926,8 +2971,11 @@
    (values DATA-LIST LOANS) for the cached samples, marking each READ. The SAME loan-registry views are returned
    each call until return-loan releases them; the app still returns each view once (return-loan is idempotent, so
    a view returned after a read-then-take is a safe no-op). NOT cleared for ship — pending counsel (R6)."
-  (%drain dr)
-  (let ((data '()) (loans '()) (touched '()))
+  ;; ADR 0093 slice 3: ONE critical section — unlike read/take-samples these mutate dr-cache inline
+  ;; rather than through %select-samples, so the drain and the cache walk share the lock here.
+  (%with-reader-cache (dr)
+   (%drain-unlocked dr)
+   (let ((data '()) (loans '()) (touched '()))
     (dolist (cs (dr-cache dr))
       (let* ((info (cached-sample-info cs)) (d (cached-sample-data cs))
              (handle (sample-info-instance-handle info)))
@@ -2939,9 +2987,9 @@
         (cond ((dds.types:flatdata-view-p d) (push d loans))     ; FlatData: the view is both DATA and loan (ADR 0017)
               ((dds.disc:secured-loan-handle-p (cached-sample-loan cs)) (push (cached-sample-loan cs) loans)))))   ; secured: the pooled-buffer handle (ADR 0038 (i))
     (dolist (h touched) (setf (gethash h (dr-instances dr)) t))
-    (values (nreverse data) (nreverse loans))))
+    (values (nreverse data) (nreverse loans)))))
 
-(defun* return-loan (dr loans)
+(defun* %return-loan-unlocked (dr loans)
     (function (data-reader list) t)
   "DataReader::return_loan — WP-FLATDATA-ZC-LOAN (FR-PF-3/4, R6, ADR 0017; NOT cleared for ship — pending
    counsel). Release each loaned flatdata-view in LOANS: INVALIDATE its cache entry (drop the cached-sample(s)
@@ -2999,10 +3047,19 @@
        (let ((backing (or (cached-sample-loan v)
                           (let ((d (cached-sample-data v)))
                             (and (dds.types:flatdata-view-p d) d)))))
-         (when backing (return-loan dr (list backing))))   ; HOTPATH-ALLOC(COLD): loan-backed samples only; the copy path never conses here
+         (when backing (%return-loan-unlocked dr (list backing))))   ; HOTPATH-ALLOC(COLD): loan-backed samples only; the copy path never conses here
        (setf (dr-cache dr) (delete v (dr-cache dr)))   ; a RETURNED sample is GONE from the cache, never stale-readable (the rule the ZC arm sets)
        (%recycle-delivery dr v))))
   t)
+
+(defun* return-loan (dr loans)
+    (function (data-reader list) t)
+  "DataReader::return_loan — the PUBLIC entry point: takes DR's cache lock (ADR 0093 slice 3) and releases
+   each loan in LOANS. All the semantics live in %RETURN-LOAN-UNLOCKED; this exists only to serialise the
+   DR-CACHE mutations that release performs against a concurrent drain on another thread.
+   Callers ALREADY holding the cache lock (the KEEP_LAST loan drop inside %DRAIN, and the recursive release
+   of a wrapper's backing loan) must call %RETURN-LOAN-UNLOCKED directly — the lock is not recursive."
+  (%with-reader-cache (dr) (%return-loan-unlocked dr loans)))
 
 (defun* return-all-loans (dr)
     (function (data-reader) t)
@@ -3015,7 +3072,8 @@
    down). A reader that drained secured samples but never took/returned them is swept here; stop-node's own
    dds.disc:node-return-all-loans back-stops any handle the DCPS layer never registered. NOT cleared for ship —
    pending counsel (R6)."
-  (return-loan dr (append (copy-list (dr-loans dr)) (copy-list (dr-secured-loans dr))))   ; WP-DCPS-SECURED-TAKE-LOAN (ADR 0038 (i)): sweep BOTH registries, each released via its own type-dispatched path
+  (%with-reader-cache (dr)
+    (%return-loan-unlocked dr (append (copy-list (dr-loans dr)) (copy-list (dr-secured-loans dr)))))   ; WP-DCPS-SECURED-TAKE-LOAN (ADR 0038 (i)): sweep BOTH registries, each released via its own type-dispatched path
   t)
 
 (defun* %drain-one-sample (dr node ts key)
@@ -3121,9 +3179,10 @@
       (dds.disc:node-consume-sample node sguid sn)))
   t)
 
-(defun* %drain (dr)
+(defun* %drain-unlocked (dr)
     (function (data-reader) t)
-  "Pull newly-received changes from the engine on the USER thread and apply them in UNIFIED
+  "⚠️ CALLER MUST HOLD DR's CACHE LOCK — %DRAIN is the locked entry point.
+   Pull newly-received changes from the engine and apply them in UNIFIED
    SEQUENCE-NUMBER ORDER. Data samples and dispose/unregister lifecycle changes share ONE writer SN
    space (each lifecycle change occupies a real SN), so they form ONE ordered CacheChange stream per
    writer (DDS 1.4 §2.2.2.5 / RTPS 2.5 §8.7.4) — applying them in SN order is the conformant behaviour
@@ -3132,8 +3191,12 @@
    single drain pass. Pending data SNs (above the dr-drained high-water mark) and pending lifecycle SNs
    (not yet in dr-lifecycle-drained) are merged and visited in SN order; each data SN runs
    %drain-one-sample and each lifecycle SN runs %drain-one-lifecycle, each maintaining its own
-   exactly-once discipline. Both streams are drained on the user thread so the reader cache +
-   instance-recs are never mutated off-thread (S2)."
+   exactly-once discipline.
+
+   ⚠️ THE OLD CLAIM HERE — 'both streams are drained on the user thread so the reader cache +
+   instance-recs are never mutated off-thread (S2)' — WAS FALSE, and is why the cache lock now exists:
+   WAIT-SET-WAIT drains from whatever thread waits, and the discovery/announcer thread rewrites the same
+   structures via %ON-WRITER-VANISHED and %AUTOPURGE-SWEEP. See %WITH-READER-CACHE (ADR 0093 slice 3)."
   (let* ((node (dp-node (sub-participant (dr-subscriber dr))))
          (ts (topic-type-support (dr-topic dr)))
          (rid (dr-entity-id dr))
@@ -3246,12 +3309,13 @@
        (member (%snapshot-instance-state dr info) instance-states)
        t))
 
-(defun* %select-samples (dr states where handle max take-p
+(defun* %select-samples-unlocked (dr states where handle max take-p
                          &optional (view-states +any-view-states+)
                                    (instance-states +any-instance-states+))
     (function (data-reader list function (or null (simple-array (unsigned-byte 8) (16)))
               (or null (integer 0)) boolean &optional list list) list)
-  "The shared read/take core (DDS 1.4 §2.2.2.5.3). Assumes DR is already drained. Selects the cached
+  "The shared read/take core (DDS 1.4 §2.2.2.5.3). ⚠️ CALLER MUST HOLD DR's CACHE LOCK
+   (%SELECT-SAMPLES is the locked entry point). Assumes DR is already drained. Selects the cached
    samples matching the THREE state masks — sample_state in STATES, view_state in VIEW-STATES,
    instance_state in INSTANCE-STATES (%state-mask-match-p; both default to ANY, so omitting them is the
    pre-three-mask behaviour) — that satisfy WHERE (the query predicate over the deserialized sample), that
@@ -3284,6 +3348,30 @@
     (dolist (h touched) (setf (gethash h (dr-instances dr)) t))   ; mark accessed after snapshot
     (when take-p (setf (dr-cache dr) (nreverse keep)))
     (nreverse out)))
+
+(defun* %drain (dr)
+    (function (data-reader) t)
+  "Drain DR under its cache lock (ADR 0093 slice 3). The work is %DRAIN-UNLOCKED; this is the entry point
+   every caller uses. Callers already holding the lock use the -UNLOCKED form directly — the lock is not
+   recursive. Lock order: cache lock OUTER, node lock INNER (the drain takes the node lock inside)."
+  (%with-reader-cache (dr) (%drain-unlocked dr)))
+
+(defun* %select-samples (dr states where handle max take-p
+                         &optional (view-states +any-view-states+)
+                                   (instance-states +any-instance-states+))
+    (function (data-reader list function (or null (simple-array (unsigned-byte 8) (16)))
+              (or null (integer 0)) boolean &optional list list) list)
+  "Select from DR's cache under its cache lock (ADR 0093 slice 3); the work is %SELECT-SAMPLES-UNLOCKED.
+
+   Selection and the preceding drain are two SEPARATE critical sections, deliberately. Holding one lock
+   across both would serialise a whole read/take against every other reader operation for no safety gain:
+   the memory-safety property needed is only that no LIST MUTATION interleaves with another, and that a
+   wrapper handed to the application is out of the cache before it can be recycled — both of which hold
+   per-section, because selection removes the sample under the lock and RETURN-LOAN recycles under it too.
+   What is NOT promised is that two threads concurrently taking from one reader each see every sample;
+   DDS never promised that, and the interleaving costs a sample to one taker, never corrupts either."
+  (%with-reader-cache (dr)
+    (%select-samples-unlocked dr states where handle max take-p view-states instance-states)))
 
 (defun* read-samples (dr &key (states +any-sample-states+) (where #'%where-any)
                               (view-states +any-view-states+)
@@ -3413,8 +3501,7 @@
     (function (data-reader) (integer 0))
   "Drain newly-received samples into the cache and return the cache size, WITHOUT
    marking anything READ — for polling before a read/take."
-  (%drain dr)
-  (length (dr-cache dr)))
+  (%with-reader-cache (dr) (%drain-unlocked dr) (length (dr-cache dr))))
 
 ;;; ---- Status surfacing: SEDP match / incompatible-QoS events -> entity statuses +
 ;;;      listeners (M3 #3, FR-DCPS-3). These fire on the disc receiver thread; status
