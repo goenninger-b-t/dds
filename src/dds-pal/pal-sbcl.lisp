@@ -55,6 +55,7 @@
   "Release memory obtained from ALLOC-STATIC. Idempotency is the caller's job."
   (static-vectors:free-static-vector vec))
 
+(declaim (inline static-pointer))   ; MEASURED: out of line this BOXES a system-area-pointer (16 B) on every raw sendto/recvfrom and every SHMEM sap-copy — the same defect %ptr+ had
 (defun* static-pointer (vec)
     (function ((simple-array (unsigned-byte 8) (*))) t)
   "Return the raw foreign pointer (SBCL system-area-pointer) to VEC for syscalls.

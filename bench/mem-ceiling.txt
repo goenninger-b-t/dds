@@ -69,8 +69,13 @@
 # to 0.00, and the end-to-end path by -112 B/sample on BOTH arms:
 #   arm64 COPY   1740.7 -> 1628.3 / 1630.5 / 1628.3   -> LOWERED 1775 -> 1660
 #   arm64 RETURN 1534.9 -> 1422.5 / 1423.7 / 1426.3   -> LOWERED 1570 -> 1460
+# LOWERED 2026-07-28 (static-pointer inlined — the SAME defect as %ptr+, one level down: an out-of-line
+# defun* returning a system-area-pointer boxes it, on every raw sendto/recvfrom and every SHMEM sap-copy):
+#   arm64 COPY   1628.3 -> 1563.8 / 1566.8 / 1566.0   -> LOWERED 1660 -> 1600
+#   arm64 RETURN 1422.5 -> 1358.8 / 1360.4 / 1358.5   -> LOWERED 1460 -> 1390
+#
 # x86_64 is NOT re-measured here; its COPY row stays 1740 and will simply not bite until someone measures
 # it on that arch. Never derive it from arm64.
 #   x86_64 not measured here — the dash is honest, not lazy.
-arm64  1660 1460
+arm64  1600 1390
 x86_64 1740 -

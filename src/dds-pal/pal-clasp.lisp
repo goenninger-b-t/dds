@@ -66,6 +66,7 @@
     (push vec (gethash (length vec) *static-pool*)))
   t)
 
+(declaim (inline static-pointer))   ; MEASURED: out of line this BOXES a system-area-pointer (16 B) on every raw sendto/recvfrom and every SHMEM sap-copy — the same defect %ptr+ had
 (defun* static-pointer (vec)
     (function ((simple-array (unsigned-byte 8) (*))) t)
   "Return the raw foreign pointer to VEC for syscalls / SHMEM. Stable across GC."

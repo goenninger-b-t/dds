@@ -51,3 +51,39 @@ candidate functions (all allocation-free) and then measuring the primitive under
 
 623/623 SBCL · gate-hotpath / types (3193) / pal / nocond / drivers PASS · ceilings lowered on both arm64
 columns. x86_64 is **not** re-measured here and its rows are untouched — never derive one arch from the other.
+
+---
+
+## Follow-up the same day: `static-pointer`, the same defect one level down — a further **−65 B/sample**
+
+Generalising the finding ("any out-of-line function returning a SAP boxes it") turned up
+`dds.pal:static-pointer`, an out-of-line `defun*` returning the foreign pointer of a static vector. It is
+called by `sap-copy-in` / `sap-copy-out` (every SHMEM record) **and** by the raw `sendto`/`recvfrom` paths
+(every UDP datagram). Same one-line fix, on both impls.
+
+| | before | after (3 runs) | ceiling |
+|---|---|---|---|
+| COPY | 1628.3 | 1563.8 · 1566.8 · 1566.0 | 1660 → **1600** |
+| RETURN | 1422.5 | 1358.8 · 1360.4 · 1358.5 | 1460 → **1390** |
+
+Isolated: `sap-copy-out` / `sap-copy-in` of 64 B went **16.06 → 0.00 B/call**.
+
+**Cumulative for the two inlines: 1740.7 → 1566 (COPY) and 1534.9 → 1360 (RETURN), −177 B/sample.**
+
+### The sweep that found it, and what it cleared
+
+Rather than guess again, every hot PAL primitive was measured in isolation (200 000 calls each):
+
+```
+load-sap-u8/u16/u32/u64   0.00     store-sap-u8/u64   0.00
+cas-sap-u32/u64           0.00     fence :acquire/:full 0.00
+sap-copy-out / -in       16.06  -> 0.00 after the fix
+monotonic-ns             16.06     realtime-ns        16.06
+```
+
+So the SAP load/store/CAS/fence primitives are genuinely free, and `shm-sap` was checked separately (0.00 —
+it reads an already-boxed slot). **The two clocks still box.** Counted over a real run: `monotonic-ns` is
+**0.00 calls/sample** (confirming it is off the per-sample path) and `realtime-ns` **1.02** — the DDS
+`source_timestamp`, one per write, so ~16 B/sample remains there. Unlike `monotonic-ns`, `realtime-ns` has
+no per-thread pre-allocated `timespec` and takes `cffi:with-foreign-object` on every call; giving it the
+same treatment is the next step, and is a better fix than narrowing its declared return type.
