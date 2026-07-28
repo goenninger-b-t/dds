@@ -693,28 +693,39 @@
         (dds.pal:free-static (dds.core.buffer:octet-buffer-vec buf))
         out))))
 
-(defun* %sample-serializer-into (ts sample rep)
-    (function (t t symbol) function)
-  "WP-PERF (NFR-MEM / NFR-PERF-8): a closure (lambda (octet-buffer) -> LENGTH) that writes SAMPLE's
-   SerializedPayload — encapsulation header + body + finalized options — DIRECTLY into a caller-supplied
-   buffer, and returns the octet length. Framing is byte-identical to %serialize-sample (same %rep->codec,
+(defmacro %with-sample-serializer-into ((var ts sample rep) &body body)
+  "WP-PERF (NFR-MEM / NFR-PERF-8): bind VAR to a serializer of SAMPLE — (lambda (octet-buffer) -> LENGTH),
+   writing the SerializedPayload (encapsulation header + body + finalized options) DIRECTLY into a
+   caller-supplied buffer — and run BODY. Framing is byte-identical to %serialize-sample (same %rep->codec,
    same header, same finalize); the ONLY difference is that the buffer is supplied, not allocated.
 
    That difference is the point: %serialize-sample allocated a static octet-buffer (alloc + ZERO), serialized,
    allocated a FRESH GC-HEAP vector, memcpy'd into it and freed the static buffer — two allocations, a zeroing,
-   a copy and a free, on EVERY write. This closure lets dds.disc:publish-sample-into serialize straight into an
-   arena-pooled buffer the CacheChange then owns, so steady state conses ZERO bytes per sample on TX.
+   a copy and a free, on EVERY write. This serializer lets dds.disc:publish-sample-into serialize straight into
+   an arena-pooled buffer the CacheChange then owns.
+
+   ⚠️ IT IS A MACRO, AND THAT IS THE WHOLE POINT (ADR 0072). It used to be a function RETURNING the closure,
+   and a closure that is RETURNED must be heap-allocated — SBCL cannot stack-allocate through the escape —
+   so every write consed one (~48 B: header + code + the four captured values). As an flet declared
+   DYNAMIC-EXTENT it stack-allocates instead. This is sound because publish-sample-into is a pure DOWNWARD
+   FUNARG consumer: it funcalls the serializer in its pooled arm and in its `allocating` fallback (itself a
+   local labels that never escapes) and stores it nowhere. Same idiom, same reasoning, as the per-ACKNACK
+   %build-acknack builder.
 
    A FlatData type with a non-XCDR2 offered rep still needs the transcoding builder (which allocates), so that
    case is not eligible — the caller (write-sample) routes it to the allocating path."
-  (multiple-value-bind (mode encap) (%rep->codec rep (dds.types:type-support-extensibility ts))
-    (let ((ser (dds.types:type-support-serialize ts)))
-      (lambda (buf)
-        (let ((wc (dds.core.buffer:cursor buf :endianness :little)))
-          (dds.cdr:make-encapsulation-header wc encap)
-          (funcall ser sample wc mode)
-          (dds.cdr:finalize-encapsulation-options wc encap)
-          (dds.core.buffer:cursor-position wc))))))
+  (let ((mode (gensym "MODE")) (encap (gensym "ENCAP")) (ser (gensym "SER")))
+    `(multiple-value-bind (,mode ,encap)
+         (%rep->codec ,rep (dds.types:type-support-extensibility ,ts))
+       (let ((,ser (dds.types:type-support-serialize ,ts)))
+         (flet ((,var (buf)
+                  (let ((wc (dds.core.buffer:cursor buf :endianness :little)))
+                    (dds.cdr:make-encapsulation-header wc ,encap)
+                    (funcall ,ser ,sample wc ,mode)
+                    (dds.cdr:finalize-encapsulation-options wc ,encap)
+                    (dds.core.buffer:cursor-position wc))))
+           (declare (dynamic-extent #',var))
+           ,@body)))))
 
 (defun* %flatdata-transcoding-p (ts rep)
     (function (t symbol) t)
@@ -1736,16 +1747,18 @@
     (let* ((ts (topic-type-support (dw-topic dw)))
            (rep (%writer-tx-rep dw))
            (ts-ns (or source-timestamp (dds.pal:realtime-ns)))   ; ADR 0055: a plain write stamps the CURRENT wall-clock (DDS 1.4 §2.2.2.4.2.11 write = write_w_timestamp(now))
-           (rc (progn
-                 (if (%flatdata-transcoding-p ts rep)
-                       ;; FlatData under a non-XCDR2 offered rep: the transcoding builder allocates -> allocating path.
-                       (dds.disc:publish-sample node (%serialize-sample ts sample rep) kh nil 0 nil
-                                                (dw-entity-id dw) ts-ns)
-                       ;; WP-PERF: serialize STRAIGHT INTO the writer's arena-pooled buffer — 0 bytes/sample on TX.
-                       ;; Degrades to the allocating path by itself if no pool can be carved / the pool is exhausted.
-                       (dds.disc:publish-sample-into node (%sample-serializer-into ts sample rep) kh
-                                                     (dw-entity-id dw)   ; WP-N-ENDPOINT-S1: THIS writer's own HistoryCache
-                                                     ts-ns)))))
+           (rc (if (%flatdata-transcoding-p ts rep)
+                   ;; FlatData under a non-XCDR2 offered rep: the transcoding builder allocates -> allocating path.
+                   (dds.disc:publish-sample node (%serialize-sample ts sample rep) kh nil 0 nil
+                                            (dw-entity-id dw) ts-ns)
+                   ;; WP-PERF: serialize STRAIGHT INTO the writer's arena-pooled buffer — 0 bytes/sample on TX.
+                   ;; Degrades to the allocating path by itself if no pool can be carved / the pool is exhausted.
+                   ;; The serializer is an flet declared DYNAMIC-EXTENT (ADR 0072), so it stack-allocates:
+                   ;; publish-sample-into is a pure downward-funarg consumer and stores it nowhere.
+                   (%with-sample-serializer-into (%ser-into ts sample rep)
+                     (dds.disc:publish-sample-into node #'%ser-into kh
+                                                   (dw-entity-id dw)   ; WP-N-ENDPOINT-S1: THIS writer's own HistoryCache
+                                                   ts-ns)))))
       (when (eq :timeout rc)
         (return-from %write-sample-1 +retcode-timeout+)))   ; full bounded cache, max_blocking_time elapsed
     (assert-liveliness dw)

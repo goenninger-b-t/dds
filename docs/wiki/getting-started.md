@@ -50,9 +50,9 @@ moves down, and the ceiling file is the record of how far NFR-MEM has actually g
 arch's row, and each measured in its **own process on its own domain**:
 
 ```
-gate-mem: COPY   allocation = 1232.0 bytes/sample (ceiling 1265, NFR-MEM target 0)
-gate-mem: RETURN allocation = 1017.8 bytes/sample (ceiling 1055, NFR-MEM target 0)
-gate-mem: PASS — no regression. Returning the loan saves 214.2 B/sample; still 1018 above the target of ZERO.
+gate-mem: COPY   allocation = 1182.7 bytes/sample (ceiling 1215, NFR-MEM target 0)
+gate-mem: RETURN allocation = 976.1 bytes/sample (ceiling 1010, NFR-MEM target 0)
+gate-mem: PASS — no regression. Returning the loan saves 206.6 B/sample; still 976 above the target of ZERO.
 ```
 
 - **COPY** — the application takes samples and drops them. The legacy arm, unchanged, so every historical
