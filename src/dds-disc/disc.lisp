@@ -2697,7 +2697,15 @@
   ;; dispatch), so the inbound cursor is LIVE at that moment and sharing one would corrupt the parse.
   (tx-cursor nil :type (or null dds.core.buffer:cursor))
   (prefixes (make-array +rx-prefix-slots+ :initial-element nil) :type simple-vector)
-  (guids (make-array +rx-prefix-slots+ :initial-element nil) :type simple-vector))
+  (guids (make-array +rx-prefix-slots+ :initial-element nil) :type simple-vector)
+  ;; The inbound SequenceNumberSet bitmap an ACKNACK is parsed into. Sized for the spec maximum (256 bits =
+  ;; 8 words, RTPS 2.5 §9.4.2.6), so it fits any legal set and needs no zeroing: the parse fills exactly the
+  ;; M words the wire declared, and every consumer bounds its walk by NUMBITS <= M*32. Unlike the caches
+  ;; beside it this IS a reused scratch — sound only because writer-on-acknack merely READS the bitmap under
+  ;; the writer lock and retains nothing, which is why it is threaded from that ONE call site and never
+  ;; defaulted on inside the parser.
+  (sns-scratch (make-array 8 :element-type '(unsigned-byte 32) :initial-element 0)
+               :type (simple-array (unsigned-byte 32) (8))))
 
 (defvar *rx-context* nil
   "The receive scratch of the receiver thread currently inside %handle-datagram (an RX-CONTEXT), or NIL on

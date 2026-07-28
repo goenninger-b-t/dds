@@ -3926,8 +3926,13 @@
    target writerId WID selects WHICH local DataWriter repairs — the retransmit + GAP + purge run against that
    writer's OWN HistoryCache (%user-writer-for), so an ACKNACK for the 2nd writer never mis-repairs from the
    primary. WID that resolves to no local writer (a foreign/builtin id) is ignored; at N=1 WID IS the primary."
+  ;; NFR-MEM: parse the SequenceNumberSet into THIS receiver thread's own scratch instead of a fresh bitmap
+  ;; per inbound ACKNACK — i.e. per sample. Sound at this call site and nowhere else by default:
+  ;; writer-on-acknack merely walks the bits under the writer lock (dotimes + seqnum-set-bit-p) and retains
+  ;; nothing, and BITMAP is used nowhere else in this function. Off the receiver thread *rx-context* is NIL
+  ;; and the parser allocates exactly as before.
   (multiple-value-bind (rid wid base numbits bitmap count finalp)
-      (dds.rtps.message:parse-acknack-body c flags)
+      (dds.rtps.message:parse-acknack-body c flags (and *rx-context* (rx-context-sns-scratch *rx-context*)))
     (declare (ignore count finalp))
     (let ((w (%user-writer-for node wid)))   ; route to the addressed local DataWriter (N=1: the primary)
       (when w
@@ -3945,13 +3950,20 @@
              base numbits bitmap t)   ; acquire send-refs on resends, atomic with the read (release-safety)
           (unwind-protect
                (let* ((*emit-writer* w)   ; WP-N-ENDPOINT-S1: retransmit + GAP + frag-HB under the ADDRESSED writer's own GUID/HC
-                      (dest (%prefix-user-destination node src-prefix))
-                      ;; (DEST-PREFIX . (host . port)) (T10): the NACKing reader's prefix (src-prefix), or the prefixed fan-out
-                      (peers (if dest (list (cons src-prefix dest)) (%match-destinations-prefixed node t))))
-                 (dolist (pd peers)   ; retransmit present DATA(_FRAG)/dispose, then GAP the missing -> the NACKing reader
-                   (let ((peer (cdr pd)))
-                     (%send-changes-packed node (disc-node-rx-tx-msg node) resends (car peer) (cdr peer) nil nil nil nil 0 (car pd))
-                     (when gaps (%send-user-gap node (disc-node-rx-tx-msg node) rid gaps (car peer) (cdr peer) (car pd))))))
+                      (dest (%prefix-user-destination node src-prefix)))
+                 ;; NFR-MEM: the resolved-destination arm used to wrap its ONE peer as (list (cons ...)) —
+                 ;; two conses per inbound ACKNACK, i.e. per sample — purely to hand a one-element list to a
+                 ;; DOLIST that immediately took it apart again. It repairs to that peer DIRECTLY now; the
+                 ;; undiscovered-prefix fan-out still walks the (already memoized) prefixed destination list.
+                 ;; flet + dynamic-extent (ADR 0072): one body, both arms, no closure consed.
+                 (flet ((%repair-to (dest-prefix peer)   ; retransmit present DATA(_FRAG)/dispose, then GAP the missing -> the NACKing reader
+                          (%send-changes-packed node (disc-node-rx-tx-msg node) resends (car peer) (cdr peer) nil nil nil nil 0 dest-prefix)
+                          (when gaps (%send-user-gap node (disc-node-rx-tx-msg node) rid gaps (car peer) (cdr peer) dest-prefix))))
+                   (declare (dynamic-extent #'%repair-to))
+                   (if dest
+                       (%repair-to src-prefix dest)   ; (DEST-PREFIX . (host . port)) (T10): the NACKing reader itself
+                       (dolist (pd (%match-destinations-prefixed node t))
+                         (%repair-to (car pd) (cdr pd))))))
             (dds.rtps.reliable:writer-release-change-refs w resends))   ; release after the retransmit datagrams are emitted (copied)
           ;; the ACKNACK advanced this reader's acked-base -> purge HistoryCache changes ALL matched readers
           ;; have now acknowledged (RTPS 2.5 §8.4.1), bounding the KEEP_ALL writer history. NACKed (resent)

@@ -347,10 +347,16 @@
     (dds.core.buffer:put-u32 cursor (aref bitmap i)))
   (dds.core.buffer:cursor-position cursor))
 
-(defun* read-sequence-number-set (cursor)
-    (function (dds.core.buffer:cursor) t)
+(defun* read-sequence-number-set (cursor &optional scratch)
+    (function (dds.core.buffer:cursor &optional (or null (simple-array (unsigned-byte 32) (*)))) t)
   "Parse a SequenceNumberSet. Returns (values base numBits bitmap-words) or NIL on
-   short buffer / numBits>256 (§9.4.2.6). Bounds-checked; never reads OOB."
+   short buffer / numBits>256 (§9.4.2.6). Bounds-checked; never reads OOB.
+
+   SCRATCH (default NIL = allocate, byte-identical to every caller that does not pass one): a caller-owned
+   bitmap of at least +SEQNUM-SET-MAX-WORDS+ words to parse INTO, for the per-sample path (NFR-MEM). It is
+   sound only where the CONSUMER is known not to retain the bitmap, so it is threaded from the call site
+   that established that — never defaulted on. Stale words beyond the parsed M are never read: every
+   consumer bounds its walk by NUMBITS, and NUMBITS <= M*32."
   (when (< (%remaining cursor) 12)
     (return-from read-sequence-number-set nil))
   (let* ((base (read-sequence-number cursor))
@@ -360,7 +366,8 @@
     (let ((m (%seqnum-set-words numbits)))
       (when (< (%remaining cursor) (* m 4))
         (return-from read-sequence-number-set nil))
-      (let ((bitmap (make-array (max 1 m) :element-type '(unsigned-byte 32) :initial-element 0)))   ; HOTPATH-ALLOC(TRACKED): SequenceNumberSet bitmap, per inbound ACKNACK/GAP (ADR 0062)
+      (let ((bitmap (or scratch
+                        (make-array (max 1 m) :element-type '(unsigned-byte 32) :initial-element 0))))   ; HOTPATH-ALLOC(TRACKED): SequenceNumberSet bitmap, per inbound ACKNACK/GAP WITHOUT a caller scratch (ADR 0062)
         (dotimes (i m) (setf (aref bitmap i) (dds.core.buffer:get-u32 cursor)))
         (values base numbits bitmap)))))
 
@@ -470,14 +477,18 @@
   (dds.core.buffer:put-u32 cursor (logand count #xFFFFFFFF))
   (dds.core.buffer:cursor-position cursor))
 
-(defun* parse-acknack-body (cursor flags)
-    (function (dds.core.buffer:cursor (unsigned-byte 8)) t)
+(defun* parse-acknack-body (cursor flags &optional scratch)
+    (function (dds.core.buffer:cursor (unsigned-byte 8)
+               &optional (or null (simple-array (unsigned-byte 32) (*))))
+              t)
   "Parse an ACKNACK body. Returns (values reader-id writer-id base numbits bitmap
-   count final-p) or NIL on short/invalid buffer. RTPS 2.5 §9.4.5.3."
+   count final-p) or NIL on short/invalid buffer. RTPS 2.5 §9.4.5.3.
+   SCRATCH (default NIL = allocate, byte-identical): a caller-owned SequenceNumberSet bitmap to parse into —
+   see read-sequence-number-set. Pass one ONLY where the consumer provably does not retain the bitmap."
   (when (< (%remaining cursor) 8) (return-from parse-acknack-body nil))
   (let ((reader-id (read-entity-id cursor))
         (writer-id (read-entity-id cursor)))
-    (multiple-value-bind (base numbits bitmap) (read-sequence-number-set cursor)
+    (multiple-value-bind (base numbits bitmap) (read-sequence-number-set cursor scratch)
       (when (null base) (return-from parse-acknack-body nil))
       (when (< (%remaining cursor) 4) (return-from parse-acknack-body nil))
       (values reader-id writer-id base numbits bitmap

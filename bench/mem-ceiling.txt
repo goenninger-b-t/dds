@@ -135,6 +135,14 @@
 #   arm64 COPY    880.5 /  879.3 /  882.3   -> LOWERED 960 -> 915
 #   arm64 RETURN  673.8 /  676.0 /  674.9   -> LOWERED 755 -> 706
 #
+# LOWERED 2026-07-28 (the ACKNACK RECEIVE path stops consing, twice: the resolved-destination arm repairs to
+# its ONE peer DIRECTLY instead of wrapping it as (list (cons ...)) for a DOLIST that took it apart again,
+# and the inbound SequenceNumberSet is parsed into the receiver thread's own scratch. The bitmap scratch is
+# threaded from the ONE call site whose consumer was proven not to retain it (writer-on-acknack only walks
+# the bits under the writer lock) and is never defaulted on inside the parser. Measured -59.9 / -66.6:
+#   arm64 COPY    820.6 /  818.9 /  819.1   -> LOWERED 915 -> 850
+#   arm64 RETURN  607.2 /  609.4 /  608.3   -> LOWERED 706 -> 640
+#
 # ⚠️ MEASURE WITH NOTHING ELSE RUNNING. A gate-mem run taken while the test suites were running in the
 # background read COPY 1710.8 and FAILED — a 160 B phantom regression from participant + CPU contention,
 # not from code. A benchmark is an instrument; give it the machine.
@@ -142,5 +150,5 @@
 # x86_64 is NOT re-measured here; its COPY row stays 1740 and will simply not bite until someone measures
 # it on that arch. Never derive it from arm64.
 #   x86_64 not measured here — the dash is honest, not lazy.
-arm64  915 706
+arm64  850 640
 x86_64 1740 -
