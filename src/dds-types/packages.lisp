@@ -16,7 +16,7 @@
            #:type-support-serialize #:type-support-deserialize
            #:type-support-serialized-size #:type-support-key-hash
            #:type-support-typeobject #:type-support-typeidentifier
-           #:type-support-sample-pool-alloc #:type-support-sample-pool-free
+           #:type-support-deserialize-into #:type-support-sample-pool-alloc #:type-support-sample-pool-free
            #:type-support-flatdata-offset #:type-support-flatdata-builder #:type-support-flatdata-ctor
            #:type-support-data-representation-mask #:type-support-field-accessors
            ;; WP-FLATDATA fixed-size layout (FR-PF-4, ADR 0015; R6)

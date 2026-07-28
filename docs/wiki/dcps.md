@@ -160,7 +160,7 @@ source docstrings (`src/dds-dcps/*.lisp`); the docstrings are the contract.
 | `dds.dcps:dispose-instance` (`dw sample-or-handle`) | `DataWriter::dispose` (DDS 1.4 §2.2.2.4.2.10) — dispose the instance (a sample or a registered handle); emits a no-payload dispose `DATA` (StatusInfo Disposed, RTPS 2.5 §9.6.4.9) over the reliable engine. Returns the handle. |
 | `dds.dcps:unregister-instance` (`dw sample-or-handle`) | `DataWriter::unregister_instance` (DDS 1.4 §2.2.2.4.2.7) — unregister the instance over the reliable engine. Per `WRITER_DATA_LIFECYCLE.autodispose_unregistered_instances` (§2.2.3.21, default **TRUE**) the unregister also **disposes** the instance: the no-payload `DATA` carries StatusInfo `Disposed\|Unregistered` (0x03) so readers report `NOT_ALIVE_DISPOSED`; with autodispose `FALSE` it carries `Unregistered` (0x02) only. Returns the handle. |
 | `dds.dcps:read-samples` (`dr &key states view-states instance-states where`) | `DataReader::read` (DDS 1.4 §2.2.2.5.3.1) — return the cached samples matching the **three DDS state masks** — `states` (sample_state, default `+any-sample-states+`), `view-states` (default `+any-view-states+`), `instance-states` (default `+any-instance-states+`) — and satisfying `where`, **without** removing them; each is marked `:read` and has its `view_state` + `instance_state` stamped from the reader's **current** per-instance state (DDS 1.4 §2.2.2.5.4: the SampleInfo fields are computed when the samples are *returned*, not frozen at delivery — so a sample received while its instance was ALIVE reports NOT_ALIVE_DISPOSED once the instance is disposed). Every mask defaults to its `ANY_*_STATE`, so the default call selects everything. |
-| `dds.dcps:take-samples` (`dr &key states view-states instance-states where`) | `DataReader::take` — like `read-samples` (same three state masks) but **removes** the returned samples from the cache. **ADR 0093:** the returned wrappers are *loans* — hand them to `return-loan` when done and the reader recycles them (**−171 B/sample measured**); not returning them is safe and simply allocates a fresh wrapper next time. |
+| `dds.dcps:take-samples` (`dr &key states view-states instance-states where`) | `DataReader::take` — like `read-samples` (same three state masks) but **removes** the returned samples from the cache. **ADR 0093:** the returned wrappers are *loans* — hand them to `return-loan` when done and the reader recycles them, wrappers and sample struct alike (**−203 B/sample measured**); not returning them is safe and simply allocates a fresh wrapper next time. |
 | `dds.dcps:samples-available` (`dr`) | Drain newly-received samples into the cache and return the cache size, **without** marking anything `:read` — for polling before a read/take. |
 | `dds.dcps:lookup-instance` (`endpoint key-holder`) | `DataWriter/DataReader::lookup_instance` (DDS 1.4 §2.2.2.4.2.13 / §2.2.2.5.2.14, WP-DCPS-API-COMPLETION S5) — the 16-octet handle the middleware associates with the instance keyed by `key-holder`, or `+instance-handle-nil+` when the endpoint knows no such instance (registered/written on a writer, delivered on a reader). |
 | `dds.dcps:get-key-value` (`endpoint handle`) | `DataWriter/DataReader::get_key_value` (§2.2.2.4.2.12 / §2.2.2.5.2.13, S5) — a representative sample carrying the **key fields** of the instance named by `handle`, or `NIL` (BAD_PARAMETER) when unknown. The handle is a one-way keyhash, so the key holder is the sample the writer registered/wrote or the reader's retained per-instance key sample. |
@@ -198,7 +198,12 @@ source docstrings (`src/dds-dcps/*.lisp`); the docstrings are the contract.
 
 `take-samples` hands back `cached-sample` wrappers. Since ADR 0093 those are **loans**: give them back with
 `return-loan` and the reader recycles the wrapper *and its `SampleInfo`* instead of consing a fresh pair per
-delivered sample. Measured **−171 B/sample** on the DCPS take path (`bench/report/2026-07-28-…`).
+delivered sample — and, since ADR 0093 slice 4, the deserialized sample struct itself. Measured
+**−203 B/sample** cumulatively on the DCPS take path (`bench/report/2026-07-28-…`).
+
+One struct is deliberately never recycled: the first sample of each instance is retained as its
+`get_key_value` key holder, so recycling it would silently rewrite the key of an instance you can still
+query. That costs one struct per *instance*, not per sample.
 
 ```lisp
 (let ((samples (dds.dcps:take-samples dr)))

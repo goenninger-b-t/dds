@@ -60,8 +60,9 @@
 # unpredictably (ADR 0087 −82.4 vs −125.4; ADR 0088 −27.7 vs −72.9), and a predicted x86_64 value has
 # already been 58 B wrong once. Measure it on that arch, or leave the dash.
 #
-# RETURN ceilings measured 2026-07-28 (ADR 0093 slice 1, bench/report/2026-07-28-…):
-#   arm64  1569.5 / 1567.2 / 1567.6 over three runs, each in its own process on its own domain
+# RETURN ceilings measured 2026-07-28, each run in its own process on its own domain:
+#   arm64  slice 1 (wrapper pooling): 1569.5 / 1567.2 / 1567.6 -> ceiling was 1600
+#   arm64  slice 4 (data-struct pooling, ADR 0093 §12): 1534.9 / 1534.0 / 1536.3 -> LOWERED to 1570
 #   x86_64 not measured here — the dash is honest, not lazy.
-arm64  1775 1600
+arm64  1775 1570
 x86_64 1740 -

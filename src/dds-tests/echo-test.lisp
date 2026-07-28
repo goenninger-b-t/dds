@@ -4071,6 +4071,7 @@
                  ("rx-wrapper-pool"          . run-rx-wrapper-pool-test)
                  ("rx-store-consumers"       . run-rx-store-consumers-test)
                  ("reader-cache-race"        . run-reader-cache-race-test)
+                 ("rx-data-pool"             . run-rx-data-pool-test)
                  ("rtps-discovery-spdp"      . dds.rtps.discovery:run-discovery-test)
                  ("rtps-discovery-sedp"      . dds.rtps.discovery:run-sedp-test)
                  ("rtps-data-representation-wire" . dds.rtps.discovery:run-data-representation-wire-test)

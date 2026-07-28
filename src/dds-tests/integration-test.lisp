@@ -13381,3 +13381,75 @@
       (dds.dcps:delete-participant pw)
       (dds.dcps:delete-participant pr))
     t))
+
+(defun* run-rx-data-pool-test ()
+    (function () t)
+  "Test: ADR 0093 slice 4 — deliveries decode into RECYCLED sample structs, and the one struct that must
+   NOT be recycled never is.
+
+   (1) THE RECYCLE HAPPENS. After a returned sample, the next delivery decodes into THAT SAME struct
+       (asserted by identity — a field check cannot tell reuse from a fresh allocation).
+   (2) ⭐ THE KEY SAMPLE IS PINNED — the leg that matters, and hazard 3 of ADR 0093 §5. The first sample of
+       an instance is retained FOREVER by its instance-rec as the get_key_value key holder. If that struct
+       went back to the pool, a LATER delivery would decode into it and silently rewrite the key of an
+       instance the application can still query — wrong data returned from a correct-looking API, with
+       nothing to indicate it. So the wrapper carrying it is PINNED and the pool simply loses one struct
+       per instance (O(instances), not O(samples)).
+   (3) The values delivered are still correct — a recycled struct must carry THIS sample's fields, not a
+       predecessor's (the generated deserialize-into resets every slot before the walk)."
+  (let* ((ts (dds.types:find-type-support "shape-type"))
+         (pw (dds.dcps:create-participant :domain (test-domain +td-rx-data-pool+)))
+         (pr (dds.dcps:create-participant :domain (test-domain +td-rx-data-pool+))))
+    (unwind-protect
+         (let* ((tw (dds.dcps:create-topic pw "Adr93Pool" "shape-type" ts))
+                (tr (dds.dcps:create-topic pr "Adr93Pool" "shape-type" ts))
+                (dw (dds.dcps:create-datawriter (dds.dcps:create-publisher pw) tw
+                                                :qos (dds.qos:make-writer-qos :reliability :reliable :history-kind :keep-all)))
+                (dr (dds.dcps:create-datareader (dds.dcps:create-subscriber pr) tr
+                                                :qos (dds.qos:make-reader-qos :reliability :reliable :history-kind :keep-all))))
+           (loop repeat 250 until (and (plusp (dds.dcps:matched-count pw)) (plusp (dds.dcps:matched-count pr)))
+                 do (dds.dcps:spin pw) (dds.dcps:spin pr) (sleep 0.02))
+           (%check :adr93p-matched (plusp (dds.dcps:matched-count pr)) "writer/reader never matched")
+           (flet ((one (color x)
+                    (dds.dcps:write-sample dw (make-shape-type :color color :x x :y 0 :shapesize 1))
+                    (let ((got nil))
+                      (loop repeat 300 until got
+                            do (let ((s (dds.dcps:take-samples dr))) (when s (setf got (first s))))
+                               (dds.dcps:spin pw) (sleep 0.01))
+                      got)))
+             ;; instance "BLUE": its FIRST sample becomes the instance's key holder -> must be PINNED
+             (let* ((cs1 (one "BLUE" 11)))
+               (%check :adr93p-first (and cs1 t) "the first sample never arrived")
+               (let ((d1 (dds.dcps:cached-sample-data cs1))
+                     (h1 (dds.dcps:sample-info-instance-handle (dds.dcps:cached-sample-info cs1))))
+                 (%check :adr93p-pinned (dds.dcps::cached-sample-data-pinned cs1)
+                         "the first sample of an instance IS its get_key_value key holder and must be PINNED")
+                 (dds.dcps:return-loan dr (list cs1))
+                 ;; a second sample on the SAME instance, then a third: the pool must never hand back d1
+                 (let* ((cs2 (one "BLUE" 22))
+                        (d2 (dds.dcps:cached-sample-data cs2)))
+                   (%check :adr93p-not-recycled-key (not (eq d1 d2))
+                           "the PINNED key sample was handed back by the pool — a later delivery would rewrite an instance's get_key_value key")
+                   (%check :adr93p-key-intact
+                           (let ((kv (dds.dcps:get-key-value dr h1)))
+                             (and kv (= 11 (shape-type-x kv))))
+                           (format nil "get_key_value must still return the KEY HOLDER's own fields (x=11); got ~s"
+                                   (let ((kv (dds.dcps:get-key-value dr h1))) (and kv (shape-type-x kv)))))
+                   (%check :adr93p-values (= 22 (shape-type-x d2))
+                           "a recycled struct must carry THIS sample's fields, not a predecessor's")
+                   (dds.dcps:return-loan dr (list cs2))
+                   ;; (1) now the pool holds d2, so the next delivery must decode INTO it
+                   (let* ((cs3 (one "BLUE" 33))
+                          (d3 (dds.dcps:cached-sample-data cs3)))
+                     (%check :adr93p-reused (eq d3 d2)
+                             "the third delivery did NOT decode into the returned struct — no data recycling happened")
+                     (%check :adr93p-values3 (= 33 (shape-type-x d3))
+                             "the recycled struct must carry the THIRD sample's fields")
+                     (%check :adr93p-key-still-intact
+                             (let ((kv (dds.dcps:get-key-value dr h1)))
+                               (and kv (= 11 (shape-type-x kv))))
+                             "get_key_value must STILL return the key holder's own fields after further recycling")
+                     (dds.dcps:return-loan dr (list cs3))))))))
+      (dds.dcps:delete-participant pw)
+      (dds.dcps:delete-participant pr))
+    t))

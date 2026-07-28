@@ -36,6 +36,11 @@
   (keyed-p t :type boolean)
   (serialize nil :type (or null function))
   (deserialize nil :type (or null function))
+  ;; ADR 0093 slice 4: (sample cursor &optional mode) -> fills SAMPLE IN PLACE and returns it (mutable
+  ;; extensibility returns (values sample-or-nil status)). Every slot is reset to its default first, so a
+  ;; recycled sample never keeps the previous occupant's value. NIL for a FlatData type — its own
+  ;; deserialize-into-<name>-fd targets a BUFFER, not a struct, so the copy path falls back to allocating.
+  (deserialize-into nil :type (or null function))
   (serialized-size nil :type (or null function))
   (key-hash nil :type (or null function))
   (typeobject nil :type t)

@@ -1289,6 +1289,9 @@
              ;; a keyed non-FlatData type keeps the struct key-hash-<name>. (R6, ADR 0015/0017.)
              :serialize (function ,(if flatp fd-ser ser))
              :deserialize (function ,(if flatp fd-des des))
+             ;; ADR 0093 slice 4: the in-place decode target for the pooled RX copy path. NOT bound for a
+             ;; FlatData type — its into-variant fills a BUFFER, not a struct, so the copy path allocates.
+             :deserialize-into ,(unless flatp `(function ,dnto))
              :serialized-size (function ,(if flatp fd-ssz ssz))
              :key-hash ,(when keys `(function ,(if flatp khf-fd khf)))
              ;; WP-DATA-REPRESENTATION (R6): the FlatData TX-transcode for a non-XCDR2 offered rep

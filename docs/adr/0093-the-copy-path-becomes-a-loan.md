@@ -95,9 +95,9 @@ Each **constrains the design**; none is hypothetical.
 |---|---|---|---|
 | 1 | **read/take aliasing** — `%select-samples` returns the SAME `cached-sample` objects, no defensive copy; `take` removes them from the cache, `read` leaves them | `entities.lisp:3119` | THE reason a loan contract is required at all: the lifetime becomes explicit instead of implied |
 | 2 | **`dr-cache` is mutated from THREE thread contexts with no synchronisation whatever** — the application (read/take/samples-available), whatever thread calls `wait-set-wait` (its predicate `%drain`s, and `ws-lock` excludes no taker), and the discovery/announcer thread (`%on-disc-unmatch` → `%on-writer-vanished`; `%spin-once` → `%autopurge-sweep`) | `conditions.lisp:197, 207`; `entities.lisp` `%on-writer-vanished`, `%autopurge-sweep` | ✅ **SLICE 3 — FIXED.** A per-reader cache lock; see §10 |
-| 3 | **`instance-rec-key-sample` retains sample #1 per instance FOREVER** for `get_key_value` | `entities.lisp:454, 1972, 2966` | that one struct is a **retained heap copy, excluded from the pool**. ⭐ It costs **O(instances), not O(samples)** — so it amortises to ~0 per sample in steady state and does **not** block the target |
+| 3 | **`instance-rec-key-sample` retains sample #1 per instance FOREVER** for `get_key_value` | `entities.lisp:454, 1972, 2966` | ✅ **SLICE 4 — the wrapper carrying it is PINNED** and never recycled. ⭐ Costs **O(instances), not O(samples)**, so it amortises to ~0 and does not block the target. See §11 |
 | 4 | **N≥2 same-topic readers leak the shared store sample** — purge is gated on `node-sole-consumer-p` | `entities.lisp:2987–2990`, `dataplane.lisp:3038` | a per-sample remaining-consumers refcount (the `%zc-bump` pattern). A real existing bug **and** a prerequisite for correct multi-reader recycling |
-| 5 | **KEEP_LAST loan UAF guard** — never releases an app-held `:read` view | `entities.lisp:2235` | extend the same guard to the pooled copy structs |
+| 5 | **KEEP_LAST loan UAF guard** — never releases an app-held `:read` view | `entities.lisp:2235` | ✅ satisfied by construction: a pooled wrapper is recycled **only** by an explicit `return-loan`, never by cache eviction (§9) |
 
 ## 6. The contract change — consumers and migration
 
@@ -137,8 +137,7 @@ Phase A being done, and per the VSD rule (thinnest end-to-end slice first, throu
   consumes that reader's share before the assertion — the first cut reported a leak-fix that had not
   happened.
 - **Slice 3 — ✅ DONE.** Hazard 2 was **not** safe; serialised. See §10.
-- **Slice 4:** pool the **data struct** via the already-generated `deserialize-into-<name>`, with the
-  hazard-3 key-sample carve-out. This is the big one and the bulk of the remaining bytes.
+- **Slice 4 — ✅ DONE, −32.5 B/sample.** See §11.
 
 Each slice: rank by profile, size by a `*flag*` A/B **set globally** (a `let` binding is thread-local and
 reads as a no-op on the receiver/user threads — the trap that produced two false "duds" in the campaign),
@@ -251,7 +250,44 @@ inherited.
 the union must be exactly those 200 with no duplicate. Falsified by disabling the lock (process dies).
 622/622 both impls; **gate-mem unchanged** — the lock costs no allocation.
 
-## 11. Two known-unknowns carried in, not papered over
+## 11. Slice 4 as built (2026-07-28) — **−32.5 B/sample**, and the pin is the point
+
+`deserialize-into-<name>` had been generated for every type since the FlatData work and **deliberately
+unused** — it needs a pooled target, which is what this ADR introduced. It is now bound on the type-support
+as `:deserialize-into` (NIL for FlatData, whose into-variant fills a *buffer*, not a struct) and the drain
+decodes into a struct popped from a **per-reader** pool.
+
+| | RETURN B/sample (3 runs, arm64) | mean |
+|---|---|---|
+| after slice 1 | 1569.5 · 1567.2 · 1567.6 | 1568.1 |
+| **after slice 4** | 1534.9 · 1534.0 · 1536.3 | **1535.1** |
+
+Ceiling lowered 1600 → **1570**. Cumulative vs the non-returning arm: **~203 B/sample** (1738 → 1535). The
+win is modest beside slice 1's 171 because `gate-mem`'s type is small at payload 0 — this removes *one
+struct per sample*, so it scales with the type.
+
+**Per-reader, not the existing per-type `dds.types:sample-pool`:** that pool is shared across readers (so
+it would need its own lock, outside the slice-3 reader lock) and its `sample-pool-release` has **no bounds
+guard** — releasing past capacity writes out of the backing vector. Per-reader is also what makes the pool
+type-safe without a check: one reader has exactly one type.
+
+**⚠️ Hazard 3 is the whole slice.** The first sample of each instance is retained *forever* by its
+`instance-rec` as the `get_key_value` key holder. Had it returned to the pool, a later delivery would
+decode into it and **silently rewrite the key of an instance the application can still query** — a
+correct-looking API handing back another sample's data. So that wrapper is **pinned** and never recycled;
+the pool loses one struct per *instance*, which is O(instances) and amortises to nothing.
+
+Every non-delivery path hands the popped struct straight back (decode failure, filter miss,
+RESOURCE_LIMITS reject, both EXCLUSIVE drops). Missing one would not corrupt anything — it would quietly
+drain the pool until it stopped helping.
+
+A half-written struct left by a *failed* decode is harmless: the generated `deserialize-into` resets every
+slot to its default before the walk, so the next use rewrites it wholesale.
+
+**Falsified:** ignoring the pin turns `:adr93p-not-recycled-key` red. 623/623 both impls; **corpus 0
+mismatches on both** — the code generator changed, so byte-exactness was the thing to check.
+
+## 12. Two known-unknowns carried in, not papered over
 
 - **A ~65 KB per-run allocation** inside the measured window, 0–3 times per run, still unexplained. At
   60 000 samples it amortises to ~1 B so the gate is not perturbed — but it is a real, possibly leaking,

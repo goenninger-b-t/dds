@@ -220,3 +220,8 @@
   "ADR 0093 slice 3 isolation offset: TWO application threads taking from ONE DataReader while a writer
    publishes. The assertion is that the union of what the two threads take is EXACTLY what was written, so
    a foreign participant's samples on the domain would break the count.")
+
+(defconstant +td-rx-data-pool+ 54
+  "ADR 0093 slice 4 isolation offset: the pooled deserialized-sample path. The assertion is that an
+   instance's retained get_key_value key sample survives later deliveries decoding into pooled structs, so
+   a foreign participant's samples on the domain would muddy which struct came from where.")

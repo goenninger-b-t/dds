@@ -173,6 +173,8 @@
    (deser-scratch :initform nil :accessor dr-deser-scratch) ; RX-POOLING Phase A (ADR 0073): reusable octet-buffer wrapper repointed at the stored bytes per COPY-path drain, so %deserialize-sample decodes IN PLACE with no per-sample make-octet-buffer / replace / free-static (NFR-MEM)
    (wrapper-pool :initform nil :accessor dr-wrapper-pool)   ; ADR 0093 slice 1: a simple-vector STACK of recycled cached-sample wrappers, each still carrying its SampleInfo. Lazily carved on the first return, so a reader that never returns pays nothing. A VECTOR, not a list: a list freelist churns two conses per sample (32 B measured), which is most of what the pooling was meant to save
    (wrapper-pool-top :initform 0 :accessor dr-wrapper-pool-top)   ; stack pointer into WRAPPER-POOL
+   (data-pool :initform nil :accessor dr-data-pool)   ; ADR 0093 slice 4: a simple-vector STACK of recycled DESERIALIZED SAMPLE structs. Per-READER, which is what makes it type-safe: one reader has exactly one type, so a parked struct is always the right type for the next sample. (The per-TYPE dds.types:sample-pool is shared across readers and its release has no bounds guard, so it is NOT used here.)
+   (data-pool-top :initform 0 :accessor dr-data-pool-top)
    (keyhash-scratch :initform nil :accessor dr-keyhash-scratch) ; RX-POOLING (ADR 0075): reusable :big cursor over a 256-octet buffer for the per-sample instance-handle key serialization — created once, zero per-sample make-octet-buffer/cursor/free-static; single-threaded per reader (the drain runs on the user thread, take is single-threaded-per-reader) (NFR-MEM)
    (keyhash-out :initform nil :accessor dr-keyhash-out) ; RX-POOLING (ADR 0076): reusable 16-octet RESULT array for the drain's TRANSIENT instance-handle — the handle is used only for the instance-rec lookup, then the STABLE handle is read off the rec; created once, zero per-sample make-array on a known instance (NFR-MEM)
    (status-lock :initform (dds.pal:make-lock "dr-status") :accessor dr-status-lock)
@@ -431,7 +433,8 @@
    sample and for a FlatData ZC loan (whose view is DATA itself, dispatched by flatdata-view-p, ADR 0017)."
   (data nil :type t)
   (loan nil :type t)
-  (info nil :type (or null sample-info)))
+  (info nil :type (or null sample-info))
+  (data-pinned nil :type boolean))   ; ADR 0093 slice 4: T when DATA was retained as an instance's get_key_value key sample, so it belongs to the instance-rec FOREVER and must NEVER go back to the reader's data pool
 
 (defparameter *rx-wrapper-pool-enabled* t
   "ADR 0093 slice 1 — the RX copy path's WRAPPER pooling (cached-sample + sample-info), on by default.
@@ -521,6 +524,7 @@
           (sample-info-sequence-number si) sequence-number)
     (setf (cached-sample-data cs) data
           (cached-sample-loan cs) nil
+          (cached-sample-data-pinned cs) nil
           (cached-sample-info cs) si)
     cs))
 
@@ -535,6 +539,34 @@
         (let ((cs (svref pool nt)))
           (setf (svref pool nt) nil)   ; drop the pool's reference so a parked wrapper is never double-held
           cs)))))
+
+(defun* %rx-data-pop (dr)
+    (function (t) t)
+  "Pop a recycled deserialized sample off DR's data pool, or NIL when empty / not yet carved. The caller
+   decodes INTO it; a NIL simply means this delivery allocates, as it did before ADR 0093 slice 4."
+  (let ((pool (dr-data-pool dr))
+        (top (dr-data-pool-top dr)))
+    (when (and pool (plusp top))
+      (let ((nt (1- top)))
+        (setf (dr-data-pool-top dr) nt)
+        (let ((d (svref pool nt)))
+          (setf (svref pool nt) nil)
+          d)))))
+
+(defun* %rx-data-push (dr data)
+    (function (t t) t)
+  "Park DATA on DR's data pool for the next delivery to decode into (ADR 0093 slice 4). Bounded by
+   *RX-WRAPPER-POOL-CAPACITY*; beyond it the struct is dropped for the GC. A no-op when pooling is off or
+   DATA is NIL, so the lever is a true no-op on both ends."
+  (when (and *rx-wrapper-pool-enabled* data)
+    (let ((pool (or (dr-data-pool dr)
+                    (setf (dr-data-pool dr)
+                          (make-array *rx-wrapper-pool-capacity* :initial-element nil))))   ; HOTPATH-ALLOC(COLD): once per reader
+          (top (dr-data-pool-top dr)))
+      (when (< top (length pool))
+        (setf (svref pool top) data
+              (dr-data-pool-top dr) (1+ top)))))
+  t)
 
 (defun* %recycle-delivery (dr cs)
     (function (t cached-sample) t)
@@ -555,8 +587,15 @@
 
    DATA and LOAN are cleared before parking, so a pooled wrapper never pins a deserialized sample."
   (when *rx-wrapper-pool-enabled*
+    ;; ADR 0093 slice 4: the deserialized struct goes back to the data pool for the next decode — UNLESS it
+    ;; was pinned as an instance's get_key_value key sample, in which case the instance-rec owns it forever
+    ;; and recycling it would rewrite that instance's key under GET_KEY_VALUE. A pinned struct is simply
+    ;; dropped from the pool's view; the next delivery allocates one. That is O(instances), not O(samples).
+    (unless (cached-sample-data-pinned cs)
+      (%rx-data-push dr (cached-sample-data cs)))
     (setf (cached-sample-data cs) nil
-          (cached-sample-loan cs) nil)   ; INFO stays attached — the pair is pooled as one object
+          (cached-sample-loan cs) nil
+          (cached-sample-data-pinned cs) nil)   ; INFO stays attached — the pair is pooled as one object
     (let ((pool (or (dr-wrapper-pool dr)
                     (setf (dr-wrapper-pool dr)
                           (make-array *rx-wrapper-pool-capacity* :initial-element nil))))   ; HOTPATH-ALLOC(COLD): once per reader, on its first return
@@ -720,8 +759,8 @@
     (:pl-cdr-le  (values :xcdr1 :little))
     (:pl-cdr-be  (values :xcdr1 :big))))
 
-(defun* %deserialize-payload (ts ob)
-    (function (t dds.core.buffer:octet-buffer) (values t (or null keyword)))
+(defun* %deserialize-payload (ts ob &optional into)
+    (function (t dds.core.buffer:octet-buffer &optional t) (values t (or null keyword)))
   "Deserialize a SerializedPayload (encap header + body) already RESIDENT in octet-buffer OB into a sample via TS,
    WITHOUT allocating or freeing OB — the buffer is caller-owned (a scratch buffer for %deserialize-sample, or the
    pooled secured-decode buffer read IN PLACE for the WP-DCPS-SECURED-TAKE-LOAN loan). The parsed encapsulation
@@ -738,10 +777,18 @@
         ;; non-transcodable representation id is now a STATUS, not a signalled reject (ADR 0064: a macro may
         ;; never emit a condition into generated code). A classic struct :deserialize returns one value, so
         ;; its status reads as NIL. Both shapes pass straight through.
-        (funcall (dds.types:type-support-deserialize ts) rc mode)))))
+        ;; ADR 0093 slice 4: with INTO (a recycled sample of this reader's type) decode IN PLACE and
+        ;; allocate nothing. The generated deserialize-into resets every slot to its default BEFORE the
+        ;; walk, so a member absent from THIS sample cannot keep the previous occupant's value — which is
+        ;; also why a half-written struct left by a FAILED decode is harmless: the next use rewrites it
+        ;; wholesale. A FlatData type has no struct-targeted into-variant, so it falls back to allocating.
+        (let ((dnto (and into (dds.types:type-support-deserialize-into ts))))
+          (if dnto
+              (funcall dnto into rc mode)
+              (funcall (dds.types:type-support-deserialize ts) rc mode)))))))
 
-(defun* %deserialize-sample (ts bytes &optional scratch)
-    (function (t (simple-array (unsigned-byte 8) (*)) &optional (or null dds.core.buffer:octet-buffer))
+(defun* %deserialize-sample (ts bytes &optional scratch into)
+    (function (t (simple-array (unsigned-byte 8) (*)) &optional (or null dds.core.buffer:octet-buffer) t)
               (values t (or null keyword)))
   "Deserialize a SerializedPayload (encap header + body) into a sample via TS. RX-POOLING Phase A (ADR 0073,
    NFR-MEM): decode DIRECTLY from the caller-owned BYTES — %deserialize-payload only READS the buffer (a cursor
@@ -757,7 +804,7 @@
                                  (dds.core.buffer:octet-buffer-capacity scratch) (length bytes))
                            scratch)
                   (t (dds.core.buffer:octet-buffer-over bytes)))))
-    (%deserialize-payload ts ob)))
+    (%deserialize-payload ts ob into)))
 
 ;;; ---- DomainParticipantFactory + participant lifecycle ----
 
@@ -3109,16 +3156,22 @@
       (%drain-one-secured dr node ts key bytes sn sguid)
       (return-from %drain-one-sample t))
     (when bytes
+     ;; ADR 0093 slice 4: pop a recycled struct of THIS reader's type and decode INTO it — zero allocation
+     ;; for the sample itself. REUSE is NIL until the application has returned something, and then this is
+     ;; byte-identical to allocating. Every non-delivery path below hands it straight back.
+     (let ((reuse (and *rx-wrapper-pool-enabled* (%rx-data-pop dr)))
+           (delivered nil))
       (multiple-value-bind (data decode-status)
           (if (typep bytes 'dds.core.buffer:octet-buffer)
               ;; ADR 0078: an RX-STORE-POOLED copy — the buffer IS the payload extent (its CAPACITY was set to
               ;; the exact plen at acquire), so it is decoded IN PLACE with no wrapper at all and under bounds
               ;; byte-identical to the exact-length vector it replaces (%deserialize-payload validates against
               ;; capacity). No scratch, no repointing — the reverse of the ADR 0073 wrapper, one step further.
-              (%deserialize-payload ts bytes)
+              (%deserialize-payload ts bytes reuse)
               (%deserialize-sample ts bytes             ; RX-POOLING Phase A (ADR 0073): decode in place through the reused per-reader scratch wrapper -> zero alloc/sample
                                    (or (dr-deser-scratch dr)
-                                       (setf (dr-deser-scratch dr) (dds.core.buffer:octet-buffer-over bytes)))))
+                                       (setf (dr-deser-scratch dr) (dds.core.buffer:octet-buffer-over bytes)))
+                                   reuse))
         ;; A REJECTED payload (FlatData: short body / non-transcodable representation id) is a STATUS now,
         ;; not a signalled condition (ADR 0064). Drop the sample: never hand a NIL DATA to the filter or to
         ;; %instance-handle. It must still fall through to the watermark advance at the tail — an early
@@ -3150,20 +3203,35 @@
               (t
                 (let* ((rec (%reader-revive-instance dr scratch (dds.disc:node-sample-writer node key)))
                        (handle (the (simple-array (unsigned-byte 8) (16)) (instance-rec-handle rec)))   ; the STABLE handle (copied once at creation) — the ONLY handle retained past this drain
-                       (depth (%reader-keeplast-depth dr)))
-                  (unless (instance-rec-key-sample rec) (setf (instance-rec-key-sample rec) data))   ; S5.T1: retain the key holder for get_key_value
+                       (depth (%reader-keeplast-depth dr))
+                       (pinned nil))
+                  (setf delivered t)
+                  ;; S5.T1: retain the key holder for get_key_value. ⚠️ ADR 0093 slice 4 HAZARD 3: that makes
+                  ;; the instance-rec the PERMANENT owner of this struct, so it must never return to the data
+                  ;; pool — a later delivery decoding into it would silently rewrite the instance's key under
+                  ;; GET_KEY_VALUE. PIN it; the pool loses one struct per INSTANCE, which is O(instances) and
+                  ;; amortises to nothing per sample.
+                  (unless (instance-rec-key-sample rec)
+                    (setf (instance-rec-key-sample rec) data
+                          pinned t))
                   (%deadline-touch dr handle)   ; WP-DCPS-API-COMPLETION S4: (re)arm this instance's requested DEADLINE on delivery (no-op + 0-alloc when INFINITE)
                   (when depth (%reader-keeplast-drop-oldest dr handle depth))   ; KEEP_LAST per-instance drop (DDS 1.4 §2.2.3.18) before append
                   ;; ADR 0093 slice 1: both wrappers come from DR's freelists when the application returns
                   ;; its taken samples, else are freshly allocated — delivery is identical either way.
                   (setf (dr-cache dr)
                         (nconc (dr-cache dr)
-                               (list (%acquire-delivery
-                                      dr data (instance-rec-state rec) handle sn
-                                      sguid   ; DDS 1.4 §2.2.2.5.4; ALIASED, never copied — see the slot docstring
-                                      (dds.disc:node-sample-timestamp node key)   ; S5.T4
-                                      (instance-rec-disposed-gen-count rec)
-                                      (instance-rec-no-writers-gen-count rec)))))))))))))
+                               (list (let ((cs (%acquire-delivery
+                                                dr data (instance-rec-state rec) handle sn
+                                                sguid   ; DDS 1.4 §2.2.2.5.4; ALIASED, never copied — see the slot docstring
+                                                (dds.disc:node-sample-timestamp node key)   ; S5.T4
+                                                (instance-rec-disposed-gen-count rec)
+                                                (instance-rec-no-writers-gen-count rec))))
+                                       (setf (cached-sample-data-pinned cs) pinned)
+                                       cs)))))))))
+        ;; ADR 0093 slice 4: EVERY non-delivery outcome hands the struct straight back — a decode failure, a
+        ;; content-filter miss, a RESOURCE_LIMITS reject, and both EXCLUSIVE-ownership drops. Missing one
+        ;; would not corrupt anything, it would just quietly drain the pool until it stopped helping.
+        (unless delivered (%rx-data-push dr (or data reuse)))))))
     (when (and sguid advance)
       (%reader-advance-drained dr sguid sn)
       ;; WP-PERF: the sample has been COPIED OUT (%deserialize-sample built an independent struct), so its bytes
