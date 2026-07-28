@@ -72,13 +72,15 @@
    for FOREIGN-FUNCALL and FOREIGN-FUNCALL-POINTER there). That residual is upstream and not ours to remove.
    It is affordable because MONOTONIC-NS is NOT on the per-sample path — it serves blocking-wait deadlines,
    the flow-controller token bucket (opt-in async writers) and shmem stress loops."
-  (flet ((read-clock (tp)
-           (if (zerop (the (signed-byte 32)
-                           (cffi:foreign-funcall-pointer
-                            *clock-gettime-fp* () :int *clock-monotonic-id* :pointer tp :int)))
-               (+ (* (cffi:mem-ref tp :int64 0) 1000000000) (cffi:mem-ref tp :int64 8))
-               (truncate (* (get-internal-real-time)
-                            (/ 1000000000 internal-time-units-per-second))))))
+  ;; MACROLET, not FLET — see REALTIME-NS: a foreign pointer passed across an out-of-line call is BOXED
+  ;; (16 B/call), so the scratch must never cross a function boundary. Zero-allocation on ANY thread.
+  (macrolet ((read-clock (tp)
+               `(if (zerop (the (signed-byte 32)
+                                (cffi:foreign-funcall-pointer
+                                 *clock-gettime-fp* () :int *clock-monotonic-id* :pointer ,tp :int)))
+                    (+ (* (cffi:mem-ref ,tp :int64 0) 1000000000) (cffi:mem-ref ,tp :int64 8))
+                    (truncate (* (get-internal-real-time)
+                                 (/ 1000000000 internal-time-units-per-second))))))
     (let ((tp *thread-timespec*))
       (if tp
           (read-clock tp)
@@ -178,12 +180,36 @@
     (function () integer)
   "Wall-clock time in NANOSECONDS since the Unix epoch (clock_gettime CLOCK_REALTIME) — the DDS
    source_timestamp source (DDS 1.4 Time_t; RTPS 2.5 §9.3.2.1 / §9.4.5.9 INFO_TS). Reads the 16-octet
-   struct timespec (tv_sec@0, tv_nsec@8, both 64-bit on the supported targets). Falls back to the
-   1-second (get-universal-time) clock if the syscall fails, so it never signals."
-  (cffi:with-foreign-object (tp :uint8 16)
-    (if (zerop (%clock-gettime 0 tp))
-        (+ (* (cffi:mem-ref tp :int64 0) 1000000000) (cffi:mem-ref tp :int64 8))
-        (* (- (get-universal-time) 2208988800) 1000000000))))
+   struct timespec (tv_sec@0, tv_nsec@8, both 64-bit on the supported targets) into THIS THREAD'S
+   PRE-ALLOCATED scratch (*THREAD-TIMESPEC*, carved once per PAL thread by CALL-WITH-THREAD-CLOCK), exactly
+   as MONOTONIC-NS does. Falls back to the 1-second (get-universal-time) clock if the syscall fails, so it
+   never signals.
+
+   ⚠️ IT USES THE PRE-ALLOCATED SCRATCH AND THE CACHED FUNCTION POINTER BECAUSE IT IS ON THE PER-SAMPLE
+   PATH — measured at 1.02 calls per sample, one per write, since every DDS sample carries a
+   source_timestamp. It previously took a per-call WITH-FOREIGN-OBJECT and went through the by-name
+   %CLOCK-GETTIME, which cost 16 B/call: passing the scratch pointer across that out-of-line call BOXES the
+   system-area-pointer, the same defect %PTR+ and STATIC-POINTER had. MONOTONIC-NS already had both fast
+   paths and is measured at 0.00 calls/sample, i.e. off this path entirely.
+
+   ⚠️ A THREAD THE PAL DID NOT CREATE still has no scratch (*THREAD-TIMESPEC* is NIL) and takes the
+   WITH-FOREIGN-OBJECT fallback. An application whose own thread writes samples can wrap itself in
+   DDS.PAL:CALL-WITH-THREAD-CLOCK to get the pre-allocated path, which is what the bench harness does."
+  ;; ⚠️ MACROLET, NOT FLET. The scratch is a foreign pointer, and passing one across an OUT-OF-LINE call
+  ;; BOXES it — 16 B, every call. A MACROLET expands in place so the pointer never crosses a function
+  ;; boundary, which is what makes BOTH branches zero-allocation, on ANY thread. (Measured: with an FLET
+  ;; this cost 16.06 B/call on a thread with no pre-allocated scratch; with-foreign-object itself was
+  ;; cleared at 0.00 in every shape, so it was never the cost.) Same defect as %PTR+ and STATIC-POINTER.
+  (macrolet ((read-clock (tp)
+               `(if (zerop (the (signed-byte 32)
+                                (cffi:foreign-funcall-pointer
+                                 *clock-gettime-fp* () :int 0 :pointer ,tp :int)))
+                    (+ (* (cffi:mem-ref ,tp :int64 0) 1000000000) (cffi:mem-ref ,tp :int64 8))
+                    (* (- (get-universal-time) 2208988800) 1000000000))))
+    (let ((tp *thread-timespec*))
+      (if tp
+          (read-clock tp)
+          (cffi:with-foreign-object (tp2 :uint8 16) (read-clock tp2))))))
 
 (defun* process-id ()
     (function () (unsigned-byte 32))

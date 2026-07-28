@@ -87,3 +87,51 @@ it reads an already-boxed slot). **The two clocks still box.** Counted over a re
 `source_timestamp`, one per write, so ~16 B/sample remains there. Unlike `monotonic-ns`, `realtime-ns` has
 no per-thread pre-allocated `timespec` and takes `cffi:with-foreign-object` on every call; giving it the
 same treatment is the next step, and is a better fix than narrowing its declared return type.
+
+---
+
+## Third and fourth instance: both clocks — **−16 B/sample**, and zero on *any* thread
+
+Owner directive, same day: *"preallocate / use the arena for any clock stuff."*
+
+`realtime-ns` supplies the DDS `source_timestamp` and is **1.02 calls/sample** (measured — one per write).
+`monotonic-ns` is **0.00 calls/sample**, i.e. off the per-sample path entirely. Both cost **16 B/call**. The
+two fast paths that already existed — a per-thread pre-allocated `timespec` and the cached
+`*clock-gettime-fp*` — had been built for the clock that does not need them.
+
+**The fix turned out not to need preallocation at all.** Every component measured 0.00 in isolation —
+`mem-ref`, the raw `clock_gettime` through the cached pointer, the `sec*1e9 + nsec` arithmetic — while the
+whole function measured 16.06. `cffi:with-foreign-object` was cleared too, at 0.00 in every shape tried.
+The 16 B was the scratch pointer crossing the `flet read-clock` boundary: **passing a SAP across an
+out-of-line call boxes it** — the same defect as `%ptr+` and `static-pointer`, third and fourth instance.
+
+Converting that `flet` to a **`macrolet`** in both clocks expands the read in place, so the pointer never
+crosses a function boundary:
+
+| | before | after |
+|---|---|---|
+| PAL-spawned thread | 16.06 | **0.00 B/call** |
+| an application thread the PAL never created | 16.06 | **0.00 B/call** |
+
+So it is zero-allocation on *any* thread — no wrapping in `call-with-thread-clock`, no per-impl
+thread-local carve. End to end **−16 B/sample**: COPY 1563.9 → 1550.0 / 1553.1 / 1550.2, RETURN
+1359.7 → 1343.3 / 1343.3 / 1342.2; ceilings lowered to **1585 / 1375**.
+
+### The fix that was rejected
+
+A **per-writer** scratch would also have removed the allocation, and was rejected: two application threads
+writing one DataWriter would share one 16-octet cell and could interleave two `clock_gettime` results into
+it — a torn timestamp, seconds from one read with nanoseconds from another. That is the
+shared-mutable-scratch hazard class. The `macrolet` fix makes the question moot.
+
+### ⚠️ A measurement-discipline failure, recorded because it cost a false alarm
+
+A `gate-mem` run taken **while the test suites were running in the background** read COPY **1710.8** and
+FAILED the gate — 163 B above the clean maximum, a phantom regression from participant and CPU contention.
+**A benchmark is an instrument; give it the machine.** Second phantom regression from harness contention in
+one session.
+
+### The sweep is now clean
+
+Every hot PAL primitive measures **0.00 B/call**: `load-sap-u8/u16/u32/u64`, `store-sap-u8/u64`,
+`cas-sap-u32/u64`, `fence :acquire/:full`, `sap-copy-in/-out`, `shm-sap`, and both clocks.

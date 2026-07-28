@@ -74,8 +74,17 @@
 #   arm64 COPY   1628.3 -> 1563.8 / 1566.8 / 1566.0   -> LOWERED 1660 -> 1600
 #   arm64 RETURN 1422.5 -> 1358.8 / 1360.4 / 1358.5   -> LOWERED 1460 -> 1390
 #
+# LOWERED 2026-07-28 (both clocks: FLET -> MACROLET, so the scratch pointer never crosses an out-of-line
+# call and is never boxed — zero-allocation on ANY thread, not just PAL-spawned ones):
+#   arm64 COPY   1550.0 / 1553.1 / 1550.2   -> LOWERED 1600 -> 1585
+#   arm64 RETURN 1343.3 / 1343.3 / 1342.2   -> LOWERED 1390 -> 1375
+#
+# ⚠️ MEASURE WITH NOTHING ELSE RUNNING. A gate-mem run taken while the test suites were running in the
+# background read COPY 1710.8 and FAILED — a 160 B phantom regression from participant + CPU contention,
+# not from code. A benchmark is an instrument; give it the machine.
+#
 # x86_64 is NOT re-measured here; its COPY row stays 1740 and will simply not bite until someone measures
 # it on that arch. Never derive it from arm64.
 #   x86_64 not measured here — the dash is honest, not lazy.
-arm64  1600 1390
+arm64  1585 1375
 x86_64 1740 -
