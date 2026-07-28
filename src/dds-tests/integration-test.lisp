@@ -13245,3 +13245,73 @@
       (dds.dcps:delete-participant p1)
       (dds.dcps:delete-participant p2))
     t))
+
+(defun* %adr93-store-count (node)
+    (function (t) (integer 0))
+  "How many (GUID,SN) payloads the node's SHARED receive store currently holds — the leak this measures."
+  (let ((n 0))
+    (maphash (lambda (guid inner) (declare (ignore guid)) (incf n (hash-table-count inner)))
+             (dds.disc::disc-node-samples node))
+    n))
+
+(defun* run-rx-store-consumers-test ()
+    (function () t)
+  "Test: ADR 0093 slice 2 — the shared receive store is freed on the LAST co-located reader's drain, not never.
+
+   TWO same-topic readers share one participant's receive store. Before this slice the purge was gated on
+   node-sole-consumer-p, so a store entry with two consumers was NEVER dropped: correct (reader-B still got
+   its sample) but a permanent leak, and because %drain rebuilds its pending list from the WHOLE store on
+   every take, an O(stored) receive path that got monotonically slower forever.
+
+   (1) After reader-A drains, the samples are STILL in the store — reader-B has not had them yet, and
+       purging here would be silent data loss. This is the assertion that must not regress.
+   (2) After reader-B drains too, the store is EMPTY. That is the leak being fixed; pre-slice this stayed
+       at 4 forever.
+   (3) Both readers still take all 4 samples — the refcount must not cost anyone a sample."
+  (let* ((ts (dds.types:find-type-support "shape-type"))
+         (pw (dds.dcps:create-participant :domain (test-domain +td-rx-consumers+)))
+         (pr (dds.dcps:create-participant :domain (test-domain +td-rx-consumers+))))
+    (unwind-protect
+         (let* ((tw  (dds.dcps:create-topic pw "Adr93Store" "shape-type" ts))
+                (tr  (dds.dcps:create-topic pr "Adr93Store" "shape-type" ts))
+                (dw  (dds.dcps:create-datawriter (dds.dcps:create-publisher pw) tw
+                                                 :qos (dds.qos:make-writer-qos :reliability :reliable :history-kind :keep-all)))
+                (sub (dds.dcps:create-subscriber pr))
+                (rqos (dds.qos:make-reader-qos :reliability :reliable :history-kind :keep-all))
+                (dra (dds.dcps:create-datareader sub tr :qos rqos))
+                (drb (dds.dcps:create-datareader sub tr :qos rqos))
+                (node (dds.dcps::dp-node pr)))
+           (flet ((%spin () (dds.dcps:spin pw) (dds.dcps:spin pr) (sleep 0.02)))
+             (loop repeat 250
+                   until (and (>= (dds.dcps:matched-count pw) 2) (plusp (dds.dcps:matched-count pr)))
+                   do (%spin))
+             (%check :adr93s-matched (>= (dds.dcps:matched-count pw) 2)
+                     "the writer must match BOTH co-located same-topic readers")
+             (dotimes (i 4) (dds.dcps:write-sample dw (make-shape-type :color (format nil "S~D" i)
+                                                                      :x (+ 10 i) :y (+ 20 i) :shapesize (+ 30 i))))
+             ;; ⚠️ POLL ONLY READER-A. samples-available DRAINS (it calls %drain), so polling reader-B here
+             ;; would consume its share before the assertion below and the store would legitimately be empty —
+             ;; the test would then report a leak-fix that had not happened. Reader-B drains at its take.
+             (loop repeat 300 until (>= (dds.dcps:samples-available dra) 4) do (%spin))
+             (let ((sa (dds.dcps:take-samples dra)))
+               (%check :adr93s-take-a (= 4 (length sa)) "reader-A must take all 4 samples")
+               ;; (1) still held: reader-A has drained (consuming its share), reader-B has not
+               (%check :adr93s-held-for-b (= 4 (%adr93-store-count node))
+                       "after ONLY reader-A drained, the shared store must STILL hold all 4 — purging here would delete them out from under reader-B")
+               (let ((sb (dds.dcps:take-samples drb)))
+                 (%check :adr93s-take-b (= 4 (length sb))
+                         "reader-B must still take all 4 AFTER reader-A took them (no cross-consumption)")
+                 ;; (2) the leak is fixed: the LAST drainer frees the store
+                 (%check :adr93s-freed (zerop (%adr93-store-count node))
+                         (format nil "after BOTH readers drained, the shared store must be EMPTY; it holds ~d (pre-slice this leaked forever)"
+                                 (%adr93-store-count node)))
+                 ;; the refcount itself must not outlive the sample it counted
+                 (%check :adr93s-no-count-leak
+                         (let ((n 0))
+                           (maphash (lambda (g inner) (declare (ignore g)) (incf n (hash-table-count inner)))
+                                    (dds.disc::disc-node-sample-consumers node))
+                           (zerop n))
+                         "the remaining-drainers counts must die with their samples, not leak in their place")))))
+      (dds.dcps:delete-participant pw)
+      (dds.dcps:delete-participant pr))
+    t))

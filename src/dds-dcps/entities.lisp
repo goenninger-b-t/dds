@@ -3112,11 +3112,13 @@
       ;; are dead — drop them from the shared node store. Nothing purged the plain (copy-path) store before, so
       ;; every sample a participant ever received was retained FOREVER: an unbounded leak, and — because %drain
       ;; rebuilds its pending-key list from the WHOLE store on EVERY take-samples — a QUADRATIC receive path.
-      ;; Gated on node-sole-consumer-p: with two SAME-topic readers the store is shared, so purging on the first
-      ;; reader's drain would delete the sample out from under the second (silent loss). The loan paths return
-      ;; earlier and own their own store-entry lifetime (node-return-loan / %secured-loan-release).
-      (when (dds.disc:node-sole-consumer-p node sguid)
-        (dds.disc:node-consume-sample node sguid sn))))
+      ;; ADR 0093 slice 2: UNCONDITIONAL now. The multi-reader question moved INTO node-consume-sample, which
+      ;; decrements a per-(guid,SN) remaining-drainers count and purges only on the LAST reader's drain. It used
+      ;; to be gated on node-sole-consumer-p, which was correct but one-sided: it refused to purge whenever two
+      ;; SAME-topic readers shared the store, so those samples were retained FOREVER — the very leak (and
+      ;; O(stored) drain) this call exists to fix, simply reinstated for multi-reader participants. The loan
+      ;; paths return earlier and own their own store-entry lifetime (node-return-loan / %secured-loan-release).
+      (dds.disc:node-consume-sample node sguid sn)))
   t)
 
 (defun* %drain (dr)

@@ -122,8 +122,20 @@ time and recorded here — not estimated now.
 Phase A being done, and per the VSD rule (thinnest end-to-end slice first, through every layer):
 
 - **Slice 1 (MVP, end-to-end) — ✅ DONE, −171 B/sample.** See §9.
-- **Slice 2:** the **N≥2 remaining-consumers refcount** (hazard 4) — fixes a real leak and is a
-  prerequisite for multi-reader correctness of the recycling.
+- **Slice 2 — ✅ DONE.** The **N≥2 remaining-consumers refcount** (hazard 4). `disc-node-sample-consumers`
+  records K at store time **only when K ≥ 2**, and `node-consume-sample` decrements it, purging on the last
+  drain; an absent entry means one consumer, so the common case is byte-identical and free. `%drain-one-sample`
+  now purges unconditionally — the multi-reader question moved into the engine, where the store lives.
+  This fixes a **real pre-existing leak**: `node-sole-consumer-p` refused to purge whenever two same-topic
+  readers shared the store, so those samples were retained *forever* — the unbounded leak and O(stored)
+  drain that `node-consume-sample` exists to prevent, reinstated for every multi-reader participant.
+  Over-counting only re-leaks; under-counting would delete an undrained sample, so `routes` (a superset of
+  the drainers) is the safe side. `node-sole-consumer-p` is kept as a query but gates nothing.
+  Falsified both ways: ignoring the refcount turns `:adr93s-held-for-b` red (data loss); restoring the old
+  gate turns `:adr93s-freed` red (the leak, holding 4). 621/621 both impls, gate-mem unchanged.
+  ⚠️ Test-writing trap found here: `samples-available` **drains**, so polling it on the second reader
+  consumes that reader's share before the assertion — the first cut reported a leak-fix that had not
+  happened.
 - **Slice 3:** **prove hazard 2 safe** (WaitSet cross-thread `%drain`), or serialise it. Gate for slice 4.
 - **Slice 4:** pool the **data struct** via the already-generated `deserialize-into-<name>`, with the
   hazard-3 key-sample carve-out. This is the big one and the bulk of the remaining bytes.

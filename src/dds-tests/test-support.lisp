@@ -210,3 +210,8 @@
     (dolist (eid reader-eids)
       (dds.disc::%reader-route-add node guid eid)))
   t)
+
+(defconstant +td-rx-consumers+ 51
+  "ADR 0093 slice 2 isolation offset: ONE writer plus TWO co-located SAME-topic readers, and the assertion is
+   about the SIZE OF THE SHARED RECEIVE STORE after each reader drains. Any foreign participant on the domain
+   would put its own samples in that store and the count would stop meaning what the test says it means.")

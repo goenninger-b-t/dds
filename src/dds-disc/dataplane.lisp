@@ -3032,20 +3032,23 @@
     (drop disc-node-sample-writer-guids)
     (drop disc-node-sample-origins)
     (drop disc-node-sample-key-hashes)
-    (drop disc-node-sample-timestamps))   ; S5.T4
+    (drop disc-node-sample-timestamps)   ; S5.T4
+    (drop disc-node-sample-consumers))   ; ADR 0093 slice 2: the remaining-drainers count dies with its sample, or it leaks exactly what this choke exists to stop
   t)
 
 (defun* node-sole-consumer-p (node guid)
     (function (disc-node (simple-array (unsigned-byte 8) (16))) t)
   "T iff AT MOST ONE local user reader is matched to remote writer GUID (its reader-route holds <= 1 id), so a
-   sample from that writer has exactly ONE consumer and may be dropped from the shared node store the moment that
-   reader has copied it out (node-consume-sample).
+   sample from that writer has exactly ONE consumer. Zero-cons.
 
-   This gate is the correctness crux of the purge: disc-node-samples is SHARED by all of a participant's readers,
-   so with TWO same-topic readers (WP-N-ENDPOINT-2C1) purging on the FIRST reader's drain would delete the sample
-   out from under the SECOND — silent data loss. When the route holds >= 2 readers the sample is therefore LEFT in
-   the store (the pre-existing behaviour: it leaks, and the drain stays O(stored) for that reader set — recorded as
-   the follow-on; a per-sample remaining-consumers refcount, like the ZC %zc-bump, is the general fix). Zero-cons."
+   ⚠️ NO LONGER THE PURGE GATE (ADR 0093 slice 2) — kept as a query, but nothing depends on it for correctness.
+   It used to gate node-consume-sample: disc-node-samples is SHARED by all of a participant's readers, so with
+   TWO same-topic readers purging on the FIRST reader's drain would delete the sample out from under the SECOND
+   (silent data loss). Refusing to purge was safe but one-sided — those samples were then retained FOREVER, which
+   is the unbounded leak AND the O(stored) drain that node-consume-sample exists to prevent, reinstated for every
+   multi-reader participant. The fix is the refcount this docstring used to name as the follow-on: a per-(guid,SN)
+   remaining-drainers count (disc-node-sample-consumers), recorded at store time when K >= 2 and decremented per
+   drain, so the entry dies on the LAST drain instead of never. See node-consume-sample."
   (let ((ids (gethash guid (disc-node-reader-routes node))))
     (or (null ids) (null (cdr ids)))))
 
@@ -3067,7 +3070,14 @@
    node-return-loan / %secured-loan-release (which own the buffer lifetime), so the store entry is dropped
    exactly once, by exactly one owner. Zero-cons (gethash + remhash only). Takes the node lock."
   (dds.pal:with-lock ((disc-node-lock node))
-    (%purge-secured-sample node guid sn))
+    ;; ADR 0093 slice 2: with K >= 2 co-located readers on this writer the store entry is SHARED, so drop it
+    ;; only on the LAST drain — an earlier drainer just decrements. An ABSENT count means ONE consumer (the
+    ;; common case is never recorded), so the fall-through purges immediately and is byte-identical.
+    (let* ((inner (gethash guid (disc-node-sample-consumers node)))
+           (remaining (and inner (gethash sn inner))))
+      (if (and remaining (> remaining 1))
+          (setf (gethash sn inner) (1- remaining))
+          (%purge-secured-sample node guid sn))))
   t)
 
 (defun* %secured-loan-release (node handle)
@@ -3429,6 +3439,16 @@
          (%record-sample-timestamp node guid sn *rx-source-timestamp*)   ; S5.T4: the INFO_TS source_timestamp (ns) preceding this DATA (NIL default = none)
          (when (plusp (hash-table-count (disc-node-decode-fail-counts node)))   ; ADR 0031 lim.1: gated -> steady-state (no failures) keeps the zero-alloc secured arm untouched
            (%decode-fail-clear node guid sn))
+         ;; ADR 0093 slice 2: the COPY path's analogue of the secured return-count below. K co-located readers
+         ;; matched to this writer will EACH drain this one stored sample, so record K and let
+         ;; node-consume-sample purge only on the LAST drain. ONLY WHEN K >= 2: with a single consumer the
+         ;; entry is left ABSENT and the purge is immediate, so the common case costs nothing and is
+         ;; byte-identical. Fixes a real leak — before this, K >= 2 left the sample in the store FOREVER
+         ;; (unbounded, and the drain is O(stored), so a long-running multi-reader participant got
+         ;; monotonically slower). Over-counting only re-leaks; under-counting would DELETE a sample a reader
+         ;; had not yet drained, so ROUTES (a superset of the drainers) is the safe side to err on.
+         (when (and (null loan) (cdr routes))
+           (setf (gethash sn (%inner-table (disc-node-sample-consumers node) guid)) (length routes)))
          (when loan
            ;; WP-N-ENDPOINT-2C3 (ADR 0048): all K readers matched to this writer (ROUTES) drain THIS one stored
            ;; handle and each returns it once — record K so %secured-loan-release purges the store slot + frees the

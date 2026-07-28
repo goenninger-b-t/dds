@@ -368,6 +368,7 @@
   (rx-store-carve-failed nil :type boolean)
   (sample-key-hashes (make-hash-table :test 'equalp) :type hash-table) ; src GUID -> SN -> 16-octet wire key-hash of the :data sample (RTPS 2.5 §9.6.4.8), absent when not captured
   (sample-timestamps (make-hash-table :test 'equalp) :type hash-table) ; S5.T4: src GUID -> SN -> source_timestamp (nanoseconds) from the preceding INFO_TS (RTPS 2.5 §9.4.5.9), absent when the DATA carried none
+  (sample-consumers (make-hash-table :test 'equalp) :type hash-table) ; ADR 0093 slice 2: src GUID -> SN -> how many co-located readers have STILL to drain this copy-path sample. ⚠️ POPULATED ONLY WHEN >= 2 READERS SHARE THE WRITER — with one consumer (the overwhelmingly common case) the entry is ABSENT and node-consume-sample purges immediately, byte-identical to the pre-slice path at zero cost. An ABSENT entry therefore means "one consumer", never "zero"
   (lifecycle-changes (make-hash-table :test 'equalp) :type hash-table) ; 2-level: 16-octet src GUID (equalp) -> SN (eql) -> (kind key-hash status writer-id source-guid) (§8.3.5.4: SN is per-writer; no per-change composite-key alloc)
   (ack-count 0 :type integer)
   (acks-in 0 :type integer)
