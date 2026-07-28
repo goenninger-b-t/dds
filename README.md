@@ -61,6 +61,13 @@ profile. Conformance is decomposed into profiles **P0–P7** (see below).
 
 ### Explicitly out of scope
 
+**Request/Reply + RPC over DDS** ([DDS-RPC] 1.0, FR-API-3) — deferred for
+this release by owner directive ([ADR 0094](docs/adr/0094-dds-rpc-is-out-of-scope-for-this-release.md)).
+It is a layer strictly above DCPS, needing no wire-format, RTPS, discovery or QoS change, so nothing below
+L9 depends on it and no P0–P7 profile contains it. Deferred, not withdrawn: the architecture must not
+preclude adding it later. (The TypeLookup service's request/reply-*shaped* builtin endpoints are a
+discovery mechanism, not DDS-RPC, and are unaffected.)
+
 The Connext *Professional* **service suite** — Routing Service, Recording/Replay Service,
 Cloud Discovery Service, Admin Console / Monitor GUIs, and similar. Each is its own program;
 they are **deferred, not designed out** — the architecture must not preclude them.
@@ -133,7 +140,7 @@ Strict bottom-up layering; each layer depends only on the contract of the one be
 nothing above L0 contains implementation-conditional code.
 
 ```
-L9  API & tooling     Lisp API, Request/Reply (planned), gen, spy, Shapes harness
+L9  API & tooling     Lisp API, gen, spy, Shapes harness   (Request/Reply+RPC: out of scope this release)
 L8  Advanced features  batching, async+flow (landed, default-off), Zero-Copy, FlatData, compression, durability, security   (P4+)
 L7  Transports         UDPv4 + SHMEM (same-host, auto-select, UDP fallback); TCP planned — behind a pluggable transport record
 L6  DCPS               entities, QoS+RxO, conditions/WaitSets, instances, read/take, content filters

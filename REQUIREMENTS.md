@@ -49,7 +49,7 @@ Implementations MUST conform to the following, at the versions stated. Where a v
 | [CDR] | CDR as defined by CORBA/GIOP, extended by [XTYPES] | — | Classic CDR = XCDR1 PLAIN baseline. `(C: high)` |
 | [SEC] | DDS Security | **1.1** (formal, ~2018) | Auth/AccessControl/Crypto/Logging/Tagging plugins. `(C: moderate)` |
 | [IDL] | OMG Interface Definition Language | **4.2** | Type definition source language. `(C: moderate)` |
-| [DDS-RPC] | RPC over DDS | **1.0** | Request/Reply + RPC pattern. `(C: moderate)` |
+| [DDS-RPC] | RPC over DDS | **1.0** | Request/Reply + RPC pattern. **DEFERRED — out of scope for this release** (ADR 0094); reference retained, nothing may preclude it. `(C: moderate)` |
 | [PSM-CXX] | ISO/IEC C++ PSM (DDS-PSM-Cxx) | 1.x | Basis of RTI's "Modern C++" API; used as an API-shape reference only. `(C: moderate)` |
 
 **Reference implementations for clean-room study (NOT to copy):** RTI Connext 7.x (gold interop target, proprietary — study behavior, never source), eProsima Fast DDS (Apache-2.0), Eclipse Cyclone DDS (EPL/EDL), OpenDDS (open). Wireshark RTPS dissector for wire validation. See NFR-IP.
@@ -181,7 +181,7 @@ A build is "**Connext-class (core)**" when P0–P5 pass conformance + interop + 
 
 - **FR-API-1 (MUST):** A Lisp-idiomatic API over the `defstruct` entities: constructors with keyword QoS, `with-…` macros for scoped lifecycle, condition-based error handling (per FR-LANG-4), and a typed reader/writer obtained from a registered type (`(make-data-writer pub topic :type 'sensor-sample …)` → a struct whose `write` slot is the monomorphic generated function).
 - **FR-API-2 (SHOULD):** An optional API layer shaped after the **ISO C++ PSM ("Modern C++")** semantics (RAII-equivalent via `with-…`, reference-type-equivalent handles) for users porting from Connext Modern C++.
-- **FR-API-3 (MUST):** **Request/Reply + RPC** ([DDS-RPC]) as a layer over DCPS.
+- **FR-API-3 (OUT OF SCOPE for this release — ADR 0094, owner directive 2026-07-28):** **Request/Reply + RPC** ([DDS-RPC]) as a layer over DCPS. **Deferred, not withdrawn.** It is a layer strictly ABOVE DCPS — ordinary DataWriters/DataReaders over correlated request/reply topics, needing no wire-format, RTPS, discovery or QoS change — so nothing below L9 depends on it and no P0–P7 profile contains it; the MVP omitting it is a DDS without one optional layered pattern, not a partial DDS. The architecture MUST NOT preclude it (ADR 0094 §4). ⚠️ Not to be confused with the TypeLookup service's request/reply-shaped builtin endpoints (FR-TYPE-3), which are unaffected.
 - **FR-API-4 (MUST):** Stable error/return model; every failure path documented; no silent drops outside explicitly-best-effort paths.
 
 ### 5.12 FR-TOOL — Tooling

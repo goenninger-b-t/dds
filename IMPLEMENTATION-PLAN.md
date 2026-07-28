@@ -12,7 +12,7 @@
 Strict bottom-up layering. Each layer depends **only** on the contract of the layer below. Nothing above L0 contains implementation-conditional code.
 
 ```
-L9  API & Tooling        Lisp API, Modern-C++-shaped API, Request/Reply+RPC, gen, spy, monitoring hooks
+L9  API & Tooling        Lisp API, Modern-C++-shaped API, gen, spy, monitoring hooks   [Request/Reply+RPC: OUT OF SCOPE this release, ADR 0094]
 L8  Advanced features    Batching, async+flow-control, Zero-Copy/SHMEM, FlatData-equiv, compression, durability, security
 L7  Transports           UDPv4/v6, SHMEM, TCP — all via the pluggable transport record
 L6  DCPS                 Entities, QoS+RxO, conditions/WaitSets, instances, read/take, content filters
@@ -55,7 +55,7 @@ dds/                      (umbrella)
   dds-feat-durability/    L8
   dds-security/           L8   (gated; depends: dds-pal FFI to libsodium/openssl)
   dds-api/                L9
-  dds-rpc/                L9
+  dds-rpc/                L9   -- NOT BUILT THIS RELEASE (FR-API-3 deferred, ADR 0094)
   dds-tools-spy/          L9
   dds-tests/  dds-bench/  dds-interop/   (cross-cutting test/bench/interop systems)
 ```
@@ -176,7 +176,7 @@ Each WP: **Owner · Inputs · Outputs · Depends · Acceptance.** (IDs map to mi
 - **WP-PERFTEST (A10, M5).** Out: latency/throughput harness mirroring RTI Perftest scenarios. Acc: produces parity report vs. Connext on identical HW.
 - **WP-INTEROP (A11, M2→).** Out: interop matrix automation + Wireshark CI + fuzz infra. Acc: matrix green per landed profile.
 - **WP-SEC (A12, M7).** Out: SEC plugins. Acc: secure interop.
-- **WP-API/RPC/SPY/DOCS (A9-A13, ongoing).** Acc: API stable; RPC interop; spy prints discovered traffic; docs current.
+- **WP-API/SPY/DOCS (A9-A13, ongoing).** Acc: API stable; spy prints discovered traffic; docs current. **RPC interop is NOT an acceptance criterion this release** — FR-API-3 is out of scope (ADR 0094).
 
 ---
 
