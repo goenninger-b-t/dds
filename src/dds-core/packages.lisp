@@ -12,7 +12,7 @@
     per RTPS 2.5 §10.2.")
   (:export #:octet-buffer #:make-octet-buffer #:octet-buffer-over #:octet-buffer-vec
            #:octet-buffer-capacity #:buffer-sap
-           #:cursor #:cursor-buffer #:cursor-position #:cursor-endianness
+           #:cursor #:cursor-reuse #:cursor-buffer #:cursor-position #:cursor-endianness
            #:cursor-origin #:cursor-set-origin #:cursor-set-endianness #:cursor-set-position
            #:cursor-reset #:align
            #:put-u8 #:get-u8 #:put-u16 #:get-u16 #:put-u32 #:get-u32

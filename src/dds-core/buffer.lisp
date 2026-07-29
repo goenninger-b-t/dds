@@ -48,6 +48,25 @@
   "Create a cursor over BUFFER at position 0, alignment origin 0."
   (%make-cursor :buffer buffer :pos 0 :origin 0 :endianness endianness))
 
+(declaim (inline cursor-reuse))
+(defun* cursor-reuse (c buffer)
+    (function ((or null cursor) octet-buffer) cursor)
+  "C reset to position 0, origin 0, little-endian and returned when it already reads BUFFER; a fresh cursor
+   over BUFFER otherwise (NFR-MEM). The ONE definition of cursor reuse, for the per-datagram and per-write
+   paths that would otherwise cons a six-word structure each time.
+
+   The EQ test is what makes reuse safe to offer at all: a caller that arrives with a DIFFERENT buffer gets
+   a fresh cursor and pays the allocation it would have paid anyway — never a cursor pointing into the
+   wrong buffer. WHOSE cursor C is remains the caller's problem, and the answers differ: the receive path
+   keeps one per receiver THREAD, the TX send path one beside the scratch buffer it reads, the payload
+   serializer one per DataWriter (safe because the payload pool hands each concurrent writer a DISTINCT
+   buffer, so the EQ test separates them)."
+  (cond ((and c (eq (cursor-buffer c) buffer))
+         (cursor-reset c)
+         (cursor-set-endianness c :little)
+         c)
+        (t (cursor buffer :endianness :little))))
+
 (declaim (inline cursor-position cursor-reset cursor-set-origin cursor-set-endianness
                  cursor-set-position))
 (defun* cursor-position (cursor)

@@ -184,6 +184,15 @@
 #   arm64 COPY    641.0 /  639.9 /  641.0   -> LOWERED 720 -> 670
 #   arm64 RETURN  432.4 /  431.4 /  431.4   -> LOWERED 510 -> 460
 #
+# LOWERED 2026-07-29 (the TX PAYLOAD SERIALIZER reuses the DataWriter's cursor — the FOURTH and last site of
+# the same 48 B struct. It had been deferred on the claim that an EQ-keyed cache "would miss" because the
+# payload pool hands out a different buffer per write; THAT CLAIM WAS WRONG — pool-acquire is a LIFO stack,
+# so acquire->release->acquire returns the SAME buffer and one slot hits in steady state. Concurrency is
+# safe by construction rather than by lock: the pool pops a DISTINCT buffer per caller, so two threads can
+# never be handed the same cursor. Predicted 48, measured -48.1 / -47.9:
+#   arm64 COPY    592.9 /  590.8 /  591.8   -> LOWERED 670 -> 625
+#   arm64 RETURN  383.3 /  385.5 /  385.5   -> LOWERED 460 -> 415
+#
 # ⚠️ MEASURE WITH NOTHING ELSE RUNNING. A gate-mem run taken while the test suites were running in the
 # background read COPY 1710.8 and FAILED — a 160 B phantom regression from participant + CPU contention,
 # not from code. A benchmark is an instrument; give it the machine.
@@ -191,5 +200,5 @@
 # x86_64 is NOT re-measured here; its COPY row stays 1740 and will simply not bite until someone measures
 # it on that arch. Never derive it from arm64.
 #   x86_64 not measured here — the dash is honest, not lazy.
-arm64  670 460
+arm64  625 415
 x86_64 1740 -

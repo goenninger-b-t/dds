@@ -129,6 +129,7 @@
    (active-readers :initform (make-hash-table :test 'equalp) :accessor dw-active-readers) ; remote reader GUID -> T while it is acknowledging; the SET is the truth, so a repeated ACKNACK cannot inflate active-count
    (keyhash-scratch :initform nil :accessor dw-keyhash-scratch) ; TX-KEYHASH (ADR 0087): reusable :big cursor over a 256-octet buffer for the per-write instance-handle key serialization — the writer twin of dr-keyhash-scratch (ADR 0075), created once, zero per-sample make-octet-buffer/cursor/free-static (NFR-MEM)
    (keyhash-busy :initform (dds.pal:make-atomic-cell) :accessor dw-keyhash-busy) ; TX-KEYHASH (ADR 0087): CAS try-lock guarding KEYHASH-SCRATCH — a DataWriter may be written CONCURRENTLY (DDS 1.4 §2.2.2.4.2.11 places no single-thread restriction on write), and two threads serializing keys through one buffer would interleave into a WRONG instance handle; the loser allocates instead, byte-identically
+   (payload-cursor :initform nil :accessor dw-payload-cursor) ; NFR-MEM: the cursor the per-write payload serializer writes through, reused instead of consed (48 B/write). Keyed by an EQ test on the pooled buffer, which is what makes it SAFE UNDER CONCURRENT WRITE without the CAS lock KEYHASH-SCRATCH needs: writer-acquire-payload-buffer pops a DISTINCT buffer per caller, so two threads can never be handed the same cursor — the second's EQ test fails and it allocates, exactly as before. The pool is a LIFO stack, so a single slot hits in steady state (acquire -> release -> acquire returns the same buffer)
    (status-lock :initform (dds.pal:make-lock "dw-status") :accessor dw-status-lock))
   (:documentation "DDS DataWriter: publishes typed samples on a Topic, carrying its
    PUBLICATION_MATCHED, OFFERED_INCOMPATIBLE_QOS and LIVELINESS_LOST statuses and optional
@@ -707,7 +708,7 @@
         (dds.pal:free-static (dds.core.buffer:octet-buffer-vec buf))
         out))))
 
-(defmacro %with-sample-serializer-into ((var ts sample rep) &body body)
+(defmacro %with-sample-serializer-into ((var ts sample rep dw) &body body)
   "WP-PERF (NFR-MEM / NFR-PERF-8): bind VAR to a serializer of SAMPLE — (lambda (octet-buffer) -> LENGTH),
    writing the SerializedPayload (encapsulation header + body + finalized options) DIRECTLY into a
    caller-supplied buffer — and run BODY. Framing is byte-identical to %serialize-sample (same %rep->codec,
@@ -728,12 +729,14 @@
 
    A FlatData type with a non-XCDR2 offered rep still needs the transcoding builder (which allocates), so that
    case is not eligible — the caller (write-sample) routes it to the allocating path."
-  (let ((mode (gensym "MODE")) (encap (gensym "ENCAP")) (ser (gensym "SER")))
+  (let ((mode (gensym "MODE")) (encap (gensym "ENCAP")) (ser (gensym "SER")) (w (gensym "DW")))
     `(multiple-value-bind (,mode ,encap)
          (%rep->codec ,rep (dds.types:type-support-extensibility ,ts))
-       (let ((,ser (dds.types:type-support-serialize ,ts)))
+       (let ((,ser (dds.types:type-support-serialize ,ts))
+             (,w ,dw))
          (flet ((,var (buf)
-                  (let ((wc (dds.core.buffer:cursor buf :endianness :little)))
+                  (let ((wc (setf (dw-payload-cursor ,w)
+                                  (dds.core.buffer:cursor-reuse (dw-payload-cursor ,w) buf))))
                     (dds.cdr:make-encapsulation-header wc ,encap)
                     (funcall ,ser ,sample wc ,mode)
                     (dds.cdr:finalize-encapsulation-options wc ,encap)
@@ -1769,7 +1772,7 @@
                    ;; Degrades to the allocating path by itself if no pool can be carved / the pool is exhausted.
                    ;; The serializer is an flet declared DYNAMIC-EXTENT (ADR 0072), so it stack-allocates:
                    ;; publish-sample-into is a pure downward-funarg consumer and stores it nowhere.
-                   (%with-sample-serializer-into (%ser-into ts sample rep)
+                   (%with-sample-serializer-into (%ser-into ts sample rep dw)
                      (dds.disc:publish-sample-into node #'%ser-into kh
                                                    (dw-entity-id dw)   ; WP-N-ENDPOINT-S1: THIS writer's own HistoryCache
                                                    ts-ns)))))

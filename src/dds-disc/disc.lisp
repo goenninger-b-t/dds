@@ -209,7 +209,7 @@
   ;; NFR-MEM: the build cursor for the TX send path, paired with the scratch buffer above rather than consed
   ;; per datagram (48 B, once per sample on the single-datagram fast path). It is NO MORE SHARED THAN THE
   ;; BUFFER IT READS — whatever discipline lets a thread write TX-MSG lets it use this cursor over it — and
-  ;; %CURSOR-REUSE's EQ test means a caller arriving with a DIFFERENT buffer (the async sender's own
+  ;; CURSOR-REUSE's EQ test means a caller arriving with a DIFFERENT buffer (the async sender's own
   ;; ASYNC-TX-MSG) gets a fresh cursor and pays the pre-existing allocation rather than parsing through the
   ;; wrong buffer. The receiver threads do NOT use this: each has its own in its RX-CONTEXT, because they
   ;; run concurrently with each other and with this one.
@@ -2724,17 +2724,6 @@
    Read by %SOURCE-GUID-CACHED. NIL means 'no scratch' and restores the per-call allocation, so every
    non-receiver caller — the durability replay, the value-level tests — is byte-identical.")
 
-(declaim (inline %cursor-reuse))
-(defun* %cursor-reuse (c buf)
-    (function ((or null dds.core.buffer:cursor) dds.core.buffer:octet-buffer) dds.core.buffer:cursor)
-  "C reset for reuse when it already reads BUF, else a fresh cursor over BUF (NFR-MEM). The ONE definition
-   of cursor reuse, shared by the inbound (%RX-CURSOR) and reply-building (%RX-TX-CURSOR) paths."
-  (cond ((and c (eq (dds.core.buffer:cursor-buffer c) buf))
-         (dds.core.buffer:cursor-reset c)
-         (dds.core.buffer:cursor-set-endianness c :little)
-         c)
-        (t (dds.core.buffer:cursor buf :endianness :little))))
-
 (declaim (inline %rx-cursor))
 (defun* %rx-cursor (ctx buf)
     (function ((or null rx-context) dds.core.buffer:octet-buffer) dds.core.buffer:cursor)
@@ -2751,7 +2740,7 @@
 
    Measured: the fresh cursor was 48 B (a 6-word struct) on EVERY datagram, 2.05 datagrams/sample =
    101 B/sample of the receive pipeline's 688."
-  (let ((fresh (%cursor-reuse (and ctx (rx-context-cursor ctx)) buf)))
+  (let ((fresh (dds.core.buffer:cursor-reuse (and ctx (rx-context-cursor ctx)) buf)))
     (when ctx (setf (rx-context-cursor ctx) fresh))
     fresh))
 
@@ -2768,7 +2757,7 @@
    The EQ test carries the same weight as in %RX-CURSOR: whatever buffer a caller supplies, a mismatch
    costs the pre-existing allocation and never a wrong parse. Off the receiver thread CTX is NIL and this
    allocates exactly as before."
-  (let ((fresh (%cursor-reuse (and ctx (rx-context-tx-cursor ctx)) buf)))
+  (let ((fresh (dds.core.buffer:cursor-reuse (and ctx (rx-context-tx-cursor ctx)) buf)))
     (when ctx (setf (rx-context-tx-cursor ctx) fresh))
     fresh))
 
