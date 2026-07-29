@@ -12,7 +12,8 @@ LISP  ?= $(CLASP)
         build-all test-all gate-hotpath gate-types corpus fuzz wire interop \
         square-pub square-sub square-spy large-pub large-sub gated-sub corpus-capture \
         nokey-pub nokey-sub keyed-flat-pub keyed-flat-sub \
-        fastdds-pub fastdds-sub fastdds-tl-probe fastdds-type-probe fastdds-keyed-flat-pub fastdds-keyed-flat-sub bench bench-shmem bench-zerocopy bench-flatdata bench-flatdata-zc-loan bench-flatdata-loan-write bench-zc-loan-lockfree bench-multi-dest-zc bench-async-flow bench-flow-edf-priority bench-keeplast bench-rtps-message bench-rtps-message-clasp bench-rtps-protection shmem-xproc zc-xproc mem sbom hooks clean
+        fastdds-pub fastdds-sub fastdds-tl-probe fastdds-type-probe fastdds-keyed-flat-pub fastdds-keyed-flat-sub bench bench-shmem bench-zerocopy bench-flatdata bench-flatdata-zc-loan bench-flatdata-loan-write bench-zc-loan-lockfree bench-multi-dest-zc bench-async-flow bench-flow-edf-priority bench-keeplast bench-rtps-message bench-rtps-message-clasp bench-rtps-protection shmem-xproc zc-xproc mem sbom hooks clean \
+        gate-arena test-linux linux-run linux-shell linux-image linux-clean-cache
 
 DOMAIN   ?= 0
 COLOR    ?= BLUE
@@ -136,6 +137,21 @@ gate-mem: ; ./scripts/gate-mem.sh
 # participant charges it, that a create/delete cycle RETURNS the charge (option (a) — the leak this design
 # exists to prevent), and that high-water < budget. FALSIFIES ITSELF on every run before asserting anything.
 gate-arena: ; ./scripts/gate-arena.sh
+
+# THE CI PLATFORM, REACHABLE FROM THE DEV BOX. macOS/arm64 cannot see a whole class of defect this
+# stack has: uninitialized memory that only shows on the wire, a stack that only deadlocks under Linux
+# thread scheduling, a discovery window only wide enough there (ADR 0096). Every one was found by Linux
+# and none by macOS, and the only way to reach Linux used to be a push. Needs Docker; ~90 s for one
+# focused test, ~7 min for the suite (amd64 runs emulated on Apple silicon). The launcher encodes the
+# five traps that each cost a wasted run — see scripts/linux-repro.sh.
+#   make test-linux                                 the whole suite on Linux x86_64
+#   make linux-run FORM='(dds.tests::run-x-test)'   one form, loaded and run in ONE process
+#   make linux-shell / linux-image / linux-clean-cache
+test-linux:   ; ./scripts/linux-repro.sh
+linux-run:    ; ./scripts/linux-repro.sh --eval '(handler-case (progn $(FORM) (format t "~&LINUX: ok~%") (uiop:quit 0)) (error (e) (format t "~&LINUX: FAILED ~a~%" e) (uiop:quit 1)))'
+linux-shell:  ; ./scripts/linux-repro.sh --shell
+linux-image:  ; ./scripts/linux-repro.sh --build-only
+linux-clean-cache: ; docker volume rm -f neodds-linux-fasl-cache
 
 # FR-CDR-8: our codec MUST reproduce, byte for byte, the SerializedPayloads RTI Connext puts ON THE WIRE.
 # The vectors in corpus/xcdr2/ are captured from a live Connext writer (scripts/capture-corpus.sh); this
