@@ -1086,9 +1086,21 @@
     (setf (writer-proxy-last-sn proxy) (max (writer-proxy-last-sn proxy) last-sn))
     (when (> new-first (writer-proxy-first-sn proxy))
       (setf (writer-proxy-first-sn proxy) new-first)
-      (let ((received (writer-proxy-received proxy)) (drop '()))
-        (maphash (lambda (sn v) (declare (ignore v)) (when (< sn new-first) (push sn drop))) received)
-        (dolist (sn drop) (remhash sn received))))
+      ;; NFR-MEM: compact IN ONE PASS. CLHS 18.2 permits exactly one mutation during MAPHASH — REMHASH of
+      ;; the key currently being processed — and that is precisely what this does, so the collect-then-remove
+      ;; two-phase walk it used to run buys nothing here. It cost a heap value cell (DROP was a closed-over
+      ;; MUTABLE) plus a cons per dropped marker, on every HEARTBEAT that advanced firstSN — which, under a
+      ;; steadily-purging writer, is every sample.
+      ;;
+      ;; ⚠️ NOT the same call as HC-PURGE-BELOW, which keeps its two phases deliberately: that one removes
+      ;; via %HC-REMOVE-CHANGE, which maintains the per-instance index and the extent and itself MAPHASHes
+      ;; the same table. This one is a bare REMHASH, the single case the standard blesses.
+      (let ((received (writer-proxy-received proxy)))
+        (flet ((%drop-below (sn v)
+                 (declare (ignore v))
+                 (when (< sn new-first) (remhash sn received))))
+          (declare (dynamic-extent #'%drop-below))
+          (maphash #'%drop-below received))))
     t)))
 
 (defun* init-writer-proxy-durability (reader writer-id skip-history)
