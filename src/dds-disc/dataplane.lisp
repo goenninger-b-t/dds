@@ -2944,6 +2944,24 @@
             ;; clamped payload length from the slot header at acquire, so a forged wire LEN cannot widen a read.
             (%make-zc-loan-marker :pool-sap sap :slot-index slot :generation gen :len slot-bytes))))))
 
+(defun* %zc-release-marker (marker)
+    (function (zc-loan-marker) t)
+  "ADR 0096 (MEMORY-SAFETY): give the writer back the Zero-Copy slot MARKER refers to — the receiver-side
+   release for a marker that will NEVER be drained, and so has no reader to return it. The writer's %zc-loan
+   preset one refcount hold per destination participant (%zc-ref-builder / %shared-loan-for), and that hold is
+   discharged either by a drainer's return-loan or here. %zc-release is generation-guarded and idempotent (a
+   reclaimed or already-released slot is a validated no-op), and a marker carrying no pool-sap (a NIL-pool test
+   marker) is an O(1) no-op. CALL THIS ONLY FOR A MARKER NO DRAINER OWES — i.e. one that was never stored AND
+   whose slot is not the one a stored marker refers to. A stored marker's drainer owes exactly one release; a
+   second would free the slot under the app's in-place read (a cross-process use-after-free — strictly worse
+   than the leak this closes), which is why %deliver-user-marker releases on the UNROUTED arm and NOT on the
+   deduped-duplicate arm (a duplicate is the same slot at the same generation, carrying no second hold)."
+  (let ((sap (zc-loan-marker-pool-sap marker)))
+    (when sap
+      (dds.xport.zerocopy::%zc-release sap
+                                       (zc-loan-marker-slot-index marker)
+                                       (zc-loan-marker-generation marker)))))
+
 (defun* %deliver-user-marker (node writer-id sn marker src-prefix effective-guid effective-sn)
     (function (disc-node (unsigned-byte 32) integer zc-loan-marker
               (simple-array (unsigned-byte 8) (12))
@@ -2976,10 +2994,26 @@
    JOINER's high-water freeze (%reader-route-add) runs under the SAME node lock, the demux and the route-add serialize:
    a marker stored before a joiner joined is <= its watermark (skipped AND excluded from ELIGIBLE) and one stored after
    has it in this snapshot (counted iff it will drain) — no drain-an-unbumped-marker window. ELIGIBLE <= 1 / route
-   length <= 1 (N=1 / different-topic S4) -> no bump, byte-identical. NOT cleared for ship — pending counsel (R6)."
+   length <= 1 (N=1 / different-topic S4) -> no bump, byte-identical.
+   RELEASE-ON-UNROUTED-DROP (ADR 0096; MEMORY-SAFETY): an UNROUTED marker (no canonical reader) is
+   %zc-release-marker'd. The writer's %zc-loan preset ONE refcount hold PER DESTINATION PARTICIPANT
+   (%zc-ref-builder / %shared-loan-for), discharged by that participant's single drainer. With no route there is
+   no drainer, so the hold was orphaned for the life of the process: a slot lost per unrouted ref, until the
+   writer's pool saturates and Zero-Copy silently degrades to full-payload sends. This is NOT a rare path —
+   matching is not symmetric (a writer matches a remote reader when it processes that reader's SEDP
+   subscription; the reader matches the writer when IT processes the writer's SEDP publication, independently),
+   so the opening samples of every fresh pairing arrive unrouted, and the RxO gate refuses some permanently.
+   THE DEDUPED-DUPLICATE ARM DELIBERATELY DOES NOT RELEASE. A duplicate ref carries NO second hold — the writer
+   loans one hold per participant and never re-loans on repair (the ACKNACK retransmit sends the retained FULL
+   payload, zc-readers 0), so a wire duplicate is the SAME slot at the SAME generation. Releasing it would
+   discharge the hold the STORED marker's drainer still owes, freeing the slot under the app's in-place read —
+   a cross-process use-after-free, strictly worse than the leak. Leak on that arm is the safe direction and it
+   is unreachable in this stack. NOT cleared for ship — pending counsel (R6)."
   (let* ((guid (%source-guid-cached src-prefix writer-id))
          (routes (%reader-routes-for node guid))     ; WP-N-ENDPOINT-S4: the ZC reader(s) matched to this writer (mirrors %deliver-user-sample's demux)
          (canon (and routes (cdr (first routes)))))   ; the CANONICAL engine reader (N=1/pre-match -> primary, byte-identical to the old primary-only path)
+    ;; ADR 0096: NO ROUTE -> no reader will ever drain this marker -> return the writer's hold (see the docstring).
+    (unless canon (%zc-release-marker marker))
     (when canon
       ;; reader-on-data ALWAYS (keeps reliable NACK/HEARTBEAT state correct for relay proxy too)
       (dds.rtps.reliable:reader-on-data canon guid sn

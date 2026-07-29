@@ -1717,6 +1717,73 @@
         (dds.pal:free-static (dds.core.buffer:octet-buffer-vec fd)))))
   t)
 
+(defun* run-zc-unrouted-release-test ()
+    (function () t)
+  "ADR 0096 (FR-PF-3/4, R6, MEMORY-SAFETY): a Zero-Copy reference that reaches a participant with NO reader
+   route RETURNS the writer's pool slot instead of orphaning it. The writer's %zc-loan presets one refcount
+   hold per destination participant, discharged by that participant's single drainer; with no route there is
+   no drainer, so before this fix the hold survived the process and every unrouted ref cost a pool slot until
+   the writer saturated and Zero-Copy silently degraded to full-payload sends. The path is ordinary, not
+   exotic: matching is not symmetric, so the opening samples of a fresh writer/reader pairing arrive before
+   the reader has routed the writer (this is what made MD-E2E-P2-VIEW red on Linux — see ADR 0096 §2).
+   Deterministic + single-process (run-zc-defer-test's technique — no networking): loan a FlatData payload
+   into the node's OWN pool, encode the 20-octet ref, drive %on-user-data with the node's own guid-prefix,
+   and read the slot's live refcount. TWO ARMS, and the ROUTED one is what keeps the fix honest:
+     (1) UNROUTED (no local reader -> no route): NOTHING is stored AND the slot's refcount is back to 0.
+     (2) ROUTED (a local reader -> the primary route): the marker IS stored and the slot STAYS held — the
+         drainer owes that one release, so releasing here would free the slot under the app's in-place read
+         (a cross-process use-after-free, strictly worse than the leak). An unconditional release passes
+         arm (1) and FAILS arm (2).
+   Skips where SHMEM (hence a ZC pool) is unavailable (Clasp/macOS by-name-attach gap, ADR 0013)."
+  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p) (return-from run-zc-unrouted-release-test t))
+  (let* ((dds.disc:*shmem-enabled* t)
+         (dds.disc:*zerocopy-enabled* t)
+         (va 201) (vb 3000000001) (vc 12345678901234567891)
+         (fd (make-fd-abc-flatdata)))
+    (setf (fd-abc-a-fd fd) va (fd-abc-b-fd fd) vb (fd-abc-c-fd fd) vc)
+    (let ((payload (subseq (dds.core.buffer:octet-buffer-vec fd) 0 +fd-abc-flatdata-size+)))
+      (unwind-protect
+           (dolist (routed '(nil t))
+             (let ((node (dds.disc:make-disc-node
+                          :guid-prefix (make-array 12 :element-type '(unsigned-byte 8)
+                                                   :initial-element (if routed 73 74))
+                          :host "127.0.0.1" :port 0)))
+               (unwind-protect
+                    (progn
+                      (when routed   ; the control arm: a local reader IS the primary route (durability gate off)
+                        (dds.disc:add-local-reader node :topic "ZcUnrouted" :type "fd-abc"
+                                                   :reliability dds.rtps.discovery:+reliability-reliable+)
+                        (dds.disc:enable-subscriber node))
+                      (dds.disc:set-zc-loan-capable node t)
+                      (let* ((sap (dds.disc::disc-node-zc-pool-sap node))
+                             (b (dds.core.buffer:make-octet-buffer 64))
+                             (c (dds.core.buffer:cursor b :endianness :little)))
+                        (multiple-value-bind (slot gen)
+                            (dds.xport.zerocopy::%zc-loan sap payload 0 (length payload) 1)
+                          (%check :zc-unrouted-loaned (and slot t) "could not loan the FlatData payload into the pool")
+                          (%check :zc-unrouted-held-before (= 1 (%zc-slot-refcount sap slot))
+                                  "the fresh loan must hold the slot at refcount 1 (non-vacuity: the release below has something to undo)")
+                          (dds.cdr:encode-zc-reference c slot gen dds.disc:+zerocopy-pool-slot-bytes+)
+                          (let ((plen (dds.core.buffer:cursor-position c)))
+                            (dds.disc::%on-user-data node #x00000102 1 b 0 plen
+                                                     (dds.disc::disc-node-guid-prefix node))
+                            (let ((got (dds.disc:node-sample-by-sn node 1)))
+                              (if routed
+                                  (progn
+                                    (%check :zc-unrouted-control-stored (dds.disc:zc-loan-marker-p got)
+                                            "a ROUTED ref must store the unresolved marker for the reader to drain")
+                                    (%check :zc-unrouted-control-held (= 1 (%zc-slot-refcount sap slot))
+                                            "a ROUTED marker's slot must STAY held — its drainer owes the one release; freeing it here is a use-after-free"))
+                                  (progn
+                                    (%check :zc-unrouted-not-stored (null got)
+                                            "an UNROUTED ref must store nothing (there is no reader to give it to)")
+                                    (%check :zc-unrouted-released (zerop (%zc-slot-refcount sap slot))
+                                            "an UNROUTED ref must RETURN the writer's slot (refcount 0) — otherwise every unrouted ref leaks one pool slot for the life of the process"))))))
+                        (dds.pal:free-static (dds.core.buffer:octet-buffer-vec b))))
+                 (dds.disc:stop-node node))))
+        (dds.pal:free-static (dds.core.buffer:octet-buffer-vec fd)))))
+  t)
+
 ;;; WP-FLATDATA compile-time gate (FR-PF-4, ADR 0015)
 (defun* run-flatdata-rejects-variable-test ()
     (function () (eql t))
@@ -3982,6 +4049,7 @@
                  ("zerocopy-end-to-end"      . run-zerocopy-end-to-end-test)
                  ("flatdata-zerocopy"        . run-flatdata-zerocopy-test)
                  ("zc-defer"                 . run-zc-defer-test)
+                 ("zc-unrouted-release"      . run-zc-unrouted-release-test)
                  ("dcps-loan-roundtrip"      . run-dcps-loan-roundtrip-test)
                  ("dcps-loan-write-e2e"      . run-dcps-loan-write-e2e-test)
                  ("multi-dest-zc-e2e"        . run-multi-dest-zc-e2e-test)

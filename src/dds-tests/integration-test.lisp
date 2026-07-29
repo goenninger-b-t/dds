@@ -9512,9 +9512,24 @@
                 (fd (make-fd-abc-flatdata)))
            (setf (fd-abc-a-fd fd) va (fd-abc-b-fd fd) vb (fd-abc-c-fd fd) vc)
            (loop repeat 300
-                 until (>= (dds.dcps:matched-count p1) 2)
+                 until (and (>= (dds.dcps:matched-count p1) 2)
+                            (plusp (dds.dcps:matched-count p2))
+                            (plusp (dds.dcps:matched-count p3)))
                  do (dds.dcps:spin p1) (dds.dcps:spin p2) (dds.dcps:spin p3) (sleep 0.02))
            (%check :md-e2e-matched (>= (dds.dcps:matched-count p1) 2) "the writer must match BOTH reader participants")
+           ;; MATCHING IS NOT SYMMETRIC AND THIS TEST NEEDS BOTH DIRECTIONS. p1 matches a remote reader when it
+           ;; processes that reader's SEDP subscription; p2/p3 match p1's writer when THEY process p1's SEDP
+           ;; publication — two independent exchanges. Waiting only on p1 (which is all this test used to do,
+           ;; and all %reader-push-targets needs) lets the write land while p2/p3 still have NO reader route for
+           ;; that writer, so %deliver-user-marker drops the ZC ref unrouted, the reliable reader never sees the
+           ;; SN, and the repair re-delivers it as a FULL payload — the reader then holds an octet-buffer for a
+           ;; sample the writer sent as a reference. That is the whole Linux failure: the pre-match window is
+           ;; wider there than on macOS, so the drop happened every run. A zero-copy DELIVERY assertion has a
+           ;; matched RECEIVER as its precondition; assert it rather than race it (ADR 0096).
+           (%check :md-e2e-readers-matched
+                   (and (plusp (dds.dcps:matched-count p2)) (plusp (dds.dcps:matched-count p3)))
+                   (format nil "both readers must match the writer BEFORE the write (p2 ~d, p3 ~d)"
+                           (dds.dcps:matched-count p2) (dds.dcps:matched-count p3)))
            ;; both destinations must advertise ZC-capable -> 2 ZC-eligible push groups
            (loop repeat 300
                  until (let ((groups (dds.disc::%reader-push-targets node1)))
