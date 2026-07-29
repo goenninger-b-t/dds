@@ -123,7 +123,14 @@
   (max-seq 0 :type fixnum)
   (payload-pool nil :type (or null dds.core.arena:buffer-pool))                   ; T5a: data_protection secured-payload pool (NIL = no pooling, byte-identical); buffers acquired+released ONLY under the owning writer's lock
   (zc-release-fn nil :type (or null function))                                    ; WP-ACKED-SLOT-PINNING (ADR 0044): opaque (lambda (slot generation)) the disc layer installs to %zc-release a pinned change's TX slot at the change-removal choke; NIL = no pinning (layering: history must not depend on dds.xport.zerocopy, so the release is a funcall'd closure, mirroring payload-pool)
-  (change-freelist '() :type list))                                               ; TASK-3 (ADR 0077): recycled cache-change STRUCTS (non-ZC / non-pooled / non-pinned only), drawn by hc-data-change/-lifecycle-change and returned by hc-try-recycle-change at the release gate (evicted + send-refcount 0) — zero per-sample struct alloc on the common write path once warm; mutated ONLY under the owning writer's lock (NFR-MEM)
+  (change-freelist '() :type list)                                             ; TASK-3 (ADR 0077): recycled cache-change STRUCTS (non-ZC / non-pooled / non-pinned only), drawn by hc-data-change/-lifecycle-change and returned by hc-try-recycle-change at the release gate (evicted + send-refcount 0) — zero per-sample struct alloc on the common write path once warm; mutated ONLY under the owning writer's lock (NFR-MEM)
+  ;; NFR-MEM: the SNs HC-PURGE-BELOW collects before removing them. It is a two-phase walk because a hash
+  ;; table may not be mutated arbitrarily during MAPHASH, and the collection used to be a fresh LIST — plus
+  ;; the closure and value cell that pushing onto a closed-over mutable variable costs on SBCL — on every
+  ;; inbound ACKNACK, i.e. per sample. Reused instead: it settles at the high-water mark of one purge and
+  ;; allocates nothing thereafter. Mutated ONLY under the owning writer's lock, exactly like
+  ;; CHANGE-FREELIST above (the sole production caller, writer-purge-acked, holds it).
+  (purge-scratch (make-array 8 :adjustable t :fill-pointer 0) :type (array t (*))))   ; HOTPATH-ALLOC(COLD): defstruct initform — one vector per HistoryCache, not per sample; it is what REMOVES the per-purge allocation
 
 (defun* %resolve-max-samples (resource-limits)
     (function (t) t)
@@ -397,12 +404,24 @@
   "Remove every change with SN < BASE (fully acknowledged + done); return the number removed. O(stored),
    no sort — bounds a KEEP_ALL writer history once all matched readers have ACKed past BASE (RTPS 2.5
    §8.4.1). Routes each removal through %HC-REMOVE-CHANGE so the per-instance index stays consistent (ADR
-   0019). The HEARTBEAT firstSN (hc-min-seq) then advances past the purged range."
-  (let ((removed '()))
-    (maphash (lambda (sn ch) (declare (ignore ch)) (when (< sn base) (push sn removed)))
-             (history-cache-changes hc))
-    (dolist (sn removed (length removed))
-      (%hc-remove-change hc sn))))
+   0019). The HEARTBEAT firstSN (hc-min-seq) then advances past the purged range.
+
+   NFR-MEM: it stays a TWO-PHASE walk — collect, then remove — because CLHS forbids mutating a hash table
+   during MAPHASH beyond remhash-ing the key currently being processed, and %HC-REMOVE-CHANGE does far more
+   than a remhash (the per-instance index, the extent, the pool/pin release gates, and a rescan that
+   MAPHASHes the same table again). Only the COLLECTION changed: into the cache's reused PURGE-SCRATCH
+   rather than a fresh list, with the collector an flet declared DYNAMIC-EXTENT so it stack-allocates.
+   MAPHASH does not retain its function, so that is sound. This runs on every inbound ACKNACK — per sample —
+   and used to cost a heap closure, a value cell for the closed-over mutable REMOVED, and a cons per SN."
+  (let ((scratch (history-cache-purge-scratch hc)))
+    (setf (fill-pointer scratch) 0)
+    (flet ((%collect-purgeable (sn ch)
+             (declare (ignore ch))
+             (when (< sn base) (vector-push-extend sn scratch))))
+      (declare (dynamic-extent #'%collect-purgeable))
+      (maphash #'%collect-purgeable (history-cache-changes hc)))
+    (dotimes (i (fill-pointer scratch) (fill-pointer scratch))
+      (%hc-remove-change hc (aref scratch i)))))
 
 (defun* %hc-rescan-extent (hc)
     (function (history-cache) t)
