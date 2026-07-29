@@ -131,6 +131,12 @@ gate-build: ; ./scripts/gate-build.sh $(LISP)
 # Fails on regression AND on an un-lowered ceiling after an improvement. SBCL only (bytes-consed is 0 on Clasp).
 gate-mem: ; ./scripts/gate-mem.sh
 
+# FR-PF-7 STATIC-MEMORY PROPERTY (ADR 0095). Asserts what `make mem` was credited with and does not check:
+# that ONE process arena sized by *static-arena-bytes* actually bounds hot-path static memory, that a live
+# participant charges it, that a create/delete cycle RETURNS the charge (option (a) — the leak this design
+# exists to prevent), and that high-water < budget. FALSIFIES ITSELF on every run before asserting anything.
+gate-arena: ; ./scripts/gate-arena.sh
+
 # FR-CDR-8: our codec MUST reproduce, byte for byte, the SerializedPayloads RTI Connext puts ON THE WIRE.
 # The vectors in corpus/xcdr2/ are captured from a live Connext writer (scripts/capture-corpus.sh); this
 # target only VERIFIES them, so it needs no Connext install and runs anywhere.

@@ -38,6 +38,8 @@
     until teardown. pool-acquire returning NIL is the exhaustion signal — the
     engine maps it to RESOURCE_LIMITS, NEVER a GC-heap fallback.")
   (:export #:*static-arena-bytes* #:arena #:init-arena #:teardown-arena
+           #:*process-arena* #:process-arena #:make-sub-arena
+           #:arena-byte-budget #:arena-bytes-used #:arena-reserved #:arena-pools
            #:arena-initialized-p #:arena-report
            #:buffer-pool #:make-buffer-pool #:pool-acquire #:pool-release
            #:pool-high-water #:pool-capacity #:pool-in-use

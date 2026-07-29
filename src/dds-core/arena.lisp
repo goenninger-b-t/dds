@@ -17,7 +17,24 @@
   (byte-budget 0 :type fixnum)
   (bytes-used 0 :type fixnum)
   (pools '() :type list)
-  (initialized nil :type boolean))
+  (initialized nil :type boolean)
+  ;; ADR 0095 option (a): a SUB-ARENA is a charge account against PARENT. Every carve here also charges the
+  ;; parent — so the ONE process budget (*static-arena-bytes*) is what is really enforced — and adds to
+  ;; RESERVED; teardown returns exactly RESERVED to the parent. That is what makes a participant
+  ;; create/delete cycle budget-neutral: without it a shared arena is bump-allocated with no way to return
+  ;; a carve, and a long-running process that churns participants eventually cannot carve at all.
+  (parent nil :type (or null arena))
+  (reserved 0 :type fixnum))
+
+(defvar *process-arena* nil
+  "THE process-wide static arena (ADR 0095), created on first use from *STATIC-ARENA-BYTES* and shared by
+   every participant in the image via its own sub-arena. NIL until PROCESS-ARENA is first called.
+
+   It exists because FR-PF-7's budget was not being enforced anywhere: every production carve used to build
+   its OWN arena sized to that one pool, so *STATIC-ARENA-BYTES* was never read outside tests and no
+   component could answer 'has this process exceeded its static-memory budget?'. Rebinding this to NIL
+   between runs is how a test gets a fresh budget; rebinding *STATIC-ARENA-BYTES* after the first carve has
+   no effect, exactly as its own docstring says.")
 
 (defstruct* (buffer-pool (:constructor %make-buffer-pool))
   "Fixed-capacity pool of equal-size octet buffers carved from a static arena; pool-acquire/pool-release reuse them with zero per-acquisition allocation (NFR-MEM)."
@@ -45,14 +62,44 @@
   (declare (type (integer 0) bytes))
   (%make-arena :byte-budget bytes :bytes-used 0 :pools '() :initialized t))
 
+(defun* process-arena ()
+    (function () arena)
+  "THE process-wide static arena (ADR 0095), created on first call with the *STATIC-ARENA-BYTES* budget and
+   returned unchanged thereafter. Every participant sub-carves from it (MAKE-SUB-ARENA), so this one budget
+   is what bounds all hot-path static memory in the image — the property FR-PF-7 asserts and that ten
+   independent per-pool arenas could not provide."
+  (or *process-arena*
+      (setf *process-arena* (init-arena))))
+
+(defun* make-sub-arena (parent)
+    (function (arena) arena)
+  "A sub-arena of PARENT: a charge account, not a pre-sized slab (ADR 0095 option (a)). It starts with no
+   reservation and grows on demand — every carve charges PARENT (so PARENT's budget is the real ceiling)
+   and is remembered in RESERVED, which TEARDOWN-ARENA returns to PARENT in full.
+
+   Demand-grown rather than fixed on purpose: a fixed per-participant slab has to be guessed, and both
+   errors are bad — too small and the participant cannot carve its pools, too large and it silently shrinks
+   the process budget for everyone else. Nothing has to be guessed here.
+
+   Its own BYTE-BUDGET is PARENT's, so a sub-carve is bounded by exactly the same ceiling; the sub-arena
+   adds ownership and teardown, never a second limit."
+  (%make-arena :byte-budget (arena-byte-budget parent) :bytes-used 0 :pools '()
+               :initialized t :parent parent :reserved 0))
+
 (defun* teardown-arena (arena)
     (function (arena) arena)
-  "Free every pool's static buffers and mark the arena uninitialized."
+  "Free every pool's static buffers, return any parent reservation, and mark the arena uninitialized.
+   ADR 0095: a sub-arena returns exactly what it charged (RESERVED) to its parent, which is what keeps a
+   participant create/delete cycle budget-neutral."
   (dolist (pool (arena-pools arena))
     (loop for b across (buffer-pool-slots pool)
           when b do (dds.pal:free-static (dds.core.buffer:octet-buffer-vec b))))
+  (let ((parent (arena-parent arena)))
+    (when parent
+      (decf (arena-bytes-used parent) (arena-reserved arena))))
   (setf (arena-pools arena) '()
         (arena-bytes-used arena) 0
+        (arena-reserved arena) 0
         (arena-initialized arena) nil)
   arena)
 
@@ -69,7 +116,10 @@
    plus an allocating fallback; they now do it by TESTING the status rather than by catching."
   (declare (type (integer 1) element-bytes capacity))
   (let* ((want (* element-bytes capacity))
-         (remaining (- (arena-byte-budget arena) (arena-bytes-used arena))))
+         ;; ADR 0095: a sub-arena's ceiling is its PARENT's remaining budget, not its own bookkeeping — the
+         ;; whole point is that ONE process budget bounds everything. A root arena charges only itself.
+         (charge-to (or (arena-parent arena) arena))
+         (remaining (- (arena-byte-budget charge-to) (arena-bytes-used charge-to))))
     (when (> want remaining)
       (bail :arena-exhausted))
     (let ((slots (make-array capacity)))
@@ -79,7 +129,13 @@
                                      :capacity capacity
                                      :slots slots
                                      :top capacity)))
-        (incf (arena-bytes-used arena) want)
+        ;; Charge the budget-holder (the parent for a sub-arena) and remember the reservation locally, so
+        ;; teardown can return exactly this much. A root arena's CHARGE-TO is itself, so both INCFs land on
+        ;; the same counter and RESERVED simply mirrors BYTES-USED — byte-identical to the pre-ADR-0095
+        ;; behaviour for every caller that still builds its own arena (the tests).
+        (incf (arena-bytes-used charge-to) want)
+        (incf (arena-reserved arena) want)
+        (unless (eq charge-to arena) (incf (arena-bytes-used arena) want))
         (push pool (arena-pools arena))
         (values pool nil)))))
 

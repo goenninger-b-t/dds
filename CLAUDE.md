@@ -83,7 +83,11 @@ make gate-hotpath # hotpath-purity-gate: fail if CLOS dispatch / per-sample allo
 make fuzz         # fuzz the CDR decoder + RTPS submessage parser (+ replay real Connext captures)
 make interop      # Connext 7.x + one of {Fast DDS, Cyclone, OpenDDS}; validate wire with tshark
 make bench        # perftest-equivalent: latency p50/p99/p99.99/max, throughput, alloc counters, per-pool high-water
-make mem          # assert hot-path workload runs entirely from the static arena, no heap fallback, high-water < budget
+make mem          # CODEC-ONLY: 0 bytes/iter serialize+deserialize. It measures NO workload — it does NOT
+                  # assert the static-arena property it used to be credited with here (ADR 0095 §1.6).
+make gate-arena   # FR-PF-7: ONE process arena sized by *static-arena-bytes* bounds hot-path static memory;
+                  # a participant charges it and a create/delete cycle RETURNS the charge; high-water <
+                  # budget. Falsifies itself on every run (ADR 0095).
 ```
 
 Per-impl invocation pattern (adapt exact flags in M0):

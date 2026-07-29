@@ -214,6 +214,12 @@
   ;; wrong buffer. The receiver threads do NOT use this: each has its own in its RX-CONTEXT, because they
   ;; run concurrently with each other and with this one.
   (tx-cursor nil :type (or null dds.core.buffer:cursor))
+  ;; ADR 0095 option (a): THIS PARTICIPANT'S sub-arena of the process arena — the one place every pool this
+  ;; node carves comes from. Before it, each %ensure-*-pool built its OWN arena sized to that one pool, so
+  ;; *static-arena-bytes* was never consulted and no component could say what the process had reserved.
+  ;; Created on the first carve (%node-arena); stop-node tears it down, returning the whole reservation to
+  ;; the process arena, which is what makes a participant create/delete cycle budget-neutral.
+  (arena nil :type (or null dds.core.arena:arena))
   ;; WP-N-ENDPOINT-S0-REGISTRY (ADR 0048): user endpoint ENGINE-INSTANCE registries — each an alist (EntityId u32 .
   ;; engine instance). N=1 today: the compat accessors disc-node-user-writer/-reader return the PRIMARY (first-
   ;; registered) entry, so the ~163 existing read sites are byte-identical. N-local send fan-out = S1, deliver = S2.
@@ -2563,6 +2569,23 @@
        (%with-scratch (,var (disc-node-secure-rx-pool ,n) (disc-node-secure-rx-lock ,n))
          ,@body))))
 
+(defun* %node-arena (node)
+    (function (disc-node) dds.core.arena:arena)
+  "NODE's own sub-arena of the process arena (ADR 0095 option (a)), created on first use — the single place
+   every pool this participant carves is charged to.
+
+   It replaces ten independent per-pool arenas, each sized to the one pool it held. That arrangement made
+   FR-PF-7 unenforceable in both directions: *static-arena-bytes* was never read in production, so the
+   process budget bounded nothing, and there was no per-participant total to return at teardown. A carve
+   here charges the PROCESS arena (the real ceiling) and is remembered in this sub-arena's reservation, so
+   stop-node's teardown hands the whole participant's static memory back in one step.
+
+   Lazy rather than at make-disc-node ON PURPOSE for this slice: which pools a node carves depends on what
+   it is actually used for (security off carves none of the crypto pools), and moving the carve to startup
+   is ADR 0095 slice 2, measured separately. This slice changes WHERE the memory is charged, not WHEN."
+  (or (disc-node-arena node)
+      (setf (disc-node-arena node) (dds.core.arena:make-sub-arena (dds.core.arena:process-arena)))))
+
 (defun* %ensure-secure-rx-pool (node)
     (function (disc-node) t)
   "Return NODE's SRTPS RX decode pool (SECURE-RX-POOL), carving it (arena + fixed pool of datagram-sized static
@@ -2586,11 +2609,11 @@
             (handler-case
                 (let* ((eb    (srtps-scratch-datagram-bytes))
                        (cap   *srtps-send-scratch-capacity*)
-                       (arena (dds.core.arena:init-arena :bytes (* eb (1+ cap))))   ; +1 slot slack
+                       (arena (%node-arena node))   ; ADR 0095: THE participant's sub-arena, charged against the process budget
                        (pool  (dds.core.arena:make-buffer-pool arena eb cap)))
                   ;; ADR 0064: :arena-exhausted is a STATUS now — an unchecked NIL pool would still
                   ;; store the ARENA below ('only after the carve succeeds'), orphaning its allocation.
-                  (when (null pool) (dds.core.arena:teardown-arena arena) (return-from %ensure-secure-rx-pool nil))
+                  (when (null pool) (return-from %ensure-secure-rx-pool nil))   ; ADR 0095: the arena is SHARED now — a failed carve charged nothing, and tearing it down would free the node's OTHER pools
                   (setf (disc-node-secure-rx-arena node) arena   ; store the arena only after the carve succeeds (teardown reachability)
                         (disc-node-secure-rx-pool node) pool))   ; set the pool LAST — the double-checked-carve flag
               (error () nil))))))   ; arena-exhausted / static-alloc failure -> leave NIL -> allocating fallback
@@ -2630,11 +2653,11 @@
             (handler-case
                 (let* ((eb    (srtps-scratch-datagram-bytes))
                        (cap   *srtps-send-scratch-capacity*)
-                       (arena (dds.core.arena:init-arena :bytes (* eb (1+ cap))))   ; +1 slot slack
+                       (arena (%node-arena node))   ; ADR 0095: THE participant's sub-arena, charged against the process budget
                        (pool  (dds.core.arena:make-buffer-pool arena eb cap)))
                   ;; ADR 0064: :arena-exhausted is a STATUS now — an unchecked NIL pool would still
                   ;; store the ARENA below ('only after the carve succeeds'), orphaning its allocation.
-                  (when (null pool) (dds.core.arena:teardown-arena arena) (return-from %ensure-bracket-rx-pool nil))
+                  (when (null pool) (return-from %ensure-bracket-rx-pool nil))   ; ADR 0095: the arena is SHARED now — a failed carve charged nothing, and tearing it down would free the node's OTHER pools
                   (setf (disc-node-bracket-rx-arena node) arena   ; store the arena only after the carve succeeds (teardown reachability)
                         (disc-node-bracket-rx-pool node) pool))   ; set the pool LAST — the double-checked-carve flag
               (error () nil))))))   ; arena-exhausted / static-alloc failure -> leave NIL -> allocating fallback
@@ -2670,11 +2693,11 @@
             (handler-case
                 (let* ((eb    4)   ; the key_id is EXACTLY 4 octets — the equalp key_id resolvers hash the whole vector
                        (cap   *srtps-send-scratch-capacity*)
-                       (arena (dds.core.arena:init-arena :bytes (* eb (1+ cap))))   ; +1 slot slack
+                       (arena (%node-arena node))   ; ADR 0095: THE participant's sub-arena, charged against the process budget
                        (pool  (dds.core.arena:make-buffer-pool arena eb cap)))
                   ;; ADR 0064: :arena-exhausted is a STATUS now — an unchecked NIL pool would still
                   ;; store the ARENA below ('only after the carve succeeds'), orphaning its allocation.
-                  (when (null pool) (dds.core.arena:teardown-arena arena) (return-from %ensure-key-id-rx-pool nil))
+                  (when (null pool) (return-from %ensure-key-id-rx-pool nil))   ; ADR 0095: the arena is SHARED now — a failed carve charged nothing, and tearing it down would free the node's OTHER pools
                   (setf (disc-node-key-id-rx-arena node) arena   ; store the arena only after the carve succeeds (teardown reachability)
                         (disc-node-key-id-rx-pool node) pool))   ; set the pool LAST — the double-checked-carve flag
               (error () nil))))))   ; arena-exhausted / static-alloc failure -> leave NIL -> allocating fallback
@@ -3301,35 +3324,32 @@
   (when (disc-node-rx-tx-msg node)
     (dds.pal:free-static (dds.core.buffer:octet-buffer-vec (disc-node-rx-tx-msg node)))
     (setf (disc-node-rx-tx-msg node) nil))
-  (when (disc-node-secure-rx-arena node)   ; WP-DDS-SECURITY-ZEROALLOC-AEAD T3(ZA-2) review: free the SRTPS RX decode pool's static buffers AFTER every receiver thread is joined (no live borrow)
-    (dds.core.arena:teardown-arena (disc-node-secure-rx-arena node))
-    (setf (disc-node-secure-rx-arena node) nil (disc-node-secure-rx-pool node) nil))
-  (when (disc-node-bracket-rx-arena node)   ; WP-DDS-SECURITY-ZEROALLOC-AEAD T5(ZA-2): free the RX SEC_PREFIX-bracket pool's static buffers AFTER every receiver thread is joined (no live borrow)
-    (dds.core.arena:teardown-arena (disc-node-bracket-rx-arena node))
-    (setf (disc-node-bracket-rx-arena node) nil (disc-node-bracket-rx-pool node) nil))
-  (when (disc-node-key-id-rx-arena node)   ; WP-DDS-SECURITY-ZEROALLOC-AEAD T5(ZA-2): free the RX key_id scratch pool's static buffers AFTER every receiver thread is joined (no live borrow)
-    (dds.core.arena:teardown-arena (disc-node-key-id-rx-arena node))
-    (setf (disc-node-key-id-rx-arena node) nil (disc-node-key-id-rx-pool node) nil))
-  (when (disc-node-send-scratch-arena node)   ; WP-DDS-SECURITY-ZEROALLOC-AEAD T3: free the SRTPS send-scratch pool's static buffers AFTER every sender/receiver thread is joined (no live borrow)
-    (dds.core.arena:teardown-arena (disc-node-send-scratch-arena node))
-    (setf (disc-node-send-scratch-arena node) nil (disc-node-send-scratch-pool node) nil))
-  (when (disc-node-submsg-scratch-arena node)   ; WP-DDS-SECURITY-ZEROALLOC-AEAD T4: free the metadata_protection submessage-scratch pool's static buffers AFTER every sender thread is joined (no live borrow)
-    (dds.core.arena:teardown-arena (disc-node-submsg-scratch-arena node))
-    (setf (disc-node-submsg-scratch-arena node) nil (disc-node-submsg-scratch-pool node) nil))
-  (when (disc-node-zc-overlay-scratch-arena node)   ; WP-SECURITY-ZC-SHMEM-OVERLAY (ADR 0051): free the in-slot SecuredPayload seal-scratch pool's static buffers AFTER every sender thread is joined (no live borrow)
-    (dds.core.arena:teardown-arena (disc-node-zc-overlay-scratch-arena node))
-    (setf (disc-node-zc-overlay-scratch-arena node) nil (disc-node-zc-overlay-scratch-pool node) nil))
-  (dolist (a (disc-node-payload-arena node))   ; WP-DDS-SECURITY-ZEROALLOC-AEAD T5a / WP-N-ENDPOINT-S3: free EVERY secured writer's payload-pool arena (a LIST now) AFTER every sender/receiver thread is joined (no live acquire/release) — no per-writer arena orphaned
-    (dds.core.arena:teardown-arena a))
-  (setf (disc-node-payload-arena node) nil)
-  (when (disc-node-decode-arena node)   ; WP-DDS-SECURITY-ZEROALLOC-AEAD T5b: return every outstanding secured loan (so loaned buffers re-enter the pool's slots) BEFORE freeing the decode pool's static buffers — the receiver thread is already joined (no live acquire)
-    (node-return-all-loans node)
-    (dds.core.arena:teardown-arena (disc-node-decode-arena node))
-    (setf (disc-node-decode-arena node) nil (disc-node-decode-pool node) nil))
-  (when (disc-node-rx-store-arena node)   ; ADR 0078: return every pooled store-copy buffer still held by a store entry (teardown-arena frees the pool's SLOTS, and pool-acquire NILs the slot it hands out — a checked-out buffer is not in them and its static memory would LEAK), then free the pool. AFTER every receiver thread is joined (no live acquire). Exactly the decode pool's node-return-all-loans discipline one line above.
-    (node-return-all-rx-store-buffers node)
-    (dds.core.arena:teardown-arena (disc-node-rx-store-arena node))
-    (setf (disc-node-rx-store-arena node) nil (disc-node-rx-store-pool node) nil))
+  ;; ADR 0095 option (a): EVERY pool above now lives in THIS NODE'S ONE SUB-ARENA, so the teardown is one
+  ;; step, not nine — and the ORDER became load-bearing in a way it was not before. Each pool used to own
+  ;; its arena, so "return the outstanding buffers, then free this pool" could be written per pool, in any
+  ;; order. With one shared arena a per-pool teardown would free a SIBLING pool's slots out from under a
+  ;; return pass that had not run yet — a use-after-free of static memory. So: EVERY return-outstanding
+  ;; pass runs FIRST, then the single teardown, which hands the participant's whole reservation back to the
+  ;; process arena (what makes a create/delete cycle budget-neutral).
+  ;;
+  ;; All of it AFTER every sender/receiver thread is joined (no live acquire or borrow) — the property each
+  ;; per-pool comment used to carry individually, and the reason this block sits where it does.
+  (when (disc-node-decode-pool node)      ; T5b: outstanding secured loans re-enter the pool's slots
+    (node-return-all-loans node))
+  (when (disc-node-rx-store-pool node)    ; ADR 0078: pool-acquire NILs the slot it hands out, so a checked-out
+    (node-return-all-rx-store-buffers node))   ; store-copy buffer is not in the slots and would leak unfreed
+  (when (disc-node-arena node)
+    (dds.core.arena:teardown-arena (disc-node-arena node))
+    (setf (disc-node-arena node) nil))
+  (setf (disc-node-secure-rx-arena node) nil          (disc-node-secure-rx-pool node) nil
+        (disc-node-bracket-rx-arena node) nil         (disc-node-bracket-rx-pool node) nil
+        (disc-node-key-id-rx-arena node) nil          (disc-node-key-id-rx-pool node) nil
+        (disc-node-send-scratch-arena node) nil       (disc-node-send-scratch-pool node) nil
+        (disc-node-submsg-scratch-arena node) nil     (disc-node-submsg-scratch-pool node) nil
+        (disc-node-zc-overlay-scratch-arena node) nil (disc-node-zc-overlay-scratch-pool node) nil
+        (disc-node-decode-arena node) nil             (disc-node-decode-pool node) nil
+        (disc-node-rx-store-arena node) nil           (disc-node-rx-store-pool node) nil
+        (disc-node-payload-arena node) nil)
   ;; ADR-0034 secret hygiene: zeroize + free the PVMS bootstrap KeyMaterials (KxKey/KxSalt-derived secrets) AFTER the receiver thread is joined (no live PVMS resolver), then clear the table (a post-teardown resolve returns NIL, fail-closed)
   (maphash (lambda (prefix km) (declare (ignore prefix)) (dds.security:zeroize-key-material km))
            (disc-node-pvms-bootstrap-kms node))

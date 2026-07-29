@@ -105,13 +105,13 @@
             (handler-case
                 (let* ((eb    (+ (srtps-scratch-datagram-bytes) +srtps-scratch-overhead+))
                        (cap   *srtps-send-scratch-capacity*)
-                       (arena (dds.core.arena:init-arena :bytes (* eb (1+ cap))))   ; +1 slot slack
+                       (arena (%node-arena node))   ; ADR 0095: THE participant's sub-arena, charged against the process budget
                        (pool  (dds.core.arena:make-buffer-pool arena eb cap)))
                   ;; ADR 0064: an exhausted arena is a STATUS now, not a condition — so it MUST be TESTED.
                   ;; An unchecked NIL pool would still run the SETF below, storing the ARENA whose own
                   ;; comment says 'only after the carve succeeds' — orphaning its static allocation on
                   ;; every failed carve.
-                  (when (null pool) (dds.core.arena:teardown-arena arena) (return-from %ensure-send-scratch-pool nil))
+                  (when (null pool) (return-from %ensure-send-scratch-pool nil))   ; ADR 0095: the arena is SHARED now — a failed carve charged nothing, and tearing it down would free the node's OTHER pools
                   (setf (disc-node-send-scratch-arena node) arena   ; store the arena only after the carve succeeds (teardown reachability)
                         (disc-node-send-scratch-pool node) pool))   ; set the pool LAST — the double-checked-carve flag
               (error () nil))))))   ; arena-exhausted / static-alloc failure -> leave NIL -> allocating fallback
@@ -150,13 +150,13 @@
             (handler-case
                 (let* ((eb    (+ (srtps-scratch-datagram-bytes) +submsg-scratch-overhead+))
                        (cap   *srtps-send-scratch-capacity*)
-                       (arena (dds.core.arena:init-arena :bytes (* eb (1+ cap))))   ; +1 slot slack
+                       (arena (%node-arena node))   ; ADR 0095: THE participant's sub-arena, charged against the process budget
                        (pool  (dds.core.arena:make-buffer-pool arena eb cap)))
                   ;; ADR 0064: an exhausted arena is a STATUS now, not a condition — so it MUST be TESTED.
                   ;; An unchecked NIL pool would still run the SETF below, storing the ARENA whose own
                   ;; comment says 'only after the carve succeeds' — orphaning its static allocation on
                   ;; every failed carve.
-                  (when (null pool) (dds.core.arena:teardown-arena arena) (return-from %ensure-submsg-scratch-pool nil))
+                  (when (null pool) (return-from %ensure-submsg-scratch-pool nil))   ; ADR 0095: the arena is SHARED now — a failed carve charged nothing, and tearing it down would free the node's OTHER pools
                   (setf (disc-node-submsg-scratch-arena node) arena   ; store the arena only after the carve succeeds (teardown reachability)
                         (disc-node-submsg-scratch-pool node) pool))   ; set the pool LAST — the double-checked-carve flag
               (error () nil))))))   ; arena-exhausted / static-alloc failure -> leave NIL -> allocating fallback
@@ -1104,13 +1104,13 @@
             (handler-case
                 (let* ((eb    (+ 44 +zerocopy-pool-slot-bytes+ 3))
                        (cap   4)
-                       (arena (dds.core.arena:init-arena :bytes (* eb (1+ cap))))   ; +1 slot slack
+                       (arena (%node-arena node))   ; ADR 0095: THE participant's sub-arena, charged against the process budget
                        (pool  (dds.core.arena:make-buffer-pool arena eb cap)))
                   ;; ADR 0064: an exhausted arena is a STATUS now, not a condition — so it MUST be TESTED.
                   ;; An unchecked NIL pool would still run the SETF below, storing the ARENA whose own
                   ;; comment says 'only after the carve succeeds' — orphaning its static allocation on
                   ;; every failed carve.
-                  (when (null pool) (dds.core.arena:teardown-arena arena) (return-from %ensure-zc-overlay-scratch nil))
+                  (when (null pool) (return-from %ensure-zc-overlay-scratch nil))   ; ADR 0095: the arena is SHARED now — a failed carve charged nothing, and tearing it down would free the node's OTHER pools
                   (setf (disc-node-zc-overlay-scratch-arena node) arena   ; store the arena only after the carve succeeds (teardown reachability)
                         (disc-node-zc-overlay-scratch-pool node) pool))   ; set the pool LAST — the double-checked-carve flag
               (error () nil))))))   ; arena-exhausted / static-alloc failure -> leave NIL -> fail-closed skip
@@ -4222,11 +4222,11 @@
                                              (dds.rtps.history:hc-depth hc)
                                              (dds.rtps.history:hc-max-samples hc))))
        (handler-case
-           (let* ((arena (dds.core.arena:init-arena :bytes (* element-bytes (1+ capacity))))   ; +1 slot slack
+           (let* ((arena (%node-arena node))   ; ADR 0095: THE participant's sub-arena, charged against the process budget
                   (pool (dds.core.arena:make-buffer-pool arena element-bytes capacity)))
              ;; ADR 0064: :arena-exhausted is a STATUS now. Test it — an unchecked NIL pool would still PUSH
              ;; the arena onto the per-writer list ("only after the carve succeeds"), leaking it.
-             (when (null pool) (dds.core.arena:teardown-arena arena) (return-from %ensure-secured-payload-pool nil))
+             (when (null pool) (return-from %ensure-secured-payload-pool nil))   ; ADR 0095: the arena is SHARED now — a failed carve charged nothing, and tearing it down would free the node's OTHER pools
              (dds.pal:with-lock ((disc-node-payload-arena-lock node))   ; WP-N-ENDPOINT-S3: serialize the shared-list push (the carve runs under the per-WRITER lock; a dedicated leaf lock stops two writers' first-publishes lost-updating the list)
                (push arena (disc-node-payload-arena node)))   ; add to the per-writer arena LIST (never overwrite a prior writer's), only after the carve succeeds (teardown reachability)
              pool)
@@ -4256,11 +4256,11 @@
             (let ((element-bytes *secured-payload-max-bytes*)
                   (capacity (+ *secured-pool-capacity* *secured-pool-headroom*)))
               (handler-case
-                  (let* ((arena (dds.core.arena:init-arena :bytes (* element-bytes (1+ capacity))))   ; +1 slot slack
+                  (let* ((arena (%node-arena node))   ; ADR 0095: THE participant's sub-arena, charged against the process budget
                          (pool (dds.core.arena:make-buffer-pool arena element-bytes capacity))
                          (handles (make-array capacity)))
                     ;; ADR 0064: :arena-exhausted is a STATUS now — test it before installing anything.
-                    (when (null pool) (dds.core.arena:teardown-arena arena) (return-from %ensure-secured-decode-pool nil))
+                    (when (null pool) (return-from %ensure-secured-decode-pool nil))   ; ADR 0095: the arena is SHARED now — a failed carve charged nothing, and tearing it down would free the node's OTHER pools
                     (dotimes (i capacity) (setf (svref handles i) (%make-secured-loan-handle)))   ; preallocate the handle freelist (recycled, zero per-sample cons)
                     (setf (disc-node-decode-handle-vec node) handles
                           (disc-node-decode-handle-top node) capacity
@@ -4318,11 +4318,11 @@
             (let ((element-bytes (+ 4 *plain-payload-max-bytes* 8))
                   (capacity *rx-store-pool-capacity*))
               (handler-case
-                  (let* ((arena (dds.core.arena:init-arena :bytes (* element-bytes (1+ capacity))))   ; +1 slot slack
+                  (let* ((arena (%node-arena node))   ; ADR 0095: THE participant's sub-arena, charged against the process budget
                          (pool (dds.core.arena:make-buffer-pool arena element-bytes capacity)))
                     ;; ADR 0064: :arena-exhausted is a STATUS — test it before installing anything, or the
                     ;; arena is pushed onto the node and orphaned ("store the arena only after the carve succeeds").
-                    (when (null pool) (dds.core.arena:teardown-arena arena) (return-from %ensure-rx-store-pool nil))
+                    (when (null pool) (return-from %ensure-rx-store-pool nil))   ; ADR 0095: the arena is SHARED now — a failed carve charged nothing, and tearing it down would free the node's OTHER pools
                     (setf (disc-node-rx-store-element-bytes node) element-bytes
                           (disc-node-rx-store-arena node) arena   ; only after the carve succeeds (teardown reachability)
                           (disc-node-rx-store-pool node) pool)

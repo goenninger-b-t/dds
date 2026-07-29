@@ -20,6 +20,7 @@ make gate-pal      # no reader conditionals outside dds-pal/ (contract §10, NFR
 make gate-hotpath  # no CLOS dispatch (NFR-CLOS) + no UNJUSTIFIED allocation (NFR-MEM) in hot-path files
 make mem           # CODEC-only: 0 bytes/sample serialize + deserialize (NFR-PERF-8) — see the caveat below
 make gate-mem      # NFR-MEM RATCHET: END-TO-END bytes/sample, must not regress (ADR 0062). SBCL only.
+make gate-arena    # FR-PF-7: the process static-memory budget is real, charged and RETURNED (ADR 0095). SBCL only.
 make wire          # validate emitted RTPS against the tshark RTPS dissector (FR-TOOL-3)
 make interop       # LIVE cross-vendor interop: Connext 7.3.1 + Fast DDS (FR-IO)
 ```
