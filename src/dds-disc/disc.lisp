@@ -206,6 +206,14 @@
   (tx-payload nil :type (or null dds.core.buffer:octet-buffer))
   (tx-msg nil :type (or null dds.core.buffer:octet-buffer))
   (rx-tx-msg nil :type (or null dds.core.buffer:octet-buffer))
+  ;; NFR-MEM: the build cursor for the TX send path, paired with the scratch buffer above rather than consed
+  ;; per datagram (48 B, once per sample on the single-datagram fast path). It is NO MORE SHARED THAN THE
+  ;; BUFFER IT READS — whatever discipline lets a thread write TX-MSG lets it use this cursor over it — and
+  ;; %CURSOR-REUSE's EQ test means a caller arriving with a DIFFERENT buffer (the async sender's own
+  ;; ASYNC-TX-MSG) gets a fresh cursor and pays the pre-existing allocation rather than parsing through the
+  ;; wrong buffer. The receiver threads do NOT use this: each has its own in its RX-CONTEXT, because they
+  ;; run concurrently with each other and with this one.
+  (tx-cursor nil :type (or null dds.core.buffer:cursor))
   ;; WP-N-ENDPOINT-S0-REGISTRY (ADR 0048): user endpoint ENGINE-INSTANCE registries — each an alist (EntityId u32 .
   ;; engine instance). N=1 today: the compat accessors disc-node-user-writer/-reader return the PRIMARY (first-
   ;; registered) entry, so the ~163 existing read sites are byte-identical. N-local send fan-out = S1, deliver = S2.

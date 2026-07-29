@@ -1532,7 +1532,10 @@
         (let ((size (%change-submessage-size change)))
           (when (and (zerop (mod size 4))                       ; 4-aligned -> %pack-plan would NOT force a boundary after it
                      (<= (+ size (if hb-first 32 0)) (%pack-budget buf)))   ; change (+ 32-octet HB) fit ONE datagram
-            (let ((mc (dds.core.buffer:cursor buf :endianness :little))
+            ;; NFR-MEM: the node's TX build cursor, reset for reuse, not a fresh 48 B struct per datagram —
+            ;; this fast path emits ONE datagram per sample. %cursor-reuse EQ-tests the buffer, so the async
+            ;; sender's own scratch simply gets a fresh cursor instead of a wrong one.
+            (let ((mc (setf (disc-node-tx-cursor node) (%cursor-reuse (disc-node-tx-cursor node) buf)))
                   (wid (%emit-wid node)))
               (dds.rtps.message:write-header mc (disc-node-guid-prefix node))
               (%write-change-submessage node change wid mc)
