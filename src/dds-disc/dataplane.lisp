@@ -1542,6 +1542,13 @@
               (when hb-first (%write-hb-submessage hb-first hb-last hb-count wid mc))
               (%send-raw-buf node buf (dds.core.buffer:cursor-position mc) host port shmem-dest dest-prefix))
             (return-from %send-changes-packed t))))))
+  ;; NFR-MEM: NOTHING TO SEND IS A NO-OP, not a plan. A datagram needs at least one submessage, so with no
+  ;; CHANGES and no HEARTBEAT the plan below is empty and the step loop emits nothing — after consing the
+  ;; state pair and walking the planner to discover that. The ACKNACK repair path takes exactly this call
+  ;; once per sample with an EMPTY resend list (the steady-state ACKNACK acks everything and repairs
+  ;; nothing) and no HEARTBEAT, so the whole allocation was spent proving there was no work.
+  (when (and (null changes) (null hb-first))
+    (return-from %send-changes-packed t))
   (let ((state (cons (cons host port)
                      (%changes-datagram-plan node buf changes
                                              (and hb-first (%heartbeat-builder node hb-first hb-last hb-count))

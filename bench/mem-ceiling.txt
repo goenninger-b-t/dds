@@ -193,6 +193,14 @@
 #   arm64 COPY    592.9 /  590.8 /  591.8   -> LOWERED 670 -> 625
 #   arm64 RETURN  383.3 /  385.5 /  385.5   -> LOWERED 460 -> 415
 #
+# LOWERED 2026-07-29 (%send-changes-packed returns immediately when there is NOTHING to send. A datagram
+# needs at least one submessage, so with no CHANGES and no HEARTBEAT the plan is empty and the step loop
+# emits nothing — after consing the state pair and walking the planner to discover that. The ACKNACK repair
+# path makes exactly that call once per sample: the steady-state ACKNACK acks everything and repairs
+# nothing. Predicted ~30, measured -32.7 / -33.8:
+#   arm64 COPY    560.2 /  558.0 /  560.2   -> LOWERED 625 -> 590
+#   arm64 RETURN  349.5 /  352.8 /  350.6   -> LOWERED 415 -> 385
+#
 # ⚠️ MEASURE WITH NOTHING ELSE RUNNING. A gate-mem run taken while the test suites were running in the
 # background read COPY 1710.8 and FAILED — a 160 B phantom regression from participant + CPU contention,
 # not from code. A benchmark is an instrument; give it the machine.
@@ -200,5 +208,5 @@
 # x86_64 is NOT re-measured here; its COPY row stays 1740 and will simply not bite until someone measures
 # it on that arch. Never derive it from arm64.
 #   x86_64 not measured here — the dash is honest, not lazy.
-arm64  625 415
+arm64  590 385
 x86_64 1740 -
