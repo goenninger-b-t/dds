@@ -4044,6 +4044,7 @@
                  ("reliable-repair-after-drop" . run-reliable-repair-after-drop-test)
                  ("hook-self-error"          . run-hook-self-error-test)
                  ("shmem-end-to-end"         . run-shmem-end-to-end-test)
+                 ("shmem-control-lane"       . run-shmem-control-lane-test)
                  ("shmem-send-self-guard"    . run-shmem-send-self-guard-test)
                  ("shmem-send-self-guard-no-regression" . run-shmem-send-self-guard-no-regression-test)
                  ("zerocopy-end-to-end"      . run-zerocopy-end-to-end-test)

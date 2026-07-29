@@ -693,6 +693,23 @@ fault the `disc-node-shmem-send-faults` counter). **The hook runs on the sender 
 block, it does **not** inherit the binding thread's dynamic environment (bind the **global** value, not a
 thread-local `let`), and a hook that itself signals is swallowed (it can never re-kill the thread).
 
+**Reliability control traffic takes the DATA's lane (ADR 0097, FR-XPORT-2).** When a destination's user DATA
+goes over SHARED MEMORY, that destination's **periodic HEARTBEAT**, **late-joiner prompt HEARTBEAT**, and
+**ACKNACK repair + GAP** go over shared memory too — the same lane, with the same UDP fallback. They used to
+go over UDP unconditionally (`%send-msg-buf` hard-passed `NIL` for `shmem-dest`), and because **the SHMEM ring
+and the UDP socket are drained by two different receiver threads**, a HEARTBEAT could overtake the DATA it
+announces: the reader then NACKs samples sitting unread in the ring and the writer retransmits what the reader
+already holds. Measured on Linux x86_64, 400 samples burst-published to a same-host peer: **2249 writer
+datagrams against a floor of 800 (+181 %, 2.81×) before; exactly 800 after**
+(`bench/report/2026-07-29-adr-0097-control-lane.md`). Every sample arrived either way and no counter moved —
+a retransmit of a sample the reader is about to read is deduped on arrival, so the delivery was always
+correct and only the bandwidth was wrong. Builtin/discovery/bootstrap senders keep `NIL`: their messages
+describe no user DATA and their destination may not be a SHMEM peer at all. The repair stays a **full
+payload** (`zc-readers` 0) — the transport was the defect, not the representation, and re-emitting a
+Zero-Copy reference would consume a second pool slot per repair (ADR 0042). Gate:
+`run-shmem-control-lane-test`, which asserts the lane per call site against `disc-node-shmem-sends` and goes
+red on `CTL-LANE-HEARTBEAT` with the call sites reverted.
+
 **SHMEM-send self-guard (WP-SHMEM-SEND-SELF-GUARD, FR-XPORT-2).** The same hook also fires — with context
 `:shmem-send-fault` — when a **signalled** `%shmem-send` hard fault (segment detached / pshared error /
 bounds) is caught in `%send-raw-buf` and the datagram is degraded to the UDP fallback. This widens the hook's

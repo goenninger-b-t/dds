@@ -8851,6 +8851,101 @@
       (dds.disc:stop-node w) (dds.disc:stop-node r)))
   t)
 
+(defun* run-shmem-control-lane-test ()
+    (function () t)
+  "ADR 0097 (FR-XPORT-2): a writer's RELIABILITY CONTROL TRAFFIC to a same-host SHMEM peer takes the SAME
+   LANE as that peer's DATA. Before ADR 0097 %send-msg-buf hard-passed NIL for shmem-dest, so the periodic
+   HEARTBEAT and the ACKNACK repair went over UDP while the DATA they refer to went over SHMEM — two
+   channels drained by DIFFERENT receiver threads, so a HEARTBEAT could overtake the DATA it announces and
+   make the reader NACK a sample sitting unread in the ring.
+   The lane is directly observable: %send-raw-buf bumps disc-node-shmem-sends only on a successful SHMEM
+   send, so a UDP-routed control message contributes NOTHING to it. Two bare disc-nodes (no DCPS, no spin,
+   so NOTHING else emits inside a measurement window), one reliable reader, KEEP_ALL.
+   BOTH WINDOWS RUN OVER A LIVE GAP, and that is load-bearing twice over. SN 2 is dropped on every send
+   (including the resend), so (a) the change stays UNACKED and the writer's HistoryCache keeps it — a
+   fully-acked HistoryCache is PURGED (RTPS 2.5 §8.4.1) and %push-heartbeat is then a silent no-op, which is
+   what a first cut of this test measured; and (b) while the drop is armed a repair plans NO submessage at
+   all, so the retransmit provably cannot contaminate window (1).
+     (0) PRECONDITIONS, each asserted so a failure names its own cause: the reader's participant really is a
+         same-host SHMEM peer (%prefix-shmem-dest resolves), the DATA path already used that lane, and the
+         writer really is announcing an unacked change.
+     (1) THE PERIODIC HEARTBEAT. One %push-heartbeat call must add at least one SHMEM datagram. Pre-ADR-0097
+         it adds ZERO — the HEARTBEAT went to UDP.
+     (2) THE ACKNACK REPAIR. Snapshot, THEN clear the drop list (so every post-clear send is inside the
+         window, including a repair for an ACKNACK already in flight), then one more %push-heartbeat. That
+         window must cost STRICTLY MORE SHMEM datagrams than window (1), which measured a bare HEARTBEAT on
+         its own — i.e. the repair itself took the lane. Comparing against window (1) rather than a hard
+         number keeps the assertion correct whatever the destination count is.
+   A fix that moved only the HEARTBEAT fails (2); one that moved only the repair fails (1).
+   The late-joiner prompt HEARTBEAT (%writer-durability-init) takes the identical two-line change and is NOT
+   separately gated here. Skips cleanly where SHMEM is off (Clasp/macOS gap, ADR 0013)."
+  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p) (return-from run-shmem-control-lane-test t))
+  (let* ((p1 (make-array 12 :element-type '(unsigned-byte 8) :initial-element 61))
+         (p2 (make-array 12 :element-type '(unsigned-byte 8) :initial-element 62))
+         (dds.disc:*shmem-enabled* t)
+         (w (dds.disc:make-disc-node :guid-prefix p1 :host "127.0.0.1" :port 0))
+         (r (dds.disc:make-disc-node :guid-prefix p2 :host "127.0.0.1" :port 0)))
+    (unwind-protect
+         (progn
+           (dds.disc:add-local-writer w :topic "ShmemCtl" :type "X")
+           (dds.disc:enable-publisher w :history-kind :keep-all)   ; KEEP_ALL: the repair needs the change retained
+           (dds.disc:add-local-reader r :topic "ShmemCtl" :type "X"
+                                      :reliability dds.rtps.discovery:+reliability-reliable+)
+           (dds.disc:enable-subscriber r)
+           (setf (dds.disc::disc-node-peers w) (list (cons "127.0.0.1" (dds.disc:disc-node-port r)))
+                 (dds.disc::disc-node-peers r) (list (cons "127.0.0.1" (dds.disc:disc-node-port w))))
+           (dds.disc:start-node w) (dds.disc:start-node r)
+           (dds.disc:announce-participant w) (dds.disc:announce-participant r)
+           (loop repeat 300
+                 until (and (plusp (dds.disc:disc-node-discovered-count w))
+                            (plusp (dds.disc:disc-node-discovered-count r)))
+                 do (sleep 0.01))
+           (dds.disc:announce-endpoints w) (dds.disc:announce-endpoints r)
+           (loop repeat 300
+                 until (and (plusp (dds.disc:disc-node-matched-count w))
+                            (plusp (dds.disc:disc-node-matched-count r)))
+                 do (sleep 0.01))
+           (%check :ctl-lane-matched (plusp (dds.disc:disc-node-matched-count w))
+                   "the writer must match the reader before any control traffic is measured")
+           (dds.disc:publish-sample w (octets 1 1 1 1 1 1 1 1))
+           (loop repeat 400 until (>= (dds.disc:node-sample-count r) 1) do (sleep 0.01))
+           (%check :ctl-lane-delivered (>= (dds.disc:node-sample-count r) 1)
+                   "the reader must receive the first sample before the control-lane windows open")
+           ;; (0) the preconditions, each naming itself
+           (%check :ctl-lane-peer-is-shmem (and (dds.disc::%prefix-shmem-dest w p2) t)
+                   "the reader's participant must resolve as a same-host SHMEM peer of the writer")
+           (%check :ctl-lane-data-took-shmem (plusp (dds.disc::disc-node-shmem-sends w))
+                   "the DATA path must already be using SHMEM for this destination (else there is no lane to share)")
+           ;; OPEN THE GAP. Unacked, SN 2 is retained (a fully-acked HistoryCache is purged and
+           ;; %push-heartbeat then announces nothing), and every repair for it plans no submessage.
+           (setf dds.disc:*debug-drop-sample-numbers* (list 2))   ; global setf: drop on EVERY thread, incl. the resend
+           (dds.disc:publish-sample w (octets 2 2 2 2 2 2 2 2))
+           (sleep 0.2)                                            ; the reader learns of SN 2 and starts NACKing; every repair is dropped
+           (multiple-value-bind (first last) (dds.rtps.reliable:writer-heartbeat (dds.disc::disc-node-user-writer w))
+             (%check :ctl-lane-has-unacked (>= last first)
+                     (format nil "the writer must still be announcing an unacked change (first ~d, last ~d) or the HEARTBEAT is a no-op" first last)))
+           ;; (1) the PERIODIC HEARTBEAT must take the lane. The repair it draws is dropped -> no datagram.
+           (let ((before (dds.disc::disc-node-shmem-sends w)))
+             (dds.disc::%push-heartbeat w)
+             (let ((hb-cost (- (dds.disc::disc-node-shmem-sends w) before)))
+               (%check :ctl-lane-heartbeat (plusp hb-cost)
+                       (format nil "one %push-heartbeat must send at least one SHMEM datagram to a SHMEM peer (sent ~d)" hb-cost))
+               ;; (2) the ACKNACK REPAIR must take the lane. Snapshot BEFORE clearing the drop list, so a
+               ;; repair for an ACKNACK already in flight cannot land outside the window and be missed.
+               (let ((before2 (dds.disc::disc-node-shmem-sends w)))
+                 (setf dds.disc:*debug-drop-sample-numbers* nil)   ; the next NACK's repair now gets through
+                 (dds.disc::%push-heartbeat w)                     ; one more HB -> a NACK -> the repair
+                 (loop repeat 400 until (>= (dds.disc:node-sample-count r) 2) do (sleep 0.01))
+                 (let ((repair-cost (- (dds.disc::disc-node-shmem-sends w) before2)))
+                   (%check :ctl-lane-repaired (>= (dds.disc:node-sample-count r) 2)
+                           "the dropped sample must be repaired before its lane can be measured")
+                   (%check :ctl-lane-repair-took-shmem (> repair-cost hb-cost)
+                           (format nil "the ACKNACK repair must take the SHMEM lane: the repair window cost ~d SHMEM datagram(s), a bare HEARTBEAT window ~d"
+                                   repair-cost hb-cost)))))))
+      (progn (setf dds.disc:*debug-drop-sample-numbers* nil)
+             (dds.disc:stop-node w) (dds.disc:stop-node r))))
+  t)
+
 ;;; WP-SHMEM-SEND-SELF-GUARD (FR-XPORT-2): a SIGNALED %shmem-send hard fault (segment detached / pshared /
 ;;; bounds), unlike a benign return-0 lane-full, must NOT propagate out of the user-data send — %send-raw-buf
 ;;; (dds.disc) catches it, bumps disc-node-shmem-send-faults, fires *sender-emit-error-hook* with the context

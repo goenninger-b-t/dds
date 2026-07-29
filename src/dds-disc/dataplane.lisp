@@ -484,21 +484,27 @@
                   (dds.xport.udp:make-udp-locator :host host :port port)
                   buf 0 len))
 
-(defun* %send-msg-buf (node buf build-fn host port &optional dest-prefix)
+(defun* %send-msg-buf (node buf build-fn host port &optional dest-prefix shmem-dest)
     (function (disc-node dds.core.buffer:octet-buffer function string (unsigned-byte 16)
-               &optional (or null (simple-array (unsigned-byte 8) (12)))) t)
+               &optional (or null (simple-array (unsigned-byte 8) (12))) t) t)
   "Build an RTPS message (Header + whatever BUILD-FN writes on the cursor) into BUF
    and send it to HOST:PORT. BUF selects the thread's scratch message buffer. DEST-PREFIX
    (default NIL) is the 12-octet destination GUID-prefix on the USER-DATA path; non-NIL engages
    T10 whole-RTPS-message protection at %send-raw-buf when that dest is :keyed (NIL = plain,
    byte-identical — every builtin/discovery/bootstrap caller leaves it NIL).
+   SHMEM-DEST (default NIL, ADR 0097) is the destination's shmem-locator when it is a same-host SHMEM peer:
+   the message then goes over SHARED MEMORY with %send-raw-buf's usual UDP fallback, so a reliability control
+   submessage (HEARTBEAT / GAP) rides the SAME ORDERED LANE as the DATA it refers to instead of racing it on a
+   second transport drained by a different receiver thread. NIL is the original all-UDP behaviour,
+   byte-for-byte — and stays the right value for every builtin/discovery/bootstrap caller, whose messages
+   describe no user DATA and whose destination may not be a SHMEM peer at all.
    NFR-MEM: the build cursor comes from the calling receiver thread's own reply-cursor slot (%rx-tx-cursor
    over *rx-context*) — this runs once per inbound HEARTBEAT to answer with an ACKNACK, and a fresh cursor
    is 48 B. Off a receiver thread *rx-context* is NIL and it allocates exactly as before."
   (let ((mc (%rx-tx-cursor *rx-context* buf)))
     (dds.rtps.message:write-header mc (disc-node-guid-prefix node))
     (funcall build-fn mc)
-    (%send-raw-buf node buf (dds.core.buffer:cursor-position mc) host port nil dest-prefix)))
+    (%send-raw-buf node buf (dds.core.buffer:cursor-position mc) host port shmem-dest dest-prefix)))
 
 (defparameter *coalesce-datagram-budget* 1400
   "Soft upper bound (octets) on a coalesced RTPS datagram built by %SEND-PACKED. Default 1400 keeps the
@@ -668,6 +674,17 @@
                (setf (gethash (copy-seq prefix) (disc-node-shmem-dest-cache node))
                      (or resolved :none))        ; cache the verdict (:none for not-a-peer) keyed by an owned copy
                resolved)))))))
+
+(defun* %prefix-shmem-dest (node prefix)
+    (function (disc-node (or null (simple-array (unsigned-byte 8) (12)))) t)
+  "%shmem-dest for a possibly-NIL destination PREFIX (ADR 0097): the shmem-locator addressing PREFIX's
+   receive segment when it is a same-host SHMEM peer, else NIL. The NIL-prefix guard the user-data CONTROL
+   senders need — a discovery-less PEERS-fallback destination carries no remote participant prefix, and
+   %shmem-dest's argument is a 12-octet prefix, never NIL. RELIABILITY CONTROL TRAFFIC MUST TAKE THE SAME
+   TRANSPORT AS THE DATA IT REFERS TO (ADR 0097): this is the resolver the HEARTBEAT / GAP / ACKNACK-repair
+   senders share, and it answers the same question %group-shmem-dest answers from a push group's reader keys
+   (DRY — one memoized %shmem-dest lookup underneath both)."
+  (when prefix (%shmem-dest node prefix)))
 
 (defun* %reader-guid-p (guid)
     (function ((simple-array (unsigned-byte 8) (16))) t)
@@ -1525,35 +1542,43 @@
     t))
 
 
-(defun* %send-user-heartbeat (node buf first last count host port &optional dest-prefix)
+(defun* %send-user-heartbeat (node buf first last count host port &optional dest-prefix shmem-dest)
     (function (disc-node dds.core.buffer:octet-buffer integer integer integer string (unsigned-byte 16)
-               &optional (or null (simple-array (unsigned-byte 8) (12)))) t)
+               &optional (or null (simple-array (unsigned-byte 8) (12))) t) t)
   "Send one NON-FINAL user-writer HEARTBEAT (FIRST,LAST,COUNT) to HOST:PORT (RTPS 2.5 §8.3.7.5;
    readerId = ENTITYID_UNKNOWN, FinalFlag NOT_SET per the Reliable StatefulWriter T7 transition §8.4.9.2.7),
    prompting the reader to ACKNACK. BUF selects the thread's scratch message buffer. DEST-PREFIX (default NIL,
-   the 12-octet dest GUID-prefix) engages T10 whole-RTPS-message protection when that dest is :keyed."
+   the 12-octet dest GUID-prefix) engages T10 whole-RTPS-message protection when that dest is :keyed.
+   SHMEM-DEST (default NIL, ADR 0097) sends it over the destination's SHARED-MEMORY lane — the SAME lane the
+   push path (%send-changes-packed) used for the DATA this HEARTBEAT announces. Sent on a second transport it
+   can OVERTAKE that DATA (the SHMEM ring and the UDP socket are drained by different receiver threads), and
+   the reader then NACKs a sample sitting unread in the ring; on the ordered lane the reader has processed the
+   DATA before it sees the HEARTBEAT that announces it."
   (%send-msg-buf node buf
                  (lambda (mc)
                    (dds.rtps.message:write-heartbeat
                     mc dds.rtps.message:+entityid-unknown+ (%emit-wid node) first last count :final nil))
-                 host port dest-prefix))
+                 host port dest-prefix shmem-dest))
 
-(defun* %send-user-gap (node buf reader-id gap-sns host port &optional dest-prefix)
+(defun* %send-user-gap (node buf reader-id gap-sns host port &optional dest-prefix shmem-dest)
     (function (disc-node dds.core.buffer:octet-buffer (unsigned-byte 32) cons string (unsigned-byte 16)
-               &optional (or null (simple-array (unsigned-byte 8) (12)))) t)
+               &optional (or null (simple-array (unsigned-byte 8) (12))) t) t)
   "Send ONE GAP to HOST:PORT declaring every SN in the non-empty GAP-SNS list irrelevant (RTPS 2.5 §8.3.7.4 /
    §9.4.5.6): readerId = the NACKing reader's EntityId READER-ID, writerId = this user writer's EntityId. The
    SequenceNumberSet is built by seqnum-set-from-sns (shared MSB-first layout) and gapStart = its base, so the
    [gapStart, base) contiguous-prefix range is empty and the set is EXACTLY the bitmapped SNs. The gap SNs all
    came from ONE inbound ACKNACK's SequenceNumberSet, so they fit one 256-SN window. BUF selects the thread's
    scratch message buffer; mirrors %send-user-heartbeat (single-submessage send via %send-msg-buf). DEST-PREFIX
-   (default NIL, the 12-octet dest GUID-prefix) engages T10 whole-RTPS-message protection when that dest is :keyed."
+   (default NIL, the 12-octet dest GUID-prefix) engages T10 whole-RTPS-message protection when that dest is :keyed.
+   SHMEM-DEST (default NIL, ADR 0097) sends it over the destination's SHARED-MEMORY lane, ordered behind the
+   repair DATA it is emitted beside — a GAP that overtakes the repair would advance the reader past an SN the
+   repair was about to deliver."
   (multiple-value-bind (base numbits bitmap) (dds.rtps.message:seqnum-set-from-sns gap-sns)
     (%send-msg-buf node buf
                    (lambda (mc)
                      (dds.rtps.message:write-gap
                       mc reader-id (%emit-wid node) base base numbits bitmap))
-                   host port dest-prefix)))
+                   host port dest-prefix shmem-dest)))
 
 (defun* %reader-push-targets (node &optional topic)
     (function (disc-node &optional (or null string)) list)
@@ -2058,7 +2083,8 @@
       (multiple-value-bind (first last count) (dds.rtps.reliable:writer-heartbeat w)
         (when (>= last first)
           (dolist (pd (%match-destinations-prefixed node t))   ; (DEST-PREFIX . (host . port)); T10 wraps a :keyed dest
-            (%send-user-heartbeat node (disc-node-tx-msg node) first last count (cadr pd) (cddr pd) (car pd)))))))
+            (%send-user-heartbeat node (disc-node-tx-msg node) first last count (cadr pd) (cddr pd) (car pd)
+                                  (%prefix-shmem-dest node (car pd))))))))   ; ADR 0097: the HB rides its own DATA's lane
   t)
 
 (defun* %writer-durability-init (node reader-guid reader-durability &optional writer-id)
@@ -2100,7 +2126,8 @@
                      (peers (if dest (list (cons prefix dest)) (%match-destinations-prefixed node t))))
                 (dolist (pd peers)
                   (%send-user-heartbeat node (disc-node-rx-tx-msg node) first last count
-                                        (cadr pd) (cddr pd) (car pd)))))))))) ; T10: wrap the prompt HB to a :keyed reader
+                                        (cadr pd) (cddr pd) (car pd)
+                                        (%prefix-shmem-dest node (car pd))))))))))) ; T10 wrap + ADR 0097 lane
   t)
 
 (defun* %reader-durability-init (node writer-guid writer-durability)
@@ -3967,9 +3994,15 @@
                  ;; DOLIST that immediately took it apart again. It repairs to that peer DIRECTLY now; the
                  ;; undiscovered-prefix fan-out still walks the (already memoized) prefixed destination list.
                  ;; flet + dynamic-extent (ADR 0072): one body, both arms, no closure consed.
+                 ;; ADR 0097: the repair takes the SAME lane the push took, so it is ORDERED behind anything
+                 ;; still queued for this destination instead of racing it on a second transport. The
+                 ;; shmem-dest is resolved ONLY when there is something to repair — the steady-state ACKNACK
+                 ;; acks everything and repairs nothing, and that arm (once per sample) must stay free of
+                 ;; %shmem-dest's node-lock hold.
                  (flet ((%repair-to (dest-prefix peer)   ; retransmit present DATA(_FRAG)/dispose, then GAP the missing -> the NACKing reader
-                          (%send-changes-packed node (disc-node-rx-tx-msg node) resends (car peer) (cdr peer) nil nil nil nil 0 dest-prefix)
-                          (when gaps (%send-user-gap node (disc-node-rx-tx-msg node) rid gaps (car peer) (cdr peer) dest-prefix))))
+                          (let ((sd (and (or resends gaps) (%prefix-shmem-dest node dest-prefix))))
+                            (%send-changes-packed node (disc-node-rx-tx-msg node) resends (car peer) (cdr peer) nil nil nil sd 0 dest-prefix)
+                            (when gaps (%send-user-gap node (disc-node-rx-tx-msg node) rid gaps (car peer) (cdr peer) dest-prefix sd)))))
                    (declare (dynamic-extent #'%repair-to))
                    (if dest
                        (%repair-to src-prefix dest)   ; (DEST-PREFIX . (host . port)) (T10): the NACKing reader itself
