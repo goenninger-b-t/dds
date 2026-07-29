@@ -318,30 +318,44 @@
    (listener entity snapshot). The status-generic seam the %notify-status propagation walk uses to
    deliver a status to whichever listener in the containment chain handles it (DDS 1.4 §2.2.4.1).")
 
-(defun* %listener-ancestry (entity)
-    (function (entity) list)
-  "ENTITY then its containment parents up to the DomainParticipant, MOST-SPECIFIC FIRST — the DDS
-   1.4 §2.2.4.1 listener-propagation chain. DataReader: reader -> Subscriber -> participant;
-   DataWriter: writer -> Publisher -> participant; Topic: topic -> participant;
-   Publisher/Subscriber: itself -> participant; DomainParticipant: itself."
+(declaim (inline %map-listener-ancestry))
+(defun* %map-listener-ancestry (entity fn)
+    (function (entity function) t)
+  "Call FN on ENTITY then on each containment parent up to the DomainParticipant, MOST-SPECIFIC FIRST —
+   the DDS 1.4 §2.2.4.1 listener-propagation chain — and return FN's first non-NIL result, or NIL.
+   DataReader: reader -> Subscriber -> participant; DataWriter: writer -> Publisher -> participant;
+   Topic: topic -> participant; Publisher/Subscriber: itself -> participant; DomainParticipant: itself.
+
+   NFR-MEM: it WALKS the chain rather than materialising it. This used to return the chain as a fresh
+   LIST, and DATA_AVAILABLE notification runs it TWICE per sample on the receiver thread (once on the
+   Subscriber for DATA_ON_READERS, once on the DataReader), so five conses — 80 B — were spent per sample
+   building two lists that were immediately walked and dropped. The chain is at most three entities and
+   its shape is fixed per entity type, so nothing needs to be built to walk it. FN is a downward funarg:
+   it is funcalled here and stored nowhere, so a caller may declare it DYNAMIC-EXTENT."
   (typecase entity
-    (data-reader (let ((s (dr-subscriber entity))) (list entity s (sub-participant s))))
-    (data-writer (let ((pb (dw-publisher entity))) (list entity pb (pub-participant pb))))
-    (topic (list entity (topic-participant entity)))
-    (publisher (list entity (pub-participant entity)))
-    (subscriber (list entity (sub-participant entity)))
-    (t (list entity))))
+    (data-reader (let ((s (dr-subscriber entity)))
+                   (or (funcall fn entity) (funcall fn s) (funcall fn (sub-participant s)))))
+    (data-writer (let ((pb (dw-publisher entity)))
+                   (or (funcall fn entity) (funcall fn pb) (funcall fn (pub-participant pb)))))
+    (topic (or (funcall fn entity) (funcall fn (topic-participant entity))))
+    (publisher (or (funcall fn entity) (funcall fn (pub-participant entity))))
+    (subscriber (or (funcall fn entity) (funcall fn (sub-participant entity))))
+    (t (funcall fn entity))))
 
 (defun* %find-enabled-listener (entity status-kw)
     (function (entity keyword) t)
   "The MOST-SPECIFIC listener in ENTITY's containment chain that is installed AND enabled for
-   STATUS-KW (its mask contains STATUS-KW), or NIL (DDS 1.4 §2.2.4.1). Walks %listener-ancestry,
+   STATUS-KW (its mask contains STATUS-KW), or NIL (DDS 1.4 §2.2.4.1). Walks %map-listener-ancestry,
    reading each entity's listener under its own listener lock; the walk STOPS at the first
-   enabled listener (that listener handles the status; propagation goes no further up)."
-  (dolist (e (%listener-ancestry entity) nil)
-    (multiple-value-bind (l mask)
-        (dds.pal:with-lock ((%entity-listener-lock e)) (%entity-listener e))
-      (when (and l (member status-kw mask)) (return l)))))
+   enabled listener (that listener handles the status; propagation goes no further up).
+   NFR-MEM: the test is an flet declared DYNAMIC-EXTENT and the ancestry is walked, not built, so the
+   whole lookup allocates nothing — it is on the per-sample DATA_AVAILABLE path."
+  (flet ((%enabled-listener (e)
+           (multiple-value-bind (l mask)
+               (dds.pal:with-lock ((%entity-listener-lock e)) (%entity-listener e))
+             (and l (member status-kw mask) l))))
+    (declare (dynamic-extent #'%enabled-listener))
+    (%map-listener-ancestry entity #'%enabled-listener)))
 
 (defun* %notify-status (entity status-bit status-kw apply-fn)
     (function (entity (unsigned-byte 32) keyword function) (eql t))

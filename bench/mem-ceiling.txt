@@ -152,6 +152,14 @@
 #   arm64 COPY    802.6 /  801.5 /  803.7 /  796.0   -> LOWERED 850 -> 835
 #   arm64 RETURN  594.1 /  594.1 /  594.1 /  594.1   -> LOWERED 640 -> 625
 #
+# LOWERED 2026-07-29 (the DATA_AVAILABLE listener lookup WALKS the containment chain instead of consing it.
+# %listener-ancestry returned reader->Subscriber->participant as a fresh LIST, and the notification runs it
+# TWICE per sample on the receiver thread — 5 conses, 80 B — to build two lists that were immediately
+# walked and dropped. It measured as the ENTIRE DATA-handler cost (89.5 of 91.7 B/sample). Predicted ~80,
+# measured -76.4 / -80.8:
+#   arm64 COPY    719.6 /  720.7 /  720.7   -> LOWERED 835 -> 750
+#   arm64 RETURN  513.3 /  513.3 /  514.4   -> LOWERED 625 -> 545
+#
 # ⚠️ MEASURE WITH NOTHING ELSE RUNNING. A gate-mem run taken while the test suites were running in the
 # background read COPY 1710.8 and FAILED — a 160 B phantom regression from participant + CPU contention,
 # not from code. A benchmark is an instrument; give it the machine.
@@ -159,5 +167,5 @@
 # x86_64 is NOT re-measured here; its COPY row stays 1740 and will simply not bite until someone measures
 # it on that arch. Never derive it from arm64.
 #   x86_64 not measured here — the dash is honest, not lazy.
-arm64  835 625
+arm64  750 545
 x86_64 1740 -
