@@ -20,6 +20,23 @@ name: Gates
 #               REMAINS A HUMAN STEP: `make test-clasp` + `make gate-build LISP=./scripts/with-clasp.sh`.
 #   * INTEROP — needs licensed RTI Connext + a Fast DDS build. Human step: `make interop`.
 #   * WIRE    — needs tshark; installed below, so it DOES run.
+#
+# 2026-07-29 — WHY THIS FILE WAS REBUILT. CI was red on ONE test and, because the runner stopped at the
+# first failure, that made it blind to everything after it. MD-E2E-P2-VIEW is 135th of 553, so 418 TESTS
+# HAD NEVER RUN IN CI AT ALL — the whole loan-write, keyed-FlatData, durability, XTypes-lookup and
+# DDS-Security suites among them. The run reported nothing about them, and the local run reported "623
+# passed" from a DIFFERENT platform, so the gap was invisible from both ends.
+#
+# run-all-tests now RECORDS each failure and CONTINUES, prints a true "N passed, M FAILED, T total" with
+# every failure named, and still SIGNALS at the end so the job goes red. Falsified deliberately: with a
+# failure injected into the FIRST test, 590 tests still ran, the summary read "622 passed, 1 FAILED,
+# 623 total", and make exited 2.
+#
+# ⚠️ EXPECT MD-E2E-P2-VIEW TO STILL FAIL HERE, and that is the point of this rebuild rather than a defect
+# in it. It has NEVER passed on Linux: it landed 2026-07-05 and this CI was created 2026-07-14, nine days
+# later, so Linux first ran it after it was merged. It is NOT skipped — skipping would hide a real
+# platform defect — so the job stays red until it is fixed, but the run now reports the status of the
+# other 552 tests instead of stopping.
 
 on:
   push:
@@ -90,6 +107,13 @@ jobs:
       - name: gate-mem (NFR-MEM allocation ratchet)
         timeout-minutes: 10
         run: make gate-mem
+
+      # ADR 0095. Asserts what `make mem` was long credited with and never checked: that ONE process arena
+      # sized by *static-arena-bytes* bounds hot-path static memory, that a live participant charges it,
+      # that a create/delete cycle RETURNS the charge, and that high-water < budget. Falsifies itself first.
+      - name: gate-arena (FR-PF-7 static-memory budget)
+        timeout-minutes: 10
+        run: make gate-arena
 
       - name: fuzz (CDR/RTPS parser fuzzers, prod + safety-0)
         run: make fuzz LISP=./scripts/with-sbcl.sh

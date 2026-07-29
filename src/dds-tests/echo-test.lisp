@@ -4474,9 +4474,35 @@
                  ("security-dn-match"             . run-security-dn-match-test)
                  ("security-crypto-manager"       . run-security-crypto-manager-test)
                  ("security-session-key-cache"    . run-security-session-key-cache-test))))
-    (dolist (test tests)
-      (format t "~&  [test] ~a ... " (car test))
-      (funcall (cdr test))
-      (format t "ok~%"))
-    (format t "~&tests: ~d passed.~%" (length tests))
-    t))
+    ;; RUN EVERY TEST, THEN REPORT. This used to be a bare DOLIST over FUNCALL: the first failure signalled
+    ;; and unwound the whole loop, so the run STOPPED THERE. In CI that was catastrophic and silent — the
+    ;; Linux-only MD-E2E-P2-VIEW failure sits 135th of 553, so 418 tests HAD NEVER RUN IN CI AT ALL,
+    ;; including the entire loan-write, keyed-FlatData, durability, XTypes-lookup and DDS-Security suites.
+    ;; Locally the same list passed end to end, so nothing looked wrong.
+    ;;
+    ;; The old summary compounded it: "~d passed" printed (LENGTH TESTS) — the size of the LIST, not a
+    ;; count of what passed. It was only ever reached when nothing had signalled, so it was not false, but
+    ;; it reported an intention rather than a result and could never say "552 of 553".
+    ;;
+    ;; Failures are RECORDED AND THE RUN CONTINUES; the summary lists every one and the function still
+    ;; SIGNALS at the end, so `make test` still exits non-zero. Nothing is hidden — the point is to learn
+    ;; what the OTHER tests do, not to tolerate a failure.
+    ;;
+    ;; ⚠️ A failure can CASCADE: a test that dies mid-way may leave participants, threads or sockets behind
+    ;; and break its successors. Read the FIRST failure as the real one and treat the rest as suspect until
+    ;; re-run in isolation. That is still strictly better than learning nothing about them.
+    (let ((failures '()) (passed 0))
+      (dolist (test tests)
+        (format t "~&  [test] ~a ... " (car test))
+        (finish-output)
+        (handler-case (progn (funcall (cdr test)) (incf passed) (format t "ok~%"))   ; HOTPATH-COND(TEST): the run-every-test harness — a failure is recorded, never allowed to end the run
+          (error (e)
+            (push (cons (car test) (princ-to-string e)) failures)
+            (format t "FAIL~%           ~a~%" e))))
+      (format t "~&tests: ~d passed, ~d FAILED, ~d total.~%" passed (length failures) (length tests))
+      (when failures
+        (format t "~&FAILURES (the FIRST is the real one; later ones may be cascades):~%")
+        (dolist (f (reverse failures)) (format t "  ~a~%    ~a~%" (car f) (cdr f)))
+        (error 'test-failure :name :run-all-tests
+                             :detail (format nil "~d of ~d tests failed" (length failures) (length tests))))
+      t)))

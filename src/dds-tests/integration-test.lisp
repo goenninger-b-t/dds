@@ -9539,10 +9539,31 @@
              (loop repeat 400
                    until (and (plusp (dds.disc:node-sample-count node2)) (plusp (dds.disc:node-sample-count node3)))
                    do (dds.dcps:spin p1) (dds.dcps:spin p2) (dds.dcps:spin p3) (sleep 0.02))
+             ;; ASSERT THE WAIT, do not just perform it. This loop was unasserted: on timeout it fell
+             ;; through and the ZC-view check below reported "p2 must take a ZC view" for a sample that had
+             ;; never ARRIVED — one message for two unrelated causes (nothing delivered, vs delivered but
+             ;; not deferred as a ZC marker), which is why the Linux failure could not be diagnosed from
+             ;; the CI log. Arrival is a precondition of the view check, so it gets its own assertion.
+             ;; A ZC VIEW HAS PRECONDITIONS — assert them, so a failure names the one that broke instead of
+             ;; blaming the outcome. %on-user-data only defers a marker when the receiving node HAS a ZC
+             ;; pool and is ZC-LOAN-CAPABLE; without either it takes the ordinary copy path and the reader
+             ;; gets an octet-buffer, which is exactly what "p2 must take a ZC view" used to report.
+             (%check :md-e2e-p2-zc-armed
+                     (and (dds.disc::disc-node-zc-pool node2) (dds.disc::disc-node-zc-loan-capable node2))
+                     (format nil "p2 must be ZC-armed (pool ~a, loan-capable ~a); p3 (pool ~a, loan-capable ~a)"
+                             (and (dds.disc::disc-node-zc-pool node2) t) (dds.disc::disc-node-zc-loan-capable node2)
+                             (and (dds.disc::disc-node-zc-pool node3) t) (dds.disc::disc-node-zc-loan-capable node3)))
+             (%check :md-e2e-delivered
+                     (and (plusp (dds.disc:node-sample-count node2))
+                          (plusp (dds.disc:node-sample-count node3)))
+                     (format nil "both readers must RECEIVE the sample (p2 stored ~d, p3 stored ~d)"
+                             (dds.disc:node-sample-count node2) (dds.disc:node-sample-count node3)))
              ;; (3) both readers take-loaned a view of the SAME shared slot, byte-exact
              (multiple-value-bind (d2 l2) (dds.dcps:take-loaned dr2)
                (multiple-value-bind (d3 l3) (dds.dcps:take-loaned dr3)
-                 (%check :md-e2e-p2-view (and d2 (dds.types:flatdata-view-p (first d2))) "p2 must take a ZC view")
+                 (%check :md-e2e-p2-view (and d2 (dds.types:flatdata-view-p (first d2)))
+                         (format nil "p2 must take a ZC view — took ~d sample(s), first is ~a"
+                                 (length d2) (if d2 (type-of (first d2)) "nothing")))
                  (%check :md-e2e-p3-view (and d3 (dds.types:flatdata-view-p (first d3))) "p3 must take a ZC view")
                  (let ((v2 (first d2)) (v3 (first d3)))
                    (%check :md-e2e-same-slot
