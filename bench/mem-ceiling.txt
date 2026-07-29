@@ -160,6 +160,14 @@
 #   arm64 COPY    719.6 /  720.7 /  720.7   -> LOWERED 835 -> 750
 #   arm64 RETURN  513.3 /  513.3 /  514.4   -> LOWERED 625 -> 545
 #
+# LOWERED 2026-07-29 (the drain skips its merged PLAN when no lifecycle change is pending — the plan exists
+# only to tag each key data-vs-lifecycle and cost a CONS PER KEY to do it, while a dispose/unregister is
+# rare. With none pending, DATA-KEYS is already the whole plan: sorted in place, drained directly.
+# Predicted ~16 B/sample (one cons per pending key), measured -14.2 / -16.4 — the probe window had said
+# 49.1 for this phase, another over-report:
+#   arm64 COPY    705.4 /  705.4 /  705.4   -> LOWERED 750 -> 730
+#   arm64 RETURN  496.9 /  496.9 /  495.8   -> LOWERED 545 -> 525
+#
 # ⚠️ MEASURE WITH NOTHING ELSE RUNNING. A gate-mem run taken while the test suites were running in the
 # background read COPY 1710.8 and FAILED — a 160 B phantom regression from participant + CPU contention,
 # not from code. A benchmark is an instrument; give it the machine.
@@ -167,5 +175,5 @@
 # x86_64 is NOT re-measured here; its COPY row stays 1740 and will simply not bite until someone measures
 # it on that arch. Never derive it from arm64.
 #   x86_64 not measured here — the dash is honest, not lazy.
-arm64  750 545
+arm64  730 525
 x86_64 1740 -

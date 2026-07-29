@@ -3332,15 +3332,28 @@
              (life-keys (dds.disc:node-collect-pending-lifecycle node #'%life-pending-p (dr-drain-life-keys dr)))
              ;; Order by raw RTPS SN (§8.3.5.4: SN is per-writer) so a dispose/revive from one writer still lands
              ;; in §2.2.2.5 SN order. Merged into the reader's REUSED plan vector and sorted in place.
-             (plan (let ((v (dr-drain-plan dr)))
-                     (setf (fill-pointer v) 0)
-                     (loop for k across data-keys do (vector-push-extend (cons :data k) v))
-                     (loop for k across life-keys do (vector-push-extend (cons :lifecycle k) v))
-                     (sort v #'< :key (lambda (e) (dds.disc:node-sample-key-sn (cdr e)))))))
-        (loop for entry across plan
-              do (ecase (car entry)
-                   (:data (%drain-one-sample dr node ts (cdr entry)))
-                   (:lifecycle (%drain-one-lifecycle dr node (cdr entry)))))
+             ;; NFR-MEM: the merged plan exists ONLY to tag each key data-vs-lifecycle, and it costs a CONS
+             ;; PER KEY to do it. A pending lifecycle change is rare — a dispose or unregister, not a sample —
+             ;; so the steady-state drain merges an empty list into a one-element one and pays a cons for the
+             ;; privilege. With no lifecycle pending, DATA-KEYS is already the whole plan: sort it in place
+             ;; (it is the reader's own reused vector) and drain it directly, consing nothing. The merged path
+             ;; below is unchanged and still handles ordering across the two streams.
+             (lifecycle-pending (plusp (fill-pointer life-keys)))
+             (plan (when lifecycle-pending
+                     (let ((v (dr-drain-plan dr)))
+                       (setf (fill-pointer v) 0)
+                       (loop for k across data-keys do (vector-push-extend (cons :data k) v))
+                       (loop for k across life-keys do (vector-push-extend (cons :lifecycle k) v))
+                       (sort v #'< :key (lambda (e) (dds.disc:node-sample-key-sn (cdr e))))))))
+        (if lifecycle-pending
+            (loop for entry across plan
+                  do (ecase (car entry)
+                       (:data (%drain-one-sample dr node ts (cdr entry)))
+                       (:lifecycle (%drain-one-lifecycle dr node (cdr entry)))))
+            ;; Same SN ordering (§8.3.5.4 / §2.2.2.5), same exactly-once discipline — one stream, no tagging.
+            (progn
+              (sort data-keys #'< :key #'dds.disc:node-sample-key-sn)
+              (loop for k across data-keys do (%drain-one-sample dr node ts k))))
         t))))
 
 (defun* %where-any (sample)
