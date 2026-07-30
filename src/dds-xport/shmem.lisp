@@ -177,18 +177,29 @@
   "A nonzero 64-bit per-sender token from the low 8 GUID-prefix octets (0 is the free-lane marker)."
   (let ((v 0)) (dotimes (i 8) (setf v (logior (ash v 8) (aref guid i)))) (if (zerop v) 1 v)))
 
-(defun* %seg-name (guid)
-    (function ((simple-array (unsigned-byte 8) (12))) string)
-  "Segment name '/dds' + 10 hex of the token (macOS ~31-char shm-name cap)."
-  (format nil "/dds~(~10,'0x~)" (%guid-token guid)))   ; HOTPATH-ALLOC(COLD): segment name, built once at segment create/open
+(defun* %seg-name (guid domain)
+    (function ((simple-array (unsigned-byte 8) (12)) (integer 0)) string)
+  "Segment name '/dds' + 10 hex of the token + 'd' + the DOMAIN id in hex (macOS ~31-char shm-name cap;
+   14 + 1 + up to 4 = 19, leaving room for the ZC pool's 'z' suffix)."
+  (format nil "/dds~(~10,'0x~)d~(~x~)" (%guid-token guid) domain))   ; HOTPATH-ALLOC(COLD): segment name, built once at segment create/open
 
-(defun* seg-name-for-guid (guid)
-    (function ((simple-array (unsigned-byte 8) (12))) string)
-  "Public alias for the deterministic receive-segment name a peer's 12-octet GUID prefix maps to
+(defun* seg-name-for-guid (guid domain)
+    (function ((simple-array (unsigned-byte 8) (12)) (integer 0)) string)
+  "Public alias for the deterministic receive-segment name a peer's 12-octet GUID prefix maps to IN DOMAIN
    (RTPS 2.5 §9.4.4 + this transport's %seg-name): a SENDER derives the destination segment name from the
    remote participant's prefix (FR-XPORT-2), so the discovery layer addresses a same-host SHMEM peer with
-   make-shmem-locator :name (seg-name-for-guid remote-prefix) without reaching the %-internal."
-  (%seg-name guid))
+   make-shmem-locator :name (seg-name-for-guid remote-prefix domain) without reaching the %-internal.
+
+   DOMAIN IS PART OF THE SEGMENT IDENTITY, and must be (owner directive, ADR 0099). A shm name is a
+   PROCESS-GLOBAL OS object, not a domain-scoped one: without the domain, two participants that share a
+   GuidPrefix in DIFFERENT DDS domains resolve to the SAME segment and cross-talk, and unlike UDP — where
+   the domain's own port range separates them — nothing else keeps them apart. DDS 1.4 §2.2.1.2.2: a domain
+   is an isolation boundary; a transport that ignores it is not implementing the boundary.
+
+   ⚠️ The token still folds only GUID-prefix octets 0..7 (%guid-token), so two prefixes differing ONLY in
+   octets 8..11 still collide within one domain. That is a separate, pre-existing narrowing — tracked, not
+   fixed here."
+  (%seg-name guid domain))
 
 (defun* %make-shmem-transport-record (seg name host-uuid lane-count capacity token)
     (function (t string (unsigned-byte 64) (integer 1) (integer 8) (unsigned-byte 64))
@@ -209,8 +220,9 @@
            :close (lambda () (shmem-transport-close st))))
     (values st nil)))
 
-(defun* make-shmem-transport (&key participant-guid (host-uuid 0) (lane-count 8) (capacity 65536))
-    (function (&key (:participant-guid (simple-array (unsigned-byte 8) (12))) (:host-uuid (unsigned-byte 64))
+(defun* make-shmem-transport (&key participant-guid (domain 0) (host-uuid 0) (lane-count 8) (capacity 65536))
+    (function (&key (:participant-guid (simple-array (unsigned-byte 8) (12))) (:domain (integer 0))
+               (:host-uuid (unsigned-byte 64))
                (:lane-count (integer 1)) (:capacity (integer 8)))
               (values (or null shmem-transport) (or null keyword)))
   "Create this participant's SHMEM receive segment (+ ring + pshared notify block) and a transport record
@@ -218,7 +230,7 @@
    Returns (values transport NIL), or (values NIL status) if the segment cannot be created/mapped or the
    ring cannot be initialised (the segment is detached AND unlinked again on that path — a failed transport
    leaves no mapped, half-initialised shm object behind for a peer to attach to)."
-  (let* ((name (%seg-name participant-guid)) (token (%guid-token participant-guid)))
+  (let* ((name (%seg-name participant-guid domain)) (token (%guid-token participant-guid)))
     (dds.pal:shm-destroy name)                       ; drop a stale leftover of the same name (no-op if absent)
     (multiple-value-bind (seg status) (dds.pal:shm-create name (%segment-bytes lane-count capacity))
       (when status (bail status))

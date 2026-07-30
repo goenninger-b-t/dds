@@ -1020,13 +1020,15 @@
   "Well-known SPDP DefaultMulticastLocator address (RTPS 2.5 §9.6.1.1): all
    participants announce + listen on UDPv4 239.255.0.1 : spdp-multicast-port.")
 
-(defun* %zc-pool-name (guid)
-    (function ((simple-array (unsigned-byte 8) (12))) string)
-  "WP-ZEROCOPY pool segment name for a participant's 12-octet GUID prefix: the SHMEM receive-segment name
-   (dds.xport.shmem:seg-name-for-guid, '/dds' + 10 hex = 14 chars) suffixed 'z' -> 15 chars, under the
-   macOS ~31-char shm-name cap. The reader derives the SAME name from the DATA source prefix (no extra
-   advertisement). ADR 0014; NOT a wire constant."
-  (concatenate 'string (dds.xport.shmem:seg-name-for-guid guid) "z"))
+(defun* %zc-pool-name (guid domain)
+    (function ((simple-array (unsigned-byte 8) (12)) (integer 0)) string)
+  "WP-ZEROCOPY pool segment name for a participant's 12-octet GUID prefix IN DOMAIN: the SHMEM
+   receive-segment name (dds.xport.shmem:seg-name-for-guid, '/dds' + 10 hex + 'd' + domain hex = up to 19
+   chars) suffixed 'z' -> up to 20, under the macOS ~31-char shm-name cap. The reader derives the SAME name
+   from the DATA source prefix and ITS OWN domain (no extra advertisement) — which is the same domain, since
+   a sample only reaches a reader in the writer's domain. ADR 0014; domain scoping per ADR 0099. NOT a wire
+   constant."
+  (concatenate 'string (dds.xport.shmem:seg-name-for-guid guid domain) "z"))
 
 (defun* %zc-make-pool (node)
     (function (disc-node) (values t (or null keyword)))
@@ -1037,7 +1039,7 @@
    initialised — the pool is NOT half-installed on the node (the slots are set only after a clean init),
    and the segment is detached before returning. NOT cleared for ship — pending counsel (R6)."
   (multiple-value-bind (seg status)
-      (dds.pal:shm-create (%zc-pool-name (disc-node-guid-prefix node))
+      (dds.pal:shm-create (%zc-pool-name (disc-node-guid-prefix node) (disc-node-domain node))
                           (dds.xport.zerocopy::%zc-bytes +zerocopy-pool-slots+ +zerocopy-pool-slot-bytes+))
     (when status (bail status))
     (multiple-value-bind (ok init-status)
@@ -1137,7 +1139,7 @@
         (when *shmem-enabled*   ; SHMEM receive segment for same-host user DATA (FR-XPORT-2)
           (multiple-value-bind (st status)
               (dds.xport.shmem:make-shmem-transport
-               :participant-guid guid-prefix :host-uuid host-uuid
+               :participant-guid guid-prefix :domain domain :host-uuid host-uuid   ; ADR 0099: the segment identity is (domain, prefix)
                :lane-count +shmem-default-lane-count+ :capacity +shmem-default-capacity+)
             (when status (bail (release status)))
             (setf shmem st)))
@@ -3339,7 +3341,7 @@
     (%zc-armed-sweep node)   ; WP-FLATDATA-LOAN-WRITE (ADR 0042): release any armed-but-never-pushed pre-committed slot BEFORE the pool dies (no stranded refcount observable by a still-attached reader)
     (dds.xport.zerocopy::%zc-destroy (disc-node-zc-pool-sap node))
     (dds.pal:shm-detach (disc-node-zc-pool node))
-    (dds.pal:shm-destroy (%zc-pool-name (disc-node-guid-prefix node)))
+    (dds.pal:shm-destroy (%zc-pool-name (disc-node-guid-prefix node) (disc-node-domain node)))
     (setf (disc-node-zc-pool node) nil (disc-node-zc-pool-sap node) nil))
   (when (disc-node-tx-payload node)
     (dds.pal:free-static (dds.core.buffer:octet-buffer-vec (disc-node-tx-payload node)))

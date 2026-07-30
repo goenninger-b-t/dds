@@ -641,7 +641,7 @@
       (let ((wl (%shmem-wire-locator spdp)))
         (when wl
           (dds.xport.shmem:make-shmem-locator
-           :name (dds.xport.shmem:seg-name-for-guid prefix)
+           :name (dds.xport.shmem:seg-name-for-guid prefix (disc-node-domain node))
            :host-uuid (disc-node-host-uuid node)
            :lane-count (dds.rtps.discovery:shmem-locator-wire-lane-count wl)
            :capacity (dds.rtps.discovery:locator-port wl)))))))
@@ -2827,7 +2827,7 @@
         ((eq cached :none) nil)
         (cached (dds.pal:shm-sap cached))
         (t (multiple-value-bind (seg status)
-               (dds.pal:shm-attach (%zc-pool-name src-prefix)
+               (dds.pal:shm-attach (%zc-pool-name src-prefix (disc-node-domain node))
                                    (dds.xport.zerocopy::%zc-bytes
                                     +zerocopy-pool-slots+ +zerocopy-pool-slot-bytes+))
              (when status (setf seg nil))          ; no such pool (or it will not map): remember "none"
