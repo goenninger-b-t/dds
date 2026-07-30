@@ -313,9 +313,11 @@ NameHash example: `MD5("color")[0:4]` = `70 dd a5 df`. (From `run-md5-test`.)
   failure leave the slot NIL and change nothing; never unwind* — and is the carve twin of `%with-scratch`, the
   shared borrow. Eight of the nine pools go through it; `%ensure-secured-payload-pool` is a documented
   exception because its pool lives on the writer's HistoryCache, not a node slot. Note what the macro does and
-  does not buy: it protects the sites that use it, not the language — a hand-written tenth carve, or a
-  `RETURN-FROM` added inside any other `HANDLER-CASE` nested in an `UNWIND-PROTECT` on a per-sample path, is
-  still unguarded.
+  does not buy: it protects the sites that use it, not the language. That gap is closed by **`make
+  gate-nlx`**, a *form walker* (not a grep — no single construct is the defect, only the nesting, and a regex
+  cannot see nesting) that flags any exit crossing an unwind from inside a handler. It learns this repo's own
+  lock macros from their expansions. The per-sample engine is held at **zero**; colder layers are ratcheted in
+  `bench/nlx-ceiling.txt` and may only go down. It found a tenth site on its first run.
 - **The raw-pointer rule is now ENFORCED, not just documented (ADR 0085).** NFR-MEM requires that anything
   addressed by a raw pointer/SAP be foreign/static, never a GC-heap array — a moving collector can
   invalidate a heap vector's address underneath a syscall, after which the kernel reads or writes whatever

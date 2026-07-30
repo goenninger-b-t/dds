@@ -2330,15 +2330,16 @@
                 (if (dds.rtps.history:history-cache-payload-pool hc)
                     (let ((buf (dds.rtps.reliable:writer-acquire-payload-buffer writer)))
                       (if buf
-                          (let ((committed nil))
+                          (let ((committed nil) (overflow nil))
                             (unwind-protect
                                  (handler-case
                                      (let ((len (dds.security:encode-serialized-payload-into buf km payload)))
                                        (setf payload (dds.core.buffer:octet-buffer-vec buf) pooled buf plen len committed t))
                                    (dds.core.buffer:buffer-overflow ()   ; payload > element-bytes: RESOURCE_LIMITS reject, never a GC fallback
-                                     (return-from publish-sample :timeout)))
+                                     (setf overflow t)))   ; ADR 0098: a FLAG, never a RETURN-FROM — an NLX out of this HANDLER-CASE through the UNWIND-PROTECT costs the handler closure its dynamic extent, so it is heap-allocated at function ENTRY and charged to EVERY publish
                               (unless committed   ; any non-local exit before commit: release the pool slot
-                                (dds.rtps.reliable:writer-release-payload-buffer writer buf))))
+                                (dds.rtps.reliable:writer-release-payload-buffer writer buf)))
+                            (when overflow (return-from publish-sample :timeout)))   ; the RESOURCE_LIMITS reject, now raised OUTSIDE the unwind
                           (return-from publish-sample :timeout)))   ; pool exhausted: RESOURCE_LIMITS, never a GC fallback
                     (setf payload (dds.security:encode-serialized-payload km payload))))   ; carve failed/unavailable: allocating fallback (byte-identical)
               (return-from publish-sample t)))))   ; fail-closed: no key -> drop

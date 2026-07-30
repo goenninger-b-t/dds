@@ -155,10 +155,26 @@ guarded carve but not the structure. Covering it would mean making the pool slot
 all optional, which buys one call site and costs every reader of the macro. The macro's docstring names that
 exception explicitly, so it stays a decision rather than decaying into an oversight.
 
-What this does **not** give: the macro protects the sites that use it, not the language. A tenth carve written
-by hand, or a `RETURN-FROM` added inside any other `HANDLER-CASE` nested in an `UNWIND-PROTECT` on a
-per-sample path, is still unguarded. The construct-level protection would be a gate — a checker that reads the
-forms and fails on that nesting — and it is **open**, not done here.
+The macro protects the sites that use it, not the language — so the construct-level protection is now a
+**gate**: `make gate-nlx` (`scripts/gate-nlx.sh` + `scripts/nlx-scan.py`). It is a **form walker, not a grep**,
+because that is forced by §3: no single construct is the defect, only the nesting, and a regex cannot see
+nesting. It parses the forms, walks a frame stack, and flags an exit whose target block lies outside an
+intervening unwind when the exit is raised from inside a handler. It **learns this repo's own lock/borrow
+macros** by finding every `defmacro` whose expansion reaches `UNWIND-PROTECT`, to a fixpoint, seeded with the
+external ones (`with-lock-held`, `with-mutex`) whose bodies are not in `src/`.
+
+Two tiers, the shape `gate-nocond` established because a permanently-red gate is an ignored gate: the
+per-sample engine is **strict (zero)**, and the rest — TypeObject/TypeLookup parsing and DARE crypto
+primitives, where 16 B *once* is not a per-sample cost — is **ratcheted** at 26 in `bench/nlx-ceiling.txt`
+and may only go down.
+
+**It found a tenth site on its first run**, which is the argument for building it: `publish-sample`'s secured
+T5a branch raised `(return-from publish-sample :timeout)` from inside a `HANDLER-CASE` nested in the
+`UNWIND-PROTECT` that releases the pooled buffer — on the per-sample write path. There the exit is *not*
+gratuitous (it must abort), so the fix is the other shape: the handler sets a flag and the exit is raised
+**outside** the unwind. ⚠️ **No allocation win is claimed for it** — the secured-publish arm measures
++0.0046 → −0.1621 B/sample, i.e. noise. The pattern is corrected because it is the documented defect; the
+measurement says this particular workload was not paying for it.
 
 ## 7. What this ADR does **not** claim
 

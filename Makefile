@@ -13,7 +13,7 @@ LISP  ?= $(CLASP)
         square-pub square-sub square-spy large-pub large-sub gated-sub corpus-capture \
         nokey-pub nokey-sub keyed-flat-pub keyed-flat-sub \
         fastdds-pub fastdds-sub fastdds-tl-probe fastdds-type-probe fastdds-keyed-flat-pub fastdds-keyed-flat-sub bench bench-shmem bench-zerocopy bench-flatdata bench-flatdata-zc-loan bench-flatdata-loan-write bench-zc-loan-lockfree bench-multi-dest-zc bench-async-flow bench-flow-edf-priority bench-keeplast bench-rtps-message bench-rtps-message-clasp bench-rtps-protection shmem-xproc zc-xproc mem sbom hooks clean \
-        gate-arena test-linux linux-run linux-shell linux-image linux-clean-cache
+        gate-arena gate-nlx test-linux linux-run linux-shell linux-image linux-clean-cache
 
 DOMAIN   ?= 0
 COLOR    ?= BLUE
@@ -115,6 +115,11 @@ gate-pal: ; ./scripts/gate-pal.sh
 # Owner directive 2026-07-14 (NON-NEGOTIABLE): no Lisp conditions in the hot path; every condition handled
 # at latest at the toplevel DDS API. Annotation lint + asserts the receiver boundary handlers still exist.
 gate-nocond: ; ./scripts/gate-nocond.sh
+
+# ADR 0098: a non-local exit must not cross a lock from inside a condition handler — the handler
+# closure loses dynamic extent and is heap-allocated on EVERY call. A FORM WALKER, not a grep:
+# no single construct is the defect, only the nesting, which a regex cannot see.
+gate-nlx: ; ./scripts/gate-nlx.sh
 
 # Every interop driver that creates a DCPS DataWriter must be able to OFFER a data representation.
 # DATA_REPRESENTATION is an RxO policy and a stock foreign reader advertises XCDR1 only, so a driver
