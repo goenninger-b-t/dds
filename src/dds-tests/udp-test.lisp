@@ -83,6 +83,43 @@
                     before (dds.core.arena:arena-bytes-used arena))))
   t)
 
+(defun* run-arena-exhaustion-test ()
+    (function () (eql t))
+  "ADR 0095 slice 4: *static-arena-bytes* is a REAL ceiling, exercised END TO END with a budget deliberately
+   too small to carve anything.
+
+   WHAT THIS PINS. FR-PF-7 / NFR-MEM require arena exhaustion to be an ORDINARY, EXPECTED outcome — a status
+   the stack degrades on, never a condition, never a crash, and never a silent claim of a zero it did not
+   achieve. Every %ensure-*-pool already returns NIL + :ARENA-EXHAUSTED (gate-arena ARM 1 proves the refusal
+   in isolation); what was never checked is that a WHOLE NODE still behaves correctly when EVERY carve is
+   refused at once — which is the only form of the question an operator ever meets.
+
+   So: a node is created and started against a 4 KiB process budget, so every carve — the pre-allocated TX
+   scratch (slice 3), the RX store pool (slice 2), the receiver's datagram buffer — is refused. It asserts
+   the node still STARTS, still STOPS cleanly, and reports its scratch as NOT arena-backed, i.e. it took the
+   documented alloc-static fallback rather than failing to come up.
+
+   ⚠️ WHAT IT DELIBERATELY DOES NOT ASSERT: that exhaustion produces RESOURCE_LIMITS on the data path. It
+   does not, today — the pools degrade to allocating fallbacks that each docstring defends as 'correct,
+   byte-identical wire'. That is a DIVERGENCE FROM ADR 0095 slice 4's wording ('the engine maps it to
+   RESOURCE_LIMITS') and from the operating contract's 'never a silent GC-heap fallback', and it is recorded
+   as such rather than papered over by a test that asserts only what the code already does."
+  (let ((dds.core.arena:*process-arena* nil)
+        (dds.core.arena:*static-arena-bytes* 4096))
+    (let ((node (dds.disc:make-disc-node :domain 244 :host "127.0.0.1" :port 0 :multicast nil)))
+      (%check :arena-exh-node-created (not (null node))
+              "a node must still be CREATED when the arena budget refuses every carve")
+      (%check :arena-exh-scratch-fallback (not (dds.disc::disc-node-scratch-arena-backed node))
+              "with the budget exhausted the TX scratch must take the alloc-static FALLBACK, not claim to be arena-backed")
+      (dds.disc:start-node node)
+      (%check :arena-exh-started (not (null (dds.disc::disc-node-rx-thread node)))
+              "the node must still START (a receiver thread) with every carve refused")
+      (%check :arena-exh-no-rx-store (null (dds.disc::disc-node-rx-store-pool node))
+              "the RX store pool must be ABSENT (refused), not silently carved outside the budget")
+      (%check :arena-exh-stopped (eq t (dds.disc:stop-node node))
+              "the node must still STOP cleanly with every carve refused (no double free of a buffer it never owned)")))
+  t)
+
 (defun* run-teardown-deadline-test ()
     (function () t)
   "Test: every teardown wait is BOUNDED and REPORTED — and reports NOTHING when the teardown is clean.

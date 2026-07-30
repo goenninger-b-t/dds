@@ -125,9 +125,34 @@ TX floor, and that `stop-node` **returns** it. **Falsified**: forcing the old pa
 `ARENA-SCRATCH-BACKED`. `gate-arena`'s participant-pair high-water moved 3 413 168 → 3 938 248 B (5.87 % of
 the 64 MiB budget) — the previously-invisible scratch, now charged.
 
-**Slice 4 — global exhaustion.** `*static-arena-bytes*` becomes a real ceiling: a carve that would exceed it
-returns the ADR 0064 status, the engine maps it to RESOURCE_LIMITS, and a test exercises a deliberately
-too-small budget end to end.
+**Slice 4 — global exhaustion. PARTIALLY SHIPPED; one half needs an owner decision.**
+
+*Shipped:* `run-arena-exhaustion-test` exercises a deliberately too-small budget **end to end** — a node
+against a 4 KiB process budget, so *every* carve is refused at once: the pre-allocated TX scratch (slice 3),
+the RX store pool (slice 2), the receiver's datagram buffer. It asserts the node still **starts**, reports
+its scratch as **not** arena-backed (it took the documented fallback rather than claiming a carve it never
+got), leaves the RX store pool **absent** rather than silently carved outside the budget, and still **stops
+cleanly** — no double free of a buffer it never owned. `gate-arena` ARM 1 already proved the refusal in
+isolation; this is the first check that a *whole node* behaves when every carve fails together, which is the
+only form of the question an operator actually meets.
+
+*Not shipped, and deliberately not decided here:* **"the engine maps it to RESOURCE_LIMITS" is not what the
+code does.** On exhaustion the pools degrade to allocating fallbacks, each defended in its own docstring as
+"correct, byte-identical wire, never a per-datagram GC on the pooled path". That is a **direct divergence
+from this ADR's own wording and from the operating contract's "arena exhaustion → RESOURCE_LIMITS
+(reject/backpressure), never a silent GC-heap fallback"**.
+
+The two readings lead to materially different products, which is why it is an owner decision and not an
+implementation detail:
+
+- **Degrade (today).** A memory-constrained deployment keeps delivering, on the GC heap, at lower
+  performance. Nothing is lost; the 0-B property is.
+- **Reject (as written).** Exhaustion becomes backpressure — RESOURCE_LIMITS, samples refused — so the
+  static-memory guarantee is absolute and the operator learns immediately. Data is dropped rather than
+  degraded.
+
+The fallbacks are *documented*, not silent, so the contract's word "silent" is arguably already satisfied.
+That is the strongest argument for the status quo, and it is not mine to settle.
 
 Also, in slice 1: **correct the operating contract's `make mem` line**, or point it at `gate-arena`. A gate
 description that overstates what it checks is worse than no description.
