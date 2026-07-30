@@ -4356,6 +4356,42 @@
    affect an ALREADY-carved node's outstanding buffers: release and teardown stay correct, they simply stop
    being re-acquired.")
 
+(defun* %prealloc-node-pools (node)
+    (function (disc-node) disc-node)
+  "ADR 0095 slice 2: carve NODE's static pools AT STARTUP rather than on first use, so the cost lands at
+   init instead of as a latency spike on the first sample — the PRE-ALLOCATION half of the standing 0-B
+   directive. Called from start-node, before any receiver thread runs. Returns NODE.
+
+   IT CARVES ONLY WHAT THIS NODE'S CONFIGURATION ALREADY DETERMINES IT WILL USE, which is the whole design
+   question here. Eagerly carving every pool would cost a plain node the ~megabytes of security scratch it
+   will never touch, breaking the property those accessors each document — 'a node with rtps_protection off
+   reserves no static memory'. So the predicates below mirror EXACTLY the gates the use sites test:
+
+     rx-store        *rx-store-pool-enabled* — the copy path runs on every receive
+     send-scratch    rtps_protection non-NONE (the %maybe-wrap-srtps gate)
+     submsg-scratch  metadata_protection non-NONE (the %maybe-wrap-user-submessages gate)
+     secure-rx / bracket-rx / key-id-rx   either wire-protection tier on — the RX side of the same traffic
+     decode          a crypto-transform installed (the T5b eager path already did this at
+                     set-secured-loan-capable; this just also covers a node configured before start)
+
+   ⚠️ THE LAZY PATH REMAINS AND MUST. Security keys can arrive AFTER start-node via the live DDS-Security
+   handshake (the crypto-manager installs them post-enable), so a node that is plain at startup and keyed
+   later still carves on first use — which is exactly why %lazy-carve-pool double-checks under the lock.
+   Pre-allocation is an OPTIMISATION OF WHEN, never a change of WHETHER. Deliberately NOT carved here:
+   %ensure-secured-payload-pool (sized per WRITER from its HistoryCache, so it belongs to writer creation,
+   not node creation) and %ensure-zc-overlay-scratch (needs a resolved EntityCrypto, ADR 0051)."
+  (when *rx-store-pool-enabled* (%ensure-rx-store-pool node))
+  (let ((rtps-on   (not (eq (disc-node-rtps-protection-kind node) :none)))
+        (submsg-on (not (eq (disc-node-user-submessage-protection-kind node) :none))))
+    (when rtps-on   (%ensure-send-scratch-pool node))
+    (when submsg-on (%ensure-submsg-scratch-pool node))
+    (when (or rtps-on submsg-on)
+      (%ensure-secure-rx-pool node)
+      (%ensure-bracket-rx-pool node)
+      (%ensure-key-id-rx-pool node)))
+  (when (disc-node-crypto-transform node) (%ensure-secured-decode-pool node))
+  node)
+
 (defun* %ensure-rx-store-pool (node)
     (function (disc-node) t)
   "ADR 0078: provision NODE's RX store-copy pool if absent and return it (or NIL on arena-allocation

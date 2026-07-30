@@ -3180,6 +3180,10 @@
    the first datagram rather than here, because the buffer belongs to the transport (start-udp-receiver
    allocates it inside the spawned thread); %rx-cursor's EQ test is what keeps that lazy fill correct if a
    transport ever hands over a different buffer."
+  ;; ADR 0095 slice 2: carve the static pools this node's CONFIGURATION already determines it will use,
+  ;; BEFORE any receiver thread runs — so the cost lands at init, not as a first-sample latency spike.
+  ;; Only the configured ones; the lazy path stays for keys installed later by the live handshake.
+  (%prealloc-node-pools node)
   (setf (disc-node-rx-thread node)
         (let ((ctx (%make-rx-context)))
           (dds.xport.udp:start-udp-receiver

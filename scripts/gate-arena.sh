@@ -78,7 +78,28 @@ cd "$(dirname "$0")/.."
       (chk (< peak (dds.core.arena:arena-byte-budget arena))
            "HIGH-WATER < BUDGET: peak ~d B of ~d B (~,2f %)"
            peak (dds.core.arena:arena-byte-budget arena)
-           (/ (* 100.0 peak) (max 1 (dds.core.arena:arena-byte-budget arena))))))
+           (/ (* 100.0 peak) (max 1 (dds.core.arena:arena-byte-budget arena)))))
+
+    ;; ARM 5 — PRE-ALLOCATED, NOT LAZY (ADR 0095 slice 2). start-node must carve what the node CONFIGURATION
+    ;; already determines it will use, BEFORE the first sample. Asserted on the slot directly, not on a
+    ;; timing proxy: the rx-store pool is the unconditional one (every copy-path receive draws from it), so
+    ;; if it is still NIL after start-node the carve is still landing on the first sample.
+    ;; FALSIFIES ITSELF: with *rx-store-pool-enabled* NIL the pool must be ABSENT, proving the assertion
+    ;; below is reading the real slot and not something that is trivially always set.
+    (let ((node (dds.disc:make-disc-node :domain 239 :host "127.0.0.1" :port 0 :multicast nil)))
+      (unwind-protect
+           (let ((dds.disc:*rx-store-pool-enabled* nil))
+             (dds.disc:start-node node)
+             (chk (null (dds.disc::disc-node-rx-store-pool node))
+                  "FALSIFICATION: with the RX store pool DISABLED, start-node carves nothing"))
+        (dds.disc:stop-node node)))
+    (let ((node (dds.disc:make-disc-node :domain 240 :host "127.0.0.1" :port 0 :multicast nil)))
+      (unwind-protect
+           (progn
+             (dds.disc:start-node node)
+             (chk (not (null (dds.disc::disc-node-rx-store-pool node)))
+                  "PRE-ALLOCATED: start-node carved the RX store pool — no first-sample carve (slice 2)"))
+        (dds.disc:stop-node node))))
 
   (if fail
       (progn (format t "~&gate-arena: FAIL~%") (uiop:quit 1))

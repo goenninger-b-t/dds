@@ -72,9 +72,30 @@ runs a real workload and asserts: exactly one arena; every pool carved from it; 
 zero carve failures. **Falsify it first** (shrink `*static-arena-bytes*` until it goes red) — per the
 standing rule that a green gate proves nothing until it has been seen to fail.
 
-**Slice 2 — startup-allocated.** Carve at participant/node creation instead of first use, so the cost lands
-at init. Keep the lazy path as the fallback for pools whose size is not known until first use, and say which
-those are.
+**Slice 2 — startup-allocated. SHIPPED.** `%prealloc-node-pools`, called from `start-node` before any
+receiver thread runs, carves the pools this node's **configuration already determines it will use**, so the
+cost lands at init instead of as a first-sample latency spike.
+
+**It deliberately does NOT carve everything**, and that is the design question. Eagerly carving every pool
+would cost a plain node the megabytes of security scratch it will never touch, breaking the property each of
+those accessors documents — *"a node with rtps_protection off reserves no static memory"*. So the predicates
+mirror exactly the gates the use sites test: the RX store pool when `*rx-store-pool-enabled*` (every
+copy-path receive draws from it); send-scratch on non-NONE rtps_protection; submsg-scratch on non-NONE
+metadata_protection; the three RX security pools when either wire tier is on; the decode pool when a
+crypto-transform is installed.
+
+**The lazy path remains and must.** Security keys can arrive *after* `start-node` via the live DDS-Security
+handshake, so a node that is plain at startup and keyed later still carves on first use — which is why
+`%lazy-carve-pool` double-checks under the lock. **Pre-allocation is an optimisation of WHEN, never a change
+of WHETHER.** Two pools stay lazy by nature: `%ensure-secured-payload-pool` (sized per WRITER from its
+HistoryCache, so it belongs to writer creation) and `%ensure-zc-overlay-scratch` (needs a resolved
+EntityCrypto, ADR 0051).
+
+`gate-arena` ARM 5 asserts it on the slot directly rather than through a timing proxy, and **falsifies
+itself**: with `*rx-store-pool-enabled*` NIL the pool must be ABSENT after `start-node`, proving the positive
+assertion reads a real slot rather than something trivially always set. Measured consequence: the gate's
+participant-pair high-water rose 2 363 824 → 3 413 168 B (5.09 % of the 64 MiB budget) — memory now
+*reserved at init* rather than discovered mid-run, which is the whole point of pre-allocation.
 
 **Slice 3 — the bypass.** Draw the receive/TX scratch buffers from the arena instead of bare `alloc-static`,
 so the ~192 KiB per node is inside the budget. This is the slice that makes "all hot-path memory" true.
