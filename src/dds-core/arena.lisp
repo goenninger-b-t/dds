@@ -139,6 +139,26 @@
         (push pool (arena-pools arena))
         (values pool nil)))))
 
+(defun* carve-buffer (arena bytes)
+    (function (arena (integer 1)) (values t (or null keyword)))
+  "One dedicated BYTES-octet buffer carved from ARENA — for a LONG-LIVED scratch buffer that belongs to one
+   owner for its whole life (a node's TX message buffer, a receiver thread's datagram buffer) rather than
+   being borrowed per operation from a pool.
+
+   ADR 0095 slice 3: these were THE BYPASS. They came from bare dds.pal:alloc-static, so the ~192 KiB of
+   receive/TX scratch per node sat OUTSIDE the *static-arena-bytes* budget, and FR-PF-7's \"all hot-path
+   memory comes from the static arena\" was false for the single largest consumer — the process could not
+   answer what it had reserved, and a budget that does not see the biggest allocation bounds nothing.
+
+   IMPLEMENTED AS A CAPACITY-1 BUFFER-POOL, deliberately: the pool already carries the budget charge, the
+   RESERVED accounting and the teardown-arena return, so a dedicated buffer needs no second mechanism and
+   cannot drift from the pool path as either evolves.
+
+   Returns (values buffer NIL), or (values NIL :ARENA-EXHAUSTED) — a STATUS, never a condition (ADR 0064).
+   Every caller keeps its unpooled fallback, so a tight budget degrades rather than failing to start."
+  (multiple-value-bind (pool status) (make-buffer-pool arena bytes 1)
+    (if pool (values (pool-acquire pool) nil) (values nil status))))
+
 (defun* pool-acquire (pool)
     (function (buffer-pool) t)
   "Pop a buffer from POOL. Return NIL on exhaustion — the caller applies

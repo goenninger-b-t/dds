@@ -42,5 +42,6 @@
            #:arena-byte-budget #:arena-bytes-used #:arena-reserved #:arena-pools
            #:arena-initialized-p #:arena-report
            #:buffer-pool #:make-buffer-pool #:pool-acquire #:pool-release
+           #:carve-buffer
            #:pool-high-water #:pool-capacity #:pool-in-use
            ))

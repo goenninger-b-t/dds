@@ -4145,6 +4145,7 @@
                  ("unmatched-writer-not-delivered" . run-unmatched-writer-not-delivered-test)
                  ("property-based"           . run-pbt-tests)
                  ("udp-loopback"             . run-udp-loopback-test)
+                 ("arena-scratch"            . run-arena-scratch-test)
                  ("teardown-deadline"        . run-teardown-deadline-test)
                  ("rx-wrapper-pool"          . run-rx-wrapper-pool-test)
                  ("rx-store-consumers"       . run-rx-store-consumers-test)

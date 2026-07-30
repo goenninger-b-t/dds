@@ -97,8 +97,33 @@ assertion reads a real slot rather than something trivially always set. Measured
 participant-pair high-water rose 2 363 824 → 3 413 168 B (5.09 % of the 64 MiB budget) — memory now
 *reserved at init* rather than discovered mid-run, which is the whole point of pre-allocation.
 
-**Slice 3 — the bypass.** Draw the receive/TX scratch buffers from the arena instead of bare `alloc-static`,
-so the ~192 KiB per node is inside the budget. This is the slice that makes "all hot-path memory" true.
+**Slice 3 — the bypass. SHIPPED.** The long-lived scratch now comes from the node's sub-arena via a new
+`dds.core.arena:carve-buffer`, not from bare `alloc-static`. Measured per node: **3 x 65 507 B receive
+(~192 KiB, the figure this slice was written around) + 2 x 65 507 + 512 B TX (~128 KiB) ≈ 328 KB** that was
+outside `*static-arena-bytes*` — and a budget that cannot see its single largest consumer bounds nothing.
+
+`carve-buffer` is a **capacity-1 buffer-pool**, deliberately: the pool already carries the budget charge, the
+RESERVED accounting and the `teardown-arena` return, so a dedicated buffer needs no second mechanism and
+cannot drift from the pool path.
+
+**Ownership moved, and the teardown rules had to move with it.** An arena-backed buffer is freed by
+`teardown-arena`, never by its user — freeing it twice is a double free of static memory. So the receiver
+thread frees only a self-allocated buffer (`owned`), and `stop-node` skips the three `free-static` calls when
+`scratch-arena-backed`. This is safe because `stop-node` **joins every thread before tearing the arena
+down**, and on a stuck join the `teardown-leaked` gate skips *both* the frees and the teardown — so buffer
+and arena leak together, exactly as the buffer alone did before.
+
+**All three TX buffers or none**, because teardown frees them as a set; a partial carve would need
+per-buffer ownership bookkeeping for no benefit. A partial carve **returns its charge** (`teardown-arena` on
+the discarded sub-arena) — otherwise a node that failed to pre-allocate would silently shrink the budget for
+every node after it. A refused carve keeps the original `alloc-static` path byte-identical: **a tight budget
+degrades, it never stops a node from starting.**
+
+Verified by `run-arena-scratch-test`, which asserts the ownership flag *by name* (so a silent revert to
+`alloc-static` is caught, not merely an arithmetic coincidence), that node creation **charges** at least the
+TX floor, and that `stop-node` **returns** it. **Falsified**: forcing the old path turns it red on
+`ARENA-SCRATCH-BACKED`. `gate-arena`'s participant-pair high-water moved 3 413 168 → 3 938 248 B (5.87 % of
+the 64 MiB budget) — the previously-invisible scratch, now charged.
 
 **Slice 4 — global exhaustion.** `*static-arena-bytes*` becomes a real ceiling: a carve that would exceed it
 returns the ADR 0064 status, the engine maps it to RESOURCE_LIMITS, and a test exercises a deliberately

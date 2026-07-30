@@ -333,6 +333,7 @@
   (durability-gate-active nil :type boolean)   ; ADR 0059: T once the DCPS layer owns the reader-side durability baseline (create-datareader / %reader-durability-init arm a WriterProxy per matched writer). ONLY then does "matched but no proxy" mean the ADR 0043 window — a bare dds.disc node (the low-level tests, the shapes runners) never arms by design, so the HEARTBEAT guard must not fire there.
   (rx-stopping nil :type boolean)   ; set by stop-node BEFORE any socket is closed: the receiver loops check it and leave on their own, so a thread is never parked in recvfrom(2) on a released fd (the state nothing on macOS can wake)
   (stuck-receiver-teardowns 0 :type (integer 0))   ; stop-node joins that TIMED OUT: a receiver thread still parked in recvfrom(2) on a closed fd. MUST STAY 0 in a healthy run. Non-zero means teardown could not prove the receiver had stopped, so the buffer frees were SKIPPED (a bounded leak) rather than risked as a use-after-free — see stop-node and dds.pal:join-bounded
+  (scratch-arena-backed nil :type boolean)   ; ADR 0095 slice 3: T when TX-PAYLOAD/TX-MSG/RX-TX-MSG were carved from this node's SUB-ARENA (teardown-arena frees them) rather than by bare alloc-static (stop-node frees them). All three or none.
   (teardown-leaked nil :type boolean)              ; T once any join above timed out: this node's send/receive scratch buffers were deliberately NOT freed
   (unrouted-match-drops 0 :type (integer 0))   ; A remote WRITER that is MATCHED (disc-node-matches) but has NO reader route, seen by %reader-routes-for once the DCPS layer owns matching. MUST STAY 0: %match-remote-endpoint route-adds every RxO-compatible local reader for a writer IMMEDIATELY BEFORE it records the match (both under the node lock), so the two cannot legitimately drift. A non-zero value means a WP has separated them, and the drop keeps it fail-SAFE — nothing is delivered to a reader that was never routed — rather than falling back to the primary reader, which is how an RxO refusal came to be advisory in the first place (see %reader-routes-for)
   (hb-unarmed-drops 0 :type (integer 0))   ; ADR 0043 residual / ADR 0059: user HEARTBEATs dropped because the writer was MATCHED but its reader-side durability baseline was not yet ARMED. MUST stay 0: the window is unreachable while SEDP + user HEARTBEATs share the one unicast rx thread. A non-zero value means a WP reopened it (user-data multicast / split metatraffic) and MUST arm the baseline atomically with %record-match — the drop keeps it fail-SAFE (no silent DURABILITY violation) but the writer's history request is delayed a HEARTBEAT period until then.
@@ -1129,7 +1130,23 @@
   (multiple-value-bind (tr sock open-status)
       (dds.xport.udp:make-udp-transport :host (if multicast "0.0.0.0" host) :port port)
     (when open-status (bail open-status))
-    (let ((host-uuid (%host-uuid)) (shmem nil) (mcast nil) (node nil))
+    (let* ((host-uuid (%host-uuid)) (shmem nil) (mcast nil) (node nil)
+           ;; ADR 0095 slice 3: the node's sub-arena exists BEFORE the struct, so its long-lived TX scratch
+           ;; (2 x *max-datagram-bytes* + the metatraffic payload = ~128 KiB) can be carved FROM the budget
+           ;; instead of by bare alloc-static. %node-arena later just returns this slot.
+           (sub (dds.core.arena:make-sub-arena (dds.core.arena:process-arena)))
+           (tx-payload-b (dds.core.arena:carve-buffer sub *metatraffic-payload-bytes*))
+           (tx-msg-b     (dds.core.arena:carve-buffer sub *max-datagram-bytes*))
+           (rx-tx-msg-b  (dds.core.arena:carve-buffer sub *max-datagram-bytes*))
+           ;; ALL THREE OR NONE: teardown frees them as a set, so a partial carve would need per-buffer
+           ;; ownership bookkeeping for no benefit. A refused carve keeps the original alloc-static path,
+           ;; byte-identical — a tight budget degrades, it never stops a node from starting.
+           (scratch-arena-p (and tx-payload-b tx-msg-b rx-tx-msg-b t))   ; AND yields the last BUFFER; the slot is a BOOLEAN
+           ;; A PARTIAL carve still CHARGED the budget for the carves that succeeded, and this sub-arena is
+           ;; about to be discarded for the fallback path — so hand the charge back, or a node that failed
+           ;; to pre-allocate would silently shrink the process budget for every node after it.
+           (%sub-returned (unless scratch-arena-p (dds.core.arena:teardown-arena sub))))
+      (declare (ignorable %sub-returned))
       ;; every failure below UNWINDS NOTHING (no conditions) — so each one must hand back the OS
       ;; resources this call already took, or a refused participant leaks an fd + an shm segment.
       (flet ((release (status)
@@ -1157,9 +1174,14 @@
                                     :on-stateless-message on-stateless-message
                                     :host-uuid host-uuid
                                     :shmem shmem
-                                    :tx-payload (dds.core.buffer:make-octet-buffer *metatraffic-payload-bytes*)
-                                    :tx-msg (dds.core.buffer:make-octet-buffer *max-datagram-bytes*)
-                                    :rx-tx-msg (dds.core.buffer:make-octet-buffer *max-datagram-bytes*)))
+                                    :arena (and scratch-arena-p sub)   ; ADR 0095 slice 3
+                                    :scratch-arena-backed scratch-arena-p
+                                    :tx-payload (if scratch-arena-p tx-payload-b
+                                                    (dds.core.buffer:make-octet-buffer *metatraffic-payload-bytes*))
+                                    :tx-msg (if scratch-arena-p tx-msg-b
+                                                (dds.core.buffer:make-octet-buffer *max-datagram-bytes*))
+                                    :rx-tx-msg (if scratch-arena-p rx-tx-msg-b
+                                                   (dds.core.buffer:make-octet-buffer *max-datagram-bytes*))))
         (when multicast
           (multiple-value-bind (ms status)
               (dds.pal:udp-open :host "0.0.0.0"
@@ -3189,14 +3211,16 @@
           (dds.xport.udp:start-udp-receiver
            (disc-node-socket node)
            (lambda (buf size) (%handle-datagram node buf size nil ctx))
-           (lambda () (disc-node-rx-stopping node)))))
+           (lambda () (disc-node-rx-stopping node))
+           (%node-arena node))))   ; ADR 0095 slice 3: the 64 KiB datagram buffer, inside the budget
   (when (disc-node-mcast-socket node)
     (setf (disc-node-mcast-rx-thread node)
           (let ((ctx (%make-rx-context)))
             (dds.xport.udp:start-udp-receiver
              (disc-node-mcast-socket node)
              (lambda (buf size) (%handle-datagram node buf size nil ctx))
-             (lambda () (disc-node-rx-stopping node))))))
+             (lambda () (disc-node-rx-stopping node))
+             (%node-arena node)))))   ; ADR 0095 slice 3
   (when (disc-node-shmem node)
     (let ((ctx (%make-rx-context)))
       (dds.xport.shmem:start-shmem-receiver
@@ -3349,15 +3373,16 @@
     (dds.pal:shm-detach (disc-node-zc-pool node))
     (dds.pal:shm-destroy (%zc-pool-name (disc-node-guid-prefix node) (disc-node-domain node)))
     (setf (disc-node-zc-pool node) nil (disc-node-zc-pool-sap node) nil))
-  (when (disc-node-tx-payload node)
-    (dds.pal:free-static (dds.core.buffer:octet-buffer-vec (disc-node-tx-payload node)))
-    (setf (disc-node-tx-payload node) nil))
-  (when (disc-node-tx-msg node)
-    (dds.pal:free-static (dds.core.buffer:octet-buffer-vec (disc-node-tx-msg node)))
-    (setf (disc-node-tx-msg node) nil))
-  (when (disc-node-rx-tx-msg node)
-    (dds.pal:free-static (dds.core.buffer:octet-buffer-vec (disc-node-rx-tx-msg node)))
-    (setf (disc-node-rx-tx-msg node) nil))
+  ;; ADR 0095 slice 3: an ARENA-BACKED scratch buffer belongs to teardown-arena below — freeing it here
+  ;; would be a double free of static memory. Only the alloc-static fallback path is freed here.
+  (unless (disc-node-scratch-arena-backed node)
+    (when (disc-node-tx-payload node)
+      (dds.pal:free-static (dds.core.buffer:octet-buffer-vec (disc-node-tx-payload node))))
+    (when (disc-node-tx-msg node)
+      (dds.pal:free-static (dds.core.buffer:octet-buffer-vec (disc-node-tx-msg node))))
+    (when (disc-node-rx-tx-msg node)
+      (dds.pal:free-static (dds.core.buffer:octet-buffer-vec (disc-node-rx-tx-msg node)))))
+  (setf (disc-node-tx-payload node) nil (disc-node-tx-msg node) nil (disc-node-rx-tx-msg node) nil)
   ;; ADR 0095 option (a): EVERY pool above now lives in THIS NODE'S ONE SUB-ARENA, so the teardown is one
   ;; step, not nine — and the ORDER became load-bearing in a way it was not before. Each pool used to own
   ;; its arena, so "return the outstanding buffers, then free this pool" could be written per pool, in any

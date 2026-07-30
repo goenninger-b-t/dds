@@ -97,17 +97,30 @@
         (dds.pal:udp-close rx-socket)
         (dds.pal:udp-close tx-socket)))))
 
-(defun* start-udp-receiver (socket on-datagram &optional stop-fn)
-    (function (t function &optional (or null function)) t)
+(defun* start-udp-receiver (socket on-datagram &optional stop-fn arena)
+    (function (t function &optional (or null function) t) t)
   "Spawn a thread that blocks on SOCKET, receiving each datagram into a 64 KiB
    octet-buffer and calling (ON-DATAGRAM buffer size). The thread exits when the socket is closed —
    dds.pal:udp-close SHUTS THE SOCKET DOWN before closing it, which is what actually wakes this thread:
    on Linux close(2) alone does NOT unblock a parked recvfrom, so without the shutdown this thread stays
    blocked forever and stop-node's join never returns (NFR-PORT; see udp-close). Returns the thread
-   (FR-XPORT-5)."
+   (FR-XPORT-5).
+
+   ARENA (default NIL, ADR 0095 slice 3): carve the 64 KiB datagram buffer FROM THAT ARENA instead of bare
+   alloc-static, so it is inside the *static-arena-bytes* budget — this buffer is the single largest
+   hot-path allocation a node makes, and three receiver threads put ~192 KiB per node outside the budget
+   before this. The ARENA OWNS IT: the thread does NOT free an arena-backed buffer, teardown-arena does,
+   which is safe because stop-node JOINS this thread before tearing the arena down, and on a stuck join it
+   skips BOTH the join-dependent frees and the teardown (disc-node-teardown-leaked) — so buffer and arena
+   are leaked together, exactly as the buffer alone was before. NIL arena, or a refused carve, keeps the
+   original self-owned alloc-static buffer, byte-identical."
   (dds.pal:spawn
    (lambda ()
-     (let ((buf (dds.core.buffer:make-octet-buffer 65507)))
+     (multiple-value-bind (arena-buf %carve-status)
+         (if arena (dds.core.arena:carve-buffer arena 65507) (values nil nil))
+       (declare (ignore %carve-status))
+      (let* ((buf (or arena-buf (dds.core.buffer:make-octet-buffer 65507)))
+             (owned (null arena-buf)))   ; ADR 0095 slice 3: only a SELF-allocated buffer is freed here
        (unwind-protect
             (loop
               ;; ⚠️ EXIT ON THE FLAG, NOT ON THE SOCKET DYING. A receiver already parked in recvfrom(2)
@@ -129,7 +142,8 @@
                   ;; one malformed or unexpected datagram must not kill the receiver
                   (handler-case (funcall on-datagram buf size)
                     (error () nil)))))
-         (dds.pal:free-static (dds.core.buffer:octet-buffer-vec buf)))))
+         (when owned   ; an arena-backed buffer belongs to teardown-arena, never to this thread
+           (dds.pal:free-static (dds.core.buffer:octet-buffer-vec buf)))))))
    :name "dds-udp-rx"))
 
 (defun* run-udp-receiver-test ()

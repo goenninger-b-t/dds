@@ -51,6 +51,38 @@
 ;;; expired; this is the falsifier for that work — each leg below either hangs forever or reports a
 ;;; false positive if its bound or its gate is removed.
 
+(defun* run-arena-scratch-test ()
+    (function () (eql t))
+  "ADR 0095 slice 3: a node's LONG-LIVED receive/TX scratch comes from its SUB-ARENA, not bare alloc-static.
+
+   THE BYPASS THIS PINS. Before slice 3 the three TX buffers (2 x *max-datagram-bytes* + the metatraffic
+   payload = ~128 KiB) and each receiver thread's 64 KiB datagram buffer (~192 KiB for three threads) were
+   allocated by dds.pal:alloc-static directly. That put ~328 KB per node OUTSIDE *static-arena-bytes*, so
+   FR-PF-7's 'all hot-path memory comes from the static arena' was false for its single largest consumer —
+   and a budget that cannot see the biggest allocation bounds nothing.
+
+   Asserted as a DELTA on the PROCESS arena across one node's lifetime, because that is the quantity FR-PF-7
+   is about, plus the ownership flag itself so a future change that silently reverts to alloc-static is
+   caught by name rather than by an arithmetic coincidence. The RETURN half matters as much as the charge:
+   an arena-backed buffer must NOT also be free-static'd at stop-node (that would be a double free of static
+   memory), and it must not leak (the charge must come back)."
+  (let* ((arena  (dds.core.arena:process-arena))
+         (before (dds.core.arena:arena-bytes-used arena))
+         (node   (dds.disc:make-disc-node :domain 243 :host "127.0.0.1" :port 0 :multicast nil)))
+    (unwind-protect
+         (let ((charged (- (dds.core.arena:arena-bytes-used arena) before))
+               (tx-floor (+ (* 2 dds.disc::*max-datagram-bytes*) dds.disc::*metatraffic-payload-bytes*)))
+           (%check :arena-scratch-backed (dds.disc::disc-node-scratch-arena-backed node)
+                   "the node's TX scratch must be ARENA-BACKED, not bare alloc-static")
+           (%check :arena-scratch-charged (>= charged tx-floor)
+                   (format nil "creating a node must CHARGE the process arena for its TX scratch (~d B charged, ~d B expected floor)"
+                           charged tx-floor)))
+      (dds.disc:stop-node node))
+    (%check :arena-scratch-returned (= (dds.core.arena:arena-bytes-used arena) before)
+            (format nil "stop-node must RETURN the arena-backed scratch (~d B before, ~d B after)"
+                    before (dds.core.arena:arena-bytes-used arena))))
+  t)
+
 (defun* run-teardown-deadline-test ()
     (function () t)
   "Test: every teardown wait is BOUNDED and REPORTED — and reports NOTHING when the teardown is clean.
