@@ -7006,6 +7006,26 @@
       (dds.pal:tcp-close ln))
     t))
 
+(defun* %tms-stop-checked (srv label)
+    (function (t string) t)
+  "Stop SRV and ASSERT the stop actually completed. microservice-server-stop returns (values T :TIMEOUT) when
+   the accept loop or a serve thread could not be proven stopped, and on that path it DELIBERATELY LEAKS the
+   listener fd and the INNER STORE rather than closing them under a live thread (ADR 0092). A leaked inner
+   store was never closed and therefore NEVER FSYNCED — precisely the precondition a cross-restart arm
+   depends on, and precisely the kind of silent miss that surfaces later as a wrong COUNT somewhere else.
+   Same class as the ADR 0096 test defect: asserting a post-condition whose precondition is never checked.
+
+   ⚠️ USE ONLY WHERE THE STOP IS LOGICAL FLOW, NEVER IN AN UNWIND-PROTECT CLEANUP. This signals on failure,
+   and a cleanup that signals while already unwinding REPLACES the original condition — hiding the real
+   failure behind this one. The cleanup-position stops are covered instead by the suite-wide stuck-teardown
+   report (run-all-tests), which sees every site and can mask nothing."
+  (multiple-value-bind (ok status) (dds.durability:microservice-server-stop srv)
+    (declare (ignore ok))
+    (%check :ms-stop-clean (null status)
+            (format nil "~a: microservice-server-stop must complete (got ~s) — on :TIMEOUT the inner store is LEAKED, never closed, never fsynced"
+                    label status)))
+  t)
+
 (defun* run-durability-microservice-test ()
     (function () t)
   "The MICROSERVICE slice (ADR 0050): a make-microservice-store client proxies the durable-store vtable
@@ -7104,7 +7124,7 @@
     (dds.durability:store-open s)
     (%check :ms-torn-precheck (= 0 (dds.durability:store-count s "A")) "a normal op succeeds before the tear")
     ;; tear the connection down under the client (stop closes the served connection + the listener)
-    (dds.durability:microservice-server-stop srv)
+    (%tms-stop-checked srv "torn")
     (%check :ms-torn-clean
             ;; ADR 0064 Slice-2: the post-tear op returns (VALUES 0 :UNAVAILABLE) (2nd value non-NIL), not a
             ;; signal; a raw error would be a bug (-> NIL, failing the check).
@@ -7341,8 +7361,9 @@
       (unwind-protect
           (progn
             (dds.durability:store-open store)
-            (%check :ms-dare-put (eq t (dds.durability:store-put store "Square" dguid dsn nil :data dpay))
-                    "DARE-wrapped put of the plaintext-topic record")
+            (let ((%rv (dds.durability:store-put store "Square" dguid dsn nil :data dpay)))
+              (%check :ms-dare-put (eq t %rv)
+                      (format nil "DARE-wrapped put of the plaintext-topic record; store-put returned ~s" %rv)))
             (let ((hay (%tms-flatten-store inner)))
               (%check :ms-dare-no-topic   (not (%pst-subseq-present-p hay tneedle))
                       "server holds NO plaintext topic name \"Square\"")

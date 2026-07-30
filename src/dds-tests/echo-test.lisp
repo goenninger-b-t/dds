@@ -3914,6 +3914,15 @@
     (%check :reg-2nd-reader-primary (eq r2 (dds.disc::disc-node-user-reader node)) "2nd distinct reader preserves the primary reader"))
   t)
 
+(defun* %test-fixture-site-p (site)
+    (function (t) t)
+  "T iff SITE names a DELIBERATE stuck-join fixture rather than a production teardown. ADR 0092's own gates
+   wedge a join on purpose to prove the wait is bounded, and they register under :TEST-* site keywords; a
+   production site (e.g. :MICROSERVICE-SERVE) never does. Kept as a NAME-PREFIX rule, not a hardcoded list,
+   so a new bounded-wait gate is classified correctly the day it is written."
+  (let ((n (symbol-name site)))
+    (and (>= (length n) 5) (string= "TEST-" n :end2 5))))
+
 (defun* run-all-tests ()
     (function () t)
   "Run every landed test; signal on first failure, else report and return T."
@@ -4570,6 +4579,31 @@
             (push (cons (car test) (princ-to-string e)) failures)
             (format t "FAIL~%           ~a~%" e))))
       (format t "~&tests: ~d passed, ~d FAILED, ~d total.~%" passed (length failures) (length tests))
+      ;; ADR 0092 built a report of every teardown wait that hit its deadline, and NOTHING EVER READ IT in a
+      ;; suite run. A stuck teardown is invisible on its own — dds.pal:join-bounded returns :TIMEOUT and the
+      ;; caller DELIBERATELY LEAKS the resource rather than closing it under a live thread — so the only
+      ;; trace is a wrong result somewhere LATER (a store never closed is a store never fsynced). Printing it
+      ;; here turns "mystery flake" into a named cause, and costs one line on a clean run.
+      ;; A site named TEST-* is a DELIBERATE fixture: ADR 0092's own gates wedge a join on purpose to prove
+      ;; the wait is bounded, so those hits are the instrument working, not a leak. They are reported
+      ;; separately — folding them into the alarm would make it fire on every clean run, and an alarm that
+      ;; always fires is an alarm nobody reads.
+      (multiple-value-bind (stuck sites) (dds.pal:stuck-teardown-joins)
+        (declare (ignorable stuck))
+        (let* ((fixtures (remove-if-not (lambda (s) (%test-fixture-site-p (car s))) sites))
+               (real     (remove-if     (lambda (s) (%test-fixture-site-p (car s))) sites))
+               (real-n   (reduce #'+ real :key #'cdr :initial-value 0)))
+          (if (plusp real-n)
+              (progn
+                (format t "~&⚠️ STUCK TEARDOWN JOINS: ~d — a bounded teardown wait hit its deadline, so its~%" real-n)
+                (format t "   resource was LEAKED rather than closed under a live thread (ADR 0092): a store left~%")
+                (format t "   unclosed was never FSYNCED. Suspect this FIRST for any unexplained failure after~%")
+                (format t "   it, especially a persistence/replay or cross-restart one.~%")
+                (dolist (s real) (format t "     ~a: ~a~%" (car s) (cdr s))))
+              (format t "~&teardown: 0 stuck joins (production sites).~%"))
+          (when fixtures
+            (format t "~&teardown: ~{~a~^, ~} — deliberate TEST fixtures (ADR 0092 bounded-wait gates), expected.~%"
+                    (mapcar (lambda (s) (format nil "~a x~a" (car s) (cdr s))) fixtures)))))
       (when failures
         (format t "~&FAILURES (the FIRST is the real one; later ones may be cascades):~%")
         (dolist (f (reverse failures)) (format t "  ~a~%    ~a~%" (car f) (cdr f)))
