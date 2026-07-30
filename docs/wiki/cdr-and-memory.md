@@ -308,7 +308,14 @@ NameHash example: `MD5("color")[0:4]` = `70 dd a5 df`. (From `run-md5-test`.)
   `WHEN`-guarded `SETF` is semantically the same with no non-local exit. What makes this one hard to find:
   **no single construct allocates.** `WITH-LOCK` alone, `HANDLER-CASE` alone, and `HANDLER-CASE` containing a
   `RETURN-FROM` alone all measure 0.0000 B/call; only the composition allocates, so a ladder that tests the
-  parts one at a time exonerates the real cause.
+  parts one at a time exonerates the real cause. **The shape now exists once.** `%lazy-carve-pool` is the
+  shared double-checked lazy carve — *carve exactly once, off the steady state, under the pool's own lock; on
+  failure leave the slot NIL and change nothing; never unwind* — and is the carve twin of `%with-scratch`, the
+  shared borrow. Eight of the nine pools go through it; `%ensure-secured-payload-pool` is a documented
+  exception because its pool lives on the writer's HistoryCache, not a node slot. Note what the macro does and
+  does not buy: it protects the sites that use it, not the language — a hand-written tenth carve, or a
+  `RETURN-FROM` added inside any other `HANDLER-CASE` nested in an `UNWIND-PROTECT` on a per-sample path, is
+  still unguarded.
 - **The raw-pointer rule is now ENFORCED, not just documented (ADR 0085).** NFR-MEM requires that anything
   addressed by a raw pointer/SAP be foreign/static, never a GC-heap array — a moving collector can
   invalidate a heap vector's address underneath a syscall, after which the kernel reads or writes whatever

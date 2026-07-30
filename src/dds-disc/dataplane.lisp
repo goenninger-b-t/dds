@@ -99,22 +99,11 @@
    never a per-datagram GC on the pooled path. The arena is stored only after the pool carve succeeds (teardown
    reachability); stop-node tears it down. NIL until the first wrap -> a node with rtps_protection off reserves no
    static memory (zero-cost when off), consistent with the other per-node security pools (T5a/T5b, all lazy)."
-  (or (disc-node-send-scratch-pool node)
-      (dds.pal:with-lock ((disc-node-send-scratch-lock node))
-        (or (disc-node-send-scratch-pool node)
-            (handler-case
-                (let* ((eb    (+ (srtps-scratch-datagram-bytes) +srtps-scratch-overhead+))
-                       (cap   *srtps-send-scratch-capacity*)
-                       (arena (%node-arena node))   ; ADR 0095: THE participant's sub-arena, charged against the process budget
-                       (pool  (dds.core.arena:make-buffer-pool arena eb cap)))
-                  ;; ADR 0064: an exhausted arena is a STATUS now, not a condition — so it MUST be TESTED.
-                  ;; An unchecked NIL pool would still run the SETF below, storing the ARENA whose own
-                  ;; comment says 'only after the carve succeeds' — orphaning its static allocation on
-                  ;; every failed carve.
-                  (when pool   ; ADR 0098: a WHEN, never a RETURN-FROM — an NLX out of this HANDLER-CASE through WITH-LOCK's UNWIND-PROTECT heap-allocates the handler closure on EVERY call (16 B/call measured, even when this branch is never entered); a failed carve charged the SHARED arena nothing, so there is nothing to tear down (ADR 0095)
-                    (setf (disc-node-send-scratch-arena node) arena   ; store the arena only after the carve succeeds (teardown reachability)
-                          (disc-node-send-scratch-pool node) pool)))   ; set the pool LAST — the double-checked-carve flag
-              (error () nil))))))   ; arena-exhausted / static-alloc failure -> leave NIL -> allocating fallback
+  (%lazy-carve-pool (pool node :pool  disc-node-send-scratch-pool
+                               :lock  disc-node-send-scratch-lock
+                               :arena disc-node-send-scratch-arena
+                               :element-bytes (+ (srtps-scratch-datagram-bytes) +srtps-scratch-overhead+)   ; a wrapped datagram + the SRTPS bracket
+                               :capacity      *srtps-send-scratch-capacity*)))
 
 (defmacro %with-send-scratch ((var node) &body body)
   "Borrow a datagram-sized scratch octet-buffer from NODE's send-scratch pool (the send twin of %with-secure-rx-scratch;
@@ -144,22 +133,11 @@
    arena is stored only after the pool carve succeeds (teardown reachability); stop-node tears it down. NIL until the first
    wrap -> a node with metadata_protection off reserves no static memory (zero-cost when off), consistent with the other
    per-node security pools (all lazy)."
-  (or (disc-node-submsg-scratch-pool node)
-      (dds.pal:with-lock ((disc-node-submsg-scratch-lock node))
-        (or (disc-node-submsg-scratch-pool node)
-            (handler-case
-                (let* ((eb    (+ (srtps-scratch-datagram-bytes) +submsg-scratch-overhead+))
-                       (cap   *srtps-send-scratch-capacity*)
-                       (arena (%node-arena node))   ; ADR 0095: THE participant's sub-arena, charged against the process budget
-                       (pool  (dds.core.arena:make-buffer-pool arena eb cap)))
-                  ;; ADR 0064: an exhausted arena is a STATUS now, not a condition — so it MUST be TESTED.
-                  ;; An unchecked NIL pool would still run the SETF below, storing the ARENA whose own
-                  ;; comment says 'only after the carve succeeds' — orphaning its static allocation on
-                  ;; every failed carve.
-                  (when pool   ; ADR 0098: a WHEN, never a RETURN-FROM — an NLX out of this HANDLER-CASE through WITH-LOCK's UNWIND-PROTECT heap-allocates the handler closure on EVERY call (16 B/call measured, even when this branch is never entered); a failed carve charged the SHARED arena nothing, so there is nothing to tear down (ADR 0095)
-                    (setf (disc-node-submsg-scratch-arena node) arena   ; store the arena only after the carve succeeds (teardown reachability)
-                          (disc-node-submsg-scratch-pool node) pool)))   ; set the pool LAST — the double-checked-carve flag
-              (error () nil))))))   ; arena-exhausted / static-alloc failure -> leave NIL -> allocating fallback
+  (%lazy-carve-pool (pool node :pool  disc-node-submsg-scratch-pool
+                               :lock  disc-node-submsg-scratch-lock
+                               :arena disc-node-submsg-scratch-arena
+                               :element-bytes (+ (srtps-scratch-datagram-bytes) +submsg-scratch-overhead+)   ; a datagram + the per-submessage bracket expansion headroom
+                               :capacity      *srtps-send-scratch-capacity*)))
 
 (defmacro %with-submsg-scratch ((var node) &body body)
   "Borrow one metadata_protection submessage-scratch octet-buffer from NODE's submsg-scratch pool (the metadata_protection
@@ -1098,22 +1076,11 @@
    sample, fail-closed, never a GC fallback). Idempotent, double-checked under the dedicated overlay lock; the
    arena is stored only after the carve succeeds (teardown reachability); stop-node tears it down. Mirrors
    %ensure-submsg-scratch-pool / %ensure-secure-rx-pool (init-arena + make-buffer-pool)."
-  (or (disc-node-zc-overlay-scratch-pool node)
-      (dds.pal:with-lock ((disc-node-zc-overlay-scratch-lock node))
-        (or (disc-node-zc-overlay-scratch-pool node)
-            (handler-case
-                (let* ((eb    (+ 44 +zerocopy-pool-slot-bytes+ 3))
-                       (cap   4)
-                       (arena (%node-arena node))   ; ADR 0095: THE participant's sub-arena, charged against the process budget
-                       (pool  (dds.core.arena:make-buffer-pool arena eb cap)))
-                  ;; ADR 0064: an exhausted arena is a STATUS now, not a condition — so it MUST be TESTED.
-                  ;; An unchecked NIL pool would still run the SETF below, storing the ARENA whose own
-                  ;; comment says 'only after the carve succeeds' — orphaning its static allocation on
-                  ;; every failed carve.
-                  (when pool   ; ADR 0098: a WHEN, never a RETURN-FROM — an NLX out of this HANDLER-CASE through WITH-LOCK's UNWIND-PROTECT heap-allocates the handler closure on EVERY call (16 B/call measured, even when this branch is never entered); a failed carve charged the SHARED arena nothing, so there is nothing to tear down (ADR 0095)
-                    (setf (disc-node-zc-overlay-scratch-arena node) arena   ; store the arena only after the carve succeeds (teardown reachability)
-                          (disc-node-zc-overlay-scratch-pool node) pool)))   ; set the pool LAST — the double-checked-carve flag
-              (error () nil))))))   ; arena-exhausted / static-alloc failure -> leave NIL -> fail-closed skip
+  (%lazy-carve-pool (pool node :pool  disc-node-zc-overlay-scratch-pool
+                               :lock  disc-node-zc-overlay-scratch-lock
+                               :arena disc-node-zc-overlay-scratch-arena
+                               :element-bytes (+ 44 +zerocopy-pool-slot-bytes+ 3)   ; the ENCRYPT framing, the LARGER of the two tiers (ADR 0058)
+                               :capacity      4)))
 
 ;;;; WP-FLATDATA-LOAN-WRITE (FR-PF-4, R6, ADR 0042; NOT cleared for ship — pending counsel). The TX loan-write
 ;;;; pool API DCPS loan-sample/discard-loan calls: a writer acquires a pool slot, the app writes its FlatData
@@ -4284,30 +4251,25 @@
    return), the registry vector (CAPACITY slots, swap-remove), and the node-take-loaned scratch vector (CAPACITY
    slots, reused per take). These are plain Lisp heap objects (NOT arena/SAP — like type-support's sample-pool),
    allocated once at carve; only the off-heap plaintext BUFFERS come from the static arena."
-  (or (disc-node-decode-pool node)                       ; fast unlocked check (steady state: no lock)
-      (dds.pal:with-lock ((disc-node-decode-pool-lock node))
-        (or (disc-node-decode-pool node)                 ; re-check under the lock (double-checked carve)
-            (let ((element-bytes *secured-payload-max-bytes*)
-                  (capacity (+ *secured-pool-capacity* *secured-pool-headroom*)))
-              (handler-case
-                  (let* ((arena (%node-arena node))   ; ADR 0095: THE participant's sub-arena, charged against the process budget
-                         (pool (dds.core.arena:make-buffer-pool arena element-bytes capacity))
-                         (handles (make-array capacity)))
-                    ;; ADR 0064: :arena-exhausted is a STATUS now — test it before installing anything.
-                    (when pool   ; ADR 0098: a WHEN, never a RETURN-FROM — an NLX out of this HANDLER-CASE through WITH-LOCK's UNWIND-PROTECT heap-allocates the handler closure on EVERY call (16 B/call measured, even when this branch is never entered); a failed carve charged the SHARED arena nothing, so there is nothing to tear down (ADR 0095)
-                      (dotimes (i capacity) (setf (svref handles i) (%make-secured-loan-handle)))   ; preallocate the handle freelist (recycled, zero per-sample cons)
-                      (setf (disc-node-decode-handle-vec node) handles
-                            (disc-node-decode-handle-top node) capacity
-                            (disc-node-secured-loan-vec node) (make-array capacity :initial-element nil)   ; registry: fixed vector + fill pointer (no per-loan cons)
-                            (disc-node-secured-loan-count node) 0
-                            (disc-node-secured-take-vec node) (make-array capacity :initial-element nil)   ; reused take result (no per-take cons)
-                            (disc-node-decode-arena node) arena   ; only after the carve succeeds (teardown reachability)
-                            (disc-node-decode-pool node) pool)
-                      pool))
-                ;; WP-SECURED-STORE-GROWTH: catch storage-condition too (a real off-heap/static-alloc OOM signals
-                ;; storage-condition, NOT error, on SBCL/Clasp) so carve-fail is graceful as documented — leave NIL ->
-                ;; bounded allocating-decode fallback, never propagate (operating contract §4 NFR-MEM).
-                ((or error storage-condition) () nil)))))))   ; arena-exhausted / static-alloc failure: leave NIL -> allocating-decode fallback
+  ;; WP-SECURED-STORE-GROWTH: the guard catches storage-condition too (a real off-heap/static-alloc OOM signals
+  ;; storage-condition, NOT error, on SBCL/Clasp) so carve-fail is graceful as documented — leave NIL ->
+  ;; bounded allocating-decode fallback, never propagate (operating contract §4 NFR-MEM).
+  (let ((capacity (+ *secured-pool-capacity* *secured-pool-headroom*)))
+    (%lazy-carve-pool (pool node :pool  disc-node-decode-pool
+                                 :lock  disc-node-decode-pool-lock
+                                 :arena disc-node-decode-arena
+                                 :element-bytes *secured-payload-max-bytes*   ; the max recovered plaintext = decode-serialized-payload-into's ct_len bound
+                                 :capacity      capacity
+                                 :conditions    (or error storage-condition))
+      ;; T5d: the CAPACITY-sized loan WRAPPERS, so the accepted loan conses 0 B/sample. Plain heap objects
+      ;; (NOT arena/SAP); only the off-heap plaintext BUFFERS come from the static arena.
+      (let ((handles (make-array capacity)))
+        (dotimes (i capacity) (setf (svref handles i) (%make-secured-loan-handle)))   ; preallocate the handle freelist (recycled, zero per-sample cons)
+        (setf (disc-node-decode-handle-vec node) handles
+              (disc-node-decode-handle-top node) capacity
+              (disc-node-secured-loan-vec node) (make-array capacity :initial-element nil)   ; registry: fixed vector + fill pointer (no per-loan cons)
+              (disc-node-secured-loan-count node) 0
+              (disc-node-secured-take-vec node) (make-array capacity :initial-element nil))))))   ; reused take result (no per-take cons)
 
 (defparameter *rx-store-pool-capacity* 64
   "ADR 0078 (NFR-MEM): the number of buffers in a disc-node's RX store-copy pool — the working set of
@@ -4346,27 +4308,19 @@
    On arena exhaustion this leaves the pool NIL — never an error, and never a GC-silent claim of a zero it
    did not achieve (operating contract §4 / NFR-MEM). storage-condition is caught alongside error because a
    static/off-heap allocation failure signals storage-condition, not error, on SBCL and Clasp."
-  (or (disc-node-rx-store-pool node)                      ; fast unlocked check (steady state: no lock)
-      (dds.pal:with-lock ((disc-node-rx-store-pool-lock node))
-        (or (disc-node-rx-store-pool node)                ; re-check under the lock (double-checked carve)
-            (let ((element-bytes (+ 4 *plain-payload-max-bytes* 8))
-                  (capacity *rx-store-pool-capacity*))
-              (handler-case
-                  (let* ((arena (%node-arena node))   ; ADR 0095: THE participant's sub-arena, charged against the process budget
-                         (pool (dds.core.arena:make-buffer-pool arena element-bytes capacity)))
-                    ;; ADR 0064: :arena-exhausted is a STATUS — test it before installing anything, or the
-                    ;; arena is pushed onto the node and orphaned ("store the arena only after the carve succeeds").
-                    (when pool   ; ADR 0098: a WHEN, never a RETURN-FROM — an NLX out of this HANDLER-CASE through WITH-LOCK's UNWIND-PROTECT heap-allocates the handler closure on EVERY call (16 B/call measured, even when this branch is never entered); a failed carve charged the SHARED arena nothing, so there is nothing to tear down (ADR 0095)
-                      (setf (disc-node-rx-store-element-bytes node) element-bytes
-                            (disc-node-rx-store-arena node) arena   ; only after the carve succeeds (teardown reachability)
-                            (disc-node-rx-store-pool node) pool)
-                      pool))
-                ;; arena-exhausted / static-alloc failure: leave the pool NIL -> allocating copy, and LATCH it.
-                ;; Without the latch a NIL pool reads as "not carved yet" and every later sample retries the
-                ;; carve (64 static allocations each), hammering a node that is already short of memory.
-                ((or error storage-condition) ()
-                  (setf (disc-node-rx-store-carve-failed node) t)
-                  nil)))))))
+  ;; arena-exhausted / static-alloc failure: leave the pool NIL -> allocating copy, and LATCH it.
+  ;; Without the latch a NIL pool reads as "not carved yet" and every later sample retries the
+  ;; carve (64 static allocations each), hammering a node that is already short of memory.
+  (let ((element-bytes (+ 4 *plain-payload-max-bytes* 8))   ; deliberately the SAME bound publish-sample-into's allocating fallback uses
+        (capacity *rx-store-pool-capacity*))
+    (%lazy-carve-pool (pool node :pool  disc-node-rx-store-pool
+                                 :lock  disc-node-rx-store-pool-lock
+                                 :arena disc-node-rx-store-arena
+                                 :element-bytes element-bytes
+                                 :capacity      capacity
+                                 :conditions    (or error storage-condition)
+                                 :on-failure    (setf (disc-node-rx-store-carve-failed node) t))
+      (setf (disc-node-rx-store-element-bytes node) element-bytes))))
 
 (defun* %rx-store-acquire (node plen)
     (function (disc-node (integer 0)) (or null dds.core.buffer:octet-buffer))

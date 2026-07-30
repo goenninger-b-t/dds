@@ -135,10 +135,30 @@ four independent gates failed at the same 16 bytes:
 `LABELS`-local function with no intervening `HANDLER-CASE`/`UNWIND-PROTECT`, and v4 shows a bare `RETURN-FROM`
 is free. It is deliberately left alone.
 
-**The duplication is the real exposure and it is not closed by this ADR.** Nine copies of one double-checked
-lazy carve is why one construct became four red gates, and nothing stops a tenth copy reintroducing it. The
-borrow half of this pair is already factored (`%with-scratch`, with thin per-pool wrappers); the carve half
-should be too. That is a separate, behaviour-free slice and it is recorded as open.
+**The duplication was the real exposure, and it is now closed — as a second, behaviour-free slice.** Nine
+copies of one double-checked lazy carve is *why* one construct became four red gates, and nothing stopped a
+tenth copy reintroducing it. The borrow half of this pair was already factored (`%with-scratch`, with thin
+per-pool wrappers); the carve half now is too.
+
+`%lazy-carve-pool` (`src/dds-disc/disc.lisp`, beside `%with-scratch` and `%node-arena`) holds the whole
+invariant in one place: *carve exactly once, off the steady state, under the pool's own lock; on failure leave
+the slot NIL and change nothing; never unwind.* It takes the pool/lock/arena accessor names, the sizing, an
+optional `:conditions` (sites whose allocation can exhaust real off-heap memory pass
+`(or error storage-condition)`), an optional `:on-failure` (for the one site that latches instead of retrying
+per sample), and an optional install body for extra state a site publishes alongside its pool. It sets the
+arena slot and then the pool slot, pool **last**, because that slot *is* the double-checked-carve flag.
+
+**Eight of the nine now go through it.** `%ensure-secured-payload-pool` deliberately does not: its pool lives
+on the writer's HistoryCache rather than a node slot, its double-check and lock belong to
+`writer-ensure-payload-pool`, and its arena is pushed onto a *list* under a different lock — it shares the
+guarded carve but not the structure. Covering it would mean making the pool slot, the lock and the arena slot
+all optional, which buys one call site and costs every reader of the macro. The macro's docstring names that
+exception explicitly, so it stays a decision rather than decaying into an oversight.
+
+What this does **not** give: the macro protects the sites that use it, not the language. A tenth carve written
+by hand, or a `RETURN-FROM` added inside any other `HANDLER-CASE` nested in an `UNWIND-PROTECT` on a
+per-sample path, is still unguarded. The construct-level protection would be a gate — a checker that reads the
+forms and fails on that nesting — and it is **open**, not done here.
 
 ## 7. What this ADR does **not** claim
 
