@@ -8443,11 +8443,19 @@
                    "the async sender thread slot must still be retained (non-NIL — only stop-node clears it) after the injected faults; the real liveness proof is the counter advancing + delivery")
            (%check :async-fault-counter (= 3 (dds.disc::disc-node-async-emit-errors w))
                    "exactly 3 emit faults must have been counted on the async sender thread")
-           (let ((snapshot (dds.pal:with-lock (lock) (copy-list fired))))
-             (%check :async-fault-hook-fired (= 3 (length snapshot))
-                     "the *sender-emit-error-hook* must have fired exactly 3 times")
-             (%check :async-fault-hook-context (every (lambda (e) (eq :async-sender (car e))) snapshot)
-                     "every hook fire must carry the :ASYNC-SENDER context"))
+           ;; *SENDER-EMIT-ERROR-HOOK* IS GLOBAL AND SHARED BY EVERY SENDER GUARD, so this scenario's
+           ;; assertions must FILTER BY CONTEXT before counting. They did not, and counted every fire:
+           ;; one unrelated :SHMEM-SEND-FAULT (ADR 0100) made the count 4 and turned this test red at
+           ;; ~1 in 6 runs. An assertion that is context-blind while its expectation is context-specific
+           ;; cannot distinguish its own failure modes (the ADR 0096 lesson, one layer up).
+           (let* ((snapshot (dds.pal:with-lock (lock) (copy-list fired)))
+                  (mine (remove :async-sender snapshot :key #'car :test-not #'eq)))
+             (%check :async-fault-hook-fired (= 3 (length mine))
+                     (format nil "the *sender-emit-error-hook* must have fired exactly 3 times for :ASYNC-SENDER; got ~d of ~d total fires ~a"
+                             (length mine) (length snapshot) snapshot))
+             (%check :async-fault-hook-context
+                     (every (lambda (e) (eq 'dds.disc:sender-emit-test-fault (cdr e))) mine)
+                     (format nil "every :ASYNC-SENDER fire must carry the INJECTED condition; got ~a" mine)))
            (%check :async-fault-delivered (>= (dds.disc:node-sample-count r) 6)
                    "all 6 samples must still be delivered (the 3 dropped DATAs repaired via HEARTBEAT/ACKNACK)"))
       (setf dds.disc:*debug-emit-fault* nil
