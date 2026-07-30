@@ -1023,8 +1023,8 @@
 (defun* %zc-pool-name (guid domain)
     (function ((simple-array (unsigned-byte 8) (12)) (integer 0)) string)
   "WP-ZEROCOPY pool segment name for a participant's 12-octet GUID prefix IN DOMAIN: the SHMEM
-   receive-segment name (dds.xport.shmem:seg-name-for-guid, '/dds' + 10 hex + 'd' + domain hex = up to 19
-   chars) suffixed 'z' -> up to 20, under the macOS ~31-char shm-name cap. The reader derives the SAME name
+   receive-segment name (dds.xport.shmem:seg-name-for-guid, '/dds' + token hex + 'd' + domain hex = up to 25
+   chars) suffixed 'z' -> up to 26, under the macOS ~31-char shm-name cap. The reader derives the SAME name
    from the DATA source prefix and ITS OWN domain (no extra advertisement) — which is the same domain, since
    a sample only reaches a reader in the writer's domain. ADR 0014; domain scoping per ADR 0099. NOT a wire
    constant."

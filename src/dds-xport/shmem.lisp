@@ -174,14 +174,28 @@
 
 (defun* %guid-token (guid)
     (function ((simple-array (unsigned-byte 8) (12))) (unsigned-byte 64))
-  "A nonzero 64-bit per-sender token from the low 8 GUID-prefix octets (0 is the free-lane marker)."
-  (let ((v 0)) (dotimes (i 8) (setf v (logior (ash v 8) (aref guid i)))) (if (zerop v) 1 v)))
+  "A nonzero 64-bit per-sender token over ALL TWELVE GUID-prefix octets, FNV-1a 64 (0 is the free-lane
+   marker, so a zero hash folds to 1). Cold: computed once per segment create / per peer resolve, never
+   per datagram — the send path reads the memoized SHMEM-TRANSPORT-TOKEN slot.
+
+   ADR 0099 §3: this previously folded only octets 0..7, narrowing a 12-octet identifier to 8. Two
+   participants whose prefixes differed ONLY in octets 8..11 then produced the SAME token, and that
+   collides TWICE OVER — the same segment NAME, and the same LANE OWNER in %claim-lane, which returns an
+   existing lane on (= owner token). Two distinct senders would share one lane in the receiver's ring,
+   which is a corruption hazard, not merely a lost optimisation. FNV-1a is chosen for being trivially
+   correct over 12 octets, not for cryptographic strength: nothing here is adversarial — a peer that wants
+   to disrupt a segment it can already open needs no hash collision to do it."
+  (let ((h 14695981039346656037))                                        ; FNV-1a 64 offset basis
+    (declare (type (unsigned-byte 64) h))
+    (dotimes (i 12)
+      (setf h (ldb (byte 64 0) (* (logxor h (aref guid i)) 1099511628211))))   ; xor-then-multiply by the FNV 64 prime
+    (if (zerop h) 1 h)))
 
 (defun* %seg-name (guid domain)
     (function ((simple-array (unsigned-byte 8) (12)) (integer 0)) string)
-  "Segment name '/dds' + 10 hex of the token + 'd' + the DOMAIN id in hex (macOS ~31-char shm-name cap;
-   14 + 1 + up to 4 = 19, leaving room for the ZC pool's 'z' suffix)."
-  (format nil "/dds~(~10,'0x~)d~(~x~)" (%guid-token guid) domain))   ; HOTPATH-ALLOC(COLD): segment name, built once at segment create/open
+  "Segment name '/dds' + the token in hex + 'd' + the DOMAIN id in hex. Length: 4 + up to 16 + 1 + up to 4
+   = 25, leaving room for the ZC pool's 'z' suffix (26) under the macOS ~31-char shm-name cap."
+  (format nil "/dds~(~x~)d~(~x~)" (%guid-token guid) domain))   ; HOTPATH-ALLOC(COLD): segment name, built once at segment create/open
 
 (defun* seg-name-for-guid (guid domain)
     (function ((simple-array (unsigned-byte 8) (12)) (integer 0)) string)
@@ -196,9 +210,8 @@
    the domain's own port range separates them — nothing else keeps them apart. DDS 1.4 §2.2.1.2.2: a domain
    is an isolation boundary; a transport that ignores it is not implementing the boundary.
 
-   ⚠️ The token still folds only GUID-prefix octets 0..7 (%guid-token), so two prefixes differing ONLY in
-   octets 8..11 still collide within one domain. That is a separate, pre-existing narrowing — tracked, not
-   fixed here."
+   The token folds ALL TWELVE prefix octets (%guid-token, FNV-1a 64), so the name distinguishes every
+   (domain, participant) pair — the octet-0..7 narrowing ADR 0099 §3 recorded is closed."
   (%seg-name guid domain))
 
 (defun* %make-shmem-transport-record (seg name host-uuid lane-count capacity token)

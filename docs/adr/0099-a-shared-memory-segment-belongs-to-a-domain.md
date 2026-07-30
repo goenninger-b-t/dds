@@ -34,7 +34,7 @@ are. The port *was* the isolation. SHMEM has no port and inherited no equivalent
 The domain becomes part of the segment identity:
 
 ```lisp
-(format nil "/dds~(~10,'0x~)d~(~x~)" (%guid-token guid) domain)   ; after
+(format nil "/dds~(~x~)d~(~x~)" (%guid-token guid) domain)   ; after (token now folds all 12 octets, §3)
 ```
 
 `seg-name-for-guid` takes the domain, and every derivation site passes it: the receive segment
@@ -42,15 +42,26 @@ The domain becomes part of the segment identity:
 (`%zc-pool-name`, ADR 0014). Sender and receiver compute the same name from the same two inputs, and a
 sample only ever reaches a reader in the writer's own domain, so the two sides always agree.
 
-Name budget is unchanged in practice: `/dds` + 10 hex + `d` + up to 4 hex = 19 characters, plus the ZC pool's
-`z` suffix = 20, still under the macOS ~31-character shm-name cap.
+Name budget: `/dds` + up to 16 hex + `d` + up to 4 hex = 25 characters, plus the ZC pool's `z` suffix = 26,
+still under the macOS ~31-character shm-name cap.
 
-## 3. What this does NOT fix — stated so it is not over-credited
+## 3. The second narrowing — deferred one slice, then closed
 
-`%guid-token` folds **only GUID-prefix octets 0..7** into the token. Two participants in the *same* domain
-whose prefixes differ only in octets 8..11 still collide on one segment name. That is a separate,
-pre-existing narrowing of a 12-octet identifier to 8 octets; it is documented at `seg-name-for-guid` and left
-open, because bundling it would have made the measurement below unattributable.
+`%guid-token` folded **only GUID-prefix octets 0..7**, narrowing a 12-octet identifier to 8. It was left open
+in the first cut of this ADR because bundling it would have made §4's measurement unattributable; it is now
+fixed (FNV-1a 64 over all twelve octets, folding 0 to 1 since 0 marks a free lane).
+
+**It was worse than the "same segment name" this section originally claimed.** The token is not only the name
+— it is also the **lane owner**, and `%claim-lane` returns an existing lane on `(= owner token)`. So two
+participants whose prefixes differed only in octets 8..11 would have been handed **the same lane in the
+receiver's ring**: two independent senders writing into one single-producer lane. That is a corruption
+hazard, not a lost optimisation, and it makes this the more dangerous half of the two defects even though it
+is the one that never showed up in a test.
+
+Name length after the change: `/dds` + up to 16 hex + `d` + up to 4 hex = **25**, plus the ZC pool's `z`
+suffix = 26, still under the macOS ~31-character cap. FNV-1a is chosen for being trivially correct over 12
+octets, not for strength — nothing here is adversarial, since a peer that can already open the segment needs
+no hash collision to disrupt it.
 
 ## 4. How it was found, and the measurement
 
@@ -87,7 +98,8 @@ the whole identifier, or verify the short form is injective, before trusting a s
 ADR 0097 was **correct and is unblocked by this ADR.** It did not introduce a defect; it moved reliability
 control traffic onto the SHMEM lane and thereby became the first traffic to depend on SHMEM honouring the
 domain boundary. Its measured benefit (2249 → 800 writer datagrams for 400 samples, **+181 % traffic saved**)
-stands. Landing it is a separate slice on top of this one, with its own re-verification.
+stands. It landed as its own slice immediately after this one (`03d8b0a`), re-verified at 625/625 on all
+three implementations with the previously-failing test passing 5/5 and **unmodified**.
 
 ## 6. Consequences
 
@@ -99,4 +111,5 @@ stands. Landing it is a separate slice on top of this one, with its own re-verif
 - The Zero-Copy pool segment (ADR 0014) inherits the scoping through `%zc-pool-name`, so a ZC slot cannot be
   read across a domain boundary either.
 - **The general lesson: a transport that names a global OS object must put every isolation dimension in the
-  name.** The domain was the missing one here; the truncation in §3 is the same class of bug one level down.
+  name — and must not narrow the identifier while doing it.** The domain was the missing dimension; §3's
+  octet-0..7 fold was the narrowing, and it reached further than the name, into lane ownership.
