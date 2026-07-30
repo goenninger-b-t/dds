@@ -170,7 +170,12 @@
   (transport nil :type (or null dds.xport:transport))
   (segment nil :type t) (name "" :type string) (host-uuid 0 :type (unsigned-byte 64))
   (lane-count 8 :type (integer 1)) (capacity 65536 :type (integer 8)) (token 0 :type (unsigned-byte 64))
-  (attach-cache (make-hash-table :test 'equal) :type hash-table) (sink nil :type t) (rx-thread nil :type t))   ; HOTPATH-ALLOC(COLD): defstruct initform — one table per transport, not per datagram
+  (attach-cache (make-hash-table :test 'equal) :type hash-table) (sink nil :type t) (rx-thread nil :type t)   ; HOTPATH-ALLOC(COLD): defstruct initform — one table per transport, not per datagram
+  ;; ADR 0100: ATTACH-CACHE is reached from FOUR threads (publisher, async sender, the receiver thread's
+  ;; ACKNACK repair, the flow scheduler) on EVERY %shmem-send. Every access — read AND write — is taken under
+  ;; this lock. An unsynchronised (setf gethash) corrupted the table, which SBCL reported as
+  ;; `failed AVER: (= HWM (HASH-TABLE-PAIRS-CAPACITY ...))`.
+  (attach-lock (dds.pal:make-lock "shmem-attach-cache") :type t))   ; HOTPATH-ALLOC(COLD): defstruct initform — one lock per transport
 
 (defun* %guid-token (guid)
     (function ((simple-array (unsigned-byte 8) (12))) (unsigned-byte 64))
@@ -291,17 +296,27 @@
    — a peer that died between advertising its locator and this send. That used to be an shm-attach
    CONDITION unwinding OUT OF A SEND; it is now a status, and %shmem-send turns it into the ordinary
    0-octets-sent result (the caller falls back to UDP), which is what the send path already meant to do.
-   A failed attach is NOT cached: the peer may come back."
-  (let ((cached (gethash (shmem-locator-name locator) (shmem-transport-attach-cache st))))
-    (when cached (return-from %attach-for (values cached nil))))
-  (let* ((seg (try (dds.pal:shm-attach
-                    (shmem-locator-name locator)
-                    (%segment-bytes (shmem-locator-lane-count locator) (shmem-locator-capacity locator)))))
-         (sap (dds.pal:shm-sap seg)))
-    (values (setf (gethash (shmem-locator-name locator) (shmem-transport-attach-cache st))
-                  (%make-shmem-dest :segment seg :sap sap
-                                    :lane (%claim-lane sap (shmem-transport-token st))))
-            nil)))
+   A failed attach is NOT cached: the peer may come back.
+
+   ADR 0100: EVERY access to ATTACH-CACHE is under ATTACH-LOCK, the lookup included. This function runs on
+   EVERY %shmem-send and from FOUR threads, so the per-datagram READ raced the first-send WRITE to a new
+   peer; on SBCL that corrupted the table and surfaced as `failed AVER: (= HWM ...)`. A double-checked
+   unlocked fast read would NOT be safe here — a reader concurrent with the rehash inside (setf gethash) is
+   the same data race, merely a narrower window. The attach + lane-claim stay inside the lock so two threads
+   racing the same new peer produce ONE segment attach and ONE lane claim, not two."
+  (dds.pal:with-lock ((shmem-transport-attach-lock st))
+    (let ((cached (gethash (shmem-locator-name locator) (shmem-transport-attach-cache st))))
+      (if cached
+          (values cached nil)
+          (let* ((seg (try (dds.pal:shm-attach
+                            (shmem-locator-name locator)
+                            (%segment-bytes (shmem-locator-lane-count locator)
+                                            (shmem-locator-capacity locator)))))
+                 (sap (dds.pal:shm-sap seg)))
+            (values (setf (gethash (shmem-locator-name locator) (shmem-transport-attach-cache st))
+                          (%make-shmem-dest :segment seg :sap sap
+                                            :lane (%claim-lane sap (shmem-transport-token st))))
+                    nil))))))
 
 (defun* %shmem-send (st locator buffer len)
     (function (shmem-transport shmem-locator dds.core.buffer:octet-buffer (integer 0)) (integer 0))
@@ -357,9 +372,10 @@
    transport's receive loop never touches (it drains only its OWN segment), so releasing them races nothing."
   (multiple-value-bind (ok status) (stop-shmem-receiver st)
     (declare (ignore ok))
-    (maphash (lambda (k v) (declare (ignore k)) (ignore-errors (dds.pal:shm-detach (shmem-dest-segment v))))
-             (shmem-transport-attach-cache st))
-    (clrhash (shmem-transport-attach-cache st))
+    (dds.pal:with-lock ((shmem-transport-attach-lock st))   ; ADR 0100: teardown walks the same table the senders fill
+      (maphash (lambda (k v) (declare (ignore k)) (ignore-errors (dds.pal:shm-detach (shmem-dest-segment v))))
+               (shmem-transport-attach-cache st))
+      (clrhash (shmem-transport-attach-cache st)))
     (when status (return-from shmem-transport-close (values nil status)))
     (let ((sap (dds.pal:shm-sap (shmem-transport-segment st))))
       (dds.pal:pshared-destroy sap +mutex-off+ +cond-off+))
@@ -413,6 +429,64 @@
            t)
       (shmem-transport-close tx)
       (shmem-transport-close rx))))
+
+(defun* run-shmem-attach-cache-race-test ()
+    (function () (eql t))
+  "ADR 0100: EVERY access to a transport's ATTACH-CACHE is under ATTACH-LOCK.
+
+   THE DEFECT THIS PINS. %attach-for did an UNLOCKED gethash followed by an UNLOCKED (setf gethash), and it
+   runs on EVERY %shmem-send from FOUR threads (the publisher, the async sender, the receiver thread's
+   ACKNACK repair, the flow scheduler). Concurrent mutation corrupted the table; SBCL caught its own
+   invariant going down — `failed AVER: (= HWM (HASH-TABLE-PAIRS-CAPACITY ...))` — and %send-raw-buf's
+   self-guard SILENTLY absorbed it into a UDP fallback, so SHMEM degraded with nothing ever going red.
+
+   THE TEST DRIVES THE RACE DIRECTLY rather than hoping a delivery test trips it: N threads all resolve the
+   SAME set of fresh destination names through ONE transport at once, which is exactly the first-send window
+   where a reader raced the filling write. It asserts (1) no thread saw an error, (2) every thread got the
+   SAME dest object per name — proof the fill happened exactly once and no thread observed a torn table —
+   and (3) the cache holds exactly one entry per name.
+
+   ⚠️ It cannot assert 'the old code fails': a data race is not required to manifest. What it CAN do is run
+   the race hard enough that a regression is likely to be caught, and assert the INVARIANT (one dest per
+   name, no errors) that unsynchronised access cannot reliably maintain.
+
+   Pass-skips on the Clasp/macOS-arm64 by-name-attach gap (ADR 0013)."
+  (unless (shm-attach-by-name-reliable-p) (return-from run-shmem-attach-cache-race-test t))
+  (let ((rxs (loop for i from 40 below 46
+                   collect (make-shmem-transport :participant-guid (%test-guid i) :host-uuid 7)))
+        (tx (make-shmem-transport :participant-guid (%test-guid 47) :host-uuid 7)))
+    (unwind-protect
+         (let* ((locs (mapcar #'shmem-transport-locator rxs))   ; HOTPATH-ALLOC(TEST): in-file self-test setup, not a send path
+                (threads 6)
+                (lock (dds.pal:make-lock "race-results"))
+                (results '()) (errors '()))
+           (let ((ts (loop repeat threads
+                           collect (dds.pal:spawn
+                                    (lambda ()
+                                      (let ((mine '()))
+                                        (handler-case
+                                            (dolist (l locs)
+                                              (multiple-value-bind (dest status) (%attach-for tx l)
+                                                (push (cons (shmem-locator-name l) (or dest status)) mine)))
+                                          (error (c) (dds.pal:with-lock (lock) (push c errors))))   ; HOTPATH-COND(TEST): the race under test would signal here
+                                        (dds.pal:with-lock (lock) (push mine results))))
+                                    :name "attach-race"))))
+             (dolist (th ts) (dds.pal:join th)))
+           (assert (null errors) () "no thread may see an error resolving the attach cache; got ~a" errors)   ; HOTPATH-COND(TEST): in-file self-test
+           (assert (= threads (length results)) () "every thread must report")   ; HOTPATH-COND(TEST): in-file self-test
+           ;; every thread must have obtained the IDENTICAL dest object for each name (filled exactly once)
+           (dolist (l locs)
+             (let* ((name (shmem-locator-name l))
+                    (seen (mapcar (lambda (r) (cdr (assoc name r :test #'string=))) results)))   ; HOTPATH-ALLOC(TEST): in-file self-test assertion
+               (assert (every (lambda (d) (eq d (first seen))) seen) ()   ; HOTPATH-COND(TEST): in-file self-test
+                       "all threads must share ONE dest for ~a (got ~a distinct)"
+                       name (length (remove-duplicates seen)))))
+           (assert (= (length locs) (hash-table-count (shmem-transport-attach-cache tx))) ()   ; HOTPATH-COND(TEST): in-file self-test
+                   "the cache must hold exactly one entry per name (~a names, ~a entries)"
+                   (length locs) (hash-table-count (shmem-transport-attach-cache tx))))
+      (shmem-transport-close tx)
+      (dolist (rx rxs) (shmem-transport-close rx))))
+  t)
 
 (defun* run-shmem-dest-cache-test ()
     (function () (eql t))

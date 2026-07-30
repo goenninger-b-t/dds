@@ -4295,6 +4295,7 @@
                  ("shmem-receiver-thread"    . dds.xport.shmem:run-shmem-receiver-test)
                  ("shmem-stress"             . dds.xport.shmem:run-shmem-stress-test)
                  ("shmem-dest-cache"         . dds.xport.shmem:run-shmem-dest-cache-test)
+                 ("shmem-attach-cache-race"  . dds.xport.shmem:run-shmem-attach-cache-race-test)
                  ("rti-shmem-recognition"    . dds.xport.rti-shmem:run-rti-shmem-recognition-test)
                  ("rti-shmem-properties"     . dds.xport.rti-shmem:run-rti-shmem-properties-test)
                  ("rti-shmem-ring-address"   . dds.xport.rti-shmem:run-rti-shmem-ring-address-test)

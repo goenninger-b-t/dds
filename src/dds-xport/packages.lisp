@@ -52,7 +52,8 @@
            ;; The resolved-once destination cache (NFR-MEM, ADR 0067): the A/B lever + escape hatch
            #:*shmem-dest-cache*
            #:run-shmem-transport-test #:run-shmem-receiver-test #:run-shmem-stress-test
-           #:run-shmem-dest-cache-test))
+           #:run-shmem-dest-cache-test
+           #:run-shmem-attach-cache-race-test))
 
 (defpackage #:net.goenninger.dds.xport.rti-shmem
   (:nicknames #:dds.xport.rti-shmem)

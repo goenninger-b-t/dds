@@ -113,6 +113,23 @@
   "Total bytes consed so far (sb-ext:get-bytes-consed) — the NFR-PERF-8 oracle."
   (sb-ext:get-bytes-consed))
 
+(defun* internal-bug-p (condition)
+    (function (t) t)
+  "T iff CONDITION is the implementation reporting a violation of its OWN internal invariants — an
+   interpreter/compiler/runtime BUG, not a condition our code raised or could have anticipated.
+
+   WHY THIS EXISTS (ADR 0100). A sender-thread guard that catches ERROR and continues is correct for an
+   ordinary emit failure (a peer's segment vanished; the datagram falls back to UDP; RTPS repair covers the
+   rest). It is WRONG for an internal-invariant violation: that says a DATA STRUCTURE IS ALREADY CORRUPT, so
+   \"carry on and use it again\" is the one response guaranteed to make things worse. Absorbing it also
+   HIDES it — the defect that motivated this ADR degraded SHMEM to UDP silently for as long as it existed,
+   with no test ever going red.
+
+   Implementation-specific by nature, hence the PAL: SBCL signals SB-INT:BUG (\"failed AVER: ...\") for these.
+   An implementation with no distinguished internal-bug type returns NIL, which restores exactly the previous
+   catch-everything behaviour — a documented NFR-PORT gap, never a silent behaviour change."
+  (typep condition 'sb-int:bug))
+
 ;;; ---- clock ----
 
 ;; MONOTONIC-NS lives in pal-net.lisp — ONE clock_gettime implementation shared by both impls.

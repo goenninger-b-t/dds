@@ -78,6 +78,8 @@
    #:tcp-shutdown #:tcp-set-recv-timeout
    ;; gc control / measurement
    #:gc-suggest #:with-gc-inhibited #:bytes-consed
+   ;; implementation-internal invariant violations (ADR 0100) — NOT ordinary errors
+   #:internal-bug-p
    ;; optimization hints
    #:with-hot-optimizations
    ;; file sync (group-commit; fdatasync on SBCL, finish-output on Clasp — NFR-PORT)

@@ -87,6 +87,29 @@
     (ignore-errors (funcall *sender-emit-error-hook* condition :shmem-send-fault n))
     n))
 
+(defun* %note-shmem-internal-bug (node condition)
+    (function (disc-node condition) fixnum)
+  "ADR 0100: the SHMEM send hit an IMPLEMENTATION-INTERNAL invariant violation (dds.pal:internal-bug-p — on
+   SBCL an SB-INT:BUG, i.e. a `failed AVER'), NOT an ordinary emit failure. Bump the node's dedicated
+   SHMEM-INTERNAL-BUGS counter, LATCH SHMEM off for this node, and fire *SENDER-EMIT-ERROR-HOOK* with the
+   DISTINCT context :SHMEM-INTERNAL-BUG.
+
+   WHY IT IS NOT JUST ANOTHER SEND FAULT. An ordinary fault means a peer's segment went away: fall back to
+   UDP, RTPS repairs the rest, carry on — correct. An internal-invariant violation means A DATA STRUCTURE IS
+   ALREADY CORRUPT, and the one response guaranteed to make that worse is to keep using it. Counting it as a
+   routine fallback ALSO hid it: the attach-cache race this ADR fixes degraded SHMEM to UDP silently for as
+   long as it existed, with no test ever going red, because its only trace was a counter nobody asserted on.
+
+   FAIL-SAFE, NOT FAIL-STOP: the datagram still falls back to UDP (delivery is preserved and the sender thread
+   survives — a signalled condition here would kill it, which the operating contract forbids and which would
+   be strictly worse). What changes is that SHMEM stops being used by this node, so a corrupt table is never
+   consulted again, and the event is loud and separately countable instead of indistinguishable from a peer
+   that simply went away."
+  (setf (disc-node-shmem-internal-bug-p node) t)   ; latch: never consult a possibly-corrupt cache again
+  (let ((n (incf (disc-node-shmem-internal-bugs node))))
+    (ignore-errors (funcall *sender-emit-error-hook* condition :shmem-internal-bug n))
+    n))
+
 (defun* %ensure-send-scratch-pool (node)
     (function (disc-node) t)
   "Return NODE's SRTPS send-scratch pool, carving it (arena + fixed pool of datagram-sized static buffers) lazily
@@ -473,11 +496,17 @@
     (when (integerp *debug-emit-fault*)
       (setf *debug-emit-fault* (when (> *debug-emit-fault* 1) (1- *debug-emit-fault*))))   ; N -> N-1, last -> NIL
     (error 'sender-emit-test-fault))   ; :persistent or a positive integer: inject; inert when NIL   ; NOCOND(TEST): inert in production (armed only by *debug-emit-fault* defaulting NIL); the UNWIND is the emit-fault mechanism under test
-  (when (and shmem-dest (disc-node-shmem node))
+  (when (and shmem-dest (disc-node-shmem node) (not (disc-node-shmem-internal-bug-p node)))   ; ADR 0100: the latch keeps a corrupt attach cache out of the send path
     (when (plusp (handler-case
                      (dds.xport:send (dds.xport.shmem:shmem-transport-transport (disc-node-shmem node))
                                      shmem-dest buf 0 len)
-                   (error (c) (%note-shmem-send-fault node c) 0)))   ; hard SHMEM fault -> counter+hook, fall to UDP
+                   ;; ADR 0100: an IMPLEMENTATION-INTERNAL invariant violation is not an emit failure — it says
+                   ;; a structure is already corrupt. Counted + latched separately; never folded into the
+                   ;; routine fallback, which is what hid the attach-cache race.
+                   (error (c) (if (dds.pal:internal-bug-p c)
+                                  (%note-shmem-internal-bug node c)
+                                  (%note-shmem-send-fault node c))
+                     0)))   ; either way the datagram falls to UDP: delivery preserved, sender thread survives
       (incf (disc-node-shmem-sends node))
       (return-from %send-raw-buf t)))   ; delivered over SHMEM: do NOT also UDP-send (no double-delivery)
   (dds.xport:send (disc-node-transport node)

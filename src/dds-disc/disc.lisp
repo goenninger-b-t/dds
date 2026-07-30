@@ -290,6 +290,8 @@
   (host-uuid 0 :type (unsigned-byte 64))  ; u64 host id (MD5 of hostname); a remote with the SAME uuid is same-host
   (shmem-sends 0 :type (integer 0))       ; count of user DATA datagrams this node routed over SHMEM (proof/diagnostic)
   (shmem-send-faults 0 :type fixnum)      ; WP-SHMEM-SEND-SELF-GUARD: count of SIGNALED %shmem-send faults caught in %send-raw-buf and degraded to the UDP fallback (proof/diagnostic; FR-XPORT-2)
+  (shmem-internal-bugs 0 :type fixnum)    ; ADR 0100: count of IMPLEMENTATION-INTERNAL invariant violations (dds.pal:internal-bug-p) caught on the SHMEM send path — counted SEPARATELY from an ordinary send fault because it means a structure is already corrupt, not that a peer went away
+  (shmem-internal-bug-p nil :type t)      ; ADR 0100: latched T by the first internal bug — SHMEM is disabled for this node from then on, so a possibly-corrupt attach cache is never consulted again (fail-safe: UDP still delivers)
   (shmem-dest-cache (make-hash-table :test 'equalp) :type hash-table) ; remote 12-octet prefix -> shmem-locator | :none; one-time resolve per peer (hot-path send reads, no lock/alloc); invalidated on SPDP re-discovery + lease-out
   ;; WP-ZEROCOPY (FR-PF-3, ADR 0014; NOT cleared for ship — pending counsel R6). All NIL/0 unless
   ;; *zerocopy-enabled* AND this node has SHMEM. ZC-POOL is this writer's per-participant SHMEM
