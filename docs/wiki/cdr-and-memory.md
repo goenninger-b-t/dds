@@ -296,6 +296,19 @@ NameHash example: `MD5("color")[0:4]` = `70 dd a5 df`. (From `run-md5-test`.)
 
 ## Notes / status
 
+- **A `RETURN-FROM` that crosses a lock is not free, and its cost lands on the path that never takes it
+  (ADR 0098).** `dds.pal:with-lock` expands to an `UNWIND-PROTECT`, and `HANDLER-CASE` installs a handler
+  closure that is normally stack-allocated. Put a `RETURN-FROM` in the `HANDLER-CASE` body that targets a
+  block *outside* that `UNWIND-PROTECT` and the non-local exit has to be able to run through the unwind — the
+  closure loses dynamic extent and is heap-allocated at **function entry**, so every call pays it, including
+  every steady-state call that never enters the branch and never signals. On SBCL x86_64 that is 16 bytes
+  (a 2-word no-capture closure). Nine lazy pool carves shared the shape and it made four DDS-Security
+  zero-alloc gates red at exactly 16 B. **The fix is a guard instead of an early exit** — in all nine, `NIL`
+  propagated out through the enclosing `OR`/`WITH-LOCK`/`OR` chain to the identical result, so a
+  `WHEN`-guarded `SETF` is semantically the same with no non-local exit. What makes this one hard to find:
+  **no single construct allocates.** `WITH-LOCK` alone, `HANDLER-CASE` alone, and `HANDLER-CASE` containing a
+  `RETURN-FROM` alone all measure 0.0000 B/call; only the composition allocates, so a ladder that tests the
+  parts one at a time exonerates the real cause.
 - **The raw-pointer rule is now ENFORCED, not just documented (ADR 0085).** NFR-MEM requires that anything
   addressed by a raw pointer/SAP be foreign/static, never a GC-heap array — a moving collector can
   invalidate a heap vector's address underneath a syscall, after which the kernel reads or writes whatever

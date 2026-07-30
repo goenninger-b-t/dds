@@ -2613,9 +2613,9 @@
                        (pool  (dds.core.arena:make-buffer-pool arena eb cap)))
                   ;; ADR 0064: :arena-exhausted is a STATUS now — an unchecked NIL pool would still
                   ;; store the ARENA below ('only after the carve succeeds'), orphaning its allocation.
-                  (when (null pool) (return-from %ensure-secure-rx-pool nil))   ; ADR 0095: the arena is SHARED now — a failed carve charged nothing, and tearing it down would free the node's OTHER pools
-                  (setf (disc-node-secure-rx-arena node) arena   ; store the arena only after the carve succeeds (teardown reachability)
-                        (disc-node-secure-rx-pool node) pool))   ; set the pool LAST — the double-checked-carve flag
+                  (when pool   ; ADR 0098: a WHEN, never a RETURN-FROM — an NLX out of this HANDLER-CASE through WITH-LOCK's UNWIND-PROTECT heap-allocates the handler closure on EVERY call (16 B/call measured, even when this branch is never entered); a failed carve charged the SHARED arena nothing, so there is nothing to tear down (ADR 0095)
+                    (setf (disc-node-secure-rx-arena node) arena   ; store the arena only after the carve succeeds (teardown reachability)
+                          (disc-node-secure-rx-pool node) pool)))   ; set the pool LAST — the double-checked-carve flag
               (error () nil))))))   ; arena-exhausted / static-alloc failure -> leave NIL -> allocating fallback
 
 (defmacro %with-bracket-rx-scratch ((var node) &body body)
@@ -2657,9 +2657,9 @@
                        (pool  (dds.core.arena:make-buffer-pool arena eb cap)))
                   ;; ADR 0064: :arena-exhausted is a STATUS now — an unchecked NIL pool would still
                   ;; store the ARENA below ('only after the carve succeeds'), orphaning its allocation.
-                  (when (null pool) (return-from %ensure-bracket-rx-pool nil))   ; ADR 0095: the arena is SHARED now — a failed carve charged nothing, and tearing it down would free the node's OTHER pools
-                  (setf (disc-node-bracket-rx-arena node) arena   ; store the arena only after the carve succeeds (teardown reachability)
-                        (disc-node-bracket-rx-pool node) pool))   ; set the pool LAST — the double-checked-carve flag
+                  (when pool   ; ADR 0098: a WHEN, never a RETURN-FROM — an NLX out of this HANDLER-CASE through WITH-LOCK's UNWIND-PROTECT heap-allocates the handler closure on EVERY call (16 B/call measured, even when this branch is never entered); a failed carve charged the SHARED arena nothing, so there is nothing to tear down (ADR 0095)
+                    (setf (disc-node-bracket-rx-arena node) arena   ; store the arena only after the carve succeeds (teardown reachability)
+                          (disc-node-bracket-rx-pool node) pool)))   ; set the pool LAST — the double-checked-carve flag
               (error () nil))))))   ; arena-exhausted / static-alloc failure -> leave NIL -> allocating fallback
 
 (defmacro %with-key-id-rx-scratch ((var node) &body body)
@@ -2697,9 +2697,9 @@
                        (pool  (dds.core.arena:make-buffer-pool arena eb cap)))
                   ;; ADR 0064: :arena-exhausted is a STATUS now — an unchecked NIL pool would still
                   ;; store the ARENA below ('only after the carve succeeds'), orphaning its allocation.
-                  (when (null pool) (return-from %ensure-key-id-rx-pool nil))   ; ADR 0095: the arena is SHARED now — a failed carve charged nothing, and tearing it down would free the node's OTHER pools
-                  (setf (disc-node-key-id-rx-arena node) arena   ; store the arena only after the carve succeeds (teardown reachability)
-                        (disc-node-key-id-rx-pool node) pool))   ; set the pool LAST — the double-checked-carve flag
+                  (when pool   ; ADR 0098: a WHEN, never a RETURN-FROM — an NLX out of this HANDLER-CASE through WITH-LOCK's UNWIND-PROTECT heap-allocates the handler closure on EVERY call (16 B/call measured, even when this branch is never entered); a failed carve charged the SHARED arena nothing, so there is nothing to tear down (ADR 0095)
+                    (setf (disc-node-key-id-rx-arena node) arena   ; store the arena only after the carve succeeds (teardown reachability)
+                          (disc-node-key-id-rx-pool node) pool)))   ; set the pool LAST — the double-checked-carve flag
               (error () nil))))))   ; arena-exhausted / static-alloc failure -> leave NIL -> allocating fallback
 
 (defvar *rx-source-timestamp* nil
