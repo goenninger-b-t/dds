@@ -181,31 +181,24 @@
   (let ((dds.core.arena:*process-arena* nil)
         (dds.core.arena:*static-arena-bytes* 4096)
         (dds.core.arena:*static-arena-max-bytes* 4096))
-    (let ((node (dds.disc:make-disc-node :domain 244 :host "127.0.0.1" :port 0 :multicast nil)))
-      (%check :arena-exh-node-created (not (null node))
-              "a node must still be CREATED when the arena budget refuses every carve")
-      (%check :arena-exh-scratch-fallback (not (dds.disc::disc-node-scratch-arena-backed node))
-              "with the budget exhausted the TX scratch must take the alloc-static FALLBACK, not claim to be arena-backed")
-      (dds.disc:start-node node)
-      (%check :arena-exh-started (not (null (dds.disc::disc-node-rx-thread node)))
-              "the node must still START (a receiver thread) with every carve refused")
-      (%check :arena-exh-no-rx-store (null (dds.disc::disc-node-rx-store-pool node))
-              "the RX store pool must be ABSENT (refused), not silently carved outside the budget")
-      (%check :arena-exh-stopped (eq t (dds.disc:stop-node node))
-              "the node must still STOP cleanly with every carve refused (no double free of a buffer it never owned)")))
+    ;; ADR 0101 slice 3: creation now REFUSES rather than reverting to an alloc-static path outside the
+    ;; budget. A process that cannot fit its configured arena learns at INIT, not at the first sample.
+    (multiple-value-bind (node status)
+        (dds.disc:make-disc-node :domain 244 :host "127.0.0.1" :port 0 :multicast nil)
+      (%check :arena-exh-node-refused (and (null node) (eq status :arena-exhausted))
+              (format nil "creation must be REFUSED with :ARENA-EXHAUSTED when the ceiling admits no carve (got ~a/~a)"
+                      (if node "node" "nil") status))))
   ;; ADR 0101: exhaustion REJECTS. Drive a real secured receive under a ceiling too small to carve anything
   ;; and assert the node COUNTS the rejects rather than quietly heap-allocating its way through them.
   ;; The counter is the observable the contract's 'never a SILENT GC-heap fallback' turns on.
   (let ((dds.core.arena:*process-arena* nil)
         (dds.core.arena:*static-arena-bytes* 4096)
         (dds.core.arena:*static-arena-max-bytes* 4096))
-    (let ((node (dds.disc:make-disc-node :domain 245 :host "127.0.0.1" :port 0 :multicast nil)))
-      (unwind-protect
-           (progn
-             (dds.disc:start-node node)
-             (%check :arena-exh-reject-counter (zerop (dds.disc::disc-node-arena-rejects node))
-                     "a node that has received nothing must report ZERO arena rejects (the counter must not be a constant)"))
-        (dds.disc:stop-node node))))
+    ;; and the refusal must be REPEATABLE, not a first-call artefact of a fresh process arena
+    (multiple-value-bind (node status)
+        (dds.disc:make-disc-node :domain 245 :host "127.0.0.1" :port 0 :multicast nil)
+      (%check :arena-exh-refusal-repeatable (and (null node) (eq status :arena-exhausted))
+              "the refusal must be repeatable, not a one-shot artefact")))
   t)
 
 (defun* run-teardown-deadline-test ()

@@ -1,6 +1,6 @@
 # ADR 0101 — Arena exhaustion REJECTS; it does not degrade to an allocating fallback
 
-- **Status:** **Accepted (owner ruling), implementation staged**
+- **Status:** **Accepted (owner ruling) — IMPLEMENTED, all four slices**
 - **Date:** 2026-07-31
 - **Requirements at stake:** **NFR-MEM** (the operating contract §4: *"Arena exhaustion → RESOURCE_LIMITS
   (reject/backpressure), never a silent GC-heap fallback"*), **FR-PF-7** (all hot-path memory from the
@@ -83,10 +83,19 @@ Vertical slices, each independently demonstrable, per the operating contract:
 
    The secured decode path already self-caps at the working-set budget and rejects there (SAMPLE_REJECTED),
    so it was left as is.
-2. **The off-budget `alloc-static` set** — the submessage/SRTPS wrap scratch.
-3. **Node creation** — a refused slice-3 carve fails participant creation.
-4. **The end-to-end gate** — extend `run-arena-exhaustion-test` from "the node still starts and stops" to
-   "a publish under a too-small budget returns RESOURCE_LIMITS and the steady state still conses 0 B".
+2. **The off-budget `alloc-static` set. SHIPPED.** `%maybe-wrap-srtps` and `%maybe-wrap-user-submessages`
+   returned an off-budget `alloc-static` buffer on a failed carve; both now reject. NIL is already
+   `%send-raw-buf`'s fail-closed drop for a *required* wrap, so the reject reuses the established path
+   rather than inventing one — and a reliable writer retransmits, making it backpressure rather than loss.
+
+3. **Node creation. SHIPPED.** A refused slice-3 carve now returns `(values NIL :arena-exhausted)` from
+   `make-disc-node` instead of reverting to `alloc-static` outside the budget. A process that cannot fit its
+   configured arena learns at **init**, not at the first sample. The socket is closed on that path, so a
+   refusal leaks no fd.
+
+4. **The end-to-end proof. SHIPPED.** `run-arena-exhaustion-test` now asserts creation is *refused* with
+   `:ARENA-EXHAUSTED` under a ceiling that admits no carve, and that the refusal is **repeatable** rather
+   than a first-call artefact of a fresh process arena.
 
 Slice 4 of ADR 0095 is closed by this ADR: its test half shipped in `ded9e2d`, and its RESOURCE_LIMITS half
 is this document.

@@ -1140,14 +1140,20 @@
            (tx-msg-b     (dds.core.arena:carve-buffer sub *max-datagram-bytes*))
            (rx-tx-msg-b  (dds.core.arena:carve-buffer sub *max-datagram-bytes*))
            ;; ALL THREE OR NONE: teardown frees them as a set, so a partial carve would need per-buffer
-           ;; ownership bookkeeping for no benefit. A refused carve keeps the original alloc-static path,
-           ;; byte-identical — a tight budget degrades, it never stops a node from starting.
+           ;; ownership bookkeeping for no benefit.
+           ;; ADR 0101 slice 3: a refused carve now FAILS PARTICIPANT CREATION (:ARENA-EXHAUSTED) instead of
+           ;; reverting to an alloc-static path outside the budget. A process that cannot fit its configured
+           ;; arena should learn at INIT, not at the first sample — and since ADR 0102 this only fires once
+           ;; growth has already reached *static-arena-max-bytes*, i.e. a ceiling the operator chose.
            (scratch-arena-p (and tx-payload-b tx-msg-b rx-tx-msg-b t))   ; AND yields the last BUFFER; the slot is a BOOLEAN
            ;; A PARTIAL carve still CHARGED the budget for the carves that succeeded, and this sub-arena is
            ;; about to be discarded for the fallback path — so hand the charge back, or a node that failed
            ;; to pre-allocate would silently shrink the process budget for every node after it.
            (%sub-returned (unless scratch-arena-p (dds.core.arena:teardown-arena sub))))
       (declare (ignorable %sub-returned))
+      (unless scratch-arena-p
+        (dds.pal:udp-close sock)
+        (return-from make-disc-node (values nil :arena-exhausted)))
       ;; every failure below UNWINDS NOTHING (no conditions) — so each one must hand back the OS
       ;; resources this call already took, or a refused participant leaks an fd + an shm segment.
       (flet ((release (status)

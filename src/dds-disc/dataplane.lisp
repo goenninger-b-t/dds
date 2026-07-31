@@ -231,12 +231,10 @@
                       (incf len 24)
                       (setf pool (%ensure-send-scratch-pool node))
                       (if (null pool)
-                          ;; pool carve failed (arena exhausted at first wrap): allocating fallback — correct +
-                          ;; byte-identical wire, never a silent drop of legit keyed traffic (self-heals once the arena frees).
-                          (let ((srtps (dds.security:encode-rtps-message km kind (subseq vec 20 len) :receivers receivers)))
-                            (if (and srtps (<= (+ 20 (length srtps)) cap))
-                                (progn (replace vec srtps :start1 20) (+ 20 (length srtps)))
-                                nil))
+                          ;; ADR 0101: a failed carve is RESOURCE_LIMITS, not an allocating fallback. NIL here is
+                          ;; %send-raw-buf's fail-closed drop, which for a REQUIRED wrap is already the semantics —
+                          ;; and a reliable writer retransmits, so the reject is backpressure, not loss.
+                          (progn (incf (disc-node-arena-rejects node)) nil)
                           ;; ZA-2 zero-alloc: borrow a scratch, build the bracket into it BY OFFSET (no subseq / →octets),
                           ;; copy [0,BLEN) back over [20,…) in BUF, release the scratch. Pool exhausted -> %with-send-scratch
                           ;; is NIL -> fail-closed drop (never a GC fallback).
@@ -445,11 +443,9 @@
         len
         (let ((pool (%ensure-submsg-scratch-pool node)))
           (if (null pool)
-              ;; pool carve failed (arena exhausted at first wrap): allocating fallback — correct + byte-identical wire,
-              ;; never a silent drop of legit keyed traffic (self-heals once the arena frees).
-              (let ((out (dds.core.buffer:make-octet-buffer (+ +srtps-scratch-datagram-bytes+ +submsg-scratch-overhead+))))
-                (unwind-protect (%wrap-user-submessages-into node buf len out)
-                  (dds.pal:free-static (dds.core.buffer:octet-buffer-vec out))))
+              ;; ADR 0101: a failed carve is RESOURCE_LIMITS, not an off-budget alloc-static fallback. NIL is the
+              ;; fail-closed drop %send-raw-buf already applies to a required-but-failed wrap.
+              (progn (incf (disc-node-arena-rejects node)) nil)
               ;; ZA-2 zero-alloc: borrow a submessage scratch, build the wrapped stream into it BY OFFSET (no subseq /
               ;; →octets), copy back over [20,…) in BUF, release. Pool EXHAUSTED -> %with-submsg-scratch never runs the
               ;; body -> the zero-alloc pre-scan decides (ZA-2 review): a datagram with NOTHING protectable passes through
