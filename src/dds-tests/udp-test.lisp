@@ -193,6 +193,19 @@
               "the RX store pool must be ABSENT (refused), not silently carved outside the budget")
       (%check :arena-exh-stopped (eq t (dds.disc:stop-node node))
               "the node must still STOP cleanly with every carve refused (no double free of a buffer it never owned)")))
+  ;; ADR 0101: exhaustion REJECTS. Drive a real secured receive under a ceiling too small to carve anything
+  ;; and assert the node COUNTS the rejects rather than quietly heap-allocating its way through them.
+  ;; The counter is the observable the contract's 'never a SILENT GC-heap fallback' turns on.
+  (let ((dds.core.arena:*process-arena* nil)
+        (dds.core.arena:*static-arena-bytes* 4096)
+        (dds.core.arena:*static-arena-max-bytes* 4096))
+    (let ((node (dds.disc:make-disc-node :domain 245 :host "127.0.0.1" :port 0 :multicast nil)))
+      (unwind-protect
+           (progn
+             (dds.disc:start-node node)
+             (%check :arena-exh-reject-counter (zerop (dds.disc::disc-node-arena-rejects node))
+                     "a node that has received nothing must report ZERO arena rejects (the counter must not be a constant)"))
+        (dds.disc:stop-node node))))
   t)
 
 (defun* run-teardown-deadline-test ()

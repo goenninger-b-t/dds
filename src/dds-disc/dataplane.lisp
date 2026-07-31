@@ -3699,15 +3699,22 @@
          ;; marked loan-capable but the live handshake has not yet installed its transform, so gate (a) does not
          ;; subsume gate (b). Such a node's steady state is the loan path, which is already pooled — excluding
          ;; it costs nothing.
-         (let* ((ob  (and *rx-store-pool-enabled*   ; ADR 0085: the same-tree A/B + field kill-switch; NIL -> the pre-pool allocating copy, never carves
-                          (null (disc-node-crypto-transform node))
-                          (not (disc-node-secured-loan-capable node))
-                          (%rx-store-acquire node plen)))
-                (vec (if ob
+         ;; ADR 0101: distinguish WANTED-BUT-EXHAUSTED from NEVER-WANTED. A failed CARVE is arena exhaustion
+         ;; -> RESOURCE_LIMITS drop + count. The ADR 0085 kill-switch being off, or the crypto/loan path not
+         ;; using this pool at all, is an operator/config choice — those keep the allocating copy, because
+         ;; rejecting there would refuse work for a reason the operator did not ask for.
+         (let* ((want (and *rx-store-pool-enabled*
+                           (null (disc-node-crypto-transform node))
+                           (not (disc-node-secured-loan-capable node))))
+                (ob  (and want (%rx-store-acquire node plen))))
+           (when (and want (null ob) (disc-node-rx-store-carve-failed node))
+             (incf (disc-node-arena-rejects node))
+             (return-from %on-user-data t))
+         (let* ((vec (if ob
                          (dds.core.buffer:octet-buffer-vec ob)
                          (make-array plen :element-type '(unsigned-byte 8)))))
            (replace vec (dds.core.buffer:octet-buffer-vec buf) :end1 plen :start2 poff :end2 (+ poff plen))
-           (%deliver-user-sample node writer-id sn vec src-prefix eff-guid eff-sn key-hash nil ob)))
+           (%deliver-user-sample node writer-id sn vec src-prefix eff-guid eff-sn key-hash nil ob))))
         ((zc-loan-marker-p zc)
          (%deliver-user-marker node writer-id sn zc src-prefix eff-guid eff-sn)) ; loan-capable: the unresolved marker
         ;; resolved ZC payload (non-loan-capable): OVERLAY is numeric here (only the %zc-try-resolve arm reaches this);

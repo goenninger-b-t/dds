@@ -263,10 +263,12 @@
            t))
     ;; ZA-2: borrow the per-thread key_id scratch (alloc-free); a not-carved pool (arena exhausted) -> a heap 4-array
     ;; fallback (byte-identical, self-heals). DISPATCH is called directly (no heap closure), so the common path conses 0.
+    ;; ADR 0101: a carve that failed is RESOURCE_LIMITS, not a heap fallback. Drop + count; the peer's
+    ;; reliable writer retransmits, which is the backpressure the contract asks for.
     (let ((pool (%ensure-key-id-rx-pool node)))
       (if pool
           (%with-key-id-rx-scratch (kb node) (dispatch (dds.core.buffer:octet-buffer-vec kb)))
-          (dispatch (make-array 4 :element-type '(unsigned-byte 8))))))
+          (incf (disc-node-arena-rejects node)))))
   t)
 
 (defun* %on-user-secure-submessage (node src-prefix bracket bracket-len km)

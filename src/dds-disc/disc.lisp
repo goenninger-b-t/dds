@@ -402,6 +402,7 @@
   ;; into a retry storm precisely when it can least afford one. Read unlocked on the receive path; only ever
   ;; set, never cleared, so the race is benign (a concurrent carve either wins or is skipped once).
   (rx-store-carve-failed nil :type boolean)
+  (arena-rejects 0 :type fixnum)   ; ADR 0101: samples/datagrams REJECTED because an arena carve failed — RESOURCE_LIMITS, never a GC-heap fallback
   (sample-key-hashes (make-hash-table :test 'equalp) :type hash-table) ; src GUID -> SN -> 16-octet wire key-hash of the :data sample (RTPS 2.5 §9.6.4.8), absent when not captured
   (sample-timestamps (make-hash-table :test 'equalp) :type hash-table) ; S5.T4: src GUID -> SN -> source_timestamp (nanoseconds) from the preceding INFO_TS (RTPS 2.5 §9.4.5.9), absent when the DATA carried none
   (sample-consumers (make-hash-table :test 'equalp) :type hash-table) ; ADR 0093 slice 2: src GUID -> SN -> how many co-located readers have STILL to drain this copy-path sample. ⚠️ POPULATED ONLY WHEN >= 2 READERS SHARE THE WRITER — with one consumer (the overwhelmingly common case) the entry is ABSENT and node-consume-sample purges immediately, byte-identical to the pre-slice path at zero cost. An ABSENT entry therefore means "one consumer", never "zero"
@@ -3090,14 +3091,21 @@
               ;; (byte-identical to the pre-T5 path; correct; no false-REJECT; self-heals when the arena frees).
               (let* ((blen (- size start))
                      (pool (%ensure-bracket-rx-pool node)))
-                (if (and pool (<= blen +srtps-scratch-datagram-bytes+))
-                    (%with-bracket-rx-scratch (br node)
-                      (replace (dds.core.buffer:octet-buffer-vec br) (dds.core.buffer:octet-buffer-vec buf)
-                               :start2 start :end2 size)
-                      (%on-secure-submessage node src-prefix (dds.core.buffer:octet-buffer-vec br) blen enforce-rtps))
-                    (let ((bracket (make-array blen :element-type '(unsigned-byte 8))))
-                      (replace bracket (dds.core.buffer:octet-buffer-vec buf) :start2 start :end2 size)
-                      (%on-secure-submessage node src-prefix bracket blen enforce-rtps)))))))
+                ;; ADR 0101: the two reasons this pool is unusable are NOT the same failure and must not share
+                ;; a branch. A CARVE THAT FAILED is arena exhaustion -> RESOURCE_LIMITS drop + count (the
+                ;; reliable writer retransmits; that is the backpressure). An OVERSIZED bracket is a legitimate
+                ;; too-big datagram, not a memory condition — rejecting it would be a FALSE-REJECT, so it keeps
+                ;; the allocating path exactly as before.
+                (cond
+                  ((and pool (<= blen +srtps-scratch-datagram-bytes+))
+                   (%with-bracket-rx-scratch (br node)
+                     (replace (dds.core.buffer:octet-buffer-vec br) (dds.core.buffer:octet-buffer-vec buf)
+                              :start2 start :end2 size)
+                     (%on-secure-submessage node src-prefix (dds.core.buffer:octet-buffer-vec br) blen enforce-rtps)))
+                  ((null pool) (incf (disc-node-arena-rejects node)))   ; arena exhausted -> reject, never a GC fallback
+                  (t (let ((bracket (make-array blen :element-type '(unsigned-byte 8))))   ; oversized: not a memory condition
+                       (replace bracket (dds.core.buffer:octet-buffer-vec buf) :start2 start :end2 size)
+                       (%on-secure-submessage node src-prefix bracket blen enforce-rtps))))))))
          ((= id dds.rtps.message:+submsg-heartbeat+)
           (let ((pos (dds.core.buffer:cursor-position c)))
             (multiple-value-bind (rid wid first last hcount hfinal hlive)

@@ -71,8 +71,18 @@ explicitly, which is the difference between a policy and an accident.
 
 Vertical slices, each independently demonstrable, per the operating contract:
 
-1. **The GC-heap set first** — the flagrant violation and the one that breaks 0 B/sample: the bracket-RX,
-   key-id-RX and RX-store fallbacks, plus the secured encode/decode paths.
+1. **The GC-heap set. SHIPPED.** `disc-node-arena-rejects` counts every reject, so "never a *silent*
+   fallback" has an observable. Converted: **key-id-RX** (was a heap 4-array), **bracket-RX** (was
+   `make-array blen`), **RX-store** (was `make-array plen`).
+
+   **Two distinctions had to be preserved, and both would have caused false-REJECTs if collapsed:**
+   - *bracket-RX* — a failed carve and an **oversized bracket** shared one `else` branch. Oversize is a
+     legitimate too-big datagram, not a memory condition; it keeps the allocating path. Only pool-NIL rejects.
+   - *RX-store* — "wanted but exhausted" versus "never wanted". The ADR 0085 kill-switch being off, or the
+     crypto/loan path not using this pool, is an **operator choice**; only `rx-store-carve-failed` rejects.
+
+   The secured decode path already self-caps at the working-set budget and rejects there (SAMPLE_REJECTED),
+   so it was left as is.
 2. **The off-budget `alloc-static` set** — the submessage/SRTPS wrap scratch.
 3. **Node creation** — a refused slice-3 carve fails participant creation.
 4. **The end-to-end gate** — extend `run-arena-exhaustion-test` from "the node still starts and stops" to
