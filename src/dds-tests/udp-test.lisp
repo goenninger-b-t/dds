@@ -83,6 +83,77 @@
                     before (dds.core.arena:arena-bytes-used arena))))
   t)
 
+(defun* run-arena-growth-test ()
+    (function () (eql t))
+  "ADR 0102 (owner requirement 2026-07-31): the arena grows in CONFIGURABLE CHUNKS up to a CONFIGURABLE MAX.
+
+   WHY GROWTH IS SAFE HERE, and would not be everywhere: the arena is ACCOUNTING, not a slab. Every buffer is
+   its own dds.pal:alloc-static region and the arena only tracks budget-vs-used, so raising the budget
+   allocates nothing, moves nothing, and cannot invalidate an address an earlier carve already handed out.
+   The same operation on a bump allocator over one contiguous block would be a use-after-free waiting to
+   happen — which is why this is written against the BUDGET and never against a region.
+
+   Four arms, each pinning one half of the requirement:
+     1 GROWS      — a carve too big for the INITIAL budget but within MAX succeeds, and the budget rose.
+     2 CEILING    — the same carve with MAX below it is REFUSED, and the budget stopped AT max (it grew as
+                    far as it was allowed and no further). Without this arm growth would be unbounded and
+                    'configurable max' would mean nothing.
+     3 DISABLABLE — chunk 0 restores the exact pre-ADR-0102 fixed-ceiling behaviour: refused, budget
+                    untouched, zero growths. A configuration, not an error.
+     4 WHOLE CHUNKS — a carve just over the budget grows by a FULL chunk, not by the exact shortfall.
+                    Exact-fit growth would make every later carve another growth step, so the budget would
+                    creep up one allocation at a time and the ceiling would stop being an operating signal."
+  (let ((mib (* 1024 1024)))
+    ;; 1 — GROWS
+    (let ((dds.core.arena:*process-arena* nil)
+          (dds.core.arena:*static-arena-bytes* 4096)
+          (dds.core.arena:*static-arena-growth-bytes* mib)
+          (dds.core.arena:*static-arena-max-bytes* (* 8 mib)))
+      (let ((a (dds.core.arena:process-arena)))
+        (multiple-value-bind (pool status) (dds.core.arena:make-buffer-pool a 65536 4)
+          (%check :arena-grow-succeeds (and pool (null status))
+                  (format nil "a carve over the INITIAL budget but under MAX must succeed (got ~a/~a)"
+                          (if pool "pool" "nil") status))
+          (%check :arena-grow-budget-rose (> (dds.core.arena:arena-byte-budget a) 4096)
+                  "the budget must have GROWN to accommodate it")
+          (%check :arena-grow-counted (plusp (dds.core.arena:arena-growths a))
+                  "the growth must be COUNTED, so it is observable rather than silent"))))
+    ;; 2 — CEILING
+    (let ((dds.core.arena:*process-arena* nil)
+          (dds.core.arena:*static-arena-bytes* 4096)
+          (dds.core.arena:*static-arena-growth-bytes* mib)
+          (dds.core.arena:*static-arena-max-bytes* 8192))
+      (let ((a (dds.core.arena:process-arena)))
+        (multiple-value-bind (pool status) (dds.core.arena:make-buffer-pool a 65536 4)
+          (%check :arena-grow-ceiling (and (null pool) (eq status :arena-exhausted))
+                  (format nil "growth must STOP at MAX and refuse (got ~a/~a)"
+                          (if pool "pool" "nil") status))
+          (%check :arena-grow-stops-at-max (<= (dds.core.arena:arena-byte-budget a)
+                                               (dds.core.arena:arena-max-bytes a))
+                  "the budget must never exceed the configured MAX"))))
+    ;; 3 — DISABLABLE
+    (let ((dds.core.arena:*process-arena* nil)
+          (dds.core.arena:*static-arena-bytes* 4096)
+          (dds.core.arena:*static-arena-growth-bytes* 0)
+          (dds.core.arena:*static-arena-max-bytes* (* 8 mib)))
+      (let ((a (dds.core.arena:process-arena)))
+        (multiple-value-bind (pool status) (dds.core.arena:make-buffer-pool a 65536 4)
+          (%check :arena-grow-disabled (and (null pool) (eq status :arena-exhausted)
+                                            (= 4096 (dds.core.arena:arena-byte-budget a))
+                                            (zerop (dds.core.arena:arena-growths a)))
+                  "chunk 0 must restore the fixed-ceiling behaviour exactly (refused, budget untouched)"))))
+    ;; 4 — WHOLE CHUNKS
+    (let ((dds.core.arena:*process-arena* nil)
+          (dds.core.arena:*static-arena-bytes* 4096)
+          (dds.core.arena:*static-arena-growth-bytes* mib)
+          (dds.core.arena:*static-arena-max-bytes* (* 64 mib)))
+      (let ((a (dds.core.arena:process-arena)))
+        (dds.core.arena:make-buffer-pool a 8192 1)
+        (%check :arena-grow-whole-chunks (= (dds.core.arena:arena-byte-budget a) (+ 4096 mib))
+                (format nil "growth must take a WHOLE chunk, not the exact shortfall (budget ~a, expected ~a)"
+                        (dds.core.arena:arena-byte-budget a) (+ 4096 mib))))))
+  t)
+
 (defun* run-arena-exhaustion-test ()
     (function () (eql t))
   "ADR 0095 slice 4: *static-arena-bytes* is a REAL ceiling, exercised END TO END with a budget deliberately
@@ -104,8 +175,12 @@
    byte-identical wire'. That is a DIVERGENCE FROM ADR 0095 slice 4's wording ('the engine maps it to
    RESOURCE_LIMITS') and from the operating contract's 'never a silent GC-heap fallback', and it is recorded
    as such rather than papered over by a test that asserts only what the code already does."
+  ;; ADR 0102: pin the CEILING as well as the initial budget — the arena grows in chunks now, so a small
+  ;; *static-arena-bytes* alone no longer exhausts anything; growth would absorb every carve and this test
+  ;; would silently stop testing exhaustion at all.
   (let ((dds.core.arena:*process-arena* nil)
-        (dds.core.arena:*static-arena-bytes* 4096))
+        (dds.core.arena:*static-arena-bytes* 4096)
+        (dds.core.arena:*static-arena-max-bytes* 4096))
     (let ((node (dds.disc:make-disc-node :domain 244 :host "127.0.0.1" :port 0 :multicast nil)))
       (%check :arena-exh-node-created (not (null node))
               "a node must still be CREATED when the arena budget refuses every carve")

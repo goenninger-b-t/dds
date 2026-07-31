@@ -37,7 +37,9 @@
     *static-arena-bytes*, read ONCE at init-arena; later rebinding is a no-op
     until teardown. pool-acquire returning NIL is the exhaustion signal — the
     engine maps it to RESOURCE_LIMITS, NEVER a GC-heap fallback.")
-  (:export #:*static-arena-bytes* #:arena #:init-arena #:teardown-arena
+  (:export #:*static-arena-bytes* #:*static-arena-growth-bytes* #:*static-arena-max-bytes*
+           #:arena-growths #:arena-max-bytes
+           #:arena #:init-arena #:teardown-arena
            #:*process-arena* #:process-arena #:make-sub-arena
            #:arena-byte-budget #:arena-bytes-used #:arena-reserved #:arena-pools
            #:arena-initialized-p #:arena-report

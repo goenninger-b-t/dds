@@ -37,8 +37,11 @@ cd "$(dirname "$0")/.."
            (unless ok (setf fail t))))
 
     ;; ARM 1 — FALSIFY FIRST. A 4 KiB budget must refuse a 256 KiB carve.
+    ;; ADR 0102: the arena GROWS in chunks now, so pinning only the initial budget no longer proves a
+    ;; refusal — growth would simply absorb the carve. The falsification must pin the CEILING.
     (let ((dds.core.arena:*process-arena* nil)
-          (dds.core.arena:*static-arena-bytes* 4096))
+          (dds.core.arena:*static-arena-bytes* 4096)
+          (dds.core.arena:*static-arena-max-bytes* 4096))
       (let ((sub (dds.core.arena:make-sub-arena (dds.core.arena:process-arena))))
         (multiple-value-bind (pool status) (dds.core.arena:make-buffer-pool sub 65536 4)
           (chk (and (null pool) (eq status :arena-exhausted))

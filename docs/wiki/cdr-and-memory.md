@@ -296,6 +296,17 @@ NameHash example: `MD5("color")[0:4]` = `70 dd a5 df`. (From `run-md5-test`.)
 
 ## Notes / status
 
+- **The arena GROWS in configurable chunks up to a configurable maximum (ADR 0102).**
+  `*static-arena-bytes*` is the *initial* reservation; `*static-arena-growth-bytes*` is the chunk a carve-miss
+  grows by (`0` disables growth); `*static-arena-max-bytes*` is the hard ceiling. Exhaustion therefore means
+  *"the configured maximum was reached"*, not *"the opening estimate was wrong"* — which is what lets ADR 0101
+  reject on exhaustion without being premature. **Growth is safe here because the arena is accounting, not a
+  slab**: every buffer is its own `alloc-static` region, so raising the budget allocates nothing, moves
+  nothing, and cannot invalidate an address a carve already handed out. Growth takes **whole chunks** (exact-fit
+  growth would make every later carve another growth step and the ceiling would stop meaning anything) and is
+  **counted** (`arena-growths`). Setting max equal to the initial budget, or the chunk to `0`, restores the old
+  fixed-ceiling behaviour exactly.
+
 - **A `RETURN-FROM` that crosses a lock is not free, and its cost lands on the path that never takes it
   (ADR 0098).** `dds.pal:with-lock` expands to an `UNWIND-PROTECT`, and `HANDLER-CASE` installs a handler
   closure that is normally stack-allocated. Put a `RETURN-FROM` in the `HANDLER-CASE` body that targets a

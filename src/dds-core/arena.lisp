@@ -1,8 +1,34 @@
 (in-package #:dds.core.arena)
 
 (defparameter *static-arena-bytes* (* 64 1024 1024)
-  "Master off-heap byte budget for all hot-path memory (REQUIREMENTS NFR-MEM).
-   Read ONCE at init-arena; rebinding afterwards has no effect until teardown.")
+  "INITIAL off-heap byte budget for all hot-path memory (REQUIREMENTS NFR-MEM).
+   Read ONCE at init-arena; rebinding afterwards has no effect until teardown.
+
+   Since ADR 0102 this is the STARTING budget, not the ceiling: a carve that does not fit grows the arena in
+   *STATIC-ARENA-GROWTH-BYTES* chunks up to *STATIC-ARENA-MAX-BYTES*. Size this for the steady state and let
+   growth absorb the peaks; size *STATIC-ARENA-MAX-BYTES* for what the deployment can actually afford.")
+
+(defparameter *static-arena-growth-bytes* (* 8 1024 1024)
+  "Chunk the arena grows by when a carve does not fit its current budget (ADR 0102, owner requirement
+   2026-07-31: \"the Arena Manager must allow for arena growth in configurable chunks up until a configurable
+   max arena size\").
+
+   WHOLE CHUNKS, not exact-fit, deliberately: growing by precisely what the current carve needs turns every
+   subsequent carve into another growth step, so the budget creeps upward one allocation at a time and the
+   ceiling stops being a meaningful operating signal. A chunk absorbs a burst in one move and leaves headroom
+   that is visible in ARENA-BYTE-BUDGET. A carve LARGER than one chunk grows by as many chunks as it needs.
+
+   Growth is pure ACCOUNTING — the arena is a budget, not a slab; every buffer is its own dds.pal:alloc-static
+   region — so growing NEVER moves an existing carve and no live pointer is invalidated. That is what makes
+   growth safe here and would not be true of a bump allocator over one contiguous block.")
+
+(defparameter *static-arena-max-bytes* (* 256 1024 1024)
+  "HARD CEILING on the process arena (ADR 0102). Growth stops here; a carve that still does not fit returns
+   :ARENA-EXHAUSTED, which under ADR 0101 is a RESOURCE_LIMITS reject, never a fallback.
+
+   THIS is the number that bounds the process, and it is the one to set from what the deployment can afford.
+   *STATIC-ARENA-BYTES* only decides how much is reserved before the first growth. Setting max EQUAL to the
+   initial budget restores the pre-ADR-0102 fixed-ceiling behaviour exactly.")
 
 ;; ARENA-EXHAUSTED (the condition) is GONE. Arena exhaustion is the ORDINARY, EXPECTED outcome NFR-MEM
 ;; demands be handled — RESOURCE_LIMITS or a documented allocating fallback, never a silent GC-heap
@@ -24,7 +50,12 @@
   ;; create/delete cycle budget-neutral: without it a shared arena is bump-allocated with no way to return
   ;; a carve, and a long-running process that churns participants eventually cannot carve at all.
   (parent nil :type (or null arena))
-  (reserved 0 :type fixnum))
+  (reserved 0 :type fixnum)
+  ;; ADR 0102: how many times this arena's budget has been grown, and the ceiling it may grow to. Only a
+  ;; ROOT arena grows — a sub-arena is a charge account whose real budget is its parent's, so growth is
+  ;; asked of the budget-holder (CHARGE-TO in make-buffer-pool), never of the sub-arena.
+  (growths 0 :type fixnum)
+  (max-bytes 0 :type fixnum))
 
 (defvar *process-arena* nil
   "THE process-wide static arena (ADR 0095), created on first use from *STATIC-ARENA-BYTES* and shared by
@@ -55,12 +86,43 @@
 (defun* pool-high-water (pool)
     (function (buffer-pool) fixnum) "Peak in-use count seen for POOL (NFR-OBS / budget tracking)." (buffer-pool-high-water pool))
 
-(defun* init-arena (&key (bytes *static-arena-bytes*))
-    (function (&key (:bytes (integer 0))) arena)
-  "Create the arena with a fixed BYTE budget (defaults from *static-arena-bytes*,
-   read once here). One-shot; pools are carved from it via make-buffer-pool."
-  (declare (type (integer 0) bytes))
-  (%make-arena :byte-budget bytes :bytes-used 0 :pools '() :initialized t))
+(defun* init-arena (&key (bytes *static-arena-bytes*) (max-bytes *static-arena-max-bytes*))
+    (function (&key (:bytes (integer 0)) (:max-bytes (integer 0))) arena)
+  "Create the arena with an INITIAL BYTES budget and a MAX-BYTES ceiling it may grow to (ADR 0102; both read
+   once here, from *static-arena-bytes* / *static-arena-max-bytes*). Pools are carved via make-buffer-pool,
+   which grows the budget in *static-arena-growth-bytes* chunks when a carve does not fit.
+
+   MAX-BYTES below BYTES would make the initial reservation already over its own ceiling, so it is raised to
+   BYTES — a ceiling under the floor is a configuration mistake, and silently honouring it would refuse the
+   very first carve for a reason the operator did not intend."
+  (declare (type (integer 0) bytes max-bytes))
+  (%make-arena :byte-budget bytes :bytes-used 0 :pools '() :initialized t
+               :max-bytes (max bytes max-bytes)))
+
+(defun* %arena-grow-to-fit (arena want)
+    (function (arena (integer 0)) t)
+  "ADR 0102: grow ARENA's budget in whole *static-arena-growth-bytes* chunks until WANT more bytes fit, or
+   until MAX-BYTES stops it. Returns T iff WANT now fits. Called only on the CARVE-MISS path — the steady
+   state never reaches it — and only ever on the budget-holder (a root arena), never on a sub-arena.
+
+   SAFE BECAUSE THE ARENA IS ACCOUNTING, NOT A SLAB: every buffer is its own dds.pal:alloc-static region, so
+   raising the budget allocates nothing, moves nothing, and cannot invalidate a pointer a carve already
+   handed out. The same operation on a bump allocator over one contiguous block would be a use-after-free
+   waiting to happen, which is why this is written against the budget and not against a region.
+
+   A chunk of 0 disables growth (the fixed-ceiling behaviour), and so does MAX-BYTES equal to the current
+   budget — both are legitimate configurations, not errors."
+  (let ((chunk *static-arena-growth-bytes*))
+    (when (or (<= chunk 0) (>= (arena-bytes-used arena) (arena-max-bytes arena)))
+      (return-from %arena-grow-to-fit nil))
+    (let* ((need (- (+ (arena-bytes-used arena) want) (arena-byte-budget arena))))
+      (when (<= need 0) (return-from %arena-grow-to-fit t))   ; already fits; nothing to do
+      (let* ((chunks (ceiling need chunk))
+             (target (min (arena-max-bytes arena) (+ (arena-byte-budget arena) (* chunks chunk)))))
+        (when (> target (arena-byte-budget arena))
+          (setf (arena-byte-budget arena) target)
+          (incf (arena-growths arena)))
+        (<= (+ (arena-bytes-used arena) want) (arena-byte-budget arena))))))
 
 (defun* process-arena ()
     (function () arena)
@@ -120,7 +182,10 @@
          ;; whole point is that ONE process budget bounds everything. A root arena charges only itself.
          (charge-to (or (arena-parent arena) arena))
          (remaining (- (arena-byte-budget charge-to) (arena-bytes-used charge-to))))
-    (when (> want remaining)
+    ;; ADR 0102: a carve that does not fit GROWS the budget-holder in chunks, up to its ceiling, before it
+    ;; is refused. Exhaustion now means "the configured MAXIMUM is reached", not "the initial reservation is
+    ;; full" — which is what makes ADR 0101's reject policy an honest signal rather than a premature one.
+    (when (and (> want remaining) (not (%arena-grow-to-fit charge-to want)))
       (bail :arena-exhausted))
     (let ((slots (make-array capacity)))
       (dotimes (i capacity)
