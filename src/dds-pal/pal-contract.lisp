@@ -64,6 +64,7 @@
    ;; Bounded-teardown REPORT (ADR 0092): every wait that hits its deadline is counted where it is
    ;; DETECTED, so a caller that ignores the status value still cannot make the failure silent.
    #:note-stuck-teardown #:stuck-teardown-joins #:reset-stuck-teardown-joins
+   #:note-test-skip #:test-skips #:reset-test-skips
    ;; The zero-allocation raw sendto(2)/recvfrom(2) datagram paths (NFR-MEM, ADR 0065/0066):
    ;; the A/B levers + escape hatches
    #:*udp-raw-sendto* #:*udp-raw-recvfrom*

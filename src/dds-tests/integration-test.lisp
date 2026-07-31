@@ -8818,7 +8818,9 @@
    *shmem-enabled* T; after match, publish 20 samples and assert the reliable reader receives all 20 AND
    the writer's shmem-sends advanced (so SHMEM, not UDP, carried the user data). Skips cleanly where SHMEM
    is off (Clasp/macOS by-name-attach gap, ADR 0013)."
-  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p) (return-from run-shmem-end-to-end-test t))
+  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
+    (dds.pal:note-test-skip "run-shmem-end-to-end-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
+    (return-from run-shmem-end-to-end-test t))
   (let* ((p1 (make-array 12 :element-type '(unsigned-byte 8) :initial-element 51))
          (p2 (make-array 12 :element-type '(unsigned-byte 8) :initial-element 52))
          (dds.disc:*shmem-enabled* t)   ; force SHMEM on for this test regardless of the global default
@@ -8887,7 +8889,9 @@
    A fix that moved only the HEARTBEAT fails (2); one that moved only the repair fails (1).
    The late-joiner prompt HEARTBEAT (%writer-durability-init) takes the identical two-line change and is NOT
    separately gated here. Skips cleanly where SHMEM is off (Clasp/macOS gap, ADR 0013)."
-  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p) (return-from run-shmem-control-lane-test t))
+  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
+    (dds.pal:note-test-skip "run-shmem-control-lane-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
+    (return-from run-shmem-control-lane-test t))
   (let* ((p1 (make-array 12 :element-type '(unsigned-byte 8) :initial-element 61))
          (p2 (make-array 12 :element-type '(unsigned-byte 8) :initial-element 62))
          (dds.disc:*shmem-enabled* t)
@@ -8968,7 +8972,9 @@
    after match, ARM *debug-shmem-send-fault* and publish a sample. Assert the reader STILL receives it (via the
    UDP fallback), disc-node-shmem-send-faults advanced (>=1), the hook fired with context :shmem-send-fault, and
    disc-node-shmem-sends did NOT advance (it went UDP, not SHMEM). Skips where SHMEM is off (ADR 0013)."
-  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p) (return-from run-shmem-send-self-guard-test t))
+  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
+    (dds.pal:note-test-skip "run-shmem-send-self-guard-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
+    (return-from run-shmem-send-self-guard-test t))
   (let* ((p1 (make-array 12 :element-type '(unsigned-byte 8) :initial-element 53))
          (p2 (make-array 12 :element-type '(unsigned-byte 8) :initial-element 54))
          (dds.disc:*shmem-enabled* t)
@@ -9135,7 +9141,9 @@
    advanced (so a 16-byte reference, not the fragmented payload, crossed), and (c) the writer pool's free
    slots fully recover once the reader has resolved+released every reference (no slot leak). Skips cleanly
    where SHMEM is off (Clasp/macOS by-name-attach gap, ADR 0013)."
-  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p) (return-from run-zerocopy-end-to-end-test t))
+  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
+    (dds.pal:note-test-skip "run-zerocopy-end-to-end-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
+    (return-from run-zerocopy-end-to-end-test t))
   (let* ((p1 (make-array 12 :element-type '(unsigned-byte 8) :initial-element 61))
          (p2 (make-array 12 :element-type '(unsigned-byte 8) :initial-element 62))
          (dds.disc:*shmem-enabled* t)
@@ -9262,7 +9270,9 @@
          is the follow-up).
    Skips cleanly where SHMEM is off (Clasp/macOS by-name-attach gap, ADR 0013); on SBCL bytes-consed is exact,
    on Clasp it reads 0 (NFR-PORT gap) so the RX assertion is smoked, not enforced."
-  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p) (return-from run-flatdata-zerocopy-test t))
+  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
+    (dds.pal:note-test-skip "run-flatdata-zerocopy-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
+    (return-from run-flatdata-zerocopy-test t))
   (let* ((p1 (make-array 12 :element-type '(unsigned-byte 8) :initial-element 63))
          (p2 (make-array 12 :element-type '(unsigned-byte 8) :initial-element 64))
          (dds.disc:*shmem-enabled* t)
@@ -9374,7 +9384,9 @@
          the registry-driven reader-close release frees the slot (refcount 0; no leaked refcount pinning the
          pool). The slot lifetime never lets the receiver thread free a slot under the app's read (no UAF) and
          never leaks a refcount (no wedge). Skips cleanly where SHMEM is off (Clasp/macOS gap, ADR 0013)."
-  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p) (return-from run-dcps-loan-roundtrip-test t))
+  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
+    (dds.pal:note-test-skip "run-dcps-loan-roundtrip-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
+    (return-from run-dcps-loan-roundtrip-test t))
   (let* ((dds.disc:*shmem-enabled* t)
          (dds.disc:*zerocopy-enabled* t)
          (dds.disc:*zerocopy-min-payload-bytes* 8)        ; fd-abc (20 octets) takes the ZC ref path
@@ -9488,7 +9500,9 @@
      (4) LIFECYCLE: return-loan frees the ONE slot (free-count K); the recycled writer-loan struct is reused by
          the next loan-sample (freelist, no per-sample struct cons).
    Skips cleanly where SHMEM is off (Clasp/macOS gap, ADR 0013)."
-  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p) (return-from run-dcps-loan-write-e2e-test t))
+  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
+    (dds.pal:note-test-skip "run-dcps-loan-write-e2e-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
+    (return-from run-dcps-loan-write-e2e-test t))
   (let* ((dds.disc:*shmem-enabled* t)
          (dds.disc:*zerocopy-enabled* t)
          (dds.disc:*zerocopy-min-payload-bytes* 8)        ; fd-abc (20 octets) takes the ZC ref path
@@ -9590,7 +9604,9 @@
      (4) EXACT LIFECYCLE: the slot frees only after BOTH readers return-loan (refcount 2 -> 1 -> 0; free-count
          restored to K) — no leak, no premature free / UAF.
    Skips cleanly where SHMEM is off (Clasp/macOS gap, ADR 0013)."
-  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p) (return-from run-multi-dest-zc-e2e-test t))
+  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
+    (dds.pal:note-test-skip "run-multi-dest-zc-e2e-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
+    (return-from run-multi-dest-zc-e2e-test t))
   (let* ((dds.disc:*shmem-enabled* t)
          (dds.disc:*zerocopy-enabled* t)
          (dds.disc:*zerocopy-min-payload-bytes* 8)
@@ -9730,7 +9746,9 @@
      (3) DATA-PROTECTED (data_protection :encrypt): likewise fallback + marker ABSENT (the loan-write-specific
          %loan-write-data-protected-p gate, ADR 0042 §6 — the slot would hold pre-transform plaintext).
    Skips cleanly where SHMEM is off (Clasp/macOS gap, ADR 0013)."
-  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p) (return-from run-loan-write-shmem-cleartext-test t))
+  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
+    (dds.pal:note-test-skip "run-loan-write-shmem-cleartext-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
+    (return-from run-loan-write-shmem-cleartext-test t))
   (let* ((dds.disc:*shmem-enabled* t)
          (dds.disc:*zerocopy-enabled* t)
          (dds.disc:*zerocopy-min-payload-bytes* 8)
@@ -9781,7 +9799,9 @@
    sample (no stale duplicate of the recycled struct) that reads SAMPLE 2's values (not sample 1, not an alias).
    Pre-fix this FAILS (take-loaned returns two samples, both the recycled V1, both reading sample 2). Skips
    cleanly where SHMEM is off (Clasp/macOS gap, ADR 0013)."
-  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p) (return-from run-loan-read-return-take-test t))
+  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
+    (dds.pal:note-test-skip "run-loan-read-return-take-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
+    (return-from run-loan-read-return-take-test t))
   (let* ((dds.disc:*shmem-enabled* t)
          (dds.disc:*zerocopy-enabled* t)
          (dds.disc:*zerocopy-min-payload-bytes* 8)        ; fd-abc (20 octets) takes the ZC ref path
@@ -9900,7 +9920,9 @@
          reference resolves across two OS processes; the literal-0-copy loan is a LOCAL read optimization — the
          wire is byte-identical). Skips cleanly where SHMEM is off (Clasp/macOS gap, ADR 0013); on SBCL
          bytes-consed is exact, on Clasp it reads 0 (NFR-PORT gap) so the headline assertion is smoked."
-  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p) (return-from run-flatdata-zc-loan-e2e-test t))
+  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
+    (dds.pal:note-test-skip "run-flatdata-zc-loan-e2e-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
+    (return-from run-flatdata-zc-loan-e2e-test t))
   (let* ((dds.disc:*shmem-enabled* t)
          (dds.disc:*zerocopy-enabled* t)
          (dds.disc:*zerocopy-min-payload-bytes* 8)        ; fd-abc (20 octets) takes the ZC ref path
@@ -9999,7 +10021,9 @@
    handle EQUALP the keyhash of a key-B buffer; (4) the loaned sample is a flatdata-view whose field reads via
    -fd are byte-correct off the slot. Skips cleanly where SHMEM is off (the ZC loan path is SBCL-only — NFR-PORT
    gap, ADR 0013; Clasp/macOS pass-skip). NOT cleared for ship — pending counsel (R6)."
-  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p) (return-from run-keyed-flatdata-loan-handle-test t))
+  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
+    (dds.pal:note-test-skip "run-keyed-flatdata-loan-handle-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
+    (return-from run-keyed-flatdata-loan-handle-test t))
   (let* ((dds.disc:*shmem-enabled* t)
          (dds.disc:*zerocopy-enabled* t)
          (dds.disc:*zerocopy-min-payload-bytes* 4)        ; keyed-fd-i32 (8 octets) takes the ZC ref path
@@ -10090,7 +10114,9 @@
    KEEP_LAST-2 loan reader is UNAFFECTED — its per-(GUID,SN)-unique synthetic handles mean each sample is its own
    instance, so the depth-2 cap never fires and all 3 loaned samples are retained. Skips cleanly where SHMEM is off
    (the ZC loan path is SBCL-only — NFR-PORT gap, ADR 0013; Clasp/macOS pass-skip). NOT cleared for ship (R6)."
-  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p) (return-from run-keyed-flatdata-loan-keeplast-test t))
+  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
+    (dds.pal:note-test-skip "run-keyed-flatdata-loan-keeplast-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
+    (return-from run-keyed-flatdata-loan-keeplast-test t))
   (let* ((dds.disc:*shmem-enabled* t)
          (dds.disc:*zerocopy-enabled* t)
          (dds.disc:*zerocopy-min-payload-bytes* 4)        ; keyed-fd-i32 (8 octets) takes the ZC ref path
@@ -10544,7 +10570,9 @@
    take-loaned reads a/b/c BYTE-EXACT off whatever the retransmit delivered (view OR copy), via the SAME
    <name>-<field>-fd Offset accessors (both a flatdata-view and an owned FlatData octet-buffer answer them).
    Bounded drive (no unbounded wait). Skips cleanly where SHMEM is off (Clasp/macOS gap, ADR 0013)."
-  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p) (return-from run-reliable-zc-retransmit-test t))
+  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
+    (dds.pal:note-test-skip "run-reliable-zc-retransmit-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
+    (return-from run-reliable-zc-retransmit-test t))
   (let* ((dds.disc:*shmem-enabled* t)
          (dds.disc:*zerocopy-enabled* t)
          (dds.disc:*zerocopy-min-payload-bytes* 8)        ; fd-abc (20 octets) takes the ZC ref path
@@ -10656,7 +10684,9 @@
    NOT advance zc-sends for this sample (it fell back, did not loan a ref); (2) take-loaned returns exactly one
    sample that is NOT a flatdata-view (a copy) with NIL in the loans list; (3) its a/b/c read byte-exact.
    Skips cleanly where SHMEM is off (Clasp/macOS gap, ADR 0013)."
-  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p) (return-from run-reliable-zc-poolfull-fallback-test t))
+  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
+    (dds.pal:note-test-skip "run-reliable-zc-poolfull-fallback-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
+    (return-from run-reliable-zc-poolfull-fallback-test t))
   (let* ((dds.disc:*shmem-enabled* t)
          (dds.disc:*zerocopy-enabled* t)
          (dds.disc:*zerocopy-min-payload-bytes* 8)
@@ -10731,7 +10761,9 @@
    mixed batch; (3) the loans list has exactly ONE entry (only the view); (4) every field of both reads byte-
    exact; (5) return-loan releases the view (registry empties) and is a no-op for the copy. Skips cleanly where
    SHMEM is off (Clasp/macOS gap, ADR 0013)."
-  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p) (return-from run-reliable-zc-mixed-test t))
+  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
+    (dds.pal:note-test-skip "run-reliable-zc-mixed-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
+    (return-from run-reliable-zc-mixed-test t))
   (let* ((dds.disc:*shmem-enabled* t)
          (dds.disc:*zerocopy-enabled* t)
          (dds.disc:*zerocopy-min-payload-bytes* 8)
@@ -10821,7 +10853,9 @@
    1 and the view still reads a/b/c byte-exact (the purge did NOT free the slot); (3) after return-loan the
    refcount is 0 and a fresh %zc-loan succeeds (the slot is reclaimable). Skips cleanly where SHMEM is off
    (Clasp/macOS gap, ADR 0013)."
-  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p) (return-from run-reliable-zc-slot-outlives-purge-test t))
+  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
+    (dds.pal:note-test-skip "run-reliable-zc-slot-outlives-purge-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
+    (return-from run-reliable-zc-slot-outlives-purge-test t))
   (let* ((dds.disc:*shmem-enabled* t)
          (dds.disc:*zerocopy-enabled* t)
          (dds.disc:*zerocopy-min-payload-bytes* 8)
@@ -10928,7 +10962,9 @@
    the TX pin, ADR 0044 §4.1); (3) the reader receives the sample byte-exact; (4) after the reader ACKs, the
    full-ACK purge drops the HC change AND releases the pin (live pin count back to 0), and after return-loan the
    slot frees (refcount 0, free-count restored). Skips cleanly where SHMEM is off (Clasp/macOS gap, ADR 0013)."
-  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p) (return-from run-acked-slot-pin-happy-test t))
+  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
+    (dds.pal:note-test-skip "run-acked-slot-pin-happy-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
+    (return-from run-acked-slot-pin-happy-test t))
   (let* ((dds.disc:*shmem-enabled* t)
          (dds.disc:*zerocopy-enabled* t)
          (dds.disc:*zerocopy-min-payload-bytes* 8)
@@ -11020,7 +11056,9 @@
    pinned with no retained payload; (2) nothing arrived during the drop; (3) after the drop clears the sample is
    ultimately received (reliable, no silent loss) and reads a/b/c byte-exact; (4) the retransmit materialised the
    payload from the slot (the change now carries a resolved serialized-payload). Skips where SHMEM is off."
-  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p) (return-from run-acked-slot-pin-retransmit-test t))
+  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
+    (dds.pal:note-test-skip "run-acked-slot-pin-retransmit-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
+    (return-from run-acked-slot-pin-retransmit-test t))
   (let* ((dds.disc:*shmem-enabled* t)
          (dds.disc:*zerocopy-enabled* t)
          (dds.disc:*zerocopy-min-payload-bytes* 8)
@@ -11083,7 +11121,9 @@
    0044). With *zc-pin-budget* bound to 0 an eligible loan-write CANNOT pin; it must fall back — materialise the
    retained payload on demand from the still-armed slot and publish as a NORMAL change (serialized-payload
    non-nil, NOT pinned, live pin count stays 0) — and still deliver byte-exact. Skips where SHMEM is off."
-  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p) (return-from run-acked-slot-pin-budget-test t))
+  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
+    (dds.pal:note-test-skip "run-acked-slot-pin-budget-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
+    (return-from run-acked-slot-pin-budget-test t))
   (let* ((dds.disc:*shmem-enabled* t)
          (dds.disc:*zerocopy-enabled* t)
          (dds.disc:*zerocopy-min-payload-bytes* 8)
@@ -11125,7 +11165,9 @@
    must materialise the retained payload eagerly (ADR 0042 behaviour, byte- and alloc-identical) — the change is
    NOT pinned, carries a serialized-payload, and the live pin count stays 0 — and deliver byte-exact. Skips where
    SHMEM is off."
-  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p) (return-from run-acked-slot-pin-ineligible-test t))
+  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
+    (dds.pal:note-test-skip "run-acked-slot-pin-ineligible-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
+    (return-from run-acked-slot-pin-ineligible-test t))
   (let* ((dds.disc:*shmem-enabled* t)
          (dds.disc:*zerocopy-enabled* t)
          (dds.disc:*zerocopy-min-payload-bytes* 8)
@@ -11184,7 +11226,9 @@
    SUPERSEDES it: the hc-add-change eviction of SN 1 fires the change-removal choke, which releases SN 1's pin
    exactly once (no retransmit owed for a superseded sample). Asserts the pin count returns to 1 (SN 2's pin) after
    SN 1 is evicted, proving the eviction drop-site releases the pin. Skips where SHMEM is off."
-  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p) (return-from run-acked-slot-pin-keeplast-evict-test t))
+  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
+    (dds.pal:note-test-skip "run-acked-slot-pin-keeplast-evict-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
+    (return-from run-acked-slot-pin-keeplast-evict-test t))
   (let* ((dds.disc:*shmem-enabled* t)
          (dds.disc:*zerocopy-enabled* t)
          (dds.disc:*zerocopy-min-payload-bytes* 8)
@@ -11321,7 +11365,9 @@
    NACKable/retransmittable — scenario 1; a best-effort ZC sample is delivered once — here). The ZC-OFF /
    non-FlatData byte-identity regression is held by the existing suite (flow-off-byte-identical, the corpus,
    zerocopy-end-to-end). Skips cleanly where SHMEM is off (Clasp/macOS gap, ADR 0013)."
-  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p) (return-from run-reliable-zc-qos-test t))
+  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
+    (dds.pal:note-test-skip "run-reliable-zc-qos-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
+    (return-from run-reliable-zc-qos-test t))
   (let ((dds.disc:*shmem-enabled* t)
         (dds.disc:*zerocopy-enabled* t)
         (dds.disc:*zerocopy-min-payload-bytes* 8))

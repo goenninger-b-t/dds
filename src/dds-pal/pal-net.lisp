@@ -311,6 +311,34 @@
    REPORTED-not-printed form the operating contract requires: a queryable snapshot, like
    DDS.LOG:LOGGER-SHED-COUNTS and DDS.DISC:DISC-NODE-STUCK-RECEIVER-TEARDOWNS.")
 
+(defvar *test-skips-lock* (make-lock "dds-test-skips")
+  "Guards *TEST-SKIPS*.")
+
+(defvar *test-skips* nil
+  "Every test that SKIPPED rather than ran, as an alist of (NAME . REASON). Read with DDS.PAL:TEST-SKIPS.
+
+   It exists because a suite that prints \"629 passed\" while 31 of those did nothing is REPORTING A NUMBER
+   WIDER THAN ITS COVERAGE — which is exactly how the DDS-Security suite sat entirely un-run on Linux for
+   weeks behind an OpenSSL pass-skip. A skip is legitimate when a platform genuinely lacks a capability; it
+   is never legitimate for it to be INVISIBLE.")
+
+(defun* note-test-skip (name reason)
+    (function (t t) (eql t))
+  "Record that test NAME skipped for REASON. Called by a pass-skip guard instead of silently returning T."
+  (with-lock (*test-skips-lock*)
+    (pushnew (cons name reason) *test-skips* :key #'car :test #'equal))
+  t)
+
+(defun* test-skips ()
+    (function () (values (integer 0) list))
+  "(values COUNT ALIST) of the tests that skipped."
+  (with-lock (*test-skips-lock*) (values (length *test-skips*) (copy-alist *test-skips*))))
+
+(defun* reset-test-skips ()
+    (function () (eql t))
+  "Clear the skip registry."
+  (with-lock (*test-skips-lock*) (setf *test-skips* nil)) t)
+
 (defun* note-stuck-teardown (site)
     (function (keyword) (eql t))
   "Record ONE teardown wait at SITE that hit its deadline, incrementing SITE's count in

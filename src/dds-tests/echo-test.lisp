@@ -1602,7 +1602,9 @@
    safely (best-effort) with no crash and no sample stored. The reference is untrusted cross-process
    input: %zc-attach-pool tolerates a garbage source prefix (attach fails -> :none -> drop) and %zc-resolve
    bounds-checks slot-index + validates generation. Skips where SHMEM (hence a ZC pool) is unavailable."
-  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p) (return-from run-zc-resolve-drop-test t))
+  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
+    (dds.pal:note-test-skip "run-zc-resolve-drop-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
+    (return-from run-zc-resolve-drop-test t))
   (let* ((dds.disc:*shmem-enabled* t)
          (dds.disc:*zerocopy-enabled* t)
          (node (dds.disc:make-disc-node
@@ -1664,7 +1666,9 @@
      (2) NON-LOAN-CAPABLE: the stored sample is a normal resolved octet-vector EQUAL to the published payload AND
          the slot WAS released (refcount 0, freed) — the shipped resolve-copy-release path, byte-unchanged.
    Skips where SHMEM (hence a ZC pool) is unavailable (Clasp/macOS by-name-attach gap, ADR 0013)."
-  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p) (return-from run-zc-defer-test t))
+  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
+    (dds.pal:note-test-skip "run-zc-defer-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
+    (return-from run-zc-defer-test t))
   (let* ((dds.disc:*shmem-enabled* t)
          (dds.disc:*zerocopy-enabled* t)
          (va 200) (vb 3000000000) (vc 12345678901234567890)
@@ -1735,7 +1739,9 @@
          (a cross-process use-after-free, strictly worse than the leak). An unconditional release passes
          arm (1) and FAILS arm (2).
    Skips where SHMEM (hence a ZC pool) is unavailable (Clasp/macOS by-name-attach gap, ADR 0013)."
-  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p) (return-from run-zc-unrouted-release-test t))
+  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
+    (dds.pal:note-test-skip "run-zc-unrouted-release-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
+    (return-from run-zc-unrouted-release-test t))
   (let* ((dds.disc:*shmem-enabled* t)
          (dds.disc:*zerocopy-enabled* t)
          (va 201) (vb 3000000001) (vc 12345678901234567891)
@@ -4591,6 +4597,21 @@
       ;; the wait is bounded, so those hits are the instrument working, not a leak. They are reported
       ;; separately — folding them into the alarm would make it fire on every clean run, and an alarm that
       ;; always fires is an alarm nobody reads.
+      ;; A suite that prints "N passed" while some of those did NOTHING reports a number wider than its
+      ;; coverage — exactly how the DDS-Security suite sat entirely un-run on Linux behind an OpenSSL
+      ;; pass-skip. A skip is legitimate when the platform lacks the capability; INVISIBLE is what is not.
+      (multiple-value-bind (nskip skips) (dds.pal:test-skips)
+        (if (plusp nskip)
+            (progn
+              (format t "~&⚠️ SKIPPED: ~d of ~d test(s) did NOT run — this suite's coverage is narrower than~%"
+                      nskip (length tests))
+              (format t "   its pass count. Reasons:~%")
+              (let ((by-reason (make-hash-table :test 'equal)))
+                (dolist (s skips) (push (car s) (gethash (cdr s) by-reason)))
+                (maphash (lambda (why names)
+                           (format t "     ~d x ~a~%       ~{~a~^, ~}~%" (length names) why (reverse names)))
+                         by-reason)))
+            (format t "~&skipped: 0 — every test ran.~%")))
       (multiple-value-bind (stuck sites) (dds.pal:stuck-teardown-joins)
         (declare (ignorable stuck))
         (let* ((fixtures (remove-if-not (lambda (s) (%test-fixture-site-p (car s))) sites))

@@ -410,7 +410,9 @@
   "Transport-level SHMEM loopback in one image: tx SEND -> rx OWN-segment drain.
    tx and rx are distinct participants (distinct guids, same host); asserts 4 octets round-trip.
    Pass-skips on the Clasp/macOS-arm64 by-name-attach gap (ADR 0013)."
-  (unless (shm-attach-by-name-reliable-p) (return-from run-shmem-transport-test t))
+  (unless (shm-attach-by-name-reliable-p)
+    (dds.pal:note-test-skip "run-shmem-transport-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
+    (return-from run-shmem-transport-test t))
   (let ((rx (make-shmem-transport :participant-guid (%test-guid 1) :host-uuid 7))
         (tx (make-shmem-transport :participant-guid (%test-guid 2) :host-uuid 7)))
     (unwind-protect
@@ -451,7 +453,9 @@
    name, no errors) that unsynchronised access cannot reliably maintain.
 
    Pass-skips on the Clasp/macOS-arm64 by-name-attach gap (ADR 0013)."
-  (unless (shm-attach-by-name-reliable-p) (return-from run-shmem-attach-cache-race-test t))
+  (unless (shm-attach-by-name-reliable-p)
+    (dds.pal:note-test-skip "run-shmem-attach-cache-race-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
+    (return-from run-shmem-attach-cache-race-test t))
   (let ((rxs (loop for i from 40 below 46
                    collect (make-shmem-transport :participant-guid (%test-guid i) :host-uuid 7)))
         (tx (make-shmem-transport :participant-guid (%test-guid 47) :host-uuid 7)))
@@ -504,7 +508,9 @@
      4. every record from both senders arrives with its own payload intact.
 
    Pass-skips on the Clasp/macOS-arm64 by-name-attach gap (ADR 0013)."
-  (unless (shm-attach-by-name-reliable-p) (return-from run-shmem-dest-cache-test t))
+  (unless (shm-attach-by-name-reliable-p)
+    (dds.pal:note-test-skip "run-shmem-dest-cache-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
+    (return-from run-shmem-dest-cache-test t))
   (let ((rx (make-shmem-transport :participant-guid (%test-guid 11) :host-uuid 7))
         (a (make-shmem-transport :participant-guid (%test-guid 12) :host-uuid 7))
         (b (make-shmem-transport :participant-guid (%test-guid 13) :host-uuid 7)))
@@ -705,7 +711,9 @@
   "SHMEM receiver-thread loopback: a background thread cond-waits, drains, and records a datagram;
    assert it arrives within a bounded wait. Returns T. Pass-skips on the Clasp/macOS-arm64
    by-name-attach gap (ADR 0013); on Clasp the receiver thread also needs GC_DONT_GC=1."
-  (unless (shm-attach-by-name-reliable-p) (return-from run-shmem-receiver-test t))
+  (unless (shm-attach-by-name-reliable-p)
+    (dds.pal:note-test-skip "run-shmem-receiver-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
+    (return-from run-shmem-receiver-test t))
   (let ((rx (make-shmem-transport :participant-guid (%test-guid 3) :host-uuid 7))
         (tx (make-shmem-transport :participant-guid (%test-guid 4) :host-uuid 7))
         (received nil))
@@ -753,7 +761,9 @@
    block. Pass-skips on the Clasp/macOS-arm64 by-name-attach gap (ADR 0013); on Clasp the receiver thread
    also needs GC_DONT_GC=1. Each sender uses a distinct GUID (distinct lane token), so they exercise the
    per-lane SPSC rings concurrently against the single shared notify block."
-  (unless (shm-attach-by-name-reliable-p) (return-from run-shmem-stress-test t))
+  (unless (shm-attach-by-name-reliable-p)
+    (dds.pal:note-test-skip "run-shmem-stress-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
+    (return-from run-shmem-stress-test t))
   (let* ((total (* senders per-sender))
          (count-lock (dds.pal:make-lock "shmem-stress"))
          (delivered 0)
