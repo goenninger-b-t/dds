@@ -385,20 +385,21 @@
 
 (defun* shm-attach-by-name-reliable-p ()
     (function () t)
-  "T except on Clasp/macOS-arm64, whose CFFI cannot pass shm_open's variadic mode_t, so a created object is
-   unre-openable by name (NFR-PORT gap, ADR 0013). The SHMEM transport REQUIRES by-name attach (the sender
-   opens the receiver's named segment), so its loopback tests pass-skip where this is NIL. SBCL is
-   conformant on every platform; Clasp on LINUX — the primary platform (§9) — uses the register varargs ABI
-   and is conformant, so Clasp is fully fitted there.
+  "T iff a segment this process creates is re-openable BY NAME, which the SHMEM transport requires because
+   the sender opens the receiver's named segment. Where this is NIL the transport's tests pass-skip.
 
-   ⚠️ DO NOT 'FIX' THIS BY SWITCHING THE CALL FORM. It was tried (2026-07-14) and it looked like it worked.
-   Over 30 create+reopen trials on Clasp/macOS-arm64: plain foreign-funcall 10/30, foreign-funcall-varargs
-   0/30, varargs-as-:int 10/30, varargs+fchmod 0/30. The mode lands as GARBAGE and a single trial passes or
-   fails on whether those bits happened to include owner-rw — so a one-shot probe 'proves' whichever answer
-   you want. See dds.pal::%shm-open-create for the full measurement. The remaining fix is upstream in Clasp.
+   Asks the PAL for the CAPABILITY rather than testing the platform (ADR 0064): the reliability of
+   shm_open's variadic mode_t is an implementation+ABI fact that belongs to dds-pal, and dds-xport is
+   outside dds-pal, where reader conditionals are banned. DDS.PAL:SHM-CREATE-MODE-RELIABLE-P carries the
+   per-arm reasoning.
 
-   Runtime check (NOT a reader conditional): dds-xport is outside dds-pal."
-  (not (and (eq (dds.pal:pal-impl-name) :clasp) (uiop:os-macosx-p))))
+   ⚠️ DO NOT 'FIX' A NIL HERE BY SWITCHING THE CFFI CALL FORM. It was tried (2026-07-14) and it looked like
+   it worked. Over 30 create+reopen trials on Clasp/macOS-arm64: plain foreign-funcall 10/30,
+   foreign-funcall-varargs 0/30, varargs-as-:int 10/30, varargs+fchmod 0/30. The mode lands as GARBAGE and a
+   single trial passes or fails on whether those bits happened to include owner-rw — so a one-shot probe
+   'proves' whichever answer you want. The fix was upstream in Clasp and landed 2026-07-31 as a C++ binding
+   of shm_open, so Clasp/macOS-arm64 is now fully fitted. See dds.pal::%shm-open-create and ADR 0103."
+  (dds.pal:shm-create-mode-reliable-p))
 
 (defun* %test-guid (b)
     (function ((unsigned-byte 8)) (simple-array (unsigned-byte 8) (12)))

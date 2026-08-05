@@ -6,6 +6,16 @@
   target but not yet wired in.
 - The `Makefile` drives per-implementation builds via `scripts/with-sbcl.sh` and
   `scripts/with-clasp.sh` (they load Quicklisp and point ASDF at the repo).
+- `with-clasp.sh` takes the **first Clasp it finds** from a candidate list — an installed
+  `/opt/clasp/bin/clasp` first, then a local source-tree build — and `CLASP_BIN=<path>` overrides both.
+  It fails loudly naming every path it tried rather than falling back to a `PATH` lookup.
+
+> ⚠️ **An INSTALLED Clasp and a SOURCE-TREE Clasp of the same version are not interchangeable for
+> dependencies.** `SYS:` resolves into the install prefix rather than the source tree, so ASDF loads
+> Quicklisp's CFFI instead of Clasp's bundled contrib CFFI, and the two differ in behaviour
+> (ADR 0104 — the PAL no longer depends on the difference). They also report the **same version string**, so
+> ASDF gives them the **same fasl-cache directory**: if you compare two Clasp builds, give each its own
+> `XDG_CACHE_HOME` or you are measuring whichever one compiled first.
 
 ## Build & test
 

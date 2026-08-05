@@ -33,6 +33,7 @@
    #:store-sap-u8
    ;; shared memory segments + in-segment PTHREAD_PROCESS_SHARED mutex/condvar (FR-XPORT-2, ADR 0013)
    #:shm-create #:shm-attach #:shm-detach #:shm-destroy #:shm-sap #:shm-segment-size
+   #:shm-create-mode-reliable-p
   ;; System V shared memory (shmget/shmat) — a SECOND mechanism, distinct from the POSIX objects
   ;; above, needed to reach RTI Connext's shared-memory segments, which are keyed by integer
   ;; (segment = 0x400000 + RTPS port) rather than named (ADR 0081)
@@ -121,6 +122,36 @@
    are being established; a later ADR drops designated kernels to (safety 0)."
   `(locally (declare (optimize (speed 3) (safety 1) (debug 0) (space 0)))
      ,@body))
+
+;;; ---- resolving a libc symbol to a POINTER (the one way, for every PAL site) ----
+
+(defun* %global-symbol-pointer (name)
+    (function (string) t)
+  "Resolve NAME in the process-global foreign namespace (RTLD_DEFAULT) to a callable pointer, or NIL.
+   The ONE way any PAL site turns a libc symbol into a pointer — clock_gettime, memcpy, sendto,
+   recvfrom, and Clasp's __atomic_* CAS primitives all go through here. Callers cache the result and
+   invoke it with CFFI:FOREIGN-FUNCALL-POINTER; a by-name foreign call re-resolves through dlsym on
+   EVERY call on Clasp (~3.8 us measured), which is why these are pointers and not names.
+
+   ⚠️ DO NOT 'SIMPLIFY' THIS BACK TO A BARE (CFFI:FOREIGN-SYMBOL-POINTER NAME) ON CLASP. That form
+   is NOT portable across Clasp installations, because two DIFFERENT CFFI distributions answer it:
+
+     - Clasp's BUNDLED contrib CFFI (present when SYS: resolves into a Clasp SOURCE TREE) translates
+       CFFI's :DEFAULT library marker to :RTLD-DEFAULT before calling the Clasp primitive, so it works.
+     - Quicklisp's upstream CFFI passes :DEFAULT straight through to
+       CLASP-FFI:%FOREIGN-SYMBOL-POINTER, which does not know that keyword and returns NIL.
+
+   An INSTALLED Clasp (e.g. /opt/clasp/...) ships no contrib lisp tree, so ASDF falls through to the
+   Quicklisp CFFI and EVERY bare lookup silently yields NIL. Measured on one host with two builds of
+   the SAME Clasp version (3.0.1-112-gc7faba5ec, arm64): all six symbols above resolved from the
+   source tree and NONE resolved from the /opt install. The failure is silent and catastrophic — a
+   NIL *RECVFROM-FP* reaches CFFI:FOREIGN-FUNCALL-POINTER as 'PTR may not be NIL' from inside the UDP
+   receiver thread, killing the suite, and a NIL CAS pointer would take the foreign-SAP atomics with it.
+
+   Calling the Clasp primitive with :RTLD-DEFAULT directly removes the dependence on WHICH CFFI got
+   loaded — verified to resolve all six on BOTH builds. Reader conditionals are permitted in dds-pal/."
+  #+clasp (clasp-ffi:%foreign-symbol-pointer name :rtld-default)
+  #-clasp (cffi:foreign-symbol-pointer name))
 
 ;;; ---- atomics: the ATOMIC-CELL the per-impl CAS / ATOMIC-INCF target ----
 ;;; Impl-agnostic (identical defstruct on both impls), so it lives in the contract; only the

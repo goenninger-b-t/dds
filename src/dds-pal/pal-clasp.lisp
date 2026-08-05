@@ -236,13 +236,13 @@
    sb-ext:cas gives on the SBCL PAL, so the SHMEM ring and the zero-copy refcount behave identically on
    both implementations.")
 
-(defparameter *cas-u64-fp* (cffi:foreign-symbol-pointer "__atomic_compare_exchange_8")
+(defparameter *cas-u64-fp* (%global-symbol-pointer "__atomic_compare_exchange_8")
   "The RESOLVED __atomic_compare_exchange_8 pointer, looked up ONCE at load. Cached for the same reason as
    *CLOCK-GETTIME-FP*: a by-NAME foreign call on Clasp re-resolves the symbol on EVERY call (~3.8 us of
    dlsym), and CAS is on the SHMEM lane-claim / zero-copy refcount hot path.")
-(defparameter *cas-u32-fp* (cffi:foreign-symbol-pointer "__atomic_compare_exchange_4")
+(defparameter *cas-u32-fp* (%global-symbol-pointer "__atomic_compare_exchange_4")
   "The RESOLVED __atomic_compare_exchange_4 pointer, looked up ONCE at load (see *CAS-U64-FP*).")
-(defparameter *fetch-add-u64-fp* (cffi:foreign-symbol-pointer "__atomic_fetch_add_8")
+(defparameter *fetch-add-u64-fp* (%global-symbol-pointer "__atomic_fetch_add_8")
   "The RESOLVED __atomic_fetch_add_8 pointer, looked up ONCE at load (see *CAS-U64-FP*).")
 
 (defmacro %cas-sap (fp sap offset old new ctype)

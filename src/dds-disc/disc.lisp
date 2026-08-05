@@ -13,13 +13,22 @@
 (in-package #:dds.disc)
 
 (defparameter *shmem-enabled*
-  (and (find-package :net.goenninger.dds.xport.shmem)
-       (not (and (eq (dds.pal:pal-impl-name) :clasp) (uiop:os-macosx-p))))
+  (let ((p (find-package :net.goenninger.dds.xport.shmem)))
+    (and p (let ((s (find-symbol "SHM-ATTACH-BY-NAME-RELIABLE-P" p)))
+             (and s (fboundp s) (funcall s) t))))
   "Master switch (read once per node at make-disc-node into the SHMEM slot) for routing same-host user
-   DATA over the shared-memory transport (FR-XPORT-2) instead of UDP. Default: T on SBCL everywhere and
-   Clasp/Linux (where the SHMEM package is present and by-name attach works); NIL on Clasp/macOS — that
-   platform's shm_open variadic-mode ABI gap (ADR 0013, dds.xport.shmem:shm-attach-by-name-reliable-p)
-   makes a created segment unre-openable by name, so SHMEM is unusable there and UDP carries everything.
+   DATA over the shared-memory transport (FR-XPORT-2) instead of UDP. Default: T wherever the SHMEM package
+   is present AND by-name attach actually works there — which since 2026-07-31 is every supported
+   implementation and platform (ADR 0103 closed the last gap, Clasp/macOS-arm64).
+
+   ⚠️ ASKS THE TRANSPORT, AND MUST KEEP ASKING IT. This used to re-derive the platform test itself —
+   literally `(not (and (eq (pal-impl-name) :clasp) (uiop:os-macosx-p)))`, a second copy of what
+   DDS.XPORT.SHMEM:SHM-ATTACH-BY-NAME-RELIABLE-P already decided. Two copies of one capability judgement is
+   one too many: when the Clasp gap closed, flipping the predicate alone would have left THIS switch NIL, so
+   the transport would have been declared usable while discovery still routed every sample over UDP — a
+   silent, green, all-UDP run that no test asserts against. The soft FIND-SYMBOL reference (not a direct
+   call) is deliberate: dds-disc must still load when dds-xport.shmem is absent.
+
    Rebind to NIL before make-disc-node to force the all-UDP path (e.g. cross-host deployments where no
    same-host peer can exist). Not a wire constant — a local transport-selection policy.")
 

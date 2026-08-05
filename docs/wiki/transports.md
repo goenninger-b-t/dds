@@ -79,16 +79,17 @@ machinery. See [When SHMEM engages](#when-shmem-engages-and-what-stays-on-udp) a
 | `dds.xport.shmem:shmem-receive-drain` | function | `(st on-datagram)` — drain all lanes of `st`'s own receive segment once, calling `on-datagram` per record (the single-shot drain the threaded receiver wraps). |
 | `dds.xport.shmem:*shmem-dest-cache*` | special variable | Default `T`: the sender resolves a destination **once** — attached segment, mapped SAP and claimed ring lane together in one `shmem-dest`, cached beside the attach (ADR 0067). `NIL`: re-derive both on every datagram, which means `shm-sap` boxing a pointer and `%claim-lane` taking the segment's pshared mutex, scanning every lane descriptor and running an `unwind-protect` — per send, for a value that cannot have changed. **The ring bytes are identical either way**; only how the sender finds its lane differs. A/B lever and escape hatch: a wrong cached lane is *silent mis-delivery* into another sender's ring, so `run-shmem-dest-cache-test` asserts lanes are claimed, stable, distinct and in agreement with a fresh `%claim-lane`. |
 | `dds.xport.shmem:shmem-transport-close` | function | `(st)` — stop the receiver, destroy the pshared objects, detach all attached + own segments, and unlink the own segment. |
-| `dds.xport.shmem:shm-attach-by-name-reliable-p` | function | `()` — `T` except on Clasp/macOS-arm64, whose plain `cffi:foreign-funcall` mispasses `shm_open`'s variadic `mode_t` so a created segment is unre-openable by name (NFR-PORT gap, ADR 0013). The transport requires by-name attach, so its loopback tests pass-skip where this is `NIL`. A runtime check, not a reader conditional. |
-| `dds.xport.shmem:run-shmem-transport-test` | function | Transport-level SHMEM loopback in one image (tx `send` -> rx own-segment drain); returns `T`. Pass-skips on the Clasp/macOS by-name-attach gap. |
-| `dds.xport.shmem:run-shmem-receiver-test` | function | Receiver-thread loopback self-test; returns `T`. Pass-skips on the same gap. |
+| `dds.xport.shmem:shm-attach-by-name-reliable-p` | function | `()` — `T` iff a segment this process creates is re-openable **by name**, which the transport requires because the sender opens the receiver's named segment. Delegates to `dds.pal:shm-create-mode-reliable-p`: it asks for the **capability**, never the platform (ADR 0064), and dds-xport is outside dds-pal where reader conditionals are banned. **`T` on every supported implementation and platform since 2026-07-31** — the last gap, Clasp/macOS-arm64, closed upstream in Clasp with a C++ binding of `shm_open` (ADR 0103, superseding the ADR 0013 gap). Where it is `NIL` the transport's tests pass-skip. |
+| `dds.pal:shm-create-mode-reliable-p` | function | `()` — the PAL-side capability: `T` iff `shm_open`'s variadic `mode_t` actually lands, so a created object grants its own creator rw. Deliberately **not** a runtime probe, unlike its sibling `sysv-sem-setval-reliable-p`: a broken mode is *garbage*, not zero, so a single create+reopen trial succeeds ~1/3 of the time and a one-shot probe would report `T` on a broken image (ADR 0103 §5). |
+| `dds.xport.shmem:run-shmem-transport-test` | function | Transport-level SHMEM loopback in one image (tx `send` -> rx own-segment drain); returns `T`. Guarded on `shm-attach-by-name-reliable-p`, which since ADR 0103 is true everywhere, so it no longer pass-skips on any supported platform. |
+| `dds.xport.shmem:run-shmem-receiver-test` | function | Receiver-thread loopback self-test; returns `T`. Same capability guard. |
 | `dds.xport.shmem:run-shmem-stress-test` | function | Contention self-test: N sender lanes -> one receiver, asserting no loss/corruption/deadlock; returns `T`. |
 
 The transport selection is a discovery-layer policy, controlled by one special variable:
 
 | Symbol | Kind | Description |
 |---|---|---|
-| `dds.disc:*shmem-enabled*` | special var | Master switch (read once per node at `make-disc-node`) for routing same-host user DATA over SHMEM instead of UDP (FR-XPORT-2). Default `T` on SBCL everywhere and Clasp/Linux (where the SHMEM package is present and by-name attach works); `NIL` on Clasp/macOS (the `shm_open` variadic-mode ABI gap, ADR 0013). Rebind to `NIL` before `make-disc-node` to force the all-UDP path. Not a wire constant — a local transport-selection policy. |
+| `dds.disc:*shmem-enabled*` | special var | Master switch (read once per node at `make-disc-node`) for routing same-host user DATA over SHMEM instead of UDP (FR-XPORT-2). Default `T` wherever the SHMEM package is present **and** `shm-attach-by-name-reliable-p` is true there — since 2026-07-31 that is every supported implementation and platform (ADR 0103). It **asks the transport** rather than re-deriving the platform test: it used to carry a second copy of that judgement, and a second copy is found only when the first one changes, which would have left this `NIL` while the transport reported itself usable — a silent all-UDP run no test asserts against. Rebind to `NIL` before `make-disc-node` to force the all-UDP path. Not a wire constant — a local transport-selection policy. |
 
 ### RTI Connext shared-memory recognition — `dds.xport.rti-shmem`
 
@@ -547,10 +548,12 @@ the receive buffer through raw pointers (ADR 0065/0066, NFR-MEM).
 Two participants on one host: the receiver creates its segment, a background receive thread cond-waits and
 drains, and the sender attaches by the receiver's locator and enqueues. The engine never sees the difference —
 the sender calls the same `dds.xport:send`. Adapted from `dds.xport.shmem:run-shmem-receiver-test`
-(`src/dds-tests/echo-test.lisp`); it pass-skips on the Clasp/macOS by-name-attach gap (ADR 0013).
+(`src/dds-tests/echo-test.lisp`). The capability guard below is retained because it states a real
+precondition, but it no longer skips anywhere: it has been true on every supported platform since the last
+gap closed (ADR 0103).
 
 ```lisp
-(when (dds.xport.shmem:shm-attach-by-name-reliable-p)        ; skip on the Clasp/macOS NFR-PORT gap
+(when (dds.xport.shmem:shm-attach-by-name-reliable-p)        ; a capability precondition, true everywhere since ADR 0103
   (let ((rx (dds.xport.shmem:make-shmem-transport
              :participant-guid (make-array 12 :element-type '(unsigned-byte 8) :initial-element 1)
              :host-uuid 7))
@@ -1010,16 +1013,18 @@ The Scope-B follow-ups above landed as three layered work packages (all R6, pate
 - **multi-destination sharing (ADR 0047)** — when a sample fans out to **≥2 co-resident ZC-capable participants**, all N share **ONE** pool slot (refcount = N) instead of taking N separate slots + N app→slot copies. **N is the ZC-eligible destination-GROUP count, not the reader-endpoint count** — a participant resolves a `readerId`-UNKNOWN DATA once regardless of how many co-located ZC readers it has, so counting endpoints would leak the slot. The send site is hoisted above the per-group loop (`%capture-push-groups` freezes every destination's unsent set once, `%shared-zc-refs` loans one slot per shareable change reaching ≥2 ZC groups); a pre-committed armed slot is bumped 1→N with `%zc-bump` (the generation-guarded dual of `%zc-release`, of which `%zc-pin` is the `delta=1` case), and the ADR 0044 pin composes additively. **Honest scope (FR-LANG-7):** this is a pool-economy *optimization* — even before it, all N destinations already received the sample over Zero-Copy; the payoff is N−1 slots + N−1 copies saved and materialises **only** with ≥2 co-resident ZC participants, not the primary 1:1 same-host case. A single ZC destination, a lost armed claim, or pool saturation falls back to the per-destination fresh loan (byte-identical, always correct). Slots + copies drop N→1 at fan-out (`bench/report/2026-07-05-wp-zc-multi-dest.md`, N ∈ {2,4,8}).
 - **an unrouted reference returns its slot (ADR 0096)** — the writer's `%zc-loan` presets **one refcount hold per destination participant**, discharged by that participant's single drainer at `return-loan`. A reference that reaches a participant with **no reader route** for that writer has no drainer, so before ADR 0096 the hold was orphaned for the life of the process: one pool slot lost per unrouted reference, until the pool saturated and Zero-Copy silently degraded to full-payload sends with no error, status or counter. This is an ordinary path, not an exotic one — **matching is not symmetric** (a writer matches a remote reader when it processes that reader's SEDP *subscription*; the reader matches the writer when *it* processes the writer's SEDP *publication*, independently), so the opening samples of every fresh pairing can arrive before the reader has routed the writer, and an RxO refusal makes the condition permanent. `%deliver-user-marker` now releases such a marker. **The deduped-duplicate arm deliberately does not release:** a duplicate reference carries no second hold (the writer loans one hold per participant and never re-loans on repair — the ACKNACK path sends the retained full payload), so releasing there would discharge the hold the *stored* marker's drainer still owes and free the slot under the app's in-place read — a cross-process use-after-free, strictly worse than the leak. The gate (`run-zc-unrouted-release-test`) asserts both arms, so an unconditional release fails it.
 
-### NFR-PORT gap — Clasp/macOS-arm64
+### NFR-PORT — the Clasp/macOS-arm64 gap, and how it closed
 
-**SBCL has full SHMEM on every platform.** On **Clasp/macOS-arm64** the transport is unavailable: Clasp's CFFI
-cannot reliably pass `shm_open`'s variadic `mode_t` argument on arm64 (verified ~40% flaky), so a created
-segment is unre-openable by name — the cross-process attach the transport depends on. There, `*shmem-enabled*`
-defaults `NIL` and **UDP carries everything** (`shm-attach-by-name-reliable-p` returns `NIL`; the SHMEM tests
-pass-skip cleanly). **Clasp/Linux** is expected to work via the register varargs ABI but is **pending
-verification on a Linux host**. (A separate, deeper Clasp gap — no usable hardware atomic over a raw foreign
-cell — keeps the SAP-CAS primitives SBCL-only, but the v1 ring's mutex-guarded claim means that gap does not
-affect SHMEM on Clasp/Linux.) This mirrors the existing Clasp threading and foreign-atomics latitude (NFR-PORT).
+**SHMEM is available on every supported implementation and platform.** SBCL has always had it everywhere.
+**Clasp/macOS-arm64 gained it on 2026-07-31** (ADR 0103): Clasp's CFFI could not reliably pass `shm_open`'s
+variadic `mode_t` on arm64 — measured 9–11 successes in 30, with *every* CFFI call form failing, because the
+mode landed as garbage rather than as a wrong-but-fixed value — so a created segment was unre-openable by
+name, which is exactly the attach the transport depends on. The fix was **upstream in Clasp**, as a C++
+binding of `shm_open` (`CORE:SYS-SHM-OPEN`) whose variadic call is emitted by clang and so is correct on
+every ABI by construction. `dds.pal::%shm-open-create` routes through it, and `*shmem-enabled*` now defaults
+`T` there. **Clasp/Linux** always worked via the register varargs ABI. (The separate Clasp foreign-atomics
+gap is likewise closed — `cas-sap-u64`/`cas-sap-u32` are real hardware CAS via the C atomic runtime — though
+the v1 ring's mutex-guarded claim never depended on them anyway.)
 
 ## Notes / status
 

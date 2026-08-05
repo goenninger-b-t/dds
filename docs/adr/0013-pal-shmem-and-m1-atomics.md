@@ -121,7 +121,16 @@ transport (a later `*shmem-enabled*` guard performs the transport selection). Th
 Clasp gains a foreign-place atomic expander or fixes the `core:acas` bignum-compare store
 (track upstream).
 
-## Clasp shm-create (macOS) gap (2026-06-14) — NFR-PORT gap
+## Clasp shm-create (macOS) gap (2026-06-14) — NFR-PORT gap — ✅ **CLOSED 2026-07-31, see ADR 0103**
+
+> **This section is superseded by [ADR 0103](0103-the-clasp-macos-shm-gap-closed-in-c-not-in-a-call-form.md).**
+> The gap is closed: Clasp gained a **C++ binding of `shm_open`** (`CORE:SYS-SHM-OPEN`), whose variadic call is
+> emitted by clang and is therefore correct on every ABI by construction. `dds.pal::%shm-open-create` routes
+> through it, `shm-attach-by-name-reliable-p` is now `T` on Clasp/macOS-arm64, and the SHMEM / Zero-Copy /
+> loan tests that used to pass-skip there run and pass. **The analysis below remains correct and is worth
+> reading** — in particular its conclusion that *no CFFI call form* could fix this, which is exactly why the
+> fix had to land upstream. The sibling `semctl(SETVAL)` variadic gap recorded elsewhere in this ADR is **not**
+> closed and is still gated by `sysv-sem-setval-reliable-p`.
 
 A second, independent Clasp/macOS-arm64 limitation surfaced while wiring `shm-create`
 (`shm_open` with `O_CREAT|O_EXCL`). `shm_open`'s third argument, `mode_t`, is **variadic**

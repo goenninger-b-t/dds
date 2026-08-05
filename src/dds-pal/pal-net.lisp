@@ -31,7 +31,7 @@
    Computed from *FEATURES* rather than a reader conditional so this shared PAL file stays conditional-free.")
 
 (defparameter *clock-gettime-fp*
-  (cffi:foreign-symbol-pointer "clock_gettime")
+  (%global-symbol-pointer "clock_gettime")
   "The RESOLVED clock_gettime function pointer, looked up ONCE at load.
 
    WP-PERF, and this is a Clasp defect worth naming: calling a foreign function BY NAME on Clasp re-resolves
@@ -134,7 +134,7 @@
 ;;; ---- bulk octet copy to/from a foreign SAP (shared-memory rings, syscall buffers) ----
 
 (defparameter *memcpy-fp*
-  (cffi:foreign-symbol-pointer "memcpy")
+  (%global-symbol-pointer "memcpy")
   "The RESOLVED memcpy pointer, looked up ONCE at load. Cached for the same reason as *clock-gettime-fp*:
    a by-NAME foreign call on Clasp re-resolves the symbol every call (~3.8 us of dlsym). Every hot foreign
    call in this codebase goes through a cached pointer.")
@@ -458,14 +458,14 @@
 ;;; ---- raw sendto(2) datagram fast path (NFR-MEM: zero allocation per datagram) ----
 
 (defparameter *sendto-fp*
-  (cffi:foreign-symbol-pointer "sendto")
+  (%global-symbol-pointer "sendto")
   "The RESOLVED sendto(2) function pointer, looked up ONCE at load — never by name per call.
    Same rule, and same reason, as *CLOCK-GETTIME-FP*: a by-name foreign call re-resolves the symbol
    through dlsym on EVERY call on Clasp (~3.8 us measured), and this one sits on the ACKNACK /
    discovery-announce send path.")
 
 (defparameter *recvfrom-fp*
-  (cffi:foreign-symbol-pointer "recvfrom")
+  (%global-symbol-pointer "recvfrom")
   "The RESOLVED recvfrom(2) function pointer, looked up ONCE at load. Same rule and reason as
    *SENDTO-FP*: never resolve a foreign symbol by name on a datagram path. Used by UDP-RECV.")
 
@@ -593,9 +593,9 @@
    *CLOCK-GETTIME-FP* predates this hook and carried the identical exposure with no hook at all; it is
    covered here rather than growing a second one-off. *NULL-SAP* is address 0 and is reload-stable, so
    it is intentionally left alone. Idempotent — re-resolving a live pointer is a no-op."
-  (setf *clock-gettime-fp* (cffi:foreign-symbol-pointer "clock_gettime")
-        *sendto-fp* (cffi:foreign-symbol-pointer "sendto")
-        *recvfrom-fp* (cffi:foreign-symbol-pointer "recvfrom"))
+  (setf *clock-gettime-fp* (%global-symbol-pointer "clock_gettime")
+        *sendto-fp* (%global-symbol-pointer "sendto")
+        *recvfrom-fp* (%global-symbol-pointer "recvfrom"))
   t)
 
 (eval-when (:load-toplevel :execute)
@@ -900,6 +900,9 @@
 #+darwin (progn (defconstant +o-creat+ #x0200) (defconstant +o-excl+ #x0800))
 #-darwin (progn (defconstant +o-creat+ #x40)   (defconstant +o-excl+ #x80))
 (defconstant +o-rdwr+ 2)
+(defconstant +o-create-excl-rdwr+ (logior +o-creat+ +o-excl+ +o-rdwr+)
+  "shm_open(2) flags for an EXCLUSIVE create: O_CREAT|O_EXCL|O_RDWR. O_EXCL is what makes the creator
+   distinguishable from an opener, which is why %SHM-OPEN-CREATE may size the object and SHM-ATTACH may not.")
 (defconstant +prot-rw+ 3)            ; PROT_READ|PROT_WRITE (1|2), same on Darwin+Linux
 (defconstant +map-shared+ 1)         ; same on Darwin+Linux
 (defconstant +map-failed-addr+ (1- (ash 1 64)))   ; mmap returns (void*)-1 on failure (LP64)
@@ -917,14 +920,23 @@
     (when (= (cffi:pointer-address p) +map-failed-addr+) (bail :mmap-failed))
     (values p nil)))
 
+#+clasp
+(defvar *native-shm-open*
+  (let ((s (find-symbol "SYS-SHM-OPEN" "CORE"))) (and s (fboundp s) s))
+  "CORE:SYS-SHM-OPEN on a Clasp carrying the native C++ POSIX-shm layer, else NIL. That primitive is
+   ::shm_open(name, oflag, (mode_t)mode) compiled by clang, so the variadic mode is passed by a real C
+   compiler and is correct on EVERY ABI by construction — which is precisely what no CFFI call form could
+   achieve on Darwin/arm64. Looked up by name, not read as CORE:SYS-SHM-OPEN, so this file still compiles
+   on a Clasp predating the layer (there the old, unreliable call form is used and
+   SHM-CREATE-MODE-RELIABLE-P reports NIL). Bound once at load: the symbol cannot appear later.")
+
 (defun* %shm-open-create (name)
     (function (string) fixnum)
   "shm_open O_CREAT|O_EXCL|O_RDWR, mode 0600. The variadic mode's ABI differs per impl on arm64.
-   SBCL: foreign-funcall-varargs (stack — verified correct). Clasp: plain foreign-funcall (correct on
-   Linux's register varargs ABI; UNRELIABLE on macOS arm64 — the NFR-PORT gap, ADR 0013). Reader
-   conditionals are permitted inside dds-pal/.
+   SBCL: foreign-funcall-varargs (stack — verified correct). Clasp: the native CORE:SYS-SHM-OPEN when this
+   image has it, else a plain foreign-funcall. Reader conditionals are permitted inside dds-pal/.
 
-   ⚠️ THE macOS-arm64 GAP IS REAL AND IT IS NOT A WRONG CALL FORM — MEASURED, 2026-07-14, because the
+   ⚠️ THE macOS-arm64 GAP WAS REAL AND IT WAS NEVER A WRONG CALL FORM — MEASURED, 2026-07-14, because the
    obvious 'fix' (just use FOREIGN-FUNCALL-VARARGS on Clasp too, as SBCL does) LOOKS like it works. It does
    not. Over 30 create+reopen trials on Clasp/macOS-arm64, the object was re-openable by name:
 
@@ -936,12 +948,48 @@
    NONE of them is correct; the mode lands as GARBAGE, and a single trial passes or fails by whether those
    garbage bits happened to include owner-rw. A one-shot probe therefore 'proves' whichever answer you want
    — which is exactly how this was nearly declared fixed. The permission bits are fixed at creation on
-   macOS (fchmod afterwards does not repair them), so there is no Lisp-side repair either. This is a Clasp
-   CFFI variadic-ABI defect on Darwin/arm64 and it belongs upstream. Linux (the primary platform, operating
-   contract §9) passes variadic args in registers, so plain foreign-funcall is correct there and Clasp is
-   fully fitted."
-  #+sbcl (cffi:foreign-funcall-varargs "shm_open" (:string name :int (logior +o-creat+ +o-excl+ +o-rdwr+)) :unsigned-int #o600 :int)
-  #-sbcl (cffi:foreign-funcall "shm_open" :string name :int (logior +o-creat+ +o-excl+ +o-rdwr+) :unsigned-int #o600 :int))
+   macOS (fchmod afterwards does not repair them), so there was no Lisp-side repair either.
+
+   ✅ CLOSED 2026-07-31 by the fix landing where it belonged, UPSTREAM IN CLASP: a C++ binding of shm_open
+   (CORE:SYS-SHM-OPEN). Re-running the same 30-trial protocol on that image, with the three old call forms
+   kept as CONTROLS to prove the measurement can still detect failure:
+
+       plain foreign-funcall ........ 11/30, 9/30    <- control, still broken, matches the 2026 baseline
+       foreign-funcall-varargs ....... 8/30, 6/30    <- control, still broken
+       varargs, mode as :int ........ 10/30, 10/30   <- control, still broken
+       CORE:SYS-SHM-OPEN ........... 30/30, 30/30    and fstat reports st_mode = 0600 on every trial
+
+   The mode is now observed DIRECTLY (fstat) rather than inferred from a reopen succeeding, so the result is
+   the requested value landing, not garbage that happened to contain owner-rw. See ADR 0103."
+  (let ((native #+clasp *native-shm-open* #-clasp nil))
+    (if native
+        (values (funcall native name +o-create-excl-rdwr+ #o600))
+        #+sbcl (cffi:foreign-funcall-varargs "shm_open" (:string name :int +o-create-excl-rdwr+) :unsigned-int #o600 :int)
+        #-sbcl (cffi:foreign-funcall "shm_open" :string name :int +o-create-excl-rdwr+ :unsigned-int #o600 :int))))
+
+(defun* shm-create-mode-reliable-p ()
+    (function () t)
+  "T iff %SHM-OPEN-CREATE's variadic mode_t actually lands, so an object this process creates is re-openable
+   BY NAME (mode 0600 grants the owner rw; a garbage mode denies even the owner, and macOS fixes the bits at
+   creation). The SHMEM transport REQUIRES by-name attach — the sender opens the receiver's named segment —
+   so DDS.XPORT.SHMEM:SHM-ATTACH-BY-NAME-RELIABLE-P is exactly this predicate, re-exported to a package where
+   reader conditionals are banned.
+
+   Arms, each with a reason rather than an assumption: SBCL uses FOREIGN-FUNCALL-VARARGS, verified correct on
+   every platform. Clasp with the native C++ CORE:SYS-SHM-OPEN is correct by construction on every ABI. Clasp
+   WITHOUT it is correct only where varargs go in registers, i.e. not Darwin/arm64 (ADR 0013, ADR 0103).
+
+   ⚠️ DELIBERATELY NOT A RUNTIME PROBE, unlike its sibling SYSV-SEM-SETVAL-RELIABLE-P — and the difference is
+   the whole lesson. A broken mode is GARBAGE, not zero, so a single create+reopen trial succeeds whenever
+   those random bits happen to include owner-rw: measured at 9-11 times in 30. A one-shot probe would
+   therefore report T about a third of the time ON A BROKEN IMAGE. SETVAL can be probed because its failure
+   is deterministic (the value silently does not change); this one cannot. Requiring N consecutive successes
+   would work, but it buys nothing here: when the answer is T the native binding makes it T by construction,
+   and when it is wrongly T the 31 SHMEM/zero-copy/loan tests FAIL LOUDLY rather than silently pass-skipping,
+   which is the safe direction to be wrong in."
+  #+(and clasp darwin)       (and *native-shm-open* t)
+  #+(and clasp (not darwin)) t
+  #-clasp                    t)
 
 (defun* shm-create (name size)
     (function (string (integer 1)) (values (or null shm-segment) (or null keyword)))
