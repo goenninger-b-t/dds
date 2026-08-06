@@ -388,6 +388,34 @@
     (dds.core.arena:teardown-arena arena)
     t))
 
+(defun* run-sample-pool-overflow-test ()
+    (function () t)
+  "Test: SAMPLE-POOL-RELEASE REFUSES an over-release instead of writing past the end of its backing vector.
+   Falsify by deleting the bounds check in dds.types:sample-pool-release — this goes red on :POOL-OVERFLOW-
+   REFUSED, and the un-guarded write it restores is an OOB heap write, so the failure mode it prevents is
+   silent corruption rather than a clean error."
+  (let* ((cap 3)
+         (pool (dds.types:make-sample-pool (lambda () (make-mpoint :x 0 :y 0)) cap)))
+    ;; drain it, then hand every sample back — the pool is now exactly full
+    (let ((taken (loop repeat cap collect (dds.types:sample-pool-acquire pool))))
+      (%check :pool-drained (every #'mpoint-p taken) "acquire did not return samples")
+      (%check :pool-empty-refuses (null (dds.types:sample-pool-acquire pool))
+              "an exhausted pool must return NIL, not a sample")
+      (dolist (s taken)
+        (multiple-value-bind (ok status) (dds.types:sample-pool-release pool s)
+          (%check :pool-release-ok (and ok (null status)) "a legal release was refused"))))
+    (%check :pool-full (= (dds.types::sample-pool-top pool) cap) "pool should be full after returning all")
+    ;; the over-release: one more than was ever loaned
+    (multiple-value-bind (ok status) (dds.types:sample-pool-release pool (make-mpoint :x 9 :y 9))
+      (%check :pool-overflow-refused (and (null ok) (eq status :pool-overflow))
+              "an over-release must be refused with :POOL-OVERFLOW"))
+    (%check :pool-top-unmoved (= (dds.types::sample-pool-top pool) cap)
+            "a refused release must leave the pool untouched")
+    ;; and the pool still works afterwards
+    (%check :pool-usable-after (mpoint-p (dds.types:sample-pool-acquire pool))
+            "pool unusable after a refused release")
+    t))
+
 ;;; WP-DATA-REPRESENTATION step 2 (TX in the offered representation, DDS-XTypes 1.3 §7.6.3.1.1).
 ;;; txr8 has an i8 followed by an i64 so the XCDR1 8-byte alignment (i64 @ body offset 8, body 16)
 ;;; differs from the XCDR2 4-byte-capped alignment (i64 @ body offset 4, body 12) — the 8-vs-4 cap.

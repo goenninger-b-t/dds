@@ -161,11 +161,15 @@ shared entry and the entry is purged on the last drain via the `disc-node-sample
    string/sequence/nested slot — the aliasing hazard this design exists to avoid.
 3. **Do not route recycling through `type-support-sample-pool-alloc/free`.** Those hooks are **dead in the
    engine and were deliberately rejected** (`entities.lisp:177`): the per-type pool is shared across readers,
-   and `sample-pool-release` (`type-support.lisp:118-124`) has **no bounds guard** — `(setf (svref … top) obj)`
-   with `top` unchecked, so an over-release is an out-of-bounds write. Use the per-reader `dr-data-pool`.
-   ⚠️ *That missing bounds guard is a real latent defect, found while verifying this design and **not yet
-   fixed or filed**. It is unreachable today only because the engine does not call these hooks — which is
-   exactly the kind of "safe because nothing uses it" that stops being true the moment something does.*
+   and `sample-pool-release` (`type-support.lisp:118-124`) had **no bounds guard** — `(setf (svref … top) obj)`
+   with `top` unchecked. Use the per-reader `dr-data-pool`.
+   ✅ *That missing guard was a real latent defect found while verifying this design, and is **fixed
+   separately** (`sample-pool-release` now refuses an over-release with `:pool-overflow`; test
+   `sample-pool-overflow`, falsified). ⚠️ Its consequence was **measured, not assumed**: the repo compiles at
+   SBCL's default safety 1, where `svref` is bounds-checked, so the un-guarded release **signalled** rather
+   than corrupting the heap — a condition escaping a pool release, which violates the no-conditions rule,
+   and a genuine OOB write only at safety 0. The identical "(safety 0) OOB" claim about ADR 0078 was false
+   for the same reason.*
 4. **`sample-info` array slots are aliases onto write-once immutable arrays.** `instance-handle` and
    `publication-handle` are `copy-seq`'d **once per instance** (`entities.lisp:2238`), never per sample. A
    per-sample deep copy would cost a measured **+63.6 B/sample** and kill the target. `take-into` must

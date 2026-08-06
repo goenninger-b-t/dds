@@ -116,9 +116,37 @@
             obj)))))
 
 (defun* sample-pool-release (pool obj)
-    (function (sample-pool t) (values))
-  "Return a loaned sample to POOL."
-  (let ((top (sample-pool-top pool)))
-    (setf (svref (sample-pool-slots pool) top) obj
+    (function (sample-pool t) (values (or null (eql t)) (or null keyword)))
+  "Return a loaned sample to POOL. (values T NIL) on success; (values NIL :pool-overflow) when POOL is
+   already full, in which case OBJ is DROPPED and the pool is left untouched.
+
+   ⚠️ THE BOUNDS CHECK IS THE POINT, AND IT USED TO BE ABSENT. This wrote (setf (svref slots top) obj) with
+   TOP unchecked against the backing vector's length, so releasing more samples than were acquired — a
+   double release, or a release of an object this pool never loaned — indexed PAST THE END of SLOTS.
+
+   WHAT THAT ACTUALLY DID, MEASURED RATHER THAN ASSUMED: this repo carries no global OPTIMIZE policy (only
+   three tiny local sites), so it compiles at SBCL's default SAFETY 1, where SVREF IS bounds-checked — the
+   un-guarded release therefore SIGNALLED (observed: 'Invalid index 3 for (SIMPLE-VECTOR 3)'), it did not
+   silently corrupt the heap. That is still a defect, and a double one: a condition escaping a pool release
+   violates the no-conditions rule, and the same code at SAFETY 0 — or in any build that lowers safety —
+   would be a genuine out-of-bounds write instead. The identical (safety 0) OOB claim was made about
+   ADR 0078 and turned out to be false for exactly this reason; do not restate it without measuring.
+
+   It was unreachable in practice only because the engine does not call these hooks: DDS.DCPS deliberately
+   uses its own per-reader DR-DATA-POOL instead (see the note at %rx-data-pop's definition — this pool is
+   shared across readers AND, until now, unguarded). 'Safe because nothing calls it' stops being true the
+   moment something does, which is exactly what the take-into design proposed to do.
+
+   REFUSES rather than signals (the no-conditions rule): an over-release is a CALLER defect, so it is
+   reported as a status the caller can test, and the pool's invariant (TOP <= capacity, every slot below TOP
+   live) holds unconditionally afterwards. Dropping OBJ is deliberate — the alternative, growing SLOTS, would
+   let a buggy or hostile caller drive unbounded allocation through a fixed-capacity pool.
+
+   Mirrors SAMPLE-POOL-ACQUIRE, which already reports exhaustion as NIL rather than signalling."
+  (let ((slots (sample-pool-slots pool))
+        (top (sample-pool-top pool)))
+    (when (>= top (length slots))
+      (return-from sample-pool-release (values nil :pool-overflow)))
+    (setf (svref slots top) obj
           (sample-pool-top pool) (1+ top))
-    (values)))
+    (values t nil)))
