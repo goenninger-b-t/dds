@@ -1,7 +1,7 @@
 # ADR 0105 — A take is not a loan: `take-into` / `read-into`, and a `copy-into` slot on `type-support`
 
-- **Status:** **Proposed** — awaiting owner acceptance. **No code may land before this is Accepted**
-  (operating contract §7.2: an ADR that touches a frozen contract is written and accepted first).
+- **Status:** **Accepted** — owner accepted 2026-08-06 by directing execution of the slice-1 plan
+  (`docs/superpowers/plans/2026-08-06-adr-0105-slice-1.md`). Implementation may proceed.
 - **Date:** 2026-08-06
 - **Owner ECR (2026-07-28, verbatim):** *"Differentiate between take and loan. A take is not a loan. And a
   take still must be 0 consing and not allocating memory due to being in the hot path."*
