@@ -173,6 +173,7 @@
    (secured-loans :initform '() :accessor dr-secured-loans) ; WP-DCPS-SECURED-TAKE-LOAN (ADR 0038 (i)): outstanding secured decode-loan handles — SEPARATE registry from dr-loans (the type-clean two-registry discipline); return-loan / reader-close node-return-loan them
    (secured-scratch :initform nil :accessor dr-secured-scratch) ; WP-DCPS-SECURED-TAKE-LOAN: reusable octet-buffer wrapper (repointed per drain) for the in-place [0,len) secured-plaintext deserialize — created once, zero per-sample cons (NFR-MEM)
    (deser-scratch :initform nil :accessor dr-deser-scratch) ; RX-POOLING Phase A (ADR 0073): reusable octet-buffer wrapper repointed at the stored bytes per COPY-path drain, so %deserialize-sample decodes IN PLACE with no per-sample make-octet-buffer / replace / free-static (NFR-MEM)
+   (decode-cursor :initform nil :accessor dr-decode-cursor) ; ADR 0105 Task 7: the reader's ONE read cursor, handed to %deserialize-payload and reused through cursor-reuse's EQ test — see that function for why the test HITS here
    (wrapper-pool :initform nil :accessor dr-wrapper-pool)   ; ADR 0093 slice 1: a simple-vector STACK of recycled cached-sample wrappers, each still carrying its SampleInfo. Lazily carved on the first return, so a reader that never returns pays nothing. A VECTOR, not a list: a list freelist churns two conses per sample (32 B measured), which is most of what the pooling was meant to save
    (wrapper-pool-top :initform 0 :accessor dr-wrapper-pool-top)   ; stack pointer into WRAPPER-POOL
    (data-pool :initform nil :accessor dr-data-pool)   ; ADR 0093 slice 4: a simple-vector STACK of recycled DESERIALIZED SAMPLE structs. Per-READER, which is what makes it type-safe: one reader has exactly one type, so a parked struct is always the right type for the next sample. (The per-TYPE dds.types:sample-pool is shared across readers and its release has no bounds guard, so it is NOT used here.)
@@ -897,8 +898,34 @@
     (:pl-cdr-le  (values :xcdr1 :little))
     (:pl-cdr-be  (values :xcdr1 :big))))
 
-(defun* %deserialize-payload (ts ob &optional into)
-    (function (t dds.core.buffer:octet-buffer &optional t) (values t (or null keyword)))
+(defun* %reader-decode-cursor (dr ob)
+    (function (data-reader dds.core.buffer:octet-buffer) dds.core.buffer:cursor)
+  "DR's read cursor, reset to position 0 / origin 0 / little-endian over OB and cached back on DR — the one
+   supported way to obtain the CURSOR argument of %DESERIALIZE-PAYLOAD (ADR 0105 Task 7). A fresh six-word
+   cursor per decode was 48.16 B/sample, the largest single allocation left on the receive path.
+
+   ⚠️ CURSOR-REUSE'S EQ TEST IS KEPT, NOT BYPASSED — and it HITS here, which the slice plan predicted it
+   would not. That prediction was wrong in exactly the way the identical prediction about the TX payload
+   serializer was wrong a week earlier (bench/mem-ceiling.txt, 2026-07-29: 'THAT CLAIM WAS WRONG — pool
+   acquire is a LIFO stack'). All three engine decode paths hand this function a buffer whose IDENTITY is
+   stable across samples: the two non-pooled paths pass a per-reader scratch octet-buffer that is REPOINTED
+   at new bytes rather than reallocated (DR-DESER-SCRATCH, DR-SECURED-SCRATCH), and the ADR 0078 pooled path
+   passes a store buffer drawn from a LIFO stack, so acquire/release/acquire returns the SAME object while
+   one sample is in flight — which is the steady state this gate measures.
+
+   Keeping the test costs nothing and is what makes reuse safe to offer: a caller arriving with a different
+   buffer gets a fresh cursor and pays the allocation it would have paid anyway, never a cursor addressing
+   the wrong buffer. The SETF is the other half — without it a miss would allocate and throw the cursor
+   away, so a reader whose first decode misses would allocate on every decode forever.
+
+   Per-READER rather than per-thread, and that is the correct grain: every decode runs under DR's cache lock
+   (%DRAIN-UNLOCKED's callers hold it), so two threads can never share this cursor, while two readers
+   draining concurrently on different threads each have their own."
+  (setf (dr-decode-cursor dr) (dds.core.buffer:cursor-reuse (dr-decode-cursor dr) ob)))
+
+(defun* %deserialize-payload (ts ob &optional into cursor)
+    (function (t dds.core.buffer:octet-buffer &optional t (or null dds.core.buffer:cursor))
+              (values t (or null keyword)))
   "Deserialize a SerializedPayload (encap header + body) already RESIDENT in octet-buffer OB into a sample via TS,
    WITHOUT allocating or freeing OB — the buffer is caller-owned (a scratch buffer for %deserialize-sample, or the
    pooled secured-decode buffer read IN PLACE for the WP-DCPS-SECURED-TAKE-LOAN loan). The parsed encapsulation
@@ -906,8 +933,16 @@
    %encap->codec, so a reader accepting (:xcdr2 :xcdr1) reads either rep a peer sent (DDS-XTypes 1.3 §7.6.3.1.2;
    WP-DATA-REPRESENTATION). A FlatData type's :deserialize self-dispatches on the rep id and ignores the passed
    mode (its own RX-transcode). Bounds-checked against OB's capacity (NFR-SEC-POSTURE): the caller sizes OB to the
-   exact payload extent so a wire-supplied length can never over-read past it."
-  (let ((rc (dds.core.buffer:cursor ob :endianness :little)))
+   exact payload extent so a wire-supplied length can never over-read past it.
+
+   CURSOR, when supplied, is a reusable read cursor offered to CURSOR-REUSE instead of consing a fresh
+   six-word structure per decode (ADR 0105 Task 7); the engine passes the reader's own, obtained from
+   %READER-DECODE-CURSOR, and the corpus, bench and test callers pass nothing and allocate, which is what
+   they want. It is offered, not trusted: CURSOR-REUSE's EQ test decides, so a cursor over a DIFFERENT
+   buffer — or one left at a non-zero position — yields a fresh cursor rather than a decode of the wrong
+   bytes, and NIL is simply the allocating case. That is why the guard is kept rather than bypassed, and it
+   is also why this function needs no precondition on CURSOR at all."
+  (let ((rc (dds.core.buffer:cursor-reuse cursor ob)))
     (let ((encap (dds.cdr:parse-encapsulation-header rc)))
       (multiple-value-bind (mode endian) (%encap->codec encap)
         (dds.core.buffer:cursor-set-endianness rc endian)
@@ -925,8 +960,9 @@
               (funcall dnto into rc mode)
               (funcall (dds.types:type-support-deserialize ts) rc mode)))))))
 
-(defun* %deserialize-sample (ts bytes &optional scratch into)
-    (function (t (simple-array (unsigned-byte 8) (*)) &optional (or null dds.core.buffer:octet-buffer) t)
+(defun* %deserialize-sample (ts bytes &optional scratch into cursor)
+    (function (t (simple-array (unsigned-byte 8) (*)) &optional (or null dds.core.buffer:octet-buffer) t
+              (or null dds.core.buffer:cursor))
               (values t (or null keyword)))
   "Deserialize a SerializedPayload (encap header + body) into a sample via TS. RX-POOLING Phase A (ADR 0073,
    NFR-MEM): decode DIRECTLY from the caller-owned BYTES — %deserialize-payload only READS the buffer (a cursor
@@ -937,12 +973,17 @@
    — no static allocation, no copy. Byte-identical to the old copy-then-decode either way. BYTES must outlive this
    call (it does: %drain runs on the user thread, the receiver never mutates a stored sample, and
    node-consume-sample frees it only after the drain). Mirrors the secured path's dr-secured-scratch. See
-   %deserialize-payload for the representation-selection contract."
+   %deserialize-payload for the representation-selection contract.
+
+   CURSOR is passed straight through to %DESERIALIZE-PAYLOAD (ADR 0105 Task 7), where CURSOR-REUSE's EQ test
+   decides whether it can be used. With SCRATCH supplied that is the buffer decoded from, so the hot path
+   passes (%READER-DECODE-CURSOR DR SCRATCH) and the test hits; with SCRATCH NIL the wrapper is allocated
+   here and any cursor fails the test and is replaced, which needs no special case."
   (let ((ob (cond (scratch (setf (dds.core.buffer:octet-buffer-vec scratch) bytes
                                  (dds.core.buffer:octet-buffer-capacity scratch) (length bytes))
                            scratch)
                   (t (dds.core.buffer:octet-buffer-over bytes)))))
-    (%deserialize-payload ts ob into)))
+    (%deserialize-payload ts ob into cursor)))
 
 ;;; ---- DomainParticipantFactory + participant lifecycle ----
 
@@ -3118,7 +3159,7 @@
     ;; repoint the reusable wrapper at THIS pooled buffer, bound to [0,len) (zero per-sample cons; NFR-SEC-POSTURE bounds)
     (setf (dds.core.buffer:octet-buffer-vec ob) (dds.disc:secured-loan-bytes loan)
           (dds.core.buffer:octet-buffer-capacity ob) len)
-    (multiple-value-bind (data decode-status) (%deserialize-payload ts ob)
+    (multiple-value-bind (data decode-status) (%deserialize-payload ts ob nil (%reader-decode-cursor dr ob))
       ;; A rejected payload is a STATUS now (ADR 0064), so DATA is NIL — never pass that to %instance-handle.
       ;; RETURN THE LOAN: this handle pins a slot in the disc-node decode pool, and it has NOT yet been
       ;; pushed onto dr-secured-loans (that happens below, on the delivery path), so nothing else would ever
@@ -3332,11 +3373,11 @@
               ;; the exact plen at acquire), so it is decoded IN PLACE with no wrapper at all and under bounds
               ;; byte-identical to the exact-length vector it replaces (%deserialize-payload validates against
               ;; capacity). No scratch, no repointing — the reverse of the ADR 0073 wrapper, one step further.
-              (%deserialize-payload ts bytes reuse)
-              (%deserialize-sample ts bytes             ; RX-POOLING Phase A (ADR 0073): decode in place through the reused per-reader scratch wrapper -> zero alloc/sample
-                                   (or (dr-deser-scratch dr)
-                                       (setf (dr-deser-scratch dr) (dds.core.buffer:octet-buffer-over bytes)))
-                                   reuse))
+              (%deserialize-payload ts bytes reuse (%reader-decode-cursor dr bytes))
+              (let ((scratch (or (dr-deser-scratch dr)   ; RX-POOLING Phase A (ADR 0073): decode in place through the reused per-reader scratch wrapper -> zero alloc/sample
+                                 (setf (dr-deser-scratch dr) (dds.core.buffer:octet-buffer-over bytes)))))
+                (%deserialize-sample ts bytes scratch reuse
+                                     (%reader-decode-cursor dr scratch))))
         ;; A REJECTED payload (FlatData: short body / non-transcodable representation id) is a STATUS now,
         ;; not a signalled condition (ADR 0064). Drop the sample: never hand a NIL DATA to the filter or to
         ;; %instance-handle. It must still fall through to the watermark advance at the tail — an early

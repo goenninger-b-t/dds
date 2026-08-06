@@ -245,6 +245,25 @@
 #   x86_64 COPY   544.8 .. 545.7   -> LOWERED 609 -> 573   (was 561.3 .. 562.5: -16.5)
 #   x86_64 RETURN 353.6 .. 355.0   -> STAYS A DASH         (was 369.0 .. 370.9: -15.7)
 #
+# LOWERED 2026-08-06 (ADR 0105 Task 7 — the PER-DECODE CURSOR, the largest single allocation left on the
+# receive path. %deserialize-payload consed a fresh six-word cursor per sample; the reader now carries one
+# (%reader-decode-cursor) and the function OFFERS it to cursor-reuse. ⭐ THE SLICE PLAN SAID cursor-reuse's
+# EQ TEST WOULD MISS HERE AND THAT A REPOINT-IN-PLACE VARIANT WAS NEEDED — the identical claim this file
+# already records as FALSE for the TX payload serializer on 2026-07-29. %rx-store-acquire draws from the
+# same arena pool: pool-acquire pops a stack top, pool-release pushes back, so one sample in flight returns
+# the SAME buffer; the two non-pooled paths pass a per-reader scratch that is REPOINTED, never reallocated.
+# The guard the plan wanted removed is what does the work. Predicted 48 B, measured -47.6 / -48.3:
+#   arm64 COPY    463.0 /  464.1 /  463.0   -> LOWERED 488 -> 488 (already banked at the measurement)
+#   arm64 RETURN  254.5 /  255.5 /  255.5   -> LOWERED 320 -> 269
+#   x86_64 COPY   497.1 /  496.3 /  496.0   -> LOWERED 573 -> 522
+#   x86_64 RETURN 306.6 /  308.6 /  306.3   -> STAYS A DASH
+#
+# ⚠️ TWO MORE BLOWUPS OBSERVED WHILE TAKING THOSE x86_64 READINGS (964.5 and 133202.0, both RETURN, both on
+# runs whose COPY was normal). The characterised range is now x2.4 / x16 / x196 / x435 — see the correction
+# block below, which those readings continue to support: it hits ONE arm at a time, either arm, on an idle
+# box. The blown readings are EXCLUDED from the ceilings above; they are a property of the instrument's
+# environment, not of the code under test.
+#
 # ⚠️ MEASURE WITH NOTHING ELSE RUNNING. A gate-mem run taken while the test suites were running in the
 # background read COPY 1710.8 and FAILED — a 160 B phantom regression from participant + CPU contention,
 # not from code. A benchmark is an instrument; give it the machine.
@@ -308,5 +327,5 @@
 # (retransmission, an empty-poll storm, a pool that never fills), not for a bigger object. Chase it with a
 # run that PRINTS the empty-poll count and the pool hit/miss counts; it can now be chased ON THE BOX, which
 # is the part that changed.
-arm64  538 320
-x86_64 573 -
+arm64  488 269
+x86_64 522 -

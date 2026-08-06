@@ -14365,6 +14365,71 @@
       (dds.dcps:delete-participant pr))
     t))
 
+;;; ---- ADR 0105 Task 7: the per-decode cursor is reused through cursor-reuse's EQ test ----
+
+(defun* run-decode-cursor-reuse-test ()
+    (function () t)
+  "Test: ADR 0105 Task 7 — %DESERIALIZE-PAYLOAD decodes through a CALLER-SUPPLIED read cursor, and
+   CURSOR-REUSE's EQ test is what decides whether that cursor may be used. A fresh six-word cursor per
+   decode was 48.16 B/sample, the largest single allocation left on the receive path.
+
+   Three properties, because the change rests on all three and each fails differently:
+     (1) REUSE ACTUALLY HAPPENS. Offered a cursor already over THIS buffer, CURSOR-REUSE returns that very
+         object (EQ). Without this the slice is a silent no-op that still allocates — the failure mode a
+         gate reading only bytes would report as 'no regression'.
+     (2) A DIFFERENT BUFFER IS NEVER DECODED THROUGH A STALE CURSOR. Offered a cursor over buffer A and
+         asked for buffer B, it yields a cursor addressing B. This is the property that lets
+         %DESERIALIZE-PAYLOAD accept a cursor from any caller without a precondition.
+     (3) A REUSED CURSOR DECODES FROM THE START. Reuse resets position and origin, so the SECOND decode
+         through one cursor reads the same bytes as the first — a cursor left where the previous decode
+         finished would read the next sample's payload as this one's.
+
+   Deliberately a UNIT arm over the two functions, with no participants: the engine paths exercise this on
+   every sample, but they cannot distinguish 'reused correctly' from 'allocated a fresh one', which is
+   exactly what (1) has to pin.
+
+   FALSIFIED THREE WAYS, and two of them are caught by the CODEC rather than by an assertion here — worth
+   recording, because it is NFR-SEC-POSTURE's bounds check doing the catching:
+     * cursor-reuse never reuses            -> RED :DCR-REUSED (an assertion; nothing else can see this).
+     * %deserialize-payload trusts the
+       cursor instead of offering it to
+       cursor-reuse                          -> RED 'buffer-overflow: need 1 octet(s), 0 remaining' —
+                                                decoding B through A's cursor runs off the end.
+     * reuse without resetting the position  -> the same buffer-overflow, on the SECOND decode.
+   A wrong-buffer or wrong-position cursor therefore fails LOUDLY at the bounds check rather than reading
+   whatever happens to be there, which is why neither can become a silent wrong-bytes decode."
+  (let* ((ts (dds.types:find-type-support "tinto"))
+         (pa (dds.dcps::%serialize-sample ts (make-tinto :k 1 :v 11 :tag "aaa")))
+         (pb (dds.dcps::%serialize-sample ts (make-tinto :k 2 :v 22 :tag "bbb")))
+         (ba (dds.core.buffer:octet-buffer-over pa))
+         (bb (dds.core.buffer:octet-buffer-over pb)))
+    ;; (1) the same buffer -> the SAME cursor object, and it decodes correctly
+    (let* ((c0 (dds.core.buffer:cursor-reuse nil ba))
+           (c1 (dds.core.buffer:cursor-reuse c0 ba)))
+      (%check :dcr-reused (eq c0 c1)
+              "cursor-reuse must return the SAME cursor for the same buffer, or the slice allocates one per decode")
+      (multiple-value-bind (s st) (dds.dcps::%deserialize-payload ts ba nil c1)
+        (%check :dcr-decode-a (and (null st) (= 11 (tinto-v s)))
+                (format nil "decoding buffer A through the reused cursor must yield v=11; got ~s / ~s" st s)))
+      ;; (3) the SECOND decode through the same cursor must start from the beginning again
+      (multiple-value-bind (s st) (dds.dcps::%deserialize-payload ts ba nil c1)
+        (%check :dcr-decode-a-again (and (null st) (= 11 (tinto-v s)))
+                (format nil "a reused cursor must be reset before each decode; second read of A gave ~s / ~s"
+                        st s)))
+      ;; (2) a DIFFERENT buffer must never be decoded through a cursor addressing the first one
+      (let ((c2 (dds.core.buffer:cursor-reuse c1 bb)))
+        (%check :dcr-different-buffer (eq bb (dds.core.buffer:cursor-buffer c2))
+                "offered a cursor over another buffer, cursor-reuse must yield one addressing the buffer asked for")
+        (multiple-value-bind (s st) (dds.dcps::%deserialize-payload ts bb nil c1)
+          (%check :dcr-decode-b (and (null st) (= 22 (tinto-v s)))
+                  (format nil "decoding buffer B while offered A's cursor must yield v=22, never A's bytes; got ~s / ~s"
+                          st s))))
+      ;; and A is still intact afterwards — the buffers were never confused
+      (multiple-value-bind (s st) (dds.dcps::%deserialize-payload ts ba nil nil)
+        (%check :dcr-a-intact (and (null st) (= 11 (tinto-v s)))
+                (format nil "buffer A must still decode to v=11 after B was decoded; got ~s / ~s" st s)))))
+  t)
+
 ;;; ---- ADR 0105 Task 6a: the DR-CACHE spine is unlinked in place and its cells are pooled ----
 
 (defun* %csu-vs (samples)

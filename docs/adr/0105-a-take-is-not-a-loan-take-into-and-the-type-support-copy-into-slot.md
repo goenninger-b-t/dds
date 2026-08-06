@@ -286,7 +286,7 @@ five further per-sample allocations remain, measured on arm64 SBCL 2.6.5:
 | site | what | B/sample |
 |---|---|---|
 | ~~`dataplane.lisp:4700`~~ | ~~`(cons guid sn)` per pending key~~ — **DONE, Task 6b**: measured **−15.3 COPY / −16.4 RETURN** | ~~16.05~~ |
-| `entities.lisp:800` | fresh 4-slot `cursor` per decode | 48.16 |
+| ~~`entities.lisp:800`~~ | ~~fresh 4-slot `cursor` per decode~~ — **DONE, Task 7**: measured **−47.6 on both arms** | ~~48.16~~ |
 | ~~`entities.lisp:3251-3253`~~ | ~~`(list …)` cell `nconc`'d onto `dr-cache`~~ — **DONE, Task 6a**: measured **−16.9 COPY / −16.7 RETURN** | ~~16.05~~ |
 | `entities.lisp:3457` | `(push cs out)` per selected sample | 16.05 |
 | ~~`entities.lisp:3452`~~ | ~~`(pushnew h touched :test #'equalp)`~~ — **DONE, Task 5**: measured **−16.2 COPY / −14.2 RETURN** | ~~16.05~~ |
@@ -467,6 +467,40 @@ against a three-instance cache to reach head, middle and tail, then delivers ont
 the spine still points at it, so the cache becomes circular and the next walk never terminates. A corrupted
 spine costs a **non-terminating drain**, not a wrong answer — which is why the unlink and the park are
 adjacent and ordered in the code rather than merely both present.
+
+### 8.5 Task 7 — the decode cursor, and the same wrong prediction twice
+
+§7 said the cursor "needs a **repoint-in-place** variant: `cursor-reuse`'s `EQ` test misses here because the
+ADR 0078 pool hands out a different buffer each time." **That is false, and it is the identical claim that
+was already recorded as false about the TX payload serializer** (`bench/mem-ceiling.txt`, 2026-07-29: *"THAT
+CLAIM WAS WRONG — pool-acquire is a LIFO stack"*). `%rx-store-acquire` uses the same `dds.core.arena` pool:
+`pool-acquire` pops a stack top, `pool-release` pushes back, so with one sample in flight the same
+`octet-buffer` returns every time. The two non-pooled decode paths pass a per-reader scratch buffer that is
+**repointed** rather than reallocated, so their identity never changes at all.
+
+All three engine paths therefore hit the existing `EQ` test. No new entry point, no bypass, no fresh
+justification — **the guard §7 wanted removed is what does the work**, and the measured −47.6 B on both arms
+is the proof it hits (a miss would have moved nothing). ⭐ The reusable lesson is not that the plan erred but
+that this claim has now been made twice about the same pool primitive and been wrong both times: **check the
+acquire discipline before believing a buffer is fresh.**
+
+`%deserialize-payload` *offers* the cursor to `cursor-reuse` rather than trusting it, so a wrong buffer, a
+non-zero position and `NIL` are all one guard's business and the function needs no precondition. The caching
+half is `%reader-decode-cursor`'s `setf`: without it a miss would allocate and discard, and a reader whose
+first decode missed would allocate forever. Per-**reader** is the right grain — every decode runs under that
+reader's cache lock.
+
+`run-decode-cursor-reuse-test` is a unit arm precisely because the engine paths **cannot distinguish "reused
+correctly" from "allocated a fresh one"**:
+
+| sabotage | result |
+|---|---|
+| `cursor-reuse` never reuses | RED `:dcr-reused` |
+| `%deserialize-payload` trusts the cursor instead of offering it | RED `buffer-overflow: need 1 octet(s), 0 remaining` |
+| reuse without resetting the position | the same overflow, on the **second** decode |
+
+⭐ Two of the three are caught by the **codec's bounds check**, not by an assertion — NFR-SEC-POSTURE turning
+a wrong-buffer cursor into a loud failure instead of a silent wrong-bytes decode.
 
 **Cross-DDS interop:** `take-into` changes **no wire surface**. The per-feature interop rule is discharged by
 no-regression against the existing Connext 7.3.1 and Fast DDS legs, stated rather than skipped.
