@@ -14365,6 +14365,81 @@
       (dds.dcps:delete-participant pr))
     t))
 
+;;; ---- ADR 0105 Task 8: the fixed-size bench type the zero-arm is measured on ----
+
+(defun* run-perf-fixed-shape-test ()
+    (function () t)
+  "Test: ADR 0105 §7.1 — PERF-FIXED, the type the `:into` gate-mem arm measures, really has the two
+   properties that arm's number depends on. Both are asserted from the OUTSIDE, on observable behaviour,
+   because both are silent when they break and neither is visible to any allocation gate.
+
+   (1) ITS KEY TAKES THE DIRECT BRANCH, NOT MD5. %KEY-HASH-DEFUN branches on whether the key's maximum
+       serialized size is an integer <= 16: at or under that the serialized key is copied straight into the
+       16-octet handle and zero-padded; over it — or with a STRING key, whose max size is not an integer at
+       all — it takes the MD5 branch, which SUBSEQs the key bytes and hashes them, measured at 255.6 B/call
+       on shape-type. ⚠️ NEITHER dsl.lisp NOR md5.lisp IS IN gate-hotpath's HOTPATH_FILES, so that
+       allocation appears in NO tracked inventory: the arm would simply never reach zero and nothing would
+       say why. The branch is asserted by the SHAPE of the handle — a direct key hash of the four-octet
+       big-endian id is those four octets followed by twelve zeros, which an MD5 digest essentially cannot
+       be — rather than by reading the declaration or the generator.
+
+   (2) IT IS GENUINELY FIXED-SIZE. A (:sequence :octet) or a string member costs a measured ~15.7 B/sample
+       even at LENGTH ZERO, because the decoder allocates the sequence object regardless. On such a type the
+       into-arm would report a floor belonging to the TYPE rather than to the access path, and slice 1's
+       exit criterion — a genuinely-0 arm — could be neither met nor falsified. Asserted by round-tripping
+       through the real codec and requiring the payload length to be CONSTANT across two samples whose
+       field VALUES differ: a variable-size member would change it.
+
+   ⚠️ THE FIXED-SIZE CHECK CARRIES ITS OWN POSITIVE CONTROL, and it needs one. Giving perf-fixed a sequence
+   member as a sabotage does NOT falsify that check — the build fails earlier, in the constructor, so the
+   assertion is never reached and 'it went red' would prove nothing about the assertion. The control is
+   PERF-DATA, which really does have a (:sequence :octet): two of ITS samples with different payload lengths
+   must serialize to DIFFERENT lengths through the very same measurement. Without that, an equal-length
+   comparison that could never distinguish anything would sit here reading green forever.
+
+   Falsified: giving perf-fixed a string key turns the handle into an MD5 digest and :PFS-KEY-DIRECT goes
+   red (observed, first octet 17 rather than 1)."
+  (let* ((ts (dds.types:find-type-support "perf-fixed"))
+         (s1 (dds.bench:make-perf-fixed :id #x01020304 :a 1 :b 2))
+         (s2 (dds.bench:make-perf-fixed :id #x7f6e5d4c :a most-positive-fixnum :b -99))
+         (h1 (funcall (dds.types:type-support-key-hash ts) s1)))
+    ;; (1) the DIRECT key branch: the 4 big-endian key octets, then twelve zeros
+    (%check :pfs-handle-len (= 16 (length h1))
+            (format nil "a DDS keyhash is 16 octets (RTPS 2.5 §9.6.4.8); got ~d" (length h1)))
+    (%check :pfs-key-direct
+            (and (= #x01 (aref h1 0)) (= #x02 (aref h1 1)) (= #x03 (aref h1 2)) (= #x04 (aref h1 3))
+                 (every #'zerop (subseq h1 4)))
+            (format nil "perf-fixed's key must take the DIRECT <=16-octet branch, so the handle is the ~
+                         big-endian id then zeros; got ~s — an MD5 digest means the key grew past 16 octets ~
+                         and the arm now pays 255.6 B/call that no gate can see" (coerce h1 'list)))
+    ;; (2) fixed size: two samples with different values must serialize to the SAME length
+    (let ((p1 (dds.dcps::%serialize-sample ts s1))
+          (p2 (dds.dcps::%serialize-sample ts s2)))
+      (%check :pfs-fixed-size (= (length p1) (length p2))
+              (format nil "perf-fixed must be FIXED-SIZE — two samples differing only in value must ~
+                           serialize to equal lengths; got ~d and ~d, so a variable-size member crept in"
+                      (length p1) (length p2)))
+      ;; the positive control: the SAME measurement must separate a genuinely variable-size type
+      (let* ((vts (dds.types:find-type-support "perf-data"))
+             (v1 (dds.dcps::%serialize-sample
+                  vts (dds.bench:make-perf-data
+                       :id 1 :data (make-array 4 :element-type '(unsigned-byte 8) :initial-element 0))))
+             (v2 (dds.dcps::%serialize-sample
+                  vts (dds.bench:make-perf-data
+                       :id 1 :data (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))))
+        (%check :pfs-control (/= (length v1) (length v2))
+                (format nil "the control must SEPARATE a variable-size type, or :pfs-fixed-size above ~
+                             proves nothing; perf-data at 4 and 32 octets both serialized to ~d / ~d"
+                        (length v1) (length v2))))
+      ;; and it must still round-trip through the real codec, or the arm measures a broken type
+      (multiple-value-bind (r st) (dds.dcps::%deserialize-payload
+                                   ts (dds.core.buffer:octet-buffer-over p2))
+        (%check :pfs-roundtrip (and (null st)
+                                    (= #x7f6e5d4c (dds.bench:perf-fixed-id r))
+                                    (= -99 (dds.bench:perf-fixed-b r)))
+                (format nil "perf-fixed must round-trip through the engine codec; got ~s / ~s" st r)))))
+  t)
+
 ;;; ---- ADR 0105 Task 7: the per-decode cursor is reused through cursor-reuse's EQ test ----
 
 (defun* run-decode-cursor-reuse-test ()

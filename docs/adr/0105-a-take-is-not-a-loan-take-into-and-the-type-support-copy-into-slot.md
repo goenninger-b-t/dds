@@ -502,6 +502,45 @@ correctly" from "allocated a fresh one"**:
 ⭐ Two of the three are caught by the **codec's bounds check**, not by an assertion — NFR-SEC-POSTURE turning
 a wrong-buffer cursor into a loud failure instead of a silent wrong-bytes decode.
 
+### 8.6 Task 8 — the arm exists, and it is NOT zero
+
+**Slice 1's exit criterion — a genuinely 0 B/sample `into` arm — is NOT MET.** The arm measures
+**223.9 / 225.0 / 223.9 B/sample** (arm64, `perf-fixed`, 60 000 samples). Stated plainly per §7's own
+instruction: not rounded, not called "essentially zero".
+
+`mode :fixed-copy` was added so the number can be *attributed* — the same type through `take-samples`
+instead of `take-into`, which is the only comparison here that means anything:
+
+| arm | type | access path | B/sample |
+|---|---|---|---|
+| `:fixed-copy` | `perf-fixed` | `take-samples`, dropped | 462.1 / 464.2 / 463.1 |
+| `:into` | `perf-fixed` | `take-into` | **223.9 / 225.0 / 223.9** |
+
+- **~239 B/sample IS the access path** — what this ADR bought, on an identical type.
+- **~224 B/sample is NOT, and is unattributed.** It survives an access operation that allocates nothing of
+  its own, so it lives in the write path, the engine, or a receive site Tasks 5–7 did not touch. That is the
+  next hunt, and slice-2 work.
+
+⚠️ **A PREMISE OF §7.1 DID NOT REPRODUCE.** §7.1 justifies the new bench type by asserting `perf-data`'s
+zero-length sequence member costs "a measured 15.73 B/sample". Measured today on the COPY arm the two types
+are indistinguishable — `perf-data` 463.0 vs `perf-fixed` 463.1, against a ~1 B spread. The floor is not
+there. ADR 0093 slice 4 (decode into a recycled struct, slots reset in place) is the likely reason the
+figure went stale, but this measurement does not establish a cause and none is claimed.
+
+`perf-fixed` is still the right type, on grounds the test now pins rather than the stale one: its **4-octet**
+key takes the direct keyhash branch (a key over 16 octets, or any string key, takes MD5 at a measured
+255.6 B/call — and **neither `dsl.lisp` nor `md5.lisp` is in `HOTPATH_FILES`**, so that cost appears in no
+tracked inventory and the arm would simply never reach zero), and it has no size-dependent member that could
+give the arm a type-dependent floor later.
+
+`run-perf-fixed-shape-test` asserts both from the outside. The key branch is read off the **shape of the
+handle** (four big-endian key octets then twelve zeros — which an MD5 digest essentially cannot be);
+falsified with a string key, RED at `:pfs-key-direct`, first octet 17 rather than 1. ⚠️ The fixed-size check
+carries a **positive control** because sabotage cannot falsify it — adding a sequence member breaks the
+constructor, so the assertion is never reached and a red would prove nothing about the assertion; the
+control is `perf-data` at 4 vs 32 octets, which must serialize to *different* lengths through the same
+measurement.
+
 **Cross-DDS interop:** `take-into` changes **no wire surface**. The per-feature interop rule is discharged by
 no-regression against the existing Connext 7.3.1 and Fast DDS legs, stated rather than skipped.
 

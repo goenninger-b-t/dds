@@ -17,6 +17,7 @@
            #:mutable-corpus-capture #:run-mutable-publisher #:run-mutable-subscriber
            #:mem-per-sample
            #:perf-data #:make-perf-data
+           #:perf-fixed #:make-perf-fixed #:perf-fixed-id #:perf-fixed-a #:perf-fixed-b
            #:run-latency #:run-throughput #:run-bench #:run-bench-shmem #:run-bench-zerocopy
            #:run-bench-smoke #:run-bench-shmem-smoke #:run-bench-zerocopy-smoke
            #:run-keeplast-bench #:run-keeplast-bench-smoke))

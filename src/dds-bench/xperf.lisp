@@ -32,6 +32,27 @@
   ;; distinction the gate exists to enforce.
   (data (:sequence :octet)))
 
+;;; ADR 0105 §7.1: the FIXED-SIZE bench type, for the arm that must reach a genuine 0 B/sample.
+;;;
+;;; ⚠️ IT EXISTS BECAUSE PERF-DATA CANNOT REACH ZERO AND NEVER COULD. Its `data` member is a
+;;; (:sequence :octet), and a sequence member costs a measured ~15.7 B/sample even at LENGTH ZERO — the
+;;; decoder allocates the sequence object regardless. Measuring the into-arm on perf-data would therefore
+;;; report a floor that is a property of the TYPE, not of the access path, and slice 1's exit criterion
+;;; (a genuinely-0 arm) could never be met or falsified.
+;;;
+;;; ⚠️ THE KEY MUST STAY <= 16 OCTETS, AND THAT IS LOAD-BEARING RATHER THAN A DETAIL. %KEY-HASH-DEFUN
+;;; branches on (<= (%key-max-size keys) 16): at or under 16 the serialized key is copied DIRECTLY into the
+;;; handle and zero-padded; over 16 — or with a string key, whose max size is not an integer — it takes the
+;;; MD5 branch, which SUBSEQs the key bytes and hashes them, measured at 255.6 B/call on shape-type. Neither
+;;; dsl.lisp nor md5.lisp is in gate-hotpath's HOTPATH_FILES, so that allocation would not appear in the
+;;; tracked inventory: the arm would simply never reach zero and nothing would say why. ONE :i32 key = 4
+;;; octets. RUN-PERF-FIXED-SHAPE-TEST asserts the branch from the OUTSIDE — by the shape of the handle it
+;;; produces — rather than trusting this comment.
+(dds.gen:define-dds-type perf-fixed (:extensibility :final)
+  (id :i32 :key t)
+  (a :i64)
+  (b :i64))
+
 (defstruct* (echo-rv (:constructor %make-echo-rv))
   "Single-in-flight PING/PONG handoff between the pinger's main thread (waits) and the receiver thread that
    delivers the echo. RECV-NS is stamped the moment the pong lands; GOT guards a lost wakeup. Mirrors the
@@ -225,9 +246,10 @@
                                  :data-representation data-representation)))
 
 (defun* mem-per-sample (&key (domain 7) (samples 60000) (warmup 500) (payload-bytes 0)
-                             (return-loans nil))
+                             (return-loans nil) (mode nil))
     (function (&key (:domain (integer 0)) (:samples (integer 1)) (:warmup (integer 0))
-                    (:payload-bytes (integer 0)) (:return-loans t))
+                    (:payload-bytes (integer 0)) (:return-loans t)
+                    (:mode (member nil :into :fixed-copy)))
               double-float)
   "END-TO-END steady-state heap allocation, in BYTES PER SAMPLE, for the DCPS path a real application
    uses: write-sample -> the engine/transport -> the receiver thread -> take-samples. This is the number
@@ -240,6 +262,26 @@
    flip of this default as a ratchet re-baseline of BOTH arch rows and say so in bench/mem-ceiling.txt.
    It exists so the slice-1 wrapper pooling can be sized honestly: with it NIL nothing is ever returned, so
    no wrapper can be recycled and the pooling is measurably a no-op by construction.
+
+   MODE :INTO (ADR 0105) measures the THIRD access shape — DataReader::take into application-owned storage,
+   §2.2.2.5.3.8's max_len>0 / owns==TRUE variant: no loan, no return obligation, the middleware recycling
+   its own struct inside the call. RETURN-LOANS is irrelevant to it and ignored. Two things about this arm
+   are deliberate and neither is incidental:
+
+     * IT USES A DIFFERENT TYPE, PERF-FIXED, and that is not a shortcut. PERF-DATA carries a
+       (:sequence :octet), and a sequence member costs ~15.7 B/sample even at LENGTH ZERO because the
+       decoder allocates the sequence object regardless. On perf-data the into-arm would report a floor
+       belonging to the TYPE, not to the access path, and the slice's exit criterion — a genuinely-0 arm —
+       could be neither met nor falsified. ⚠️ COPY AND RETURN MEASURE PERF-DATA AND :INTO MEASURES
+       PERF-FIXED, so those numbers are NOT comparable to each other and each ratchets against its OWN
+       history. MODE :FIXED-COPY exists so the comparison that IS meaningful can be made — perf-fixed
+       through TAKE-SAMPLES, i.e. the same type as :INTO reached by the other access path. (:FIXED-COPY
+       minus :INTO) is then the access path's own contribution, and whatever :INTO still reads above zero
+       after that subtraction is NOT the access path and has to be hunted elsewhere. Without it the into
+       number is a bare figure nobody can attribute.
+     * THE DESTINATION VECTORS ARE ALLOCATED ONCE, BEFORE THE MEASURED WINDOW, because that is precisely
+       what the owns==TRUE contract says the application does. Allocating them per cycle would measure a
+       different API than the one this arm exists to characterise.
 
    It is deliberately NOT what `run-mem-test` measures. That measures the CODEC in isolation
    (serialize/deserialize/AEAD) and correctly reports ~0 B/iter — which is why `make mem` was green while
@@ -274,12 +316,14 @@
    real scale-dependence rather than the old readings' unknown quanta is NOT established — measured 0-quantum
    floors move ~+57 B on arm64 and ~-9 B on x86_64 across 3000 -> 60000, not even in the same direction. Treat
    any pre-60000 number as non-comparable, and never derive one arch's ceiling from the other's."
-  (let* ((ts (dds.types:find-type-support "perf-data"))
+  (let* ((intop (eq mode :into))
+         (fixedp (member mode '(:into :fixed-copy)))
+         (ts (dds.types:find-type-support (if fixedp "perf-fixed" "perf-data")))
          (pw (dds.dcps:create-participant :domain domain :autonomous t :advertise-address "127.0.0.1"))
          (pr (dds.dcps:create-participant :domain domain :autonomous t :advertise-address "127.0.0.1")))
     (unwind-protect
-         (let* ((tw (dds.dcps:create-topic pw "PerfPing" "PerfData" ts))
-                (tr (dds.dcps:create-topic pr "PerfPing" "PerfData" ts))
+         (let* ((tw (dds.dcps:create-topic pw "PerfPing" (if fixedp "PerfFixed" "PerfData") ts))
+                (tr (dds.dcps:create-topic pr "PerfPing" (if fixedp "PerfFixed" "PerfData") ts))
                 (dw (dds.dcps:create-datawriter
                      (dds.dcps:create-publisher pw) tw
                      :qos (dds.qos:make-writer-qos :reliability :reliable
@@ -288,7 +332,13 @@
                      (dds.dcps:create-subscriber pr) tr
                      :qos (dds.qos:make-reader-qos :reliability :reliable
                                                    :history-kind :keep-last :history-depth 1)))
-                (sample (make-perf-data :id 1 :data (%perf-payload payload-bytes))))
+                (sample (if fixedp
+                            (make-perf-fixed :id 1 :a 1 :b 2)
+                            (make-perf-data :id 1 :data (%perf-payload payload-bytes))))
+                ;; ADR 0105: the into-arm's destinations are the APPLICATION's, allocated ONCE here —
+                ;; OUTSIDE the measured window, which is the whole point of the owns==TRUE variant.
+                (into-data  (when intop (vector (make-perf-fixed :id 0 :a 0 :b 0))))
+                (into-infos (when intop (vector (dds.dcps:make-sample-info)))))
            (loop with deadline = (+ (get-universal-time) 30)
                  until (and (plusp (dds.dcps:matched-count pw)) (plusp (dds.dcps:matched-count pr)))
                  do (when (> (get-universal-time) deadline)   ; NOCOND(BENCH): pure perf-harness precondition — a measurement that never matched is the bench's own failure
@@ -297,12 +347,17 @@
                     (sleep 0.05))
            (flet ((cycle ()
                     (dds.dcps:write-sample dw sample)
-                    (loop repeat 200
-                          for got = (dds.dcps:take-samples dr)
-                          until got
-                          do (sleep 0.0002)
-                          finally (when (and return-loans (listp got))   ; ADR 0093: an application that honours the loan contract
-                                    (dds.dcps:return-loan dr got)))))
+                    (if intop
+                        (loop repeat 200
+                              for n = (dds.dcps:take-into dr into-data into-infos)
+                              until (plusp n)
+                              do (sleep 0.0002))   ; no loan, no return obligation — that IS the arm
+                        (loop repeat 200
+                              for got = (dds.dcps:take-samples dr)
+                              until got
+                              do (sleep 0.0002)
+                              finally (when (and return-loans (listp got))   ; ADR 0093: an application that honours the loan contract
+                                        (dds.dcps:return-loan dr got))))))
              (dotimes (i warmup) (cycle))
              (let ((before (dds.pal:bytes-consed)))
                (dotimes (i samples) (cycle))
