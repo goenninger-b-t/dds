@@ -62,6 +62,50 @@ sharpest hazard itself: the DEADLINE retention path is **conditional** — under
 `DURATION_INFINITE` it arms nothing, so a wrongly-recycled handle would look correct until someone
 configured a finite DEADLINE.
 
+## After ADR 0106: the core enumerated down to TWO sites
+
+ADR 0106 closed ~32 of the keyed 43. Re-bisected, the write path is now ~80 B common core + ~12 keyed
+residue + ~12 reliable — so the **core is the whole remaining story**, and it is present *unkeyed* and
+*best-effort*, i.e. it is neither the keyhash nor the reliable bookkeeping.
+
+`sb-sprof :mode :alloc` over 40 000 no-peer writes finds **exactly two** allocating sites:
+
+| site | % of alloc events |
+|---|---|
+| `DDS.DISC:PUBLISH-SAMPLE-INTO` | **60.4** |
+| `DDS.RTPS.HISTORY:HC-ADD-CHANGE` | **39.6** |
+
+48 sampled regions ≈ 3072 kB over 40 000 writes = **~78.6 B/sample**, which is the ~80 B core — so the two
+sites account for it, split roughly **~47 B** and **~31 B**.
+
+⚠️ Used strictly to ENUMERATE. The profiler charges callee allocation to caller frames and ranks EVENTS not
+BYTES ([[dds-allocation-campaign-lessons]]); with only two frames the list is trustworthy as a *list*, and
+nothing here is sized from its ordering.
+
+### The leading candidate, and a gate that does not catch it
+
+`publish-sample-into`'s pooled arm is **`handler-case` nested inside `unwind-protect`**:
+
+```lisp
+(unwind-protect
+     (handler-case (let ((len (funcall serialize-fn buf))) …)
+       (dds.core.buffer:buffer-overflow () …))
+  (unless committed (writer-release-payload-buffer writer buf)))
+```
+
+That is precisely the ADR 0098 shape — *"no single construct allocates; only the NESTING does"*, measured
+there at 16 B/call, and the reason `%ensure-secured-payload-pool` a few lines below carries a comment about
+an NLX through a writer lock heap-allocating the handler closure **on every call**.
+
+⛔ **`make gate-nlx` — the gate built for exactly this defect — does NOT flag this site.** It passes with
+*"26 to go in the ratcheted set"* and its output names no `dataplane.lisp` line. So either the site is
+outside the gate's scanned set or its form-walker does not match this shape. **That gap is worth more than
+the bytes**: the gate exists so this pattern cannot reappear, and here it is on the hottest write path.
+
+**Not yet verified as the cause** — it is a hypothesis with two independent supports (the profiler ranks the
+frame first; the shape is a documented, measured defect). Confirm by A/B, per the campaign rule that the
+source sizes and `gate-mem` confirms.
+
 ## Where in the write path it is *not*
 
 `write-sample` → `%publish-one` already serializes **straight into the writer's arena-pooled buffer** through
