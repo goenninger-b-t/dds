@@ -64,11 +64,19 @@ structs. `max_len` is `(length data)` in this PSM; there is no separate argument
 
 Nothing signals: `(values count status)` throughout (`gate-nocond` ratchet is at 0).
 
-**At an index whose sample has `valid_data = FALSE`** only the key fields are meaningful. The middleware
-wrapper carries `data = NIL` there (`entities.lisp:2254`, `2258`); with `take-samples` the application sees a
-literal `NIL` it cannot miss, but a pre-allocated destination would otherwise retain the **previous**
-sample's contents. Spec-legal, but a real divergence: it is part of the documented contract, and the copy
-step must not fault on a NIL source.
+**At an index whose sample has `valid_data = FALSE`, NOTHING in the destination sample is meaningful — not
+even the key fields.** The middleware wrapper carries `data = NIL` there (`entities.lisp:2254`, `2258`), so
+there is nothing to copy and the destination is left exactly as the previous call left it: it holds some
+*earlier* sample's fields, and on a multi-instance reader that is a **different instance's key**. With
+`take-samples` the application sees a literal `NIL` it cannot miss; a pre-allocated destination cannot. The
+instance is identified **solely** by `SampleInfo.instance_handle` (with `get_key_value` available to turn
+that handle into a key sample). Spec-legal, but a real divergence: it is part of the documented contract,
+and the copy step must not fault on a NIL source.
+
+⚠️ **An earlier draft of this clause said "only the key fields are meaningful", and that was wrong in a way
+its own test could not see** — the test disposed the same instance whose sample the destination last held,
+so a stale key and a correctly-filled key were indistinguishable. The arm now establishes a *second*
+instance in between, and asserts the destination's key is the **other** instance's.
 
 ## 4. The mechanism, and the hazards that shape it
 
@@ -95,6 +103,24 @@ for exactly this reason.
 **Decision: a `was-exposed` bit on `cached-sample`**, set whenever a wrapper is handed to the application by
 any read/take path. `take-into` recycles only structs whose bit is clear. State-mask semantics are untouched;
 a previously-read sample is still *taken*, merely not recycled, so that one allocates.
+
+⚠️ **"ANY READ/TAKE PATH" IS THREE PATHS, NOT ONE, AND THE FIRST CUT WIRED ONLY ONE.** The set is exactly the
+set `%note-accessed` is called from — its docstring already enumerated them: `%select-samples-unlocked`
+(`read-samples` / `take-samples` and the six `_instance`/`_next` entries), **`take-loaned`** and
+**`read-loaned`**. `read-loaned` is the dangerous member and it is not the obvious one:
+
+- it hands the application the middleware's **pooled deserialized struct**, exactly as `read-samples` does;
+- it **leaves the wrapper in `dr-cache`**, so the default `(:read :not-read)` mask re-selects it; and
+- for a plain copy-backed sample it registers **nothing** in `dr-loans` / `dr-secured-loans`, so §4.4's
+  outstanding-loan refusal — the guard that would otherwise have covered for the missing latch — does not
+  fire.
+
+Measured on the working tree with the latch set only in `%select-samples-unlocked`: after `read-loaned`, a
+`take-into` was accepted, recycled the struct, and the next delivery decoded into it — the application's held
+sample went from `v=7 tag="held"` to `v=100 tag="ovr100"` with no error and no test red.
+`take-loaned` needs the latch only for symmetry (it empties `dr-cache`, so its wrappers are unreachable to a
+later selection); it is set there anyway, because the rule is *a sample leaving the middleware latches*, not
+*a sample whose omission currently bites latches*.
 
 ⚠️ **It is a BIT, not a slot, and that is measured rather than stylistic.** It shares one packed `flags` slot
 with ADR 0093's `data-pinned` (`+cs-flag-was-exposed+` / `+cs-flag-data-pinned+`). Added as its own boolean
@@ -133,6 +159,18 @@ generally** (never bind the slot). `take-into` refuses a loan-capable reader in 
 `%drain-one-sample` pins the first delivered struct per instance as that instance's key holder (`3244-3246`),
 honoured on recycle via `cached-sample-data-pinned` (`609`). Bypassing it rewrites the instance's key under
 `get_key_value` on the next delivery — silent, application-visible, covered by no existing test.
+
+⚠️ **The destructive half is NOT atomic, and slice 1 records that rather than hiding it.** The recycle for
+sample *i* runs inside the copy loop while the `dr-cache` commit runs after it, so a non-local exit part-way
+through leaves earlier wrappers **both** parked on the wrapper pool **and** still listed in the cache — one
+wrapper describing two samples, plus a `valid_data = T` entry whose `data` is `NIL`. That state was
+*reproduced* on the working tree, reached by the most ordinary application mistake (a destination vector of
+zeros). §6.1's destination validation closes **every trigger the middleware controls**; what remains is an
+application-supplied `WHERE` predicate that itself signals, which is out of contract for every access
+operation here and harmless for the list-returning ones because they do nothing destructive before their own
+commit. Making it unconditionally atomic means deferring the recycles past the commit — a hot-path change,
+which under `FR-LANG-7` needs a before/after measurement, so it is **slice 2 work**, not an unmeasured
+tidy-up.
 
 ### 4.6 Not a hazard — recorded so it is not re-investigated
 
@@ -182,6 +220,32 @@ range: a vendor bit must **not** be parked in those holes.
 
 and the generator emits a per-type `copy-into-<name>` bound to it.
 
+**`type-support` gains a SECOND slot, added during slice 1's review and recorded here rather than left
+silent:**
+
+```lisp
+;; ADR 0105: the generated <name>-P structure predicate. take-into VALIDATES each application-supplied
+;; destination element with it. Bound for EVERY type, FlatData included.
+(sample-p nil :type (or null function))
+```
+
+**Why a predicate had to exist at all, and why NIL-testing was not enough.** `copy-into-<name>` is declaimed
+`(function (<name> <name>) <name>)` and `%copy-sample-info-into` is `(sample-info sample-info)`;
+`entities.lisp` carries no `(safety 0)`, so a wrong-typed destination element makes SBCL signal a
+**`TYPE-ERROR` out of the middle of the copy loop** — a Lisp condition escaping `src/`, which the standing
+order forbids outright, and which `gate-nocond` cannot see because it is raised by a type declaration in
+generated code rather than by a signalling form. It is not a theoretical shape: `(make-array 32)` is the
+obvious reading of "vectors the application allocates once", and SBCL fills a simple-vector with **zeros**,
+so the *first* element faults. A NIL test would therefore not have caught the most likely mistake — hence a
+type predicate, not a null check. `take-into` validates indices `0..max_samples-1` of both vectors up front
+and returns `PRECONDITION_NOT_MET`; elements past that bound are deliberately not examined, and that is
+asserted too.
+
+The generator now names the predicate explicitly (`(:predicate <name>-p)`) instead of relying on
+`defstruct`'s default, so the vtable binding does not depend on where the symbol happens to intern. The
+emitted name is identical to the previous default, so existing users of `mline-p` / `mpoint-p` are
+unaffected.
+
 **Why a vtable slot and not a generic function:** the hot path is CLOS-free (NFR-CLOS); a `defgeneric`
 copier is barred outright. The `type-support` struct *is* the manual vtable (`IMPLEMENTATION-PLAN.md` §7.3).
 
@@ -199,17 +263,20 @@ per-reader `dr-data-pool`.
 | consumer | impact |
 |---|---|
 | `src/dds-gen/dsl.lisp` — the **only production constructor** | binds the new slot; emits `copy-into-<name>` |
-| `src/dds-types/type-support.lisp` (defstruct) + `packages.lisp` (export) | the slot + its export |
+| `src/dds-types/type-support.lisp` (defstruct) + `packages.lisp` (export) | **two** slots + their exports |
 | `src/dds-tests/xtypes-test.lisp` ×2, `src/dds-tests/integration-test.lisp` ×1 | **no change** — see below |
 | every reader of the other 18 slots | **no change** |
 
-**The migration is empty, and that is a property of the change, not an accident.** `make-type-support` is a
-keyword constructor, so an added slot defaults to `NIL` in every existing call. **Precedent: ADR 0093 slice 4
+**The migration is empty for both slots, and that is a property of the change, not an accident.**
+`make-type-support` is a keyword constructor, so an added slot defaults to `NIL` in every existing call. **Precedent: ADR 0093 slice 4
 added the `deserialize-into` slot to this same frozen struct the same way** (`type-support.lisp:39`). The
 frozen-contract gate applies because the struct shape is frozen — not because the change breaks anyone.
 
 ⚠️ **What a consumer MUST NOT assume:** `copy-into` is `NIL` for a FlatData type, exactly as
-`deserialize-into` is. A caller must test it, not assume it is bound.
+`deserialize-into` is, and both new slots are `NIL` on any hand-built `type-support`. A caller must test
+them, not assume they are bound. `%access-into` refuses a reader whose type-support lacks **either**, in one
+clause: without `sample-p` the destinations cannot be validated, so proceeding would mean skipping a refusal
+the contract promises.
 
 ## 7. Slices
 
@@ -272,9 +339,33 @@ state-mask/WHERE filtering, and are gated pending counsel).
 Every gate falsified and seen red: the copy is a real deep copy (not an alias) · every slot copied, observed
 **at the copy** rather than through a later read (ADR 0093 covered 10 of 13 slots *while appearing to cover
 all*) · `read`-then-`take-into` leaves read samples intact · `get_key_value` survives · a loan-capable reader
-is refused · an invalid-data index carries key fields only and does not fault · both spec refusals · a
-concurrent `take-into` from an `on_data_available` listener on the receiver thread · the ratcheted zero arm ·
-and both existing `gate-mem` rows unchanged.
+is refused · an invalid-data index does not fault and leaves the destination untouched · both spec refusals ·
+a `take-into` from an `on_data_available` listener · the ratcheted zero arm · and both existing `gate-mem`
+rows unchanged.
+
+### 8.1 What slice 1's review added, each falsified
+
+| arm | falsified by | observed red |
+|---|---|---|
+| `read-loaned` then `take-into` (§4.1's third path) | deleting the latch in `read-loaned` | `:tie-latched` |
+| …and its payload | deleting the `was-exposed` test in the recycle guard | `:tie-not-corrupted` — the held sample read `v=100 tag="overwrite"` |
+| destination elements validated | deleting the `%into-destinations-ready-p` clause | `:ti-dest-zeros`; with samples cached, `TYPE-ERROR` + a wrapper in **both** cache and pool |
+| the destination-length bound | `(or max-samples (length data))` → `max-samples` | unhandled `TYPE-ERROR` (index past the app's vector) |
+| the same bound, the form §7 names | `(< n max)` → `(<= n max)` | unhandled `INVALID-ARRAY-INDEX-ERROR` |
+| the `dr-loans` half of the loan refusal | deleting that disjunct | `:ti-outstanding-zc-loan-refused` |
+| the NIL-source guard | deleting `(when d …)` | unhandled `TYPE-ERROR` |
+| the invalid-data arm's own precondition | removing the intervening second instance | `:ti-invalid-setup` |
+| `take-into` from a listener, **writer-vanished** path | putting the wake back inside `%with-reader-cache` | `:til-no-conditions` — `(:EXIT (:CONDITION SIMPLE-ERROR))` |
+
+⚠️ **The listener requirement found a PRE-EXISTING defect that this ADR's own §4.2 had assumed away.**
+§4.2 cites `on_data_available` listeners calling take as the justification for doing the copy and the recycle
+inside the reader cache lock — but `%on-writer-vanished` fired that notification **from inside**
+`%with-reader-cache`, which is not recursive, so a matched remote writer merely vanishing threw
+`"Recursive lock attempt"` into the discovery thread of any application using the listener idiom. It hit
+`take-samples` identically and had nothing to do with `take-into`; it survived because the *other* two firing
+sites are outside the lock and nothing exercised this one. The notification is now collected inside the
+critical section and fired after it — the discipline `%prune-participant-locked` already uses for the node
+lock — and both firing paths are exercised.
 
 **Cross-DDS interop:** `take-into` changes **no wire surface**. The per-feature interop rule is discharged by
 no-regression against the existing Connext 7.3.1 and Fast DDS legs, stated rather than skipped.
@@ -286,3 +377,13 @@ Every file:line here was verified against the working tree on 2026-08-06 by a pa
 on the receiver thread (§4), `deserialize-into-<name>` is already live (§4.4), and the `read`/`take-into`
 aliasing hazard (§4.1), which no earlier draft contained. Two more corrected its numbers: the ≈112 B floor
 (§7) and the absence of a standard status for an over-large sample (§5).
+
+A second review pass over slice 1's Tasks 3–4 (2026-08-06) produced the amendments in §3, §4.1, §4.5, §6 and
+§8.1. Each was **reproduced against the working tree before being accepted** — the `read-loaned` corruption,
+the escaping `TYPE-ERROR` with the doubly-owned wrapper, and the recursive-lock error — and each fix was then
+seen red with the fix removed. Two review recommendations were **not** taken and are recorded instead of
+being silently dropped: making the destructive half unconditionally atomic (§4.5 — a hot-path change owing a
+measurement, so slice 2), and earning a real Zero-Copy loan for the `dr-loans` refusal arm rather than
+planting one (the registry membership *is* the predicate the production check reads, and a planted entry
+tests it without making the arm depend on a live SHMEM fixture; the arm's stale claim that a real loan would
+have required a platform-gated test — false since ADR 0103 closed the Clasp gap — has been removed).

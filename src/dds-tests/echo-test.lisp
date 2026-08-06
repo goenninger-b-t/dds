@@ -4161,6 +4161,11 @@
                  ("rx-store-consumers"       . run-rx-store-consumers-test)
                  ("reader-cache-race"        . run-reader-cache-race-test)
                  ("rx-data-pool"             . run-rx-data-pool-test)
+                 ("take-into"                . run-take-into-test)          ; ADR 0105 slice 1
+                 ("take-into-poison"         . run-take-into-poison-test)   ; ADR 0105 Task 4
+                 ("take-into-truncate"       . run-take-into-truncate-test) ; ADR 0105 the destination bound
+                 ("take-into-exposure"       . run-take-into-exposure-test) ; ADR 0105 §4.1 via read-loaned
+                 ("take-into-listener"       . run-take-into-listener-test) ; ADR 0105 §8 listener re-entry
                  ("rtps-discovery-spdp"      . dds.rtps.discovery:run-discovery-test)
                  ("rtps-discovery-sedp"      . dds.rtps.discovery:run-sedp-test)
                  ("rtps-data-representation-wire" . dds.rtps.discovery:run-data-representation-wire-test)

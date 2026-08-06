@@ -44,6 +44,10 @@
   ;; ADR 0105: (src dst) -> fills DST from SRC in place, DEEP for every reference slot, returns DST. NIL for
   ;; a FlatData type, whose sample IS a buffer — take-into refuses such a reader in slice 1.
   (copy-into nil :type (or null function))
+  ;; ADR 0105: the generated <name>-P structure predicate. take-into VALIDATES each application-supplied
+  ;; destination element with it and refuses PRECONDITION_NOT_MET, because copy-into's declared argument
+  ;; type would otherwise fault on a wrong-typed element and no Lisp condition may escape src/.
+  (sample-p nil :type (or null function))
   (serialized-size nil :type (or null function))
   (key-hash nil :type (or null function))
   (typeobject nil :type t)

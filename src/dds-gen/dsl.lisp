@@ -763,6 +763,7 @@
          (sszi (%sym pkg "%SSIZE-" (string name)))
          (dnto (%sym pkg "DESERIALIZE-INTO-" (string name)))
          (cpto (%sym pkg "COPY-INTO-" (string name)))
+         (pred (%sym pkg (string name) "-P"))
          (khf  (%sym pkg "KEY-HASH-" (string name)))
          (khf-fd (%sym pkg "KEY-HASH-" (string name) "-FD"))
          (keys (remove-if-not (lambda (m) (getf m :key)) parsed))
@@ -816,7 +817,9 @@
            (fd-acc (m) (%sym pkg (string name) "-" (string (getf m :slot)) "-FD")))
       (declare (ignorable #'fd-acc))
       `(progn
-         (defstruct (,name (:constructor ,ctor))
+         ;; :PREDICATE is named rather than defaulted because ADR 0105 binds it into the type-support
+         ;; vtable — a defstruct default would leave the vtable depending on where the symbol interns.
+         (defstruct (,name (:constructor ,ctor) (:predicate ,pred))
            ,@(loop for m in parsed
                    collect `(,(getf m :slot) ,(getf m :default) :type ,(getf m :ltype))))
          ;; A bounded string member gains its bound as a constant and a CHECKED setter. The plain
@@ -1321,6 +1324,10 @@
              ;; ADR 0105: the app-destination copier for take-into. NOT bound for a FlatData type — its
              ;; sample IS a buffer, so take-into refuses such a reader in slice 1.
              :copy-into ,(unless flatp `(function ,cpto))
+             ;; ADR 0105: the structure predicate take-into validates each app-supplied destination with.
+             ;; Bound for EVERY type, FlatData included — it answers "is this one of my samples?", which is
+             ;; well-defined there too, and a caller must never have to ask which slots a type binds.
+             :sample-p (function ,pred)
              :serialized-size (function ,(if flatp fd-ssz ssz))
              :key-hash ,(when keys `(function ,(if flatp khf-fd khf)))
              ;; WP-DATA-REPRESENTATION (R6): the FlatData TX-transcode for a non-XCDR2 offered rep

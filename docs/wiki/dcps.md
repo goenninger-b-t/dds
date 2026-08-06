@@ -161,6 +161,7 @@ source docstrings (`src/dds-dcps/*.lisp`); the docstrings are the contract.
 | `dds.dcps:unregister-instance` (`dw sample-or-handle`) | `DataWriter::unregister_instance` (DDS 1.4 §2.2.2.4.2.7) — unregister the instance over the reliable engine. Per `WRITER_DATA_LIFECYCLE.autodispose_unregistered_instances` (§2.2.3.21, default **TRUE**) the unregister also **disposes** the instance: the no-payload `DATA` carries StatusInfo `Disposed\|Unregistered` (0x03) so readers report `NOT_ALIVE_DISPOSED`; with autodispose `FALSE` it carries `Unregistered` (0x02) only. Returns the handle. |
 | `dds.dcps:read-samples` (`dr &key states view-states instance-states where`) | `DataReader::read` (DDS 1.4 §2.2.2.5.3.1) — return the cached samples matching the **three DDS state masks** — `states` (sample_state, default `+any-sample-states+`), `view-states` (default `+any-view-states+`), `instance-states` (default `+any-instance-states+`) — and satisfying `where`, **without** removing them; each is marked `:read` and has its `view_state` + `instance_state` stamped from the reader's **current** per-instance state (DDS 1.4 §2.2.2.5.4: the SampleInfo fields are computed when the samples are *returned*, not frozen at delivery — so a sample received while its instance was ALIVE reports NOT_ALIVE_DISPOSED once the instance is disposed). Every mask defaults to its `ANY_*_STATE`, so the default call selects everything. |
 | `dds.dcps:take-samples` (`dr &key states view-states instance-states where`) | `DataReader::take` — like `read-samples` (same three state masks) but **removes** the returned samples from the cache. **ADR 0093:** the returned wrappers are *loans* — hand them to `return-loan` when done and the reader recycles them, wrappers and sample struct alike (**−203 B/sample measured**); not returning them is safe and simply allocates a fresh wrapper next time. |
+| `dds.dcps:take-into` / `read-into` (`dr data infos &key states view-states instance-states where max-samples`) | **ADR 0105 — a take is not a loan.** `DataReader::take` / `read` into **application-owned storage**: the DDS 1.4 §2.2.2.5.3.8 `max_len > 0 && owns == TRUE` variant, the one our list-returning `take-samples` is *not*. `data` and `infos` are vectors you allocate **once** and reuse forever; the call fills elements `0..count-1` **in place** and returns `(values COUNT STATUS)`. **No loan, no return obligation** — the middleware recycles its own decoded struct inside the same call, which the loan variant structurally cannot. `max-samples` defaults to `nil` = `LENGTH_UNLIMITED` = `(length data)`. **The elements must already be constructed objects** — a sample of the reader's type and a `sample-info`; the call fills them, it does not create them, so `(make-array 32)` is not a valid destination. `STATUS` is `nil` on success, `+retcode-no-data+` with `COUNT 0` when nothing matched, `:not-enabled` on a disabled reader, and `+retcode-precondition-not-met+` when the two vectors differ in length (rule 1), when `max-samples` exceeds `(length data)` (rule 5), when a destination element is not a constructed sample / `sample-info`, on a FlatData type, or — in slice 1 — on a reader holding an outstanding Zero-Copy / secured loan. `read-into` is the non-destructive twin: same lambda list, same refusals, samples stay cached. |
 | `dds.dcps:samples-available` (`dr`) | Drain newly-received samples into the cache and return the cache size, **without** marking anything `:read` — for polling before a read/take. |
 | `dds.dcps:lookup-instance` (`endpoint key-holder`) | `DataWriter/DataReader::lookup_instance` (DDS 1.4 §2.2.2.4.2.13 / §2.2.2.5.2.14, WP-DCPS-API-COMPLETION S5) — the 16-octet handle the middleware associates with the instance keyed by `key-holder`, or `+instance-handle-nil+` when the endpoint knows no such instance (registered/written on a writer, delivered on a reader). |
 | `dds.dcps:get-key-value` (`endpoint handle`) | `DataWriter/DataReader::get_key_value` (§2.2.2.4.2.12 / §2.2.2.5.2.13, S5) — a representative sample carrying the **key fields** of the instance named by `handle`, or `NIL` (BAD_PARAMETER) when unknown. The handle is a one-way keyhash, so the key holder is the sample the writer registered/wrote or the reader's retained per-instance key sample. |
@@ -217,6 +218,53 @@ query. That costs one struct per *instance*, not per sample.
 **It is a `should`, not a `must`.** An unreturned wrapper is never recycled, so the next delivery allocates
 a fresh one — exactly the pre-ADR-0093 behaviour. There is no failure mode for a caller that ignores this,
 which is why existing code needed no migration.
+
+### A take that is not a loan — `take-into` / `read-into` (ADR 0105)
+
+`take-samples` returns a fresh **list** of middleware-owned wrappers, so even at its best it conses the list
+and defers the recycle until you `return-loan`. `take-into` is the DDS variant where **you** own the
+collections: allocate them once, reuse them forever, and there is nothing to give back.
+
+```lisp
+(let ((data  (coerce (loop repeat 32 collect (make-my-type)) 'simple-vector))
+      (infos (coerce (loop repeat 32 collect (dds.dcps:make-sample-info)) 'simple-vector)))
+  (loop
+    (multiple-value-bind (n status) (dds.dcps:take-into dr data infos)
+      (case status
+        ((nil) (dotimes (i n)
+                 (let ((si (svref infos i)))
+                   (if (dds.dcps:sample-info-valid-data si)
+                       (handle (svref data i) si)
+                       ;; NOTHING in (svref data i) is meaningful here — not even the key.
+                       (handle-lifecycle (dds.dcps:sample-info-instance-handle si) si)))))
+        (:no-data (return))                                        ; nothing matched; the vectors are untouched
+        (t (report status))))))                                    ; a refusal; nothing was written
+```
+
+**Three things to know, each of which is a real trap rather than a style note:**
+
+- **⚠️ Always test `sample-info-valid-data` before reading *any* field of the destination sample.** At an
+  invalid-data index — a dispose or unregister — the middleware has no sample to copy, so the destination is
+  left **exactly as the previous call left it**: it holds some earlier sample's fields, and on a
+  multi-instance reader that is a *different instance's key*. **Nothing there is meaningful, key fields
+  included.** The instance is identified solely by `sample-info-instance-handle` (feed it to
+  `get-key-value` if you need the key). `take-samples` hands back a literal `nil` you cannot miss; a
+  pre-allocated destination cannot, so this is part of the documented contract.
+- **The vectors' elements are your responsibility, and they are checked.** Every index the call could write
+  must already hold a constructed sample and a constructed `sample-info` — `(make-array 32)` gives you 32
+  zeros, which is refused with `+retcode-precondition-not-met+` rather than faulting inside the middleware.
+  Build them the way the example above does.
+- **A refusal writes nothing.** Every `+retcode-precondition-not-met+` is decided before the first copy, so
+  `COUNT 0` after a refusal means exactly that: the vectors are untouched, and nothing was consumed.
+- **`read-into` recycles nothing, and that is deliberate.** The wrapper it copied out of is still a live
+  cache entry, so parking it would let the next delivery overwrite a sample the cache still lists. It costs
+  no allocation either — it simply recovers none. Only `take-into` recycles, and only for a wrapper no
+  earlier `read-samples` handed you: a sample you are still holding is *taken* but not recycled.
+
+Slice 1 refuses a **loan-capable** reader (Zero-Copy / FlatData / secured) with
+`+retcode-precondition-not-met+` — a FlatData sample *is* a buffer, and copying a `flatdata-view` into the
+struct pool would never `%zc-release` its slot. Widening to those arms is a later slice, as is growing a
+variable-size member's destination in chunks to a ceiling instead of reallocating it.
 
 **Two rules the implementation enforces, worth knowing:**
 

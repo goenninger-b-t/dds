@@ -225,3 +225,28 @@
   "ADR 0093 slice 4 isolation offset: the pooled deserialized-sample path. The assertion is that an
    instance's retained get_key_value key sample survives later deliveries decoding into pooled structs, so
    a foreign participant's samples on the domain would muddy which struct came from where.")
+
+(defconstant +td-take-into+ 55
+  "ADR 0105 slice 1 isolation offset: TAKE-INTO / READ-INTO. The assertions count EXACTLY how many samples
+   one call wrote and which wrapper the reader recycled, so a foreign participant's sample on the domain
+   would change both.")
+
+(defconstant +td-take-into-poison+ 56
+  "ADR 0105 Task 4 isolation offset: the SampleInfo poison arm. It takes ONE sample into a sentinel-filled
+   destination and asserts no sentinel survives; a second, foreign sample would be written over the first
+   and the surviving-sentinel set would stop meaning what the test says it means. Distinct from
+   +td-take-into+ so the two into tests never share a domain (the standing order).")
+
+(defconstant +td-take-into-truncate+ 57
+  "ADR 0105 slice 1 isolation offset: the destination-length bound. The arm writes EXACTLY one more sample
+   than the destination has slots and asserts the surplus stayed cached, so one foreign sample on the
+   domain would change the count on both sides of the bound and the arm would stop testing the bound.")
+
+(defconstant +td-take-into-exposed+ 58
+  "ADR 0105 §4.1 isolation offset: the READ-LOANED-then-TAKE-INTO hazard. The arm holds one specific
+   struct across further deliveries and asserts its fields never change, so a foreign sample decoded into
+   a pooled struct on this domain is indistinguishable from the defect being tested.")
+
+(defconstant +td-take-into-listener+ 59
+  "ADR 0105 §8 isolation offset: TAKE-INTO called from an ON_DATA_AVAILABLE listener. The arm counts
+   listener entries against listener exits, and a foreign participant's traffic fires the same listener.")

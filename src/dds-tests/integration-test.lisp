@@ -13649,3 +13649,600 @@
       (dds.dcps:delete-participant pw)
       (dds.dcps:delete-participant pr))
     t))
+
+;;; ---- ADR 0105 slice 1: take-into / read-into (the NON-LOAN access operations) ----
+
+(dds.gen:define-dds-type tinto (:extensibility :final)
+  (k :i32 :key t)
+  (v :i32)
+  (tag :string))
+
+(defun* %ti-pair (offset)
+    (function ((integer 0)) (values t t t t))
+  "Two matched participants on a RELIABLE / KEEP_ALL tinto topic, returned as
+   (values WRITER-PARTICIPANT READER-PARTICIPANT DATAWRITER DATAREADER). OFFSET is the +td-*+ isolation
+   offset — the standing order is that concurrently-running tests never share a DDS domain."
+  (let* ((ts (dds.types:find-type-support "tinto"))
+         (pw (dds.dcps:create-participant :domain (test-domain offset)))
+         (pr (dds.dcps:create-participant :domain (test-domain offset)))
+         (dw (dds.dcps:create-datawriter
+              (dds.dcps:create-publisher pw) (dds.dcps:create-topic pw "TakeInto" "tinto" ts)
+              :qos (dds.qos:make-writer-qos :reliability :reliable :history-kind :keep-all)))
+         (dr (dds.dcps:create-datareader
+              (dds.dcps:create-subscriber pr) (dds.dcps:create-topic pr "TakeInto" "tinto" ts)
+              :qos (dds.qos:make-reader-qos :reliability :reliable :history-kind :keep-all))))
+    (loop repeat 250 until (and (plusp (dds.dcps:matched-count pw)) (plusp (dds.dcps:matched-count pr)))
+          do (dds.dcps:spin pw) (dds.dcps:spin pr) (sleep 0.02))
+    (values pw pr dw dr)))
+
+(defun* %ti-settle (pw pr dr want)
+    (function (t t t (integer 0)) (integer 0))
+  "Spin both participants until DR's cache holds at least WANT samples, returning the cache size reached.
+   SAMPLES-AVAILABLE counts the WHOLE cache (read and not-read alike), which is what the into tests need:
+   a READ-SAMPLES leaves its sample cached and a later TAKE-INTO still selects it."
+  (loop repeat 300 until (>= (dds.dcps:samples-available dr) want)
+        do (dds.dcps:spin pw) (dds.dcps:spin pr) (sleep 0.01))
+  (dds.dcps:samples-available dr))
+
+(defun* %ti-drain-empty (dr data infos)
+    (function (t simple-vector simple-vector) t)
+  "TAKE-INTO repeatedly until nothing is left, so a following arm starts from a known-empty cache."
+  (loop repeat 20 until (zerop (dds.dcps:take-into dr data infos)))
+  t)
+
+(defun* run-take-into-test ()
+    (function () t)
+  "Test: ADR 0105 slice 1 — TAKE-INTO / READ-INTO fill APPLICATION-OWNED vectors in place, report a count,
+   impose every refusal the ADR §3 contract table pins, recycle the middleware's struct when and ONLY when
+   it is safe to, and never corrupt a sample an earlier READ handed the application.
+
+   (1) THE TWO SPEC REFUSALS. DDS 1.4 §2.2.2.5.3.8 rule 1 (the two collections must be one-to-one) and
+       rule 5 third bullet (max_len must be able to hold max_samples) are both PRECONDITION_NOT_MET, and
+       both must be decided BEFORE anything is written — a partially-filled destination after a refusal is
+       worse than the refusal, because the application has no count telling it how far the damage went.
+  (1b) THE DESTINATION ELEMENTS ARE VALIDATED, NOT ASSUMED. A vector of zeros, a NIL element and a
+       wrong-typed element are each refused with PRECONDITION_NOT_MET rather than faulting inside the
+       fully-typed copier — a Lisp condition escaping src/ is what the standing order forbids outright,
+       and a mid-loop fault also left a wrapper parked on the pool while still listed in the cache.
+       Elements PAST the max-samples bound are deliberately not examined; that is asserted too.
+   (2) NO_DATA ON AN EMPTY SELECTION, with COUNT 0 (§2.2.2.5.3). Not an error; the count is the contract.
+   (3) A LOAN-CAPABLE READER IS REFUSED (ADR 0105 §4.4). Exercised three ways, because the production
+       check is a disjunction and a single arm leaves the other disjuncts deletable: a FlatData topic
+       (no copy-into at all — its sample IS a buffer), an outstanding DR-LOANS entry (the Zero-Copy
+       registry, whose flatdata-view copied into the struct pool would never %ZC-RELEASE — precisely the
+       ADR 0096 slot leak), and an outstanding DR-SECURED-LOANS entry.
+   (4) THE HAPPY PATH FILLS IN PLACE. The destination is the SAME OBJECT the application allocated (asserted
+       by identity — a value check cannot tell filling from replacing), every field is the written sample's,
+       and the SampleInfo carries the selection-time states.
+   (5) THE RECYCLE HAPPENS — the positive control WITHOUT which (6) is vacuous. A wrapper the application
+       never held goes back on the reader's pool inside the same call, which is the whole reason this
+       operation can reach zero where the loan variant structurally cannot.
+   (6) ⭐ A PRIOR READ IS NOT CORRUPTED — the hazard ADR 0105 §4.1 exists for, and the one that no earlier
+       draft of the design contained. READ-SAMPLES is non-destructive and returns the cache's OWN wrappers;
+       the default sample-state mask is (:read :not-read), so a later TAKE-INTO re-selects them. Recycling
+       one hands its struct to the next delivery while the application is still reading it. Asserted twice:
+       the wrapper still points at its struct, AND that struct still holds ITS OWN values after a further
+       delivery has been decoded (which is what actually rewrites it).
+   (7) GET_KEY_VALUE SURVIVES (ADR 0105 §4.5) — the recycle goes through %RECYCLE-DELIVERY, which honours
+       the instance's pinned key holder. A raw %RX-DATA-PUSH would rewrite that instance's key on the next
+       delivery: silent, application-visible, covered by no other test.
+   (8) READ-INTO RECYCLES NOTHING and leaves the sample cached and re-readable. It must not: the wrapper it
+       copied out of is still a live cache entry, so parking it would let the next delivery overwrite a
+       sample the cache still lists."
+  (let ((fdp nil))
+    (multiple-value-bind (pw pr dw dr) (%ti-pair +td-take-into+)
+      (unwind-protect
+           (let ((data  (vector (make-tinto :k 0 :v 0 :tag "") (make-tinto :k 0 :v 0 :tag "")))
+                 (infos (vector (dds.dcps:make-sample-info) (dds.dcps:make-sample-info))))
+             (%check :ti-matched (plusp (dds.dcps:matched-count pr)) "writer/reader never matched")
+             ;; (1) the two spec refusals, decided before anything is written
+             (multiple-value-bind (n st) (dds.dcps:take-into dr data (vector (dds.dcps:make-sample-info)))
+               (%check :ti-len-mismatch (and (zerop n) (eq st dds.dcps:+retcode-precondition-not-met+))
+                       (format nil "mismatched data/infos lengths must be PRECONDITION_NOT_MET; got ~d / ~s" n st)))
+             (multiple-value-bind (n st) (dds.dcps:take-into dr data infos :max-samples 99)
+               (%check :ti-maxsamples (and (zerop n) (eq st dds.dcps:+retcode-precondition-not-met+))
+                       (format nil "max-samples > (length data) must be PRECONDITION_NOT_MET; got ~d / ~s" n st)))
+             ;; (1b) THE DESTINATION ELEMENTS ARE PART OF THE CONTRACT. (make-array n) is the obvious
+             ;; reading of "vectors the application allocates once", and SBCL fills a simple-vector with
+             ;; ZEROS — so the very first element faults inside the fully-typed copier and a Lisp condition
+             ;; escapes src/, which the standing order forbids outright. Each shape is refused SEPARATELY:
+             ;; one combined check could pass on the wrong half.
+             (multiple-value-bind (n st) (dds.dcps:take-into dr (make-array 2) infos)
+               (%check :ti-dest-zeros (and (zerop n) (eq st dds.dcps:+retcode-precondition-not-met+))
+                       (format nil "(make-array 2) as DATA must be PRECONDITION_NOT_MET, never a TYPE-ERROR; got ~d / ~s" n st)))
+             (multiple-value-bind (n st) (dds.dcps:take-into dr data (make-array 2))
+               (%check :ti-dest-infos-zeros (and (zerop n) (eq st dds.dcps:+retcode-precondition-not-met+))
+                       (format nil "(make-array 2) as INFOS must be PRECONDITION_NOT_MET, never a TYPE-ERROR; got ~d / ~s" n st)))
+             (multiple-value-bind (n st) (dds.dcps:take-into dr (vector (svref data 0) nil) infos)
+               (%check :ti-dest-nil (and (zerop n) (eq st dds.dcps:+retcode-precondition-not-met+))
+                       (format nil "a NIL destination element must be PRECONDITION_NOT_MET; got ~d / ~s" n st)))
+             (multiple-value-bind (n st) (dds.dcps:take-into dr (vector (svref data 0) (dds.dcps:make-sample-info)) infos)
+               (%check :ti-dest-wrong-type (and (zerop n) (eq st dds.dcps:+retcode-precondition-not-met+))
+                       (format nil "a WRONG-TYPED destination element must be PRECONDITION_NOT_MET; got ~d / ~s" n st)))
+             ;; ...and the bound is MAX-SAMPLES, not the whole vector: an element the call could never
+             ;; write must not be able to refuse it. Falsify by scanning (length data) instead of the limit.
+             (multiple-value-bind (n st) (dds.dcps:take-into dr (vector (svref data 0) nil) infos :max-samples 1)
+               (%check :ti-dest-beyond-limit (and (zerop n) (eq st dds.dcps:+retcode-no-data+))
+                       (format nil "an unwritable element past MAX-SAMPLES must not refuse the call; got ~d / ~s" n st)))
+             ;; (2) nothing selected -> NO_DATA with a count of 0
+             (multiple-value-bind (n st) (dds.dcps:take-into dr data infos)
+               (%check :ti-no-data (and (zerop n) (eq st dds.dcps:+retcode-no-data+))
+                       (format nil "an empty selection must be (0 . NO_DATA); got ~d / ~s" n st)))
+             ;; (3) a loan-capable (FlatData) reader is refused
+             (setf fdp (dds.dcps:create-participant :domain (test-domain +td-take-into+)))
+             (let* ((fts (dds.types:find-type-support "fd-abc"))
+                    (fdr (dds.dcps:create-datareader
+                          (dds.dcps:create-subscriber fdp)
+                          (dds.dcps:create-topic fdp "TakeIntoFd" "fd-abc" fts))))
+               (%check :ti-fd-no-copier (null (dds.types:type-support-copy-into fts))
+                       "a FlatData type must have NO copy-into — the refusal below tests nothing otherwise")
+               (multiple-value-bind (n st) (dds.dcps:take-into fdr (vector nil)
+                                                              (vector (dds.dcps:make-sample-info)))
+                 (%check :ti-loan-refused (and (zerop n) (eq st dds.dcps:+retcode-precondition-not-met+))
+                         (format nil "a loan-capable/FlatData reader must be PRECONDITION_NOT_MET; got ~d / ~s" n st))))
+             ;; (3b) the OTHER half of the loan refusal: an OUTSTANDING loan on an ordinary reader. The
+             ;; production check is (OR (DR-LOANS DR) (DR-SECURED-LOANS DR)) and BOTH registries are
+             ;; planted, separately — with only one of them exercised, deleting the other disjunct is a
+             ;; GREEN sabotage, and DR-LOANS is precisely the Zero-Copy registry whose flatdata-view is the
+             ;; ADR 0096 slot leak this refusal exists to prevent. Exercised white-box on purpose: the
+             ;; registry membership IS the condition the production check reads, so planting one tests the
+             ;; same predicate an earned loan would, without making the arm depend on a live ZC fixture.
+             (push :ti-fake-zc-loan (dds.dcps::dr-loans dr))
+             (multiple-value-bind (n st) (dds.dcps:take-into dr data infos)
+               (pop (dds.dcps::dr-loans dr))
+               (%check :ti-outstanding-zc-loan-refused
+                       (and (zerop n) (eq st dds.dcps:+retcode-precondition-not-met+))
+                       (format nil "a reader holding an outstanding ZERO-COPY loan must be PRECONDITION_NOT_MET; got ~d / ~s" n st)))
+             (push :ti-fake-loan (dds.dcps::dr-secured-loans dr))
+             (multiple-value-bind (n st) (dds.dcps:take-into dr data infos)
+               (pop (dds.dcps::dr-secured-loans dr))
+               (%check :ti-outstanding-loan-refused
+                       (and (zerop n) (eq st dds.dcps:+retcode-precondition-not-met+))
+                       (format nil "a reader holding an outstanding SECURED loan must be PRECONDITION_NOT_MET; got ~d / ~s" n st)))
+             ;; (4) the happy path, filled IN PLACE
+             (let ((d0 (svref data 0)) (i0 (svref infos 0)))
+               (dds.dcps:write-sample dw (make-tinto :k 1 :v 42 :tag "alpha"))
+               (%ti-settle pw pr dr 1)
+               (multiple-value-bind (n st) (dds.dcps:take-into dr data infos)
+                 (%check :ti-count (and (= n 1) (null st))
+                         (format nil "take-into must report exactly one sample and no status; got ~d / ~s" n st))
+                 (%check :ti-in-place (and (eq d0 (svref data 0)) (eq i0 (svref infos 0)))
+                         "take-into REPLACED the application's destination instead of filling it")
+                 (%check :ti-value (and (= 1 (tinto-k d0)) (= 42 (tinto-v d0)) (string= "alpha" (tinto-tag d0)))
+                         "take-into did not fill every field of the destination sample")
+                 (%check :ti-info (and (eq :read (dds.dcps:sample-info-sample-state i0))
+                                       (eq :new (dds.dcps:sample-info-view-state i0))
+                                       (eq :alive (dds.dcps:sample-info-instance-state i0))
+                                       (dds.dcps:sample-info-valid-data i0))
+                         "take-into did not fill the SampleInfo with the selection-time states"))
+               ;; (5) the recycle happened — without this (6) proves nothing
+               (%check :ti-recycled (plusp (dds.dcps::dr-wrapper-pool-top dr))
+                       "take-into did not recycle a wrapper the application never held — the whole reason this operation can reach zero")
+               ;; (7) the pinned get_key_value key holder survived the recycle
+               (let ((h (dds.dcps:sample-info-instance-handle i0)))
+                 (dds.dcps:write-sample dw (make-tinto :k 1 :v 43 :tag "beta"))
+                 (%ti-settle pw pr dr 1)
+                 (dds.dcps:take-into dr data infos)
+                 (%check :ti-second (= 43 (tinto-v d0)) "the second sample did not reach the destination")
+                 (let ((kv (dds.dcps:get-key-value dr h)))
+                   (%check :ti-key-intact (and kv (= 1 (tinto-k kv)) (= 42 (tinto-v kv)))
+                           (format nil "get_key_value must still return the PINNED key holder's own fields (k=1 v=42); got ~s"
+                                   (and kv (list (tinto-k kv) (tinto-v kv))))))))
+             ;; (6) ⭐ a sample an earlier READ handed out must survive a later take-into
+             ;; ⚠️ THE HELD SAMPLE MUST NOT BE ITS INSTANCE'S FIRST. An instance's first delivered struct is
+             ;; PINNED as its get_key_value key holder, and %RECYCLE-DELIVERY already refuses to pool a
+             ;; pinned struct — so a first sample is protected by the PIN and this arm would prove nothing
+             ;; about the WAS-EXPOSED latch. It measured exactly that: with the latch deleted the arm stayed
+             ;; GREEN. Establish the instance with a throwaway sample first, then hold the SECOND one.
+             (dds.dcps:write-sample dw (make-tinto :k 2 :v 1 :tag "pin"))
+             (%ti-settle pw pr dr 1)
+             (dds.dcps:take-into dr data infos)
+             (dds.dcps:write-sample dw (make-tinto :k 2 :v 7 :tag "held"))
+             (%ti-settle pw pr dr 1)
+             (let* ((held (first (dds.dcps:read-samples dr)))
+                    (hd (and held (dds.dcps:cached-sample-data held))))
+               (%check :ti-held-arrived (and hd t) "the read-then-take-into arm never got its sample")
+               (%check :ti-held-not-pinned (not (dds.dcps::cached-sample-data-pinned held))
+                       "the held sample is its instance's PINNED key holder, so the pin — not the was-exposed latch — is what protects it, and the two checks below would pass with the latch deleted")
+               (dds.dcps:write-sample dw (make-tinto :k 3 :v 8 :tag "next"))
+               (%ti-settle pw pr dr 2)
+               (dds.dcps:take-into dr data infos)
+               (%check :ti-read-not-detached (eq hd (dds.dcps:cached-sample-data held))
+                       "take-into recycled a wrapper the application was still holding — its DATA slot was cleared out from under it")
+               ;; the recycle only BITES once the parked struct is decoded into, so force that
+               (dds.dcps:write-sample dw (make-tinto :k 4 :v 99 :tag "overwrite"))
+               (%ti-settle pw pr dr 1)
+               (dds.dcps:take-into dr data infos)
+               (%check :ti-read-not-corrupted (and (= 7 (tinto-v hd)) (string= "held" (tinto-tag hd)))
+                       (format nil "take-into recycled a struct the application was still holding; it now reads v=~d tag=~s"
+                               (tinto-v hd) (tinto-tag hd))))
+             ;; (1c) THE DESTINATION VALIDATION MUST HOLD WITH SAMPLES ACTUALLY SELECTABLE. The (1b) arms
+             ;; run against an EMPTY cache, where an unvalidated call reaches no copy at all and returns
+             ;; NO_DATA — so they falsify the refusal but NOT the fault it exists to prevent. Measured with
+             ;; the guard removed and two samples cached: TYPE-ERROR out of the middle of the copy loop,
+             ;; and because the DR-CACHE commit is after the loop, the wrapper already recycled for the
+             ;; first sample stayed listed in the cache while also sitting on the wrapper pool — one
+             ;; wrapper describing two samples. Both halves are asserted.
+             (%ti-drain-empty dr data infos)
+             (dds.dcps:write-sample dw (make-tinto :k 11 :v 111 :tag "g1"))
+             (dds.dcps:write-sample dw (make-tinto :k 12 :v 112 :tag "g2"))
+             (%ti-settle pw pr dr 2)
+             (%check :ti-dest-live-setup (= 2 (dds.dcps:samples-available dr))
+                     "this arm needs TWO selectable samples, or an unvalidated call never reaches a copy and the arm is vacuous")
+             (let ((top (dds.dcps::dr-wrapper-pool-top dr)))
+               (multiple-value-bind (n st) (dds.dcps:take-into dr (vector (svref data 0) 0) infos)
+                 (%check :ti-dest-live-refused (and (zerop n) (eq st dds.dcps:+retcode-precondition-not-met+))
+                         (format nil "a bad destination element must be refused even when samples ARE selectable; got ~d / ~s" n st)))
+               (%check :ti-dest-live-cache-intact (= 2 (dds.dcps:samples-available dr))
+                       "a refused take-into must consume nothing")
+               (%check :ti-dest-live-pool-intact (= top (dds.dcps::dr-wrapper-pool-top dr))
+                       "a refused take-into must not have parked a wrapper that is still listed in the cache — one wrapper owned twice"))
+             ;; (8) read-into recycles nothing and leaves the sample readable
+             (%ti-drain-empty dr data infos)
+             (dds.dcps:write-sample dw (make-tinto :k 5 :v 55 :tag "ri"))
+             (%ti-settle pw pr dr 1)
+             (let ((top (dds.dcps::dr-wrapper-pool-top dr)))
+               (multiple-value-bind (n st) (dds.dcps:read-into dr data infos)
+                 (%check :ti-read-into-count (and (= n 1) (null st))
+                         (format nil "read-into must report one sample and no status; got ~d / ~s" n st))
+                 (%check :ti-read-into-value (= 55 (tinto-v (svref data 0)))
+                         "read-into did not fill the destination"))
+               (%check :ti-read-into-no-recycle (= top (dds.dcps::dr-wrapper-pool-top dr))
+                       "read-into RECYCLED a wrapper that is still a live cache entry — the next delivery would overwrite a sample the cache still lists")
+               (%check :ti-read-into-non-destructive (= 1 (dds.dcps:samples-available dr))
+                       "read-into removed its sample from the cache — read is non-destructive")
+               (multiple-value-bind (n st) (dds.dcps:read-into dr data infos)
+                 (%check :ti-read-into-again (and (= n 1) (null st))
+                         "a second read-into must still see the same cached sample")))
+             ;; (9) an INVALID-DATA index must not fault, and keeps the destination's previous contents
+             ;; ⚠️ A SECOND INSTANCE IS ESTABLISHED BETWEEN THE TAKE AND THE DISPOSE, and that is what makes
+             ;; this arm mean anything. Disposing the SAME instance whose sample was last copied leaves the
+             ;; destination holding that instance's key either way, so the arm would pass whether the
+             ;; destination were stale or correctly key-filled, and the documented contract — that NOTHING
+             ;; in the destination is meaningful at such an index, key fields INCLUDED — would be untested.
+             ;; With k=8 written in between, the destination's key is 8 while the SampleInfo names 7.
+             (%ti-drain-empty dr data infos)
+             (dds.dcps:write-sample dw (make-tinto :k 7 :v 70 :tag "alive"))
+             (%ti-settle pw pr dr 1)
+             (dds.dcps:take-into dr data infos)
+             (dds.dcps:write-sample dw (make-tinto :k 8 :v 80 :tag "other"))
+             (%ti-settle pw pr dr 1)
+             (dds.dcps:take-into dr data infos)
+             (%check :ti-invalid-setup (= 8 (tinto-k (svref data 0)))
+                     "the second instance must be the destination's last occupant, or the arm below cannot tell a stale key from a filled one")
+             (let ((h8 (dds.dcps:sample-info-instance-handle (svref infos 0))))
+               (dds.dcps:dispose-instance dw (make-tinto :k 7 :v 0 :tag ""))
+               (%ti-settle pw pr dr 1)
+               (multiple-value-bind (n st) (dds.dcps:take-into dr data infos)
+                 (%check :ti-invalid-count (and (= n 1) (null st))
+                         (format nil "the dispose notification must be selectable; got ~d / ~s" n st))
+                 (%check :ti-invalid-flag (not (dds.dcps:sample-info-valid-data (svref infos 0)))
+                         "the dispose notification must arrive with valid_data NIL")
+                 ;; the documented divergence from take-samples: a pre-allocated destination cannot carry NIL
+                 (%check :ti-invalid-keeps-previous
+                         (and (= 8 (tinto-k (svref data 0))) (= 80 (tinto-v (svref data 0))))
+                         "at an invalid-data index the destination keeps its PREVIOUS contents — the copy step must neither fault on the NIL sample nor blank the struct")
+                 ;; ...and that is exactly why the destination's KEY is NOT the disposed instance's key
+                 (%check :ti-invalid-key-is-stale
+                         (not (equalp h8 (dds.dcps:sample-info-instance-handle (svref infos 0))))
+                         "the dispose notification must name instance 7 while the destination still holds instance 8 — the documented reason NOTHING in the destination is meaningful at an invalid-data index, key fields included")
+                 (let ((kv (dds.dcps:get-key-value dr (dds.dcps:sample-info-instance-handle (svref infos 0)))))
+                   (%check :ti-invalid-key-via-handle (and kv (= 7 (tinto-k kv)))
+                           (format nil "SAMPLE-INFO-INSTANCE-HANDLE + GET-KEY-VALUE is the ONLY way to identify the instance at an invalid-data index; got ~s"
+                                   (and kv (tinto-k kv))))))))
+        (when fdp (dds.dcps:delete-participant fdp))
+        (dds.dcps:delete-participant pw)
+        (dds.dcps:delete-participant pr)))
+    t))
+
+(defun* %ti-poison-info (si ih ph)
+    (function (t t t) t)
+  "Write a sentinel into every one of SampleInfo SI's 13 slots, using IH / PH as the two handle sentinels
+   so the caller can test them by IDENTITY (%COPY-SAMPLE-INFO-INTO aliases those two slots, so an EQ test
+   is exact where a byte test could in principle collide with a real handle).
+
+   ⚠️ THIS IS NOT %ADR93-POISON-SAMPLE-INFO AND MUST NOT BE, even though they poison the same 13 slots.
+   That one is observed at DRAIN time, where the correct states are :not-read / :new / :alive, so its
+   sentinels are the opposites. This one is observed at SELECTION time, where the correct sample_state is
+   :READ — which is exactly that function's sentinel for the slot. Reusing it would make the sample_state
+   check unfalsifiable: it would report the sentinel as gone whether or not the slot was ever assigned."
+  (setf (dds.dcps:sample-info-sample-state si) :not-read
+        (dds.dcps:sample-info-view-state si) :not-new
+        (dds.dcps:sample-info-instance-state si) :not-alive-disposed
+        (dds.dcps:sample-info-source-timestamp si) 424242424242
+        (dds.dcps:sample-info-instance-handle si) ih
+        (dds.dcps:sample-info-publication-handle si) ph
+        (dds.dcps:sample-info-disposed-generation-count si) 7777
+        (dds.dcps:sample-info-no-writers-generation-count si) 8888
+        (dds.dcps:sample-info-sample-rank si) 9999
+        (dds.dcps:sample-info-generation-rank si) 1111
+        (dds.dcps:sample-info-absolute-generation-rank si) 2222
+        (dds.dcps:sample-info-valid-data si) nil
+        (dds.dcps:sample-info-sequence-number si) 333333)
+  t)
+
+(defun* %ti-surviving-poison (si ih ph)
+    (function (t t t) list)
+  "The NAMES of the SampleInfo slots of SI whose %TI-POISON-INFO sentinel is still there — i.e. the slots
+   %COPY-SAMPLE-INFO-INTO failed to assign. Returning the NAMES rather than a boolean is the point: %CHECK
+   aborts a test at its first failure, so thirteen separate assertions would report only the first missing
+   slot, and one falsification run could never show that all thirteen are covered. One assertion over this
+   list names every one of them at once."
+  (let ((bad '()))
+    (unless (eq :read (dds.dcps:sample-info-sample-state si)) (push :sample-state bad))
+    (unless (eq :new (dds.dcps:sample-info-view-state si)) (push :view-state bad))
+    (unless (eq :alive (dds.dcps:sample-info-instance-state si)) (push :instance-state bad))
+    (when (eql 424242424242 (dds.dcps:sample-info-source-timestamp si)) (push :source-timestamp bad))
+    (when (eq ih (dds.dcps:sample-info-instance-handle si)) (push :instance-handle bad))
+    (when (eq ph (dds.dcps:sample-info-publication-handle si)) (push :publication-handle bad))
+    (when (eql 7777 (dds.dcps:sample-info-disposed-generation-count si)) (push :disposed-generation-count bad))
+    (when (eql 8888 (dds.dcps:sample-info-no-writers-generation-count si)) (push :no-writers-generation-count bad))
+    (when (eql 9999 (dds.dcps:sample-info-sample-rank si)) (push :sample-rank bad))
+    (when (eql 1111 (dds.dcps:sample-info-generation-rank si)) (push :generation-rank bad))
+    (when (eql 2222 (dds.dcps:sample-info-absolute-generation-rank si)) (push :absolute-generation-rank bad))
+    (unless (dds.dcps:sample-info-valid-data si) (push :valid-data bad))
+    (when (eql 333333 (dds.dcps:sample-info-sequence-number si)) (push :sequence-number bad))
+    bad))
+
+(defun* run-take-into-poison-test ()
+    (function () t)
+  "Test: ADR 0105 Task 4 — TAKE-INTO leaves NO field of the destination's previous occupant behind.
+
+   A destination the application allocates once and reuses is, on its second call onward, a struct still
+   holding the LAST sample's fields. So every slot %COPY-SAMPLE-INFO-INTO forgets hands the application a
+   field of a sample it already consumed — silent, application-visible, and invisible to every allocation
+   gate, because the byte count is identical either way. Both destinations (the SampleInfo's 13 slots and
+   the sample struct's 3) are sentinel-filled, one TAKE-INTO runs, and NO sentinel may survive.
+
+   ⚠️ OBSERVED AT THE COPY, NOT THROUGH A LATER READ, and that is the whole design of this test. ADR 0093's
+   equivalent went through TAKE and therefore covered 10 of 13 slots WHILE APPEARING TO COVER ALL OF THEM,
+   because %SELECT-SAMPLES legitimately re-stamps sample_state, view_state and instance_state at selection.
+   Here the destination is the application's OWN object and nothing touches it after the copy returns, so
+   what is asserted is exactly what the copier wrote.
+
+   ⚠️ THE HANDLE SLOTS ARE CHECKED BY IDENTITY. %COPY-SAMPLE-INFO-INTO deliberately ALIASES instance_handle
+   and publication_handle rather than copying them (both are write-once immutable arrays; copying would cost
+   a measured ~32 B each per sample). So 'the sentinel is gone' means 'the slot no longer holds the sentinel
+   OBJECT' — an EQ test, exact, where comparing octets could in principle collide with a real handle."
+  (multiple-value-bind (pw pr dw dr) (%ti-pair +td-take-into-poison+)
+    (unwind-protect
+         (let* ((data  (vector (make-tinto :k 0 :v 0 :tag "")))
+                (infos (vector (dds.dcps:make-sample-info)))
+                (ih (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xEE))
+                (ph (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xDD)))
+           (%check :tip-matched (plusp (dds.dcps:matched-count pr)) "writer/reader never matched")
+           (dds.dcps:write-sample dw (make-tinto :k 6 :v 61 :tag "poison"))
+           (%ti-settle pw pr dr 1)
+           ;; poison BOTH destinations, then take exactly one sample into them
+           (%ti-poison-info (svref infos 0) ih ph)
+           (setf (tinto-k (svref data 0)) -424242
+                 (tinto-v (svref data 0)) -777777
+                 (tinto-tag (svref data 0)) (copy-seq "POISONED"))
+           (multiple-value-bind (n st) (dds.dcps:take-into dr data infos)
+             (%check :tip-count (and (= n 1) (null st))
+                     (format nil "the poison arm needs exactly one sample; got ~d / ~s" n st)))
+           (let ((survivors (%ti-surviving-poison (svref infos 0) ih ph)))
+             (%check :tip-every-info-slot (null survivors)
+                     (format nil "%copy-sample-info-into left ~d of the 13 SampleInfo slots UNASSIGNED, so the application reads the PREVIOUS sample there: ~{~a~^ ~}"
+                             (length survivors) survivors)))
+           (let ((d (svref data 0)))
+             (%check :tip-sample-slots (and (= 6 (tinto-k d)) (= 61 (tinto-v d)) (string= "poison" (tinto-tag d)))
+                     (format nil "the generated copy-into left a poisoned field in the destination sample: k=~d v=~d tag=~s"
+                             (tinto-k d) (tinto-v d) (tinto-tag d)))))
+      (dds.dcps:delete-participant pw)
+      (dds.dcps:delete-participant pr))
+    t))
+
+(defun* run-take-into-truncate-test ()
+    (function () t)
+  "Test: ADR 0105 slice 1 — the DESTINATION-LENGTH BOUND, the MAX-SAMPLES LIMITER, and the retention of
+   whatever did not fit. One arm, because all three ride on the same expression.
+
+   ⚠️ THIS IS THE SLICE'S ONLY OUT-OF-BOUNDS GUARD AND NOTHING ELSE FALSIFIES IT. %ACCESS-INTO passes
+   (or MAX-SAMPLES (length DATA)) as the selection core's MAX, and the core's (< n max) test is the sole
+   thing keeping the write index inside the application's vector — the writes are (svref INTO-DATA n) /
+   (svref INTO-INFOS n). Every other into arm in the suite presents at most as many selectable samples as
+   the destination has slots, so the truncating branch is never entered: relaxing the test to (<= n max),
+   or dropping the (length DATA) default so an absent MAX-SAMPLES means LENGTH_UNLIMITED, leaves all of
+   them GREEN while the call writes one element past the end of application memory. Here THREE samples meet
+   a TWO-slot destination.
+
+   ⚠️ AND THE SURPLUS MUST STAY CACHED, NOT BE CONSUMED. A truncating take that dropped what it could not
+   copy would lose a sample silently — the count would still read 2 and every value assertion would still
+   pass. The retention is asserted by SAMPLES-AVAILABLE and then by actually taking the third sample.
+
+   The MAX-SAMPLES limiter is asserted separately for the same reason: the suite otherwise tests
+   MAX-SAMPLES only as a REFUSAL (max-samples > (length data)), which is a different clause in a different
+   function, so nothing pins it as a LIMIT."
+  (multiple-value-bind (pw pr dw dr) (%ti-pair +td-take-into-truncate+)
+    (unwind-protect
+         (let ((data  (vector (make-tinto :k 0 :v 0 :tag "") (make-tinto :k 0 :v 0 :tag "")))
+               (infos (vector (dds.dcps:make-sample-info) (dds.dcps:make-sample-info))))
+           (%check :tit-matched (plusp (dds.dcps:matched-count pr)) "writer/reader never matched")
+           (dds.dcps:write-sample dw (make-tinto :k 1 :v 11 :tag "a"))
+           (dds.dcps:write-sample dw (make-tinto :k 2 :v 22 :tag "b"))
+           (dds.dcps:write-sample dw (make-tinto :k 3 :v 33 :tag "c"))
+           (%ti-settle pw pr dr 3)
+           (%check :tit-three-cached (= 3 (dds.dcps:samples-available dr))
+                   (format nil "the arm needs THREE cached samples against a TWO-slot destination; got ~d"
+                           (dds.dcps:samples-available dr)))
+           (multiple-value-bind (n st) (dds.dcps:take-into dr data infos)
+             (%check :tit-count (and (= n 2) (null st))
+                     (format nil "take-into must write exactly (length data) = 2 and stop; got ~d / ~s" n st))
+             (%check :tit-values (and (= 11 (tinto-v (svref data 0))) (= 22 (tinto-v (svref data 1))))
+                     "the two copied samples must be the first two in cache order"))
+           (%check :tit-surplus-kept (= 1 (dds.dcps:samples-available dr))
+                   (format nil "the sample that did not fit must STAY cached, not be consumed; ~d available"
+                           (dds.dcps:samples-available dr)))
+           (multiple-value-bind (n st) (dds.dcps:take-into dr data infos)
+             (%check :tit-surplus-returned (and (= n 1) (null st) (= 33 (tinto-v (svref data 0))))
+                     (format nil "a second take-into must return the retained third sample; got ~d / ~s / v=~d"
+                             n st (tinto-v (svref data 0)))))
+           ;; MAX-SAMPLES as a LIMITER, not as a refusal
+           (dds.dcps:write-sample dw (make-tinto :k 4 :v 44 :tag "d"))
+           (dds.dcps:write-sample dw (make-tinto :k 5 :v 55 :tag "e"))
+           (%ti-settle pw pr dr 2)
+           (multiple-value-bind (n st) (dds.dcps:take-into dr data infos :max-samples 1)
+             (%check :tit-max-limits (and (= n 1) (null st) (= 44 (tinto-v (svref data 0))))
+                     (format nil "max-samples 1 against a 2-sample cache must write exactly one; got ~d / ~s / v=~d"
+                             n st (tinto-v (svref data 0)))))
+           (%check :tit-max-remainder (= 1 (dds.dcps:samples-available dr))
+                   "max-samples must LIMIT, leaving the rest cached — not consume what it did not copy"))
+      (dds.dcps:delete-participant pw)
+      (dds.dcps:delete-participant pr))
+    t))
+
+(defun* run-take-into-exposure-test ()
+    (function () t)
+  "Test: ADR 0105 §4.1 on the path §4.1's own evidence paragraph did not enumerate — READ-LOANED.
+
+   ⭐ THE LATCH HAS THREE SET SITES BECAUSE A SAMPLE LEAVES THE MIDDLEWARE BY THREE DOORS, and only one of
+   them was wired at first. %NOTE-ACCESSED's docstring already named all three (%SELECT-SAMPLES,
+   TAKE-LOANED, READ-LOANED); READ-LOANED is the dangerous one and it is not the obvious one:
+
+     - it hands the application the middleware's POOLED deserialized struct, exactly as READ-SAMPLES does;
+     - it LEAVES the wrapper in DR-CACHE, so the default (:read :not-read) mask re-selects it;
+     - and for a plain copy-backed sample it registers NOTHING in DR-LOANS or DR-SECURED-LOANS, so
+       TAKE-INTO's outstanding-loan refusal — the one guard that would otherwise have covered for the
+       missing latch — does not fire.
+
+   Without the latch, the following TAKE-INTO parks that struct on the reader's data pool and the next
+   delivery decodes into it: the application's held sample silently changes value, with no error, no
+   status, and no other test red. MEASURED on the working tree before the fix — v=7 tag=\"held\" became
+   v=100 tag=\"ovr100\" while the application held it.
+
+   ⚠️ THE HELD SAMPLE MUST NOT BE ITS INSTANCE'S FIRST. An instance's first delivered struct is PINNED as
+   its get_key_value key holder and %RECYCLE-DELIVERY already refuses to pool a pinned struct, so a first
+   sample is protected by the PIN and this arm would prove nothing about the latch. The instance is
+   established with a throwaway sample first; the assertion that the held wrapper is unpinned is part of
+   the test, not a comment.
+
+   ⚠️ AND THE OVERWRITE MUST BE FORCED. Recycling only BITES once something decodes into the parked
+   struct, so a further sample is written and taken after the take-into under test; asserting immediately
+   after it would pass with the latch deleted."
+  (multiple-value-bind (pw pr dw dr) (%ti-pair +td-take-into-exposed+)
+    (unwind-protect
+         (let ((data  (vector (make-tinto :k 0 :v 0 :tag "")))
+               (infos (vector (dds.dcps:make-sample-info))))
+           (%check :tie-matched (plusp (dds.dcps:matched-count pr)) "writer/reader never matched")
+           ;; establish the instance so the held sample is NOT the pinned key holder
+           (dds.dcps:write-sample dw (make-tinto :k 1 :v 1 :tag "pin"))
+           (%ti-settle pw pr dr 1)
+           (dds.dcps:take-into dr data infos)
+           (dds.dcps:write-sample dw (make-tinto :k 1 :v 7 :tag "held"))
+           (%ti-settle pw pr dr 1)
+           (let ((held (first (dds.dcps:read-loaned dr)))
+                 (cs (first (dds.dcps::dr-cache dr))))
+             (%check :tie-held-arrived (and held (= 7 (tinto-v held)))
+                     "read-loaned must hand back the second sample of the instance")
+             (%check :tie-no-loan-registered
+                     (and (null (dds.dcps::dr-loans dr)) (null (dds.dcps::dr-secured-loans dr)))
+                     "a copy-backed read-loaned registers NO loan — which is exactly why the outstanding-loan refusal cannot cover for the latch")
+             (%check :tie-still-cached (and cs (eq held (dds.dcps::cached-sample-data cs)))
+                     "read-loaned must LEAVE its wrapper in the cache — otherwise the hazard does not exist and this arm tests nothing")
+             (%check :tie-not-pinned (not (dds.dcps::cached-sample-data-pinned cs))
+                     "the held sample is its instance's PINNED key holder, so the pin — not the latch — would protect it and the assertion below would pass with the latch deleted")
+             (%check :tie-latched (dds.dcps::cached-sample-was-exposed cs)
+                     "read-loaned must LATCH +cs-flag-was-exposed+ on the wrapper whose struct it just handed out")
+             ;; the take-into that would recycle it, then a delivery that would decode into it
+             (multiple-value-bind (n st) (dds.dcps:take-into dr data infos)
+               (%check :tie-taken (and (= n 1) (null st))
+                       (format nil "the exposed sample is still TAKEN, merely not recycled; got ~d / ~s" n st)))
+             (dds.dcps:write-sample dw (make-tinto :k 9 :v 100 :tag "overwrite"))
+             (%ti-settle pw pr dr 1)
+             (dds.dcps:take-into dr data infos)
+             (%check :tie-not-corrupted (and (= 7 (tinto-v held)) (string= "held" (tinto-tag held)))
+                     (format nil "take-into recycled a struct READ-LOANED had handed the application; it now reads v=~d tag=~s"
+                             (tinto-v held) (tinto-tag held)))))
+      (dds.dcps:delete-participant pw)
+      (dds.dcps:delete-participant pr))
+    t))
+
+(defclass take-into-listener (capture-mixin dds.dcps:data-reader-listener)
+  ((data  :initform (vector (make-tinto :k 0 :v 0 :tag "")) :accessor til-data)
+   (infos :initform (vector (dds.dcps:make-sample-info)) :accessor til-infos))
+  (:documentation "ADR 0105 §8: an on_data_available listener that calls TAKE-INTO, allocating its two
+   destination vectors ONCE at listener-construction time — which is how an application using this API is
+   meant to hold them, and which keeps the callback itself allocation-free."))
+
+(defmethod dds.dcps:on-data-available ((l take-into-listener) reader)
+  ;; ENTER and EXIT are recorded separately on purpose: a recursive-lock error inside take-into records the
+  ;; enter and never the exit, which is the exact signature this test asserts against.
+  (dds.pal:with-lock ((cap-lock l)) (push :enter (cap-hits l)))
+  (let ((st (handler-case (nth-value 1 (dds.dcps:take-into reader (til-data l) (til-infos l)))
+              (error (e) (list :condition (type-of e))))))
+    (dds.pal:with-lock ((cap-lock l)) (push (list :exit st) (cap-hits l)))))
+
+(defun* %til-count (l tag)
+    (function (t t) (integer 0))
+  "How many hits of listener L have TAG as their head — :ENTER and :EXIT are counted separately so the
+   test can assert every entry reached its exit."
+  (count-if (lambda (h) (eq tag (if (consp h) (first h) h))) (cap-snapshot l)))
+
+(defun* run-take-into-listener-test ()
+    (function () t)
+  "Test: ADR 0105 §8's listener requirement — TAKE-INTO called from an ON_DATA_AVAILABLE listener, on BOTH
+   threads that fire one. ADR 0105 §4.2 cites this call pattern by name as the justification for doing the
+   copy and the recycle inside the reader cache lock, and shipped code does it (src/dds-bench/xperf.lisp
+   calls take from on-data-available), so leaving it unexercised left the design's stated premise untested.
+
+   ⭐ THE TWO FIRING SITES ARE NOT EQUIVALENT, AND ONLY ONE OF THEM WAS EVER SAFE.
+     (a) NEW DATA — %DELIVER-DATA-ON-READERS, from the discovery receiver thread, OUTSIDE any reader cache
+         lock. take-into takes the lock itself and completes.
+     (b) A MATCHED WRITER VANISHING — %ON-WRITER-VANISHED, from the discovery UNMATCH hook. It wrapped its
+         whole body, notification included, in %WITH-READER-CACHE, whose own docstring says the lock is
+         NOT RECURSIVE; SBCL answers the second acquisition with \"Recursive lock attempt\". So an ordinary
+         remote shutdown threw a Lisp condition into the discovery thread of any application using the
+         listener idiom — and (a) passing says nothing about it, which is why both are exercised here.
+
+   (b) is driven DIRECTLY rather than by deleting the remote participant and waiting: the production
+   trigger is an unmatch hook whose timing depends on discovery, and a timing-dependent arm that silently
+   never fires is a green test proving nothing. The call is the same one the hook makes, from a thread that
+   does not already hold the lock — which is exactly the hook's own situation.
+
+   The listener records ENTER before the call and EXIT WITH THE OUTCOME after it, and the callback catches
+   rather than propagates — otherwise the recursive-lock error would abort the notifying thread and the
+   arm would report a hang or an unrelated teardown failure instead of the defect. FALSIFIED: with the
+   wake put back inside %WITH-READER-CACHE, the delivery path still records (:EXIT NIL) and the
+   writer-vanished path records (:EXIT (:CONDITION SIMPLE-ERROR)) — which is why both are exercised and
+   why the assertion is on the OUTCOME, not merely on the entry/exit balance."
+  (let ((l (make-instance 'take-into-listener)))
+    (multiple-value-bind (pw pr dw dr) (%ti-pair +td-take-into-listener+)
+      (unwind-protect
+           (progn
+             (%check :til-matched (plusp (dds.dcps:matched-count pr)) "writer/reader never matched")
+             (dds.dcps:set-reader-listener dr l '(:data-available))
+             ;; (a) the ordinary delivery path
+             (dds.dcps:write-sample dw (make-tinto :k 1 :v 11 :tag "live"))
+             (loop repeat 300 until (plusp (%til-count l :enter))
+                   do (dds.dcps:spin pw) (dds.dcps:spin pr) (sleep 0.01))
+             (%check :til-fired (plusp (%til-count l :enter))
+                     "on_data_available never fired on the delivery path — the arm below would be vacuous")
+             (%check :til-delivery-completed (= (%til-count l :enter) (%til-count l :exit))
+                     (format nil "take-into from an on_data_available listener must COMPLETE; ~d entered, ~d exited"
+                             (%til-count l :enter) (%til-count l :exit)))
+             ;; (b) the unmatch path — the one that held the cache lock across the notification
+             (dds.dcps:take-into dr (vector (make-tinto :k 0 :v 0 :tag "")) (vector (dds.dcps:make-sample-info)))
+             (let ((wid nil))
+               (maphash (lambda (h rec)
+                          (declare (ignore h))
+                          (let ((w (first (dds.dcps::instance-rec-writers rec))))
+                            (when w (setf wid w))))
+                        (dds.dcps::dr-instance-recs dr))
+               (%check :til-writer-known (and wid t)
+                       "the reader must have recorded the remote writer against an instance, or %on-writer-vanished changes nothing and the arm is vacuous")
+               (let ((before-enter (%til-count l :enter)))
+                 (dds.dcps::%on-writer-vanished dr wid)
+                 (%check :til-vanish-fired (> (%til-count l :enter) before-enter)
+                         "the writer-vanished path must fire on_data_available, or this arm tests nothing")))
+             (%check :til-vanish-completed (= (%til-count l :enter) (%til-count l :exit))
+                     (format nil "take-into from the WRITER-VANISHED notification must COMPLETE, not deadlock or signal a recursive-lock error; ~d entered, ~d exited"
+                             (%til-count l :enter) (%til-count l :exit)))
+             (%check :til-no-conditions
+                     (notany (lambda (h) (and (consp h) (eq :exit (first h)) (consp (second h))))
+                             (cap-snapshot l))
+                     (format nil "no take-into from a listener may raise a Lisp condition; got ~s" (cap-snapshot l))))
+        (dds.dcps:set-reader-listener dr nil '())
+        (dds.dcps:delete-participant pw)
+        (dds.dcps:delete-participant pr))))
+  t)

@@ -456,8 +456,16 @@
    so it belongs to the instance-rec FOREVER and must NEVER go back to the reader's data pool.")
 
 (defconstant +cs-flag-was-exposed+ 2
-  "CACHED-SAMPLE-FLAGS bit: the application has been handed this wrapper by a list-returning read/take
-   (ADR 0105), so TAKE-INTO must never recycle its struct — the application may still be reading it.")
+  "CACHED-SAMPLE-FLAGS bit: the application has been handed this wrapper, or its DATA struct, by one of
+   the THREE list-returning access paths (ADR 0105 §4.1), so TAKE-INTO must never recycle its struct —
+   the application may still be reading it.
+
+   ⚠️ THE SET SITES ARE EXACTLY THE SET %NOTE-ACCESSED IS CALLED FROM, and that is the invariant, not a
+   coincidence: %SELECT-SAMPLES-UNLOCKED (READ-SAMPLES / TAKE-SAMPLES and the six _instance/_next entries),
+   TAKE-LOANED and READ-LOANED. Anything that hands a sample out marks it accessed; anything that hands a
+   sample out must also latch it. READ-LOANED is the sharp one — it hands out the pooled DATA struct and
+   LEAVES the wrapper in DR-CACHE, so a later TAKE-INTO re-selects it and, without the latch, parks a
+   struct the application is still reading (measured: the held sample's fields changed under it).")
 
 ;;; ⚠️ THESE TWO BOOLEANS SHARE ONE SLOT, AND THAT IS A MEASURED DECISION, NOT TIDINESS. They were separate
 ;;; BOOLEAN slots until 2026-08-06. On SBCL/arm64 a 4-slot defstruct is 47.8 B and a 5-slot one is 64.2 B
@@ -476,7 +484,8 @@
 
 (defun* cached-sample-was-exposed (cs)
     (function (cached-sample) boolean)
-  "T once CS has been handed to the application by a list-returning read/take (ADR 0105). TAKE-INTO recycles
+  "T once CS — or its DATA struct — has been handed to the application by any of the three list-returning
+   access paths (ADR 0105 §4.1: %SELECT-SAMPLES-UNLOCKED, TAKE-LOANED, READ-LOANED). TAKE-INTO recycles
    only wrappers whose bit is CLEAR, because the application may still be holding an exposed one."
   (logtest (cached-sample-flags cs) +cs-flag-was-exposed+))
 
@@ -530,7 +539,8 @@
 
 (defparameter *rx-wrapper-pool-capacity* 64
   "How many returned delivery wrappers ONE DataReader parks for reuse (ADR 0093 slice 1). Read once, when
-   a reader's pool is lazily carved on its first RETURN-LOAN.
+   a reader's pool is lazily carved — on its first RETURN-LOAN, or, since ADR 0105, on its first TAKE-INTO
+   that recycles (the two callers of %RECYCLE-DELIVERY).
 
    It is a CAP, not a budget: steady state needs ONE (take, return, reuse). The depth only matters for a
    burst — an application that takes N samples and returns them together — and beyond it a returned wrapper
@@ -623,16 +633,25 @@
 
 (defun* %recycle-delivery (dr cs)
     (function (t cached-sample) t)
-  "Park CS (with its SampleInfo attached) on DR's wrapper pool for reuse (ADR 0093 slice 1). Called ONLY
-   from RETURN-LOAN — i.e. only once the application has explicitly given the sample back.
+  "Park CS (with its SampleInfo attached) on DR's wrapper pool for reuse (ADR 0093 slice 1).
 
-   ⚠️ IT IS NEVER CALLED ON CACHE EVICTION, AND THAT IS DELIBERATE. A KEEP_LAST drop removes a sample from
-   DR-CACHE, but READ is non-destructive — the application may still hold that very wrapper from an earlier
-   read. Recycling it there would hand its struct to the next sample while the application is still reading
-   it: a wrong-bytes aliasing bug, the copy-path twin of the loan use-after-free
-   %READER-KEEPLAST-DROP-OLDEST-LOAN exists to prevent. An explicit return is the only proof we have that
-   the application is done, so it is the only trigger. DATA is NOT recycled here — that is ADR 0093 slice 4,
-   which needs the get_key_value key-sample carve-out.
+   ⚠️ THERE ARE EXACTLY TWO CALLERS, AND EACH CARRIES ITS OWN PROOF THAT THE APPLICATION IS DONE WITH CS.
+   (1) RETURN-LOAN (ADR 0093 slice 1) — the application EXPLICITLY gave the wrapper back.
+   (2) TAKE-INTO, and only for a wrapper whose +CS-FLAG-WAS-EXPOSED+ is CLEAR (ADR 0105 §4.1) — the
+       application was NEVER given this wrapper or its struct, because take-into copies out of it into the
+       caller's own storage and hands back nothing. The latch is the proof, and it is why that call site is
+       safe without an explicit return. WITHOUT the latch test it is NOT safe: an earlier READ-SAMPLES or
+       READ-LOANED leaves its wrapper in DR-CACHE and a later take-into re-selects it.
+   ⛔ A THIRD CALLER NEEDS A THIRD PROOF OF THE SAME STRENGTH. Do not add one on the grounds that the
+   sample is leaving the cache — see the next paragraph.
+
+   ⚠️ IT IS NEVER CALLED ON AN EVICTION THAT DOES NOT ALSO PROVE THE APPLICATION IS DONE, AND THAT IS
+   DELIBERATE. A KEEP_LAST drop removes a sample from DR-CACHE, but READ is non-destructive — the
+   application may still hold that very wrapper from an earlier read. Recycling it there would hand its
+   struct to the next sample while the application is still reading it: a wrong-bytes aliasing bug, the
+   copy-path twin of the loan use-after-free %READER-KEEPLAST-DROP-OLDEST-LOAN exists to prevent. Leaving
+   the cache is NOT the proof; an explicit return, or a wrapper that provably never left, is. DATA is NOT
+   recycled by caller (1)'s path beyond ADR 0093 slice 4's key-sample carve-out, honoured below.
 
    ⚠️ IT ALSO RESPECTS *RX-WRAPPER-POOL-ENABLED*. Parking while the acquire side is disabled would push onto
    a pool nothing ever draws from — an unbounded leak, and it measured +33.5 B/sample in the slice's own A/B
@@ -1523,6 +1542,14 @@
    delete_* of a container that still holds contained entities / a Topic still referenced by an
    endpoint (§2.2.2.2.1.5). Represented as the keyword :precondition-not-met; nothing was deleted.")
 
+(defparameter +retcode-no-data+ :no-data
+  "DDS 1.4 ReturnCode_t RETCODE_NO_DATA (§2.2.4.4): the operation completed but returned no data — no
+   sample satisfied the read/take selection (§2.2.2.5.3). Represented as the keyword :no-data. Returned by
+   TAKE-INTO / READ-INTO (ADR 0105) alongside a count of ZERO, with the application's vectors left exactly
+   as they were: an empty result is not an error, and the count is what the caller loops over.
+   ⚠️ The LIST-returning READ-SAMPLES / TAKE-SAMPLES do NOT use it — an empty list already says the same
+   thing, and returning a keyword there would collide with the (or list (member :not-enabled)) contract.")
+
 (defparameter +retcode-immutable-policy+ :immutable-policy
   "DDS 1.4 ReturnCode_t RETCODE_IMMUTABLE_POLICY (§2.2.4.4): set_qos on an ENABLED entity tried
    to change a policy the DDS 1.4 §2.2.3 'changeable' column marks immutable-after-enable.
@@ -2400,21 +2427,32 @@
    ⚠️ FIRED FROM THE DISCOVERY UNMATCH HOOK, i.e. NOT the application thread, so it takes the cache lock
    (ADR 0093 slice 3). Safe against the drain's lock order because dds.disc fires ON-UNMATCH *outside* the
    node lock (%prune-participant-locked hands its removed matches out first): cache lock OUTER, node lock
-   INNER, never the reverse."
-  (%with-reader-cache (dr)
-   (let ((changed nil))
-    (maphash
-     (lambda (handle rec)
-       (when (member wid (instance-rec-writers rec))
-         (setf (instance-rec-writers rec) (remove wid (instance-rec-writers rec)))
-         (when (and (null (instance-rec-writers rec))
-                    (eq (instance-rec-state rec) :alive))
-           (setf (instance-rec-state rec) :not-alive-no-writers)
-           (%note-not-alive-since rec)   ; stamp the autopurge clock (DDS 1.4 §2.2.3.22)
-           (%enqueue-instance-notification dr handle rec)
-           (setf changed t))))
-     (dr-instance-recs dr))
-    (when changed (%wake-reader-data dr))))
+   INNER, never the reverse.
+
+   ⚠️ THE NOTIFICATION IS FIRED *OUTSIDE* THE CACHE LOCK, and that is load-bearing rather than tidy.
+   %WAKE-READER-DATA runs the application's ON_DATA_AVAILABLE listener, and shipped code calls take from
+   inside one (src/dds-bench/xperf.lisp) — take then takes this same lock, which %WITH-READER-CACHE's own
+   docstring says is NOT RECURSIVE, and SBCL answers a recursive acquisition with a SIMPLE-ERROR
+   (\"Recursive lock attempt\") thrown into the discovery thread. So a matched remote writer merely
+   vanishing — an ordinary shutdown — would take down the discovery thread of any application using the
+   listener idiom. CHANGED is collected inside the critical section and the wake happens after it, exactly
+   the discipline %PRUNE-PARTICIPANT-LOCKED already uses for the node lock (dds-disc/disc.lisp). The other
+   two firing sites (%DELIVER-DATA-ON-READERS, NOTIFY-DATAREADERS) were already outside it, which is why
+   only this one was reachable."
+  (let ((changed nil))
+    (%with-reader-cache (dr)
+     (maphash
+      (lambda (handle rec)
+        (when (member wid (instance-rec-writers rec))
+          (setf (instance-rec-writers rec) (remove wid (instance-rec-writers rec)))
+          (when (and (null (instance-rec-writers rec))
+                     (eq (instance-rec-state rec) :alive))
+            (setf (instance-rec-state rec) :not-alive-no-writers)
+            (%note-not-alive-since rec)   ; stamp the autopurge clock (DDS 1.4 §2.2.3.22)
+            (%enqueue-instance-notification dr handle rec)
+            (setf changed t))))
+      (dr-instance-recs dr)))
+    (when changed (%wake-reader-data dr)))   ; OUTSIDE the lock: the listener may call take, which retakes it
   t)
 
 (defun* %reader-revive-instance (dr handle wid)
@@ -3058,8 +3096,12 @@
    slot is held by the writer's refcount from %zc-loan, never released by the receiver thread, until return-loan
    (or reader-close) %zc-releases it — so the app's in-place read can never race a writer force-reclaim
    (force-reclaim skips refcount>0). The app MUST return-loan the views when done (a leaked loan pins a slot ⇒
-   the writer's pool eventually falls back to non-ZC — graceful, never a wedge). NOT cleared for ship — pending
-   counsel (R6)."
+   the writer's pool eventually falls back to non-ZC — graceful, never a wedge).
+
+   It latches +CS-FLAG-WAS-EXPOSED+ per wrapper (ADR 0105 §4.1) for the same reason read-loaned does, though
+   only read-loaned NEEDS it: take-loaned empties DR-CACHE, so its wrappers are unreachable to a later
+   selection. The latch belongs wherever a sample leaves the middleware, not only where it currently bites.
+   NOT cleared for ship — pending counsel (R6)."
   ;; ADR 0093 slice 3: ONE critical section — unlike read/take-samples these mutate dr-cache inline
   ;; rather than through %select-samples, so the drain and the cache walk share the lock here.
   (%with-reader-cache (dr)
@@ -3072,6 +3114,7 @@
         (pushnew handle touched :test #'equalp)
         (setf (sample-info-sample-state info) :read)
         (%note-accessed dr info)   ; ADR 0090 A3b: accessed is what makes a sample acknowledgeable
+        (%cs-set-flag cs +cs-flag-was-exposed+ t)   ; ADR 0105 §4.1: D leaves the middleware here
         (push d data)
         (cond ((dds.types:flatdata-view-p d) (push d loans))     ; FlatData: the view is both DATA and loan (ADR 0017)
               ((dds.disc:secured-loan-handle-p (cached-sample-loan cs)) (push (cached-sample-loan cs) loans)))))   ; secured: the pooled-buffer handle (ADR 0038 (i)); NIL otherwise
@@ -3085,7 +3128,15 @@
    counsel). Like take-loaned but LEAVES the samples in the cache (mirrors read-samples vs take-samples): returns
    (values DATA-LIST LOANS) for the cached samples, marking each READ. The SAME loan-registry views are returned
    each call until return-loan releases them; the app still returns each view once (return-loan is idempotent, so
-   a view returned after a read-then-take is a safe no-op). NOT cleared for ship — pending counsel (R6)."
+   a view returned after a read-then-take is a safe no-op).
+
+   ⚠️ IT LATCHES +CS-FLAG-WAS-EXPOSED+ ON EVERY WRAPPER IT WALKS, and that is the sharpest instance of ADR
+   0105 §4.1's hazard rather than symmetry with take-loaned. On a copy-backed sample this hands the
+   application the middleware's POOLED struct and LEAVES the wrapper in DR-CACHE registered in NEITHER loan
+   registry — so take-into's outstanding-loan refusal does not fire, the default (:read :not-read) mask
+   re-selects the wrapper, and without the latch take-into parks a struct the application is still reading.
+   Measured before the latch existed: the held sample's fields changed under it on the next delivery.
+   NOT cleared for ship — pending counsel (R6)."
   ;; ADR 0093 slice 3: ONE critical section — unlike read/take-samples these mutate dr-cache inline
   ;; rather than through %select-samples, so the drain and the cache walk share the lock here.
   (%with-reader-cache (dr)
@@ -3098,6 +3149,7 @@
         (pushnew handle touched :test #'equalp)
         (setf (sample-info-sample-state info) :read)
         (%note-accessed dr info)   ; ADR 0090 A3b: accessed is what makes a sample acknowledgeable
+        (%cs-set-flag cs +cs-flag-was-exposed+ t)   ; ADR 0105 §4.1: D leaves the middleware here and the wrapper STAYS cached
         (push d data)
         (cond ((dds.types:flatdata-view-p d) (push d loans))     ; FlatData: the view is both DATA and loan (ADR 0017)
               ((dds.disc:secured-loan-handle-p (cached-sample-loan cs)) (push (cached-sample-loan cs) loans)))))   ; secured: the pooled-buffer handle (ADR 0038 (i))
@@ -3458,11 +3510,50 @@
        (member (%snapshot-instance-state dr info) instance-states)
        t))
 
+(defun* %copy-sample-info-into (src dst)
+    (function (sample-info sample-info) sample-info)
+  "Fill DST from SRC in place (ADR 0105) and return DST — the SampleInfo half of TAKE-INTO / READ-INTO,
+   where the destination is an APPLICATION-OWNED struct the application allocated once and reuses.
+
+   ⚠️ EVERY ONE OF SAMPLE-INFO'S 13 SLOTS IS ASSIGNED UNCONDITIONALLY, for exactly the reason
+   %ACQUIRE-DELIVERY gives for the recycled-wrapper case: the destination is a REUSED struct still holding
+   the PREVIOUS sample's fields, so a slot this function forgets hands the application a field of a sample
+   it already consumed. That failure is silent, application-visible, and invisible to every allocation gate
+   (they measure bytes, and the byte count is identical either way). ADDING A SLOT TO SAMPLE-INFO REQUIRES
+   ADDING IT HERE — RUN-TAKE-INTO-POISON-TEST is what proves none was missed, by sentinel-filling all 13
+   and observing the destination AT THE COPY rather than through a later read (ADR 0093 covered 10 of 13
+   slots while appearing to cover all, because %SELECT-SAMPLES legitimately re-stamps three of them).
+
+   ⚠️ THE TWO ARRAY SLOTS — INSTANCE-HANDLE and PUBLICATION-HANDLE — ARE ALIASED, NOT COPIED, and that is
+   correct rather than lazy. Both are WRITE-ONCE immutable arrays: the instance handle is copy-seq'd once
+   per INSTANCE at instance-rec creation and never mutated, and the publication handle is the per-received-
+   sample GUID %SOURCE-GUID freshly allocates and nothing mutates (see the SAMPLE-INFO slot docstring,
+   which makes that aliasing a load-bearing invariant of ADR 0088 Option B). Copying them would cost a
+   measured ~32 B each per sample on the one arm this ADR exists to drive to zero. ⚠️ IF EITHER TARGET EVER
+   BECOMES MUTABLE this must become a REPLACE into application-preallocated 16-octet arrays."
+  (setf (sample-info-sample-state dst)                 (sample-info-sample-state src)
+        (sample-info-view-state dst)                   (sample-info-view-state src)
+        (sample-info-instance-state dst)               (sample-info-instance-state src)
+        (sample-info-source-timestamp dst)             (sample-info-source-timestamp src)
+        (sample-info-instance-handle dst)              (sample-info-instance-handle src)
+        (sample-info-publication-handle dst)           (sample-info-publication-handle src)
+        (sample-info-disposed-generation-count dst)    (sample-info-disposed-generation-count src)
+        (sample-info-no-writers-generation-count dst)  (sample-info-no-writers-generation-count src)
+        (sample-info-sample-rank dst)                  (sample-info-sample-rank src)
+        (sample-info-generation-rank dst)              (sample-info-generation-rank src)
+        (sample-info-absolute-generation-rank dst)     (sample-info-absolute-generation-rank src)
+        (sample-info-valid-data dst)                   (sample-info-valid-data src)
+        (sample-info-sequence-number dst)              (sample-info-sequence-number src))
+  dst)
+
 (defun* %select-samples-unlocked (dr states where handle max take-p
                          &optional (view-states +any-view-states+)
-                                   (instance-states +any-instance-states+))
+                                   (instance-states +any-instance-states+)
+                                   (into-data nil) (into-infos nil))
     (function (data-reader list function (or null (simple-array (unsigned-byte 8) (16)))
-              (or null (integer 0)) boolean &optional list list) list)
+              (or null (integer 0)) boolean &optional list list
+              (or null simple-vector) (or null simple-vector))
+              (values list (integer 0)))
   "The shared read/take core (DDS 1.4 §2.2.2.5.3). ⚠️ CALLER MUST HOLD DR's CACHE LOCK
    (%SELECT-SAMPLES is the locked entry point). Assumes DR is already drained. Selects the cached
    samples matching the THREE state masks — sample_state in STATES, view_state in VIEW-STATES,
@@ -3473,8 +3564,47 @@
    INSTANCE-level SampleInfo fields — view_state + instance_state — from the reader's CURRENT per-instance
    state, as DDS 1.4 §2.2.2.5.4 requires (they are computed when the samples are returned, not frozen at
    delivery); a secured decode loan is released per returned sample. TAKE-P removes the selected samples
-   from the cache; otherwise they stay. Returns the selected cached-samples in order."
+   from the cache; otherwise they stay. Returns (values SELECTED-CACHED-SAMPLES COUNT) in order.
+
+   ⚠️ INTO-MODE (ADR 0105). With INTO-DATA + INTO-INFOS both supplied this writes each selected sample into
+   INTO-DATA[i] / INTO-INFOS[i] — application-owned storage — instead of consing a list of middleware
+   wrappers, and returns (values NIL COUNT). The mode is a BRANCH INSIDE THIS FUNCTION and not a private
+   loop of its own, deliberately (ADR 0105 §4.3): a separate implementation would have to replicate the
+   three-mask predicate, the §2.2.2.5.4 view/instance-state snapshot stamping, %NOTE-ACCESSED for APP-ACK,
+   %RELEASE-SECURED-COPY-LOAN and the two-phase touched -> DR-INSTANCES marking — and any omission is a
+   silent correctness regression that no allocation gate measures.
+
+   ⚠️ CALLER CONTRACT FOR INTO-MODE, all five checked by TAKE-INTO / READ-INTO before they get here:
+   MAX is <= (length INTO-DATA) so the write index can never run off the end; the two vectors are the same
+   length; the reader's type-support has a bound COPY-INTO (a FlatData type's is NIL); every destination
+   element 0..MAX-1 is already a constructed sample / SampleInfo, so neither copier can fault on it
+   (%INTO-DESTINATIONS-READY-P); and the reader has no outstanding loan, so no selected sample's DATA can
+   be a flatdata-view.
+
+   ⚠️ RECORDED RESIDUE — THE DESTRUCTIVE HALF IS NOT ATOMIC. The recycle for sample i runs inside the loop
+   while the DR-CACHE commit runs after it, so a non-local exit part-way through leaves earlier wrappers
+   BOTH parked on the pool and still listed in the cache. Every trigger the middleware controls is closed
+   by the caller contract above; what remains is an application-supplied WHERE predicate that signals — out
+   of contract for every access operation here, and harmless for the list-returning ones because they do
+   nothing destructive before their own commit. Making it unconditionally atomic means deferring the
+   recycles past the commit, which is a hot-path change and therefore needs a measurement; it is recorded
+   in ADR 0105 §4.5 as slice-2 work rather than done unmeasured.
+
+   ⚠️ THE RECYCLE IS CONDITIONAL ON *THREE* THINGS AND EACH ONE IS A REAL DEFECT WITHOUT IT.
+   (a) TAKE-P — a READ leaves the wrapper IN DR-CACHE, so parking it on the wrapper pool would hand a live
+       cache entry to the next delivery and the cache would then hold one wrapper describing two samples.
+   (b) CACHED-SAMPLE-WAS-EXPOSED clear — a wrapper an earlier READ-SAMPLES handed out is still owned by the
+       application (§4.1); recycling it rewrites data the application is reading. Such a sample is still
+       TAKEN, merely not recycled, so it costs an allocation rather than correctness.
+   (c) %RECYCLE-DELIVERY, never a raw %RX-DATA-PUSH (§4.5) — %DRAIN-ONE-SAMPLE pins the first struct of each
+       instance as that instance's GET_KEY_VALUE key holder, and bypassing the pin rewrites the instance's
+       key on the next delivery.
+   Copy and recycle both run under the caller's cache lock (§4.2): %RX-DATA-POP / -PUSH are unsynchronised
+   read-modify-writes, and shipped code calls take from an ON_DATA_AVAILABLE listener on the receiver
+   thread, so recycling outside the lock would race two threads onto one struct (the ADR 0085 shape)."
   (let ((out '()) (keep '()) (touched '()) (n 0)
+        (copy-into (and into-data
+                        (dds.types:type-support-copy-into (topic-type-support (dr-topic dr)))))
         (node (dp-node (sub-participant (dr-subscriber dr)))))
     (dolist (cs (dr-cache dr))
       (let* ((info (cached-sample-info cs))
@@ -3491,13 +3621,21 @@
            (setf (sample-info-sample-state info) :read)
            (%note-accessed dr info)   ; ADR 0090 A3b: accessed is what makes a sample acknowledgeable
            (%release-secured-copy-loan dr node cs)   ; release the secured decode loan (data struct is independent); FlatData view untouched
-           (incf n)
-           (%cs-set-flag cs +cs-flag-was-exposed+ t)   ; ADR 0105: the app is about to hold this wrapper
-           (push cs out))
+           (cond
+             (into-data
+              (let ((d (cached-sample-data cs)))
+                (when d (funcall copy-into d (svref into-data n))))   ; valid_data NIL carries a NIL DATA: destination untouched, never a fault (ADR 0105 §3)
+              (%copy-sample-info-into info (svref into-infos n))
+              (when (and take-p (not (cached-sample-was-exposed cs)))
+                (%recycle-delivery dr cs)))   ; the three conditions are in the docstring; each omission is a real defect
+             (t
+              (%cs-set-flag cs +cs-flag-was-exposed+ t)   ; ADR 0105: the app is about to hold this wrapper
+              (push cs out)))
+           (incf n))
           (t (when take-p (push cs keep))))))     ; take keeps only the UN-selected; read leaves the cache intact
     (dolist (h touched) (setf (gethash h (dr-instances dr)) t))   ; mark accessed after snapshot
     (when take-p (setf (dr-cache dr) (nreverse keep)))
-    (nreverse out)))
+    (values (nreverse out) n)))
 
 (defun* %drain (dr)
     (function (data-reader) t)
@@ -3521,7 +3659,9 @@
    What is NOT promised is that two threads concurrently taking from one reader each see every sample;
    DDS never promised that, and the interleaving costs a sample to one taker, never corrupts either."
   (%with-reader-cache (dr)
-    (%select-samples-unlocked dr states where handle max take-p view-states instance-states)))
+    ;; ONE value: the core also returns a COUNT for ADR 0105's into-mode, and letting that leak out would
+    ;; silently add a second return value to read-samples/take-samples and the six _instance/_next entries.
+    (values (%select-samples-unlocked dr states where handle max take-p view-states instance-states))))
 
 (defun* read-samples (dr &key (states +any-sample-states+) (where #'%where-any)
                               (view-states +any-view-states+)
@@ -3550,6 +3690,158 @@
   (unless (entity-enabled-p dr) (return-from take-samples +retcode-not-enabled+))
   (%drain dr)
   (%select-samples dr states where nil nil t view-states instance-states))
+
+;;; ---- ADR 0105: the NON-LOAN access operations. A take is not a loan. ----
+
+(defun* %into-destinations-ready-p (sample-p data infos limit)
+    (function (function simple-vector simple-vector (integer 0)) boolean)
+  "T iff every destination element TAKE-INTO / READ-INTO could write — indices 0..LIMIT-1 of BOTH DATA and
+   INFOS — already holds a constructed object of the right kind: a sample of the reader's own type
+   (SAMPLE-P is that type's generated <name>-P predicate, carried in the type-support vtable) and a
+   SAMPLE-INFO. Only 0..LIMIT-1 is examined, because that is the most the call can write; a longer vector's
+   tail is the application's business.
+
+   ⚠️ THIS IS NOT DEFENSIVE PROGRAMMING, IT IS THE NO-CONDITIONS RULE. The copiers are fully typed —
+   %COPY-SAMPLE-INFO-INTO is (SAMPLE-INFO SAMPLE-INFO) and the generated COPY-INTO-<name> is (<name>
+   <name>) — and entities.lisp compiles at the default safety, so a wrong-typed destination element makes
+   SBCL signal a TYPE-ERROR out of the middle of the copy loop, i.e. a Lisp condition escaping src/, which
+   the operating contract forbids outright. The natural mistake produces one: (MAKE-ARRAY 32) is the
+   obvious reading of \"vectors the application allocates once\", and SBCL fills a simple-vector with 0, so
+   the FIRST element already faults. A mere NIL test would not catch that — which is why the type-support
+   carries a predicate rather than this function testing for NIL.
+
+   ⚠️ IT IS ALSO WHAT MAKES THE DESTRUCTIVE HALF SAFE. The copy loop recycles each taken wrapper as it
+   goes, while DR-CACHE is committed only after the loop; a fault part-way through therefore skipped the
+   commit and left a wrapper parked on the pool AND still listed in the cache — one wrapper describing two
+   samples, plus a VALID-DATA T entry whose DATA is NIL. Measured on the working tree before this guard
+   existed. Validating up front removes every trigger the middleware controls; the residue is recorded in
+   %SELECT-SAMPLES-UNLOCKED."
+  (loop for i from 0 below limit
+        always (and (funcall sample-p (svref data i))
+                    (sample-info-p (svref infos i)))))
+
+(defun* %access-into (dr data infos states where view-states instance-states max-samples take-p)
+    (function (data-reader simple-vector simple-vector list function list list
+               (or null (integer 0)) boolean)
+              (values (integer 0) (or null keyword)))
+  "The shared body of TAKE-INTO (TAKE-P T) and READ-INTO (TAKE-P NIL) — the DDS 1.4 §2.2.2.5.3.8
+   max_len>0 / owns==TRUE variant, in which the middleware COPIES into the caller's collections and there
+   is no loan and no return obligation (ADR 0105). Returns (values COUNT STATUS): COUNT elements of DATA
+   and INFOS were filled in place, STATUS is NIL on success and a ReturnCode_t otherwise. Nothing signals.
+
+   THE SIX REFUSALS, in the order they are cheapest to decide:
+     :NOT-ENABLED               a disabled reader (DDS 1.4 §2.2.2.1.1.7)
+     :PRECONDITION-NOT-MET      (/= (length DATA) (length INFOS)) — §2.2.2.5.3.8 rule 1, the collections
+                                must be one-to-one, or the application cannot pair a sample with its info
+     :PRECONDITION-NOT-MET      MAX-SAMPLES > (length DATA) — rule 5, third bullet: the application would
+                                be asking for samples that could never be returned. NIL is LENGTH_UNLIMITED
+                                and means (length DATA), which is what max_len is in this PSM
+     :PRECONDITION-NOT-MET      the reader's type has NO COPY-INTO — a FlatData type, whose sample IS a
+                                buffer and not a struct. Slice 1 refuses it (ADR 0105 §4.4). The same
+                                clause refuses a type-support with no SAMPLE-P, because the destinations
+                                could then not be validated and the next refusal would have to be skipped
+     :PRECONDITION-NOT-MET      a destination element of DATA or INFOS is not already a constructed sample
+                                / SAMPLE-INFO — §2.2.2.5.3.8's malformed-collection class. See
+                                %INTO-DESTINATIONS-READY-P for why this is the no-conditions rule and not
+                                belt-and-braces
+     :PRECONDITION-NOT-MET      the reader holds an OUTSTANDING LOAN. See below
+   and :NO-DATA with COUNT 0 when nothing was selected (§2.2.2.5.3) — an empty result, not an error.
+
+   ⚠️ WHY AN OUTSTANDING LOAN IS THE LOAN-CAPABLE TEST, and why it is exact rather than a proxy. ADR 0105
+   §4.4 refuses Zero-Copy / FlatData / secured readers in slice 1, because copying a flatdata-view into the
+   struct pool would never %ZC-RELEASE it — recreating the ADR 0096 slot leak — and because a secured
+   sample's pooled decode buffer is not ours to recycle. A ZC view is in DR-CACHE if and only if it is in
+   DR-LOANS: %DRAIN-ONE-LOAN registers it before delivery and %RETURN-LOAN-UNLOCKED deletes the cache entry
+   and the registry entry together, precisely so a returned loan can never be stale-read. The same holds
+   for a secured handle and DR-SECURED-LOANS. So testing the two REGISTRIES under the cache lock decides
+   the property for the whole cache in O(1), where a per-sample FLATDATA-VIEW-P test would cost a typecheck
+   on every selected sample and decide no more. It is deliberately CONSERVATIVE: a reader that still holds
+   a loan it took earlier is refused even if every cached sample is a plain struct.
+
+   ⚠️ THE REGISTRY TEST MUST RUN UNDER THE SAME LOCK AS THE SELECTION, not before it. %DRAIN and the
+   selection are two separate critical sections on purpose, so another application thread can drain
+   loan-bearing samples into this reader between them; checking inside the selection's own lock makes the
+   cache we test the exact cache we then read."
+  (let* ((ts (topic-type-support (dr-topic dr)))
+         (sample-p (dds.types:type-support-sample-p ts))
+         (limit (or max-samples (length data))))
+    (cond
+      ((not (entity-enabled-p dr)) (values 0 +retcode-not-enabled+))
+      ((/= (length data) (length infos)) (values 0 +retcode-precondition-not-met+))
+      ((and max-samples (> max-samples (length data))) (values 0 +retcode-precondition-not-met+))
+      ((or (null (dds.types:type-support-copy-into ts)) (null sample-p))
+       (values 0 +retcode-precondition-not-met+))
+      ((not (%into-destinations-ready-p sample-p data infos limit))
+       (values 0 +retcode-precondition-not-met+))
+      (t
+       (%drain dr)
+       (%with-reader-cache (dr)
+         (if (or (dr-loans dr) (dr-secured-loans dr))
+             (values 0 +retcode-precondition-not-met+)
+             (let ((n (nth-value 1 (%select-samples-unlocked
+                                    dr states where nil limit take-p
+                                    view-states instance-states data infos))))
+               (values n (if (zerop n) +retcode-no-data+ nil)))))))))
+
+(defun* take-into (dr data infos &key (states +any-sample-states+) (where #'%where-any)
+                                      (view-states +any-view-states+)
+                                      (instance-states +any-instance-states+)
+                                      (max-samples nil))
+    (function (data-reader simple-vector simple-vector &key (:states list) (:where function)
+                    (:view-states list) (:instance-states list) (:max-samples (or null (integer 0))))
+              (values (integer 0) (or null keyword)))
+  "DataReader::take into APPLICATION-OWNED storage — the DDS 1.4 §2.2.2.5.3.8 max_len>0 / owns==TRUE
+   variant (ADR 0105). DATA and INFOS are vectors the application allocates ONCE and reuses forever; this
+   fills elements 0..COUNT-1 IN PLACE and returns (values COUNT STATUS). There is NO loan and NO return
+   obligation, which is exactly what distinguishes it from TAKE-SAMPLES: the middleware's own pooled struct
+   is recycled here, inside the same critical section, instead of being handed out and waited on.
+
+   Like TAKE-SAMPLES it REMOVES the selected samples from the reader cache, marks them READ, and applies
+   the same three state masks (STATES / VIEW-STATES / INSTANCE-STATES, each defaulting to its ANY_*_STATE)
+   and the same WHERE query predicate. MAX-SAMPLES defaults to NIL = LENGTH_UNLIMITED = (length DATA).
+
+   ⚠️ DATA's and INFOS's elements must ALREADY be constructed objects — a sample of this reader's type and
+   a SAMPLE-INFO — for indices 0..MAX-SAMPLES-1 (or the whole vector when MAX-SAMPLES is NIL). This fills
+   them; it does not create them. (MAKE-ARRAY 32) is NOT a valid destination: it is 32 zeros.
+
+   Refuses with PRECONDITION_NOT_MET when the two vectors differ in length, when MAX-SAMPLES exceeds
+   (length DATA), when a destination element is not a constructed sample / SampleInfo, on a FlatData type,
+   and — in slice 1 — on a reader holding an outstanding Zero-Copy or secured loan; with NOT_ENABLED on a
+   disabled reader; and reports NO_DATA with COUNT 0 when nothing matched. See %ACCESS-INTO for why each of
+   those is the rule it is.
+
+   ⚠️ AT AN INDEX WHOSE SAMPLEINFO HAS VALID-DATA NIL, NOTHING IN THE DESTINATION SAMPLE IS MEANINGFUL —
+   NOT EVEN THE KEY FIELDS. The middleware's wrapper carries a NIL sample for a dispose/unregister, so
+   there is nothing to copy and the destination struct is left EXACTLY as the previous call left it: it
+   holds some earlier sample's fields, and on a multi-instance reader that is a DIFFERENT INSTANCE's key.
+   The instance is identified SOLELY by SAMPLE-INFO-INSTANCE-HANDLE (with GET-KEY-VALUE available to turn
+   that handle into a key sample). TAKE-SAMPLES hands back a literal NIL that cannot be missed; a
+   pre-allocated destination cannot, so this is part of the documented contract. ALWAYS test
+   SAMPLE-INFO-VALID-DATA before reading ANY field of the destination sample."
+  (%access-into dr data infos states where view-states instance-states max-samples t))
+
+(defun* read-into (dr data infos &key (states +any-sample-states+) (where #'%where-any)
+                                      (view-states +any-view-states+)
+                                      (instance-states +any-instance-states+)
+                                      (max-samples nil))
+    (function (data-reader simple-vector simple-vector &key (:states list) (:where function)
+                    (:view-states list) (:instance-states list) (:max-samples (or null (integer 0))))
+              (values (integer 0) (or null keyword)))
+  "DataReader::read into APPLICATION-OWNED storage — the non-destructive twin of TAKE-INTO, same lambda
+   list, same refusals, same (values COUNT STATUS) contract (ADR 0105). It ships in the SAME slice and not
+   later because §2.2.2.5.3.8 is the READ clause and take merely inherits it; a take-only owns==TRUE
+   variant would be a conformance gap.
+
+   The selected samples STAY in the cache marked READ, exactly as READ-SAMPLES leaves them. ⚠️ Nothing is
+   recycled here, and that is not an oversight: the wrapper this copied out of is still a live cache entry,
+   so parking it on the reader's pool would let the next delivery overwrite a sample the cache still lists.
+   READ-INTO costs no allocation either — it simply recovers none.
+
+   The same destination-element precondition and the same VALID-DATA caveat as TAKE-INTO apply: the
+   elements must already be constructed objects, and at an invalid-data index NOTHING in the destination
+   sample is meaningful — it simply keeps its previous contents, so the instance is identified only by
+   SAMPLE-INFO-INSTANCE-HANDLE."
+  (%access-into dr data infos states where view-states instance-states max-samples nil))
 
 ;;; ---- Instance / next sample-access (S5.T2, DDS 1.4 §2.2.2.5.3). Each carries the FULL DDS three-mask
 ;;;      (sample_states + view_states + instance_states) signature, as the base read/take do. ----

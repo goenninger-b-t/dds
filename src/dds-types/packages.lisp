@@ -16,7 +16,7 @@
            #:type-support-serialize #:type-support-deserialize
            #:type-support-serialized-size #:type-support-key-hash
            #:type-support-typeobject #:type-support-typeidentifier
-           #:type-support-deserialize-into #:type-support-copy-into
+           #:type-support-deserialize-into #:type-support-copy-into #:type-support-sample-p
            #:type-support-sample-pool-alloc #:type-support-sample-pool-free
            #:type-support-flatdata-offset #:type-support-flatdata-builder #:type-support-flatdata-ctor
            #:type-support-data-representation-mask #:type-support-field-accessors

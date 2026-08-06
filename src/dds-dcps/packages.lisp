@@ -34,6 +34,10 @@
            #:delete-datawriter #:delete-datareader #:delete-publisher #:delete-subscriber
            #:delete-topic #:delete-contained-entities
            #:write-sample #:read-samples #:take-samples #:samples-available
+           ;; ADR 0105: the NON-LOAN access operations (DDS 1.4 §2.2.2.5.3.8 max_len>0 / owns==TRUE) —
+           ;; the application owns the two collections, the middleware fills them in place and recycles
+           ;; its own struct; no loan, no return obligation. (values COUNT STATUS).
+           #:take-into #:read-into #:+retcode-no-data+
            #:read-instance #:take-instance #:read-next-instance #:take-next-instance
            #:read-next-sample #:take-next-sample
            ;; WP-FLATDATA-ZC-LOAN literal-0-copy loan API (FR-PF-3/4, R6, ADR 0017)
