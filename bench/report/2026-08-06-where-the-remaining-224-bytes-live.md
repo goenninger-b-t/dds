@@ -24,6 +24,44 @@ in-place unlink and the cell pooling are collectively at zero per call — so th
 work that only happens when a sample is actually *there* (the receiver thread's per-datagram handling and
 the delivery/decode), not the access machinery slice 1 rebuilt.
 
+## Inside the write path: a three-way bisect, no peer, no code edited
+
+The arms differ **only** by public knobs — the type's `@key` and the writer QoS — so each difference names a
+sub-path without touching engine code. Two runs each; arm B was identical to 0.1 B.
+
+| arm | B/sample | what the difference names |
+|---|---|---|
+| A keyed + reliable | 122.3 / 123.4 | the baseline |
+| B **unkeyed** + reliable | **79.7 / 79.7** | A − B = **~43 B is the KEYED path** |
+| C keyed + **best-effort** | 111.4 / 112.5 | A − C = **~11 B is RELIABLE bookkeeping** |
+
+So the write path is roughly **~80 B common core + ~43 B keyed + ~11 B reliable**.
+
+(KEEP_ALL is deliberately not an arm: with no reader nothing is ever acked, so the cache would grow without
+bound and the growth would dominate the reading instead of measuring eviction.)
+
+### ~32 of the keyed 43 B is already diagnosed, in `%write-key-hash`'s own docstring
+
+> *"The RESULT array is still allocated fresh, **deliberately**: the handle is RETAINED on THREE paths —
+> threaded onto the CacheChange for KEEP_LAST per-instance eviction; used as a `dw-instances` EQUALP hash
+> key; and, when the offered DEADLINE is finite, passed on by `%deadline-touch-writer` as the
+> `dw-deadline-timers` key. Recycling it would alias every change's handle and mutate live keys. … Only the
+> SCRATCH is reusable; **closing the remaining 32 B needs the ADR 0076 stable-handle indirection on the
+> writer side**."*
+
+That is the campaign's RETAINED question already answered correctly: **retained ⇒ a write-once per-instance
+cache, never a scratch.** The RX drain has done exactly this since ADR 0076 — compute into a transient
+scratch, use it only for the instance lookup, then read the *stable* handle off the record. A writer has few
+instances and many writes, so the TX twin is the same shape.
+
+**It is not a drive-by change, and it should not be attempted as one.** `dw-instances` maps
+`handle → key-sample`, and Common Lisp gives no way to read a hash entry's stored *key* back — so the stable
+handle has to be reachable some other way (widen the value, intern through a second table, or cache the last
+handle). That alters a documented value shape at five sites, which needs an ADR. And the docstring names the
+sharpest hazard itself: the DEADLINE retention path is **conditional** — under the default
+`DURATION_INFINITE` it arms nothing, so a wrongly-recycled handle would look correct until someone
+configured a finite DEADLINE.
+
 ## Where in the write path it is *not*
 
 `write-sample` → `%publish-one` already serializes **straight into the writer's arena-pooled buffer** through
