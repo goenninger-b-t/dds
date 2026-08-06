@@ -5,7 +5,11 @@
   take still must be 0 consing and not allocating memory due to being in the hot path."*
 - **Requirements:** NFR-MEM (steady state allocates **zero** bytes/sample), FR-PF-7, NFR-PERF-8, FR-LANG-5.
 - **Amends:** ADR 0093 (which made the copy path a loan). Does **not** supersede it — the loan variant stays.
-- **Status:** design approved in session 2026-08-06; ADR to be written from this document before code.
+- **Status:** design approved 2026-08-06. **Superseded as the authority by
+  [ADR 0105](../../adr/0105-a-take-is-not-a-loan-take-into-and-the-type-support-copy-into-slot.md)** — that
+  ADR carries the decision, the frozen-contract change and the consumer list, and must be **Accepted before
+  any code**. This document remains the reasoning, the hazard analysis and the verification record behind it;
+  where the two differ, the ADR wins.
 
 ---
 
