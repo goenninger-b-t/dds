@@ -257,6 +257,11 @@
    sample arriving mid-arm would add an instance whose first access falls in a different call and the
    NEW/NOT_NEW pattern being asserted would stop describing what the test says it does.")
 
+(defconstant +td-cache-spine-unlink+ 62
+  "ADR 0105 Task 6a isolation offset: the in-place DR-CACHE spine unlink. The arm pins the exact residue and
+   ORDER of a three-sample cache after taking the head, the middle and the tail one at a time, so a foreign
+   participant's sample landing in that cache changes both the count and the order being asserted.")
+
 (defconstant +td-lifecycle-drained-identity+ 61
   "ADR 0105 Task 6 isolation offset: the lifecycle drained-set key identity. The arm drains exactly two
    dispose changes in two SEPARATE passes and then asserts a third pass delivers NOTHING, so any foreign

@@ -4168,6 +4168,7 @@
                  ("take-into-listener"       . run-take-into-listener-test) ; ADR 0105 §8 listener re-entry
                  ("view-state-snapshot"      . run-view-state-snapshot-test) ; DDS 1.4 §2.2.2.5.1.4 snapshot ordering
                  ("lifecycle-drained-identity" . run-lifecycle-drained-identity-test) ; ADR 0105 Task 6 key-cons retention
+                 ("cache-spine-unlink"       . run-cache-spine-unlink-test) ; ADR 0105 Task 6a in-place spine unlink
                  ("rtps-discovery-spdp"      . dds.rtps.discovery:run-discovery-test)
                  ("rtps-discovery-sedp"      . dds.rtps.discovery:run-sedp-test)
                  ("rtps-data-representation-wire" . dds.rtps.discovery:run-data-representation-wire-test)

@@ -144,6 +144,7 @@
    (disc-endpoint :initform nil :accessor dr-disc-endpoint) ; WP-DCPS-API-COMPLETION S2.T4: this reader's SEDP endpoint-data (from add-local-reader), so delete_datareader can remove-local-reader it from discovery
 
    (cache :initform '() :accessor dr-cache)                       ; list of cached-sample
+   (cache-cells :initform '() :accessor dr-cache-cells)           ; ADR 0105 Task 6a: free list of SPINE conses %select-samples unlinked, reused by %cache-append
    (instances :initform (make-hash-table :test 'equalp) :accessor dr-instances) ; handle -> accessed-p
    (instance-recs :initform (make-hash-table :test 'equalp) :accessor dr-instance-recs) ; handle -> instance-rec (DDS 1.4 §2.2.2.5.1.3)
    (drained :initform (make-hash-table :test 'equalp) :accessor dr-drained) ; 16-octet source GUID -> highest engine SN drained for that writer (§8.3.5.4: SN is per-writer)
@@ -497,6 +498,58 @@
         (if on
             (logior (cached-sample-flags cs) bit)
             (logandc2 (cached-sample-flags cs) bit))))
+
+;;; ---- The DR-CACHE spine, and why its cons cells are pooled (ADR 0105 Task 6a) ----
+;;;
+;;; DR-CACHE is a LIST of cached-sample in arrival order, and the SPINE cost one fresh cons per delivered
+;;; sample: every append was (NCONC (DR-CACHE DR) (LIST CS)). The wrapper it points at has been pooled since
+;;; ADR 0093; the cell holding it was not. These three functions close that, and they are the ONLY places
+;;; the spine's cells are created or released.
+;;;
+;;; ⚠️ A CELL MAY BE PARKED ONLY BY WHOEVER UNLINKED IT, AND ONLY %SELECT-SAMPLES-UNLOCKED DOES. Verified by
+;;; reading every holder: the two list-returning access paths build their result with PUSH, so what they
+;;; hand the application is a FRESH list and never the spine (%SELECT-SAMPLES-UNLOCKED's OUT, TAKE-LOANED's
+;;; and READ-LOANED's DATA / LOANS); the WaitSet and ReadCondition predicates only COUNT-IF over the spine;
+;;; and the DELETE / REMOVE sites (KEEP_LAST eviction, instance purge, return-loan invalidation) drop their
+;;; cells to the GC rather than parking them — correct, because DELETE relinks destructively and does not
+;;; report which cells it dropped. Those paths are rare; the delivery/take cycle is not, and it is the one
+;;; that closes.
+;;;
+;;; The free list is BOUNDED by the reader's own peak cache length — cells enter it only by being unlinked
+;;; from the spine and leave it on the next append — so it costs at most what the spine it came from cost,
+;;; and it shrinks again as the cache refills. It needs no capacity of its own.
+
+(defun* %cache-cell (dr cs)
+    (function (data-reader cached-sample) cons)
+  "A one-element list holding CS, taken from DR's parked-cell free list when one is available and freshly
+   consed when it is not. The steady state is a closed cycle: take unlinks the cell and parks it, the next
+   delivery pops it straight back, so a reader that is being drained allocates no spine at all."
+  (let ((cell (dr-cache-cells dr)))
+    (cond (cell
+           (setf (dr-cache-cells dr) (cdr cell)
+                 (car cell) cs
+                 (cdr cell) nil)
+           cell)
+          (t (list cs)))))
+
+(defun* %park-cache-cell (dr cell)
+    (function (data-reader cons) t)
+  "Return CELL — already UNLINKED from DR's cache spine by the caller — to DR's free list. The CAR is
+   cleared first: a parked cell that still pointed at its cached-sample would keep the wrapper, its
+   SampleInfo and its decoded sample struct reachable for as long as the reader lived, which is a leak
+   rather than a corruption but exactly the kind this campaign exists to remove."
+  (setf (car cell) nil
+        (cdr cell) (dr-cache-cells dr)
+        (dr-cache-cells dr) cell)
+  t)
+
+(defun* %cache-append (dr cs)
+    (function (data-reader cached-sample) t)
+  "Append CS to the tail of DR's cache, in arrival order — the ONE append the four delivery paths share
+   (ordinary data, the synthetic invalid-data notification, the Zero-Copy loan and the secured loan). The
+   spine cell comes from %CACHE-CELL, so a steady-state delivery conses nothing here."
+  (setf (dr-cache dr) (nconc (dr-cache dr) (%cache-cell dr cs)))
+  t)
 
 (defparameter *rx-wrapper-pool-enabled* t
   "ADR 0093 slice 1 — the RX copy path's WRAPPER pooling (cached-sample + sample-info), on by default.
@@ -2311,17 +2364,15 @@
    REC's current instance_state + generation counts (DDS 1.4 §2.2.2.5.1.4: a dispose/no-writers
    change yields a SampleInfo with valid_data=FALSE and no associated Data). NOT_READ so read/take
    surface it once; sequence-number 0 (no wire SN — it is an instance-state change, not a sample)."
-  (setf (dr-cache dr)
-        (nconc (dr-cache dr)
-               (list (make-cached-sample
-                      :data nil
-                      :info (make-sample-info
-                             :sample-state :not-read :view-state :new
-                             :instance-state (instance-rec-state rec) :valid-data nil
-                             :instance-handle handle
-                             :disposed-generation-count (instance-rec-disposed-gen-count rec)
-                             :no-writers-generation-count (instance-rec-no-writers-gen-count rec)
-                             :sequence-number 0)))))
+  (%cache-append dr (make-cached-sample
+                     :data nil
+                     :info (make-sample-info
+                            :sample-state :not-read :view-state :new
+                            :instance-state (instance-rec-state rec) :valid-data nil
+                            :instance-handle handle
+                            :disposed-generation-count (instance-rec-disposed-gen-count rec)
+                            :no-writers-generation-count (instance-rec-no-writers-gen-count rec)
+                            :sequence-number 0)))
   t)
 
 (defun* %note-not-alive-since (rec)
@@ -3004,19 +3055,17 @@
           (push view (dr-loans dr))                                ; register BEFORE delivery (reader-close safety)
           (let ((depth (%reader-keeplast-depth dr)))
             (when depth (%reader-keeplast-drop-oldest-loan dr handle depth)))   ; KEEP_LAST per-instance drop, LOAN-aware: releases the evicted view's loan, not a bare delete (DDS 1.4 §2.2.3.18); UAF-guarded (never an app-held :read view); for NO_KEY FlatData the per-(GUID,SN)-unique handle means the cap never fires
-          (setf (dr-cache dr)
-                (nconc (dr-cache dr)
-                       (list (make-cached-sample
-                              :data view
-                              :info (make-sample-info
-                                     :sample-state :not-read :view-state :new
-                                     :instance-state (instance-rec-state rec) :valid-data t
-                                     :instance-handle handle :sequence-number sn
-                                     :publication-handle sguid   ; DDS 1.4 §2.2.2.5.4; ALIASED, never copied — see the slot docstring
-                                     :source-timestamp (dds.disc:node-sample-timestamp   ; S5.T4
-                                                        (dp-node (sub-participant (dr-subscriber dr))) key)
-                                     :disposed-generation-count (instance-rec-disposed-gen-count rec)
-                                     :no-writers-generation-count (instance-rec-no-writers-gen-count rec)))))))))
+          (%cache-append dr (make-cached-sample
+                             :data view
+                             :info (make-sample-info
+                                    :sample-state :not-read :view-state :new
+                                    :instance-state (instance-rec-state rec) :valid-data t
+                                    :instance-handle handle :sequence-number sn
+                                    :publication-handle sguid   ; DDS 1.4 §2.2.2.5.4; ALIASED, never copied — see the slot docstring
+                                    :source-timestamp (dds.disc:node-sample-timestamp   ; S5.T4
+                                                       (dp-node (sub-participant (dr-subscriber dr))) key)
+                                    :disposed-generation-count (instance-rec-disposed-gen-count rec)
+                                    :no-writers-generation-count (instance-rec-no-writers-gen-count rec)))))))
     (when sguid                                                    ; advance the per-writer watermark (best-effort: ACKed, never retransmit)
       (%reader-advance-drained dr sguid sn)))
   t)
@@ -3033,19 +3082,17 @@
     (push loan (dr-secured-loans dr))                             ; register the LOAN handle BEFORE delivery (reader-close safety)
     (let ((depth (%reader-keeplast-depth dr)))
       (when depth (%reader-keeplast-drop-oldest-secured dr handle depth)))
-    (setf (dr-cache dr)
-          (nconc (dr-cache dr)
-                 (list (make-cached-sample
-                        :data data
-                        :loan loan
-                        :info (make-sample-info
-                               :sample-state :not-read :view-state :new
-                               :instance-state (instance-rec-state rec) :valid-data t
-                               :instance-handle handle :sequence-number sn
-                               :publication-handle sguid   ; DDS 1.4 §2.2.2.5.4; ALIASED, never copied — see the slot docstring
-                               :source-timestamp (dds.disc:node-sample-timestamp node key)   ; S5.T4
-                               :disposed-generation-count (instance-rec-disposed-gen-count rec)
-                               :no-writers-generation-count (instance-rec-no-writers-gen-count rec)))))))
+    (%cache-append dr (make-cached-sample
+                       :data data
+                       :loan loan
+                       :info (make-sample-info
+                              :sample-state :not-read :view-state :new
+                              :instance-state (instance-rec-state rec) :valid-data t
+                              :instance-handle handle :sequence-number sn
+                              :publication-handle sguid   ; DDS 1.4 §2.2.2.5.4; ALIASED, never copied — see the slot docstring
+                              :source-timestamp (dds.disc:node-sample-timestamp node key)   ; S5.T4
+                              :disposed-generation-count (instance-rec-disposed-gen-count rec)
+                              :no-writers-generation-count (instance-rec-no-writers-gen-count rec)))))
   (when sguid
     (%reader-advance-drained dr sguid sn))
   t)
@@ -3336,16 +3383,14 @@
                   (when depth (%reader-keeplast-drop-oldest dr handle depth))   ; KEEP_LAST per-instance drop (DDS 1.4 §2.2.3.18) before append
                   ;; ADR 0093 slice 1: both wrappers come from DR's freelists when the application returns
                   ;; its taken samples, else are freshly allocated — delivery is identical either way.
-                  (setf (dr-cache dr)
-                        (nconc (dr-cache dr)
-                               (list (let ((cs (%acquire-delivery
-                                                dr data (instance-rec-state rec) handle sn
-                                                sguid   ; DDS 1.4 §2.2.2.5.4; ALIASED, never copied — see the slot docstring
-                                                (dds.disc:node-sample-timestamp node key)   ; S5.T4
-                                                (instance-rec-disposed-gen-count rec)
-                                                (instance-rec-no-writers-gen-count rec))))
-                                       (%cs-set-flag cs +cs-flag-data-pinned+ pinned)
-                                       cs)))))))))
+                  (let ((cs (%acquire-delivery
+                             dr data (instance-rec-state rec) handle sn
+                             sguid   ; DDS 1.4 §2.2.2.5.4; ALIASED, never copied — see the slot docstring
+                             (dds.disc:node-sample-timestamp node key)   ; S5.T4
+                             (instance-rec-disposed-gen-count rec)
+                             (instance-rec-no-writers-gen-count rec))))
+                    (%cs-set-flag cs +cs-flag-data-pinned+ pinned)
+                    (%cache-append dr cs)))))))
         ;; ADR 0093 slice 4: EVERY non-delivery outcome hands the struct straight back — a decode failure, a
         ;; content-filter miss, a RESOURCE_LIMITS reject, and both EXCLUSIVE-ownership drops. Missing one
         ;; would not corrupt anything, it would just quietly drain the pool until it stopped helping.
@@ -3608,14 +3653,23 @@
    (%INTO-DESTINATIONS-READY-P); and the reader has no outstanding loan, so no selected sample's DATA can
    be a flatdata-view.
 
-   ⚠️ RECORDED RESIDUE — THE DESTRUCTIVE HALF IS NOT ATOMIC. The recycle for sample i runs inside the loop
-   while the DR-CACHE commit runs after it, so a non-local exit part-way through leaves earlier wrappers
-   BOTH parked on the pool and still listed in the cache. Every trigger the middleware controls is closed
-   by the caller contract above; what remains is an application-supplied WHERE predicate that signals — out
-   of contract for every access operation here, and harmless for the list-returning ones because they do
-   nothing destructive before their own commit. Making it unconditionally atomic means deferring the
-   recycles past the commit, which is a hot-path change and therefore needs a measurement; it is recorded
-   in ADR 0105 §4.5 as slice-2 work rather than done unmeasured.
+   ⚠️ TAKE REMOVES EACH SELECTED SAMPLE IN PLACE, one cell at a time, rather than rebuilding DR-CACHE from
+   a KEEP list at the end (ADR 0105 Task 6a). The walk carries PREV so the cell can be unlinked where it
+   sits, and the cell is then parked on the reader's free list for the next delivery to reuse — which is
+   the whole win: the spine stopped costing a cons per sample. The un-selected keep their cells and their
+   arrival order untouched, so nothing is rebuilt and nothing is reversed.
+
+   ⚠️ RECORDED RESIDUE — THE DESTRUCTIVE HALF IS STILL NOT ATOMIC, but the failure it degrades to is now a
+   different and better one. Both halves of removing sample i (the unlink and, in into-mode, the recycle)
+   now happen in ITS OWN iteration, so a non-local exit part-way through can no longer leave a wrapper
+   simultaneously parked on the pool and listed in the cache — the one-wrapper-describing-two-samples shape
+   that was measured before %INTO-DESTINATIONS-READY-P existed. What it can now leave is the samples
+   selected SO FAR removed from the cache while the OUT list that would have returned them is discarded,
+   i.e. lost rather than corrupted. The only trigger is an application-supplied WHERE predicate that
+   signals, which is out of contract for every access operation here; every trigger the middleware controls
+   is closed by the caller contract above. Making it unconditionally atomic means deferring the removals
+   past the loop, which reinstates a per-sample cons unless the deferral list is itself pooled — a hot-path
+   change owing a measurement, recorded in ADR 0105 §4.5 as slice-2 work rather than done unmeasured.
 
    ⚠️ THE RECYCLE IS CONDITIONAL ON *THREE* THINGS AND EACH ONE IS A REAL DEFECT WITHOUT IT.
    (a) TAKE-P — a READ leaves the wrapper IN DR-CACHE, so parking it on the wrapper pool would hand a live
@@ -3629,12 +3683,14 @@
    Copy and recycle both run under the caller's cache lock (§4.2): %RX-DATA-POP / -PUSH are unsynchronised
    read-modify-writes, and shipped code calls take from an ON_DATA_AVAILABLE listener on the receiver
    thread, so recycling outside the lock would race two threads onto one struct (the ADR 0085 shape)."
-  (let ((out '()) (keep '()) (n 0)
+  (let ((out '()) (n 0) (prev nil) (cell (dr-cache dr))
         (copy-into (and into-data
                         (dds.types:type-support-copy-into (topic-type-support (dr-topic dr)))))
         (node (dp-node (sub-participant (dr-subscriber dr)))))
-    (dolist (cs (dr-cache dr))
-      (let* ((info (cached-sample-info cs))
+    (loop while cell do
+      (let* ((next (cdr cell))
+             (cs (car cell))
+             (info (cached-sample-info cs))
              (sel (and (%state-mask-match-p dr info states view-states instance-states)
                        (or (null max) (< n max))
                        (or (null handle) (equalp handle (sample-info-instance-handle info)))
@@ -3646,6 +3702,12 @@
            (setf (sample-info-sample-state info) :read)
            (%note-accessed dr info)   ; ADR 0090 A3b: accessed is what makes a sample acknowledgeable
            (%release-secured-copy-loan dr node cs)   ; release the secured decode loan (data struct is independent); FlatData view untouched
+           ;; take REMOVES what it selected: unlink the spine cell and park it (ADR 0105 Task 6a). BEFORE
+           ;; the recycle below, so a wrapper on the pool is never also listed in the cache.
+           (cond (take-p
+                  (if prev (setf (cdr prev) next) (setf (dr-cache dr) next))
+                  (%park-cache-cell dr cell))
+                 (t (setf prev cell)))
            (cond
              (into-data
               (let ((d (cached-sample-data cs)))
@@ -3657,12 +3719,12 @@
               (%cs-set-flag cs +cs-flag-was-exposed+ t)   ; ADR 0105: the app is about to hold this wrapper
               (push cs out)))
            (incf n))
-          (t (when take-p (push cs keep))))))     ; take keeps only the UN-selected; read leaves the cache intact
+          (t (setf prev cell)))      ; UN-selected: stays, in place and in order, for take and read alike
+        (setf cell next)))
     ;; phase two: mark accessed AFTER the snapshot, off the set this pass already materialised
     (if into-data
         (dotimes (i n) (%mark-instance-accessed dr (svref into-infos i)))
         (dolist (cs out) (%mark-instance-accessed dr (cached-sample-info cs))))
-    (when take-p (setf (dr-cache dr) (nreverse keep)))
     (values (nreverse out) n)))
 
 (defun* %drain (dr)

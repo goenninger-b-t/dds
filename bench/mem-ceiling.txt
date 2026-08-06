@@ -229,6 +229,22 @@
 #   arm64 COPY    522.3 /  528.5 /  528.5   -> LOWERED 571 -> 555
 #   arm64 RETURN  320.0 /  318.9 /  320.0   -> LOWERED 355 -> 337
 #
+# LOWERED 2026-08-06 (ADR 0105 Task 6a — the DR-CACHE SPINE. Every delivery appended with
+# (NCONC (DR-CACHE DR) (LIST CS)): the wrapper has been pooled since ADR 0093, the cell holding it was not,
+# and take then discarded the whole spine and rebuilt it from a KEEP list. %SELECT-SAMPLES-UNLOCKED now
+# walks with a PREV pointer, UNLINKS each selected cell in place and PARKS it on a per-reader free list the
+# next delivery pops back; the un-selected keep their cells and their order. ⚠️ THE INTRUSIVE ALTERNATIVE (a
+# NEXT slot on cached-sample) WAS REJECTED ON THIS FILE'S OWN EVIDENCE: that would be a FIFTH slot, 47.8 ->
+# 64.2 B, and the COPY arm allocates a wrapper per sample because it never returns a loan — +16 B/sample
+# there, cancelling the win exactly. Predicted 16 B/sample, measured -16.9 / -16.7 on a QUIET machine:
+#   arm64 COPY    512.1 /  511.1 /  511.0   -> LOWERED 555 -> 538
+#   arm64 RETURN  304.7 /  302.5 /  302.5   -> LOWERED 337 -> 320
+# and measured DIRECTLY on the real x86_64 box (5 runs; the 5 clean COPY and 4 clean RETURN readings —
+# one RETURN run read 964.5, the intermittent characterised below, and is excluded as it is not a property
+# of this code):
+#   x86_64 COPY   544.8 .. 545.7   -> LOWERED 609 -> 573   (was 561.3 .. 562.5: -16.5)
+#   x86_64 RETURN 353.6 .. 355.0   -> STAYS A DASH         (was 369.0 .. 370.9: -15.7)
+#
 # ⚠️ MEASURE WITH NOTHING ELSE RUNNING. A gate-mem run taken while the test suites were running in the
 # background read COPY 1710.8 and FAILED — a 160 B phantom regression from participant + CPU contention,
 # not from code. A benchmark is an instrument; give it the machine.
@@ -292,5 +308,5 @@
 # (retransmission, an empty-poll storm, a pool that never fills), not for a bigger object. Chase it with a
 # run that PRINTS the empty-poll count and the pool hit/miss counts; it can now be chased ON THE BOX, which
 # is the part that changed.
-arm64  555 337
-x86_64 609 -
+arm64  538 320
+x86_64 573 -

@@ -14365,6 +14365,85 @@
       (dds.dcps:delete-participant pr))
     t))
 
+;;; ---- ADR 0105 Task 6a: the DR-CACHE spine is unlinked in place and its cells are pooled ----
+
+(defun* %csu-vs (samples)
+    (function (list) list)
+  "The tinto V field of each cached-sample in SAMPLES, in cache order — what the spine assertions compare,
+   and what their failure messages print, since 'the cache is wrong' is useless without the order it is in."
+  (mapcar (lambda (cs) (tinto-v (dds.dcps:cached-sample-data cs))) samples))
+
+(defun* run-cache-spine-unlink-test ()
+    (function () t)
+  "Test: ADR 0105 Task 6a — TAKE removes each selected sample from DR-CACHE by unlinking its spine cell IN
+   PLACE (the walk carries PREV) and parking that cell for the next delivery to reuse, instead of rebuilding
+   the cache from a KEEP list. The samples it does not select must survive, unchanged and IN ARRIVAL ORDER,
+   whether the taken one was the HEAD, the MIDDLE or the TAIL of the spine.
+
+   ⚠️ THE MIDDLE CASE IS THE ONE THAT NEEDED AN ARM. Unlinking the head only ever executes the
+   (SETF (DR-CACHE DR) NEXT) branch, and every take arm the suite had takes a prefix — the whole cache, or
+   the first N of it — so the (SETF (CDR PREV) NEXT) branch, the only one that can corrupt a spine, was
+   never reached. TAKE_INSTANCE against a three-instance cache reaches all three positions.
+
+   FALSIFIED THREE WAYS, and the third fails differently from the other two — which is the part to remember:
+     1. unlink always as if the cell were the head -> RED at :CSU-MID-RESIDUE, residue (33): taking the
+        middle threw away everything before it.
+     2. never advance PREV past an UN-SELECTED sample -> the same RED, by the same mechanism (PREV stays
+        NIL, so every unlink takes the head branch). Two different edits, one defect.
+     3. park the cell WITHOUT unlinking it first -> NOT a red assertion but a HANG. %PARK-CACHE-CELL
+        rewrites the cell's CDR to the free list while the spine still points at that cell, so the cache
+        becomes circular and the next walk never terminates. A corrupted spine is likelier to cost a
+        non-terminating drain than a wrong answer, which is why the unlink and the park are adjacent and
+        ordered in the code rather than merely both present."
+  (multiple-value-bind (pw pr dw dr) (%ti-pair +td-cache-spine-unlink+)
+    (unwind-protect
+         (let* ((ts (dds.types:find-type-support "tinto"))
+                (h (lambda (k) (funcall (dds.types:type-support-key-hash ts)
+                                        (make-tinto :k k :v 0 :tag "")))))
+           (%check :csu-matched (plusp (dds.dcps:matched-count pr)) "writer/reader never matched")
+           (dds.dcps:write-sample dw (make-tinto :k 1 :v 11 :tag "a"))
+           (dds.dcps:write-sample dw (make-tinto :k 2 :v 22 :tag "b"))
+           (dds.dcps:write-sample dw (make-tinto :k 3 :v 33 :tag "c"))
+           (%ti-settle pw pr dr 3)
+           (%check :csu-three (= 3 (dds.dcps:samples-available dr))
+                   (format nil "the arm needs three distinct instances cached; got ~d"
+                           (dds.dcps:samples-available dr)))
+           ;; MIDDLE — the (setf (cdr prev) next) branch, and the only one that can corrupt a spine
+           (let ((got (%csu-vs (dds.dcps:take-instance dr (funcall h 2)))))
+             (%check :csu-mid-taken (equal '(22) got)
+                     (format nil "take_instance must remove exactly the middle sample; got ~s" got)))
+           (let ((left (%csu-vs (dds.dcps:read-samples dr))))
+             (%check :csu-mid-residue (equal '(11 33) left)
+                     (format nil "unlinking the MIDDLE cell must leave its neighbours cached IN ORDER; got ~s"
+                             left)))
+           ;; HEAD — the (setf (dr-cache dr) next) branch
+           (let ((got (%csu-vs (dds.dcps:take-instance dr (funcall h 1)))))
+             (%check :csu-head-taken (equal '(11) got)
+                     (format nil "take_instance must remove exactly the head sample; got ~s" got)))
+           (let ((left (%csu-vs (dds.dcps:read-samples dr))))
+             (%check :csu-head-residue (equal '(33) left)
+                     (format nil "unlinking the HEAD cell must leave the rest cached; got ~s" left)))
+           ;; TAIL — unlinking the last cell must terminate the spine, not orphan it
+           (let ((got (%csu-vs (dds.dcps:take-instance dr (funcall h 3)))))
+             (%check :csu-tail-taken (equal '(33) got)
+                     (format nil "take_instance must remove exactly the tail sample; got ~s" got)))
+           (%check :csu-empty (zerop (dds.dcps:samples-available dr))
+                   (format nil "the cache must be empty after taking all three; ~d available"
+                           (dds.dcps:samples-available dr)))
+           ;; The parked cells must be REUSED and must not have leaked into the cache: three more samples
+           ;; arrive on the recycled spine and must read back exactly, in order.
+           (dds.dcps:write-sample dw (make-tinto :k 1 :v 44 :tag "d"))
+           (dds.dcps:write-sample dw (make-tinto :k 2 :v 55 :tag "e"))
+           (dds.dcps:write-sample dw (make-tinto :k 3 :v 66 :tag "f"))
+           (%ti-settle pw pr dr 3)
+           (let ((got (%csu-vs (dds.dcps:read-samples dr))))
+             (%check :csu-reuse (equal '(44 55 66) got)
+                     (format nil "deliveries onto the RECYCLED spine cells must read back in arrival order; got ~s"
+                             got))))
+      (dds.dcps:delete-participant pw)
+      (dds.dcps:delete-participant pr))
+    t))
+
 ;;; ---- ADR 0105 Task 6: the drain's pending-key conses, and which stream may reuse them ----
 
 (defun* %ldi-invalid (samples)

@@ -287,7 +287,7 @@ five further per-sample allocations remain, measured on arm64 SBCL 2.6.5:
 |---|---|---|
 | ~~`dataplane.lisp:4700`~~ | ~~`(cons guid sn)` per pending key~~ — **DONE, Task 6b**: measured **−15.3 COPY / −16.4 RETURN** | ~~16.05~~ |
 | `entities.lisp:800` | fresh 4-slot `cursor` per decode | 48.16 |
-| `entities.lisp:3251-3253` | `(list …)` cell `nconc`'d onto `dr-cache` | 16.05 |
+| ~~`entities.lisp:3251-3253`~~ | ~~`(list …)` cell `nconc`'d onto `dr-cache`~~ — **DONE, Task 6a**: measured **−16.9 COPY / −16.7 RETURN** | ~~16.05~~ |
 | `entities.lisp:3457` | `(push cs out)` per selected sample | 16.05 |
 | ~~`entities.lisp:3452`~~ | ~~`(pushnew h touched :test #'equalp)`~~ — **DONE, Task 5**: measured **−16.2 COPY / −14.2 RETURN** | ~~16.05~~ |
 
@@ -432,6 +432,41 @@ notification, and the pass after it must deliver nothing and leave k=1 `ALIVE`.
 
 That last assertion is the honest statement of what this protects — a DDS property, not an internal identity
 check: **a dispose the reader has already consumed must never come back and re-dispose a revived instance.**
+
+### 8.4 Task 6a — the cache spine, and the intrusive fix that measurement rejected
+
+§7 offered "a reused adjustable vector **or** a free-list of cells". The obvious third option — an
+**intrusive** list, a `next` slot on `cached-sample` and no spine cells at all — is the one to name, because
+it is the one that looks best and is wrong here. `cached-sample` has exactly **four** slots, and SBCL/arm64
+measures a 4-slot defstruct at **47.8 B** against a 5-slot one at **64.2 B** — the same finding that packed
+`data-pinned` and `was-exposed` into one `flags` slot in Task 2. The COPY arm allocates a wrapper *per
+sample* because it never returns a loan and so never recycles, so a fifth slot costs it **+16 B/sample** and
+cancels this task's win exactly: net zero on COPY, −16 on RETURN. Pooling the cells wins on both arms.
+
+The full representation change (list → vector) was also rejected, on scope: `dr-cache` has **13 mutation
+sites**, not the four walkers §7 lists.
+
+`%select-samples-unlocked` now walks with `prev` and unlinks each selected cell in place, parking it for the
+next delivery. **Only that function may park a cell**, and every holder was read to establish it: the
+list-returning paths build their result with `push` so the application never sees the spine; the WaitSet and
+ReadCondition predicates only `count-if` over it; and the `delete` / `remove` sites drop cells to the GC,
+because `delete` relinks destructively and does not report what it dropped.
+
+⚠️ **THE SUITE COULD NOT REACH THE DANGEROUS BRANCH.** Every take arm it had takes a *prefix* — the whole
+cache, or the first N — so unlinking only ever executed the head branch, and `(setf (cdr prev) next)`, the
+only branch that can corrupt a spine, was never exercised. `run-cache-spine-unlink-test` uses `take_instance`
+against a three-instance cache to reach head, middle and tail, then delivers onto the recycled cells.
+
+| sabotage | result |
+|---|---|
+| unlink always as if the cell were the head | RED `:csu-mid-residue`, residue `(33)` |
+| never advance `prev` past an un-selected sample | RED, same check — two edits, one defect |
+| park the cell **without** unlinking it first | **HANG**, not a red assertion |
+
+⭐ **The third is the one to remember.** `%park-cache-cell` rewrites the cell's `cdr` to the free list while
+the spine still points at it, so the cache becomes circular and the next walk never terminates. A corrupted
+spine costs a **non-terminating drain**, not a wrong answer — which is why the unlink and the park are
+adjacent and ordered in the code rather than merely both present.
 
 **Cross-DDS interop:** `take-into` changes **no wire surface**. The per-feature interop rule is discharged by
 no-regression against the existing Connext 7.3.1 and Fast DDS legs, stated rather than skipped.
