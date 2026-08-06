@@ -44,9 +44,21 @@
 # from the other:
 #   arm64   1769.8 -> 1742.1  (-27.7)
 #   x86_64  1777.4 -> 1704.5  (-72.9)
-# ⚠️ TWO CEILINGS PER ARCH SINCE 2026-07-28 (ADR 0093 slice 1). Format:
+# ⚠️ THREE CEILINGS PER ARCH SINCE 2026-08-06 (ADR 0105 Task 9). Format:
 #
-#     <arch>  <ceiling-COPY>  <ceiling-RETURN>
+#     <arch>  <ceiling-COPY>  <ceiling-RETURN>  <ceiling-INTO>
+#
+#   INTO   — DataReader::take into APPLICATION-OWNED storage (DDS 1.4 §2.2.2.5.3.8's max_len>0 / owns==TRUE
+#            variant): no loan, no return obligation, the middleware recycling its own struct inside the
+#            call. ⚠️ IT MEASURES A DIFFERENT TYPE — perf-fixed, fixed-size with a 4-octet key, not
+#            perf-data — so its number is NOT comparable to COPY's or RETURN's and ratchets only against its
+#            own column. The type had to change: a sequence member gives the arm a floor belonging to the
+#            TYPE, and a key over 16 octets (or any string key) takes the MD5 keyhash branch at a measured
+#            255.6 B/call in files gate-hotpath does not scan — either would make a zero unreachable with
+#            nothing saying why. ⛔ BANKED AT 237 AND THAT IS NOT A TARGET MET: slice 1's owner-stated exit
+#            criterion was a genuinely 0 B/sample arm and the arm reads ~224. See the report for the split
+#            (~239 B/sample of the old 463 WAS the access path; the remaining ~224 is NOT and is
+#            unattributed).
 #
 #   COPY   — the legacy workload: the application takes samples and DROPS them. Unchanged, and every
 #            historical row above refers to this column, so it stays comparable across the whole campaign.
@@ -264,6 +276,18 @@
 # box. The blown readings are EXCLUDED from the ceilings above; they are a property of the instrument's
 # environment, not of the code under test.
 #
+# BANKED 2026-08-06 (ADR 0105 Task 9 — the INTO column starts ratcheting). Measured 223.9 / 225.0 / 223.9
+# on a quiet arm64 machine; ceiling 237 = max + 5%, and the gate was fed its own suggested value back and
+# returns exit 0 (the trap fixed in 881b878, where the advice broke the build). Falsified four ways, each
+# observed: a ceiling BELOW the measurement fails as a REGRESSION; a ceiling far above fails demanding a
+# lower one; an absent column (a 3-field row) reports the number and does NOT gate; and a MALFORMED column
+# ('23O') stops the gate loudly instead of being coerced to 0 and passing silently.
+#   arm64 INTO    223.9 /  225.0 /  223.9   -> BANKED - -> 237
+#   x86_64 INTO   276.5 /  276.0 /  276.0   -> BANKED - -> 291   (measured on the real box, 4 readings with
+#                                                                 a 0.5 B spread; never derived from arm64)
+# ⚠️ The x86_64 RETURN column stays a DASH even though its neighbours are now banked — that dash is the open
+# CI question recorded below, not a gap in this task.
+#
 # ⚠️ MEASURE WITH NOTHING ELSE RUNNING. A gate-mem run taken while the test suites were running in the
 # background read COPY 1710.8 and FAILED — a 160 B phantom regression from participant + CPU contention,
 # not from code. A benchmark is an instrument; give it the machine.
@@ -327,5 +351,5 @@
 # (retransmission, an empty-poll storm, a pool that never fills), not for a bigger object. Chase it with a
 # run that PRINTS the empty-poll count and the pool hit/miss counts; it can now be chased ON THE BOX, which
 # is the part that changed.
-arm64  488 269
-x86_64 522 -
+arm64  488 269 237
+x86_64 522 - 291

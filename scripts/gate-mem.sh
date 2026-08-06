@@ -70,10 +70,27 @@ ROW="$(awk -v a="$ARCH" '$1==a {print; exit}' "$CEILING_FILE")"
   exit 1; }
 CEILING_COPY="$(awk '{print $2}'   <<<"$ROW")"
 CEILING_RETURN="$(awk '{print $3}' <<<"$ROW")"
+CEILING_INTO="$(awk '{print $4}'   <<<"$ROW")"
 [[ -n "$CEILING_RETURN" ]] || CEILING_RETURN="-"     # a legacy two-field row = RETURN not yet measured
+[[ -n "$CEILING_INTO" ]]   || CEILING_INTO="-"       # a three-field row  = INTO   not yet measured
 [[ "$CEILING_COPY" =~ ^[0-9]+$ ]] || {
   echo "gate-mem: FAIL — arch '$ARCH' has no numeric COPY ceiling in $CEILING_FILE (got '$CEILING_COPY')." >&2
   exit 1; }
+
+# ⚠️ THE EMPTY->DASH DEFAULTS ABOVE ARE LOAD-BEARING, AND SO IS THIS GUARD. Without the default, a row that
+# does not yet carry the column yields an EMPTY ceiling, awk coerces it to 0, and the arm fails with a bogus
+# "REGRESSED ... > ceiling 0" — a red that says nothing true. Without the guard, a typo in the column ('55O'
+# for '550', a stray comma) is not a number and not a dash: awk's coercion then decides the arm's fate
+# silently, and the likeliest outcome is a permanently-GREEN no-op, which is the one failure mode a ratchet
+# can never notice about itself. A malformed column must stop the gate, loudly.
+check_ceiling () {   # $1 = column label, $2 = the value read from the row
+  [[ "$2" =~ ^([0-9]+|-)$ ]] || {
+    echo "gate-mem: FAIL — arch '$ARCH' has a malformed $1 ceiling in $CEILING_FILE (got '$2')." >&2
+    echo "          A column is a whole number of bytes, or '-' meaning not yet measured on this arch." >&2
+    exit 1; }
+}
+check_ceiling RETURN "$CEILING_RETURN"
+check_ceiling INTO   "$CEILING_INTO"
 
 # SBCL only: dds.pal:bytes-consed returns 0 on Clasp, so a Clasp run would measure NOTHING and "pass"
 # vacuously. Refuse rather than pretend (the documented NFR-PORT gap).
@@ -85,14 +102,14 @@ case "$LISP" in
 esac
 
 # One arm = one FRESH PROCESS on its OWN domain (see the header: sharing either lets the arms discover
-# each other and reads high). $1 = :return-loans value, $2 = domain.
+# each other and reads high). $1 = the mem-per-sample keyword arguments that DEFINE the arm, $2 = domain.
 measure_arm () {
-  local ret="$1" dom="$2" out measured
+  local kwargs="$1" dom="$2" out measured
   out="$("$LISP" \
     --eval '(asdf:load-system :dds-bench)' \
     --eval "(handler-case
                  (format t \"~&MEASURED ~,1f~%\"
-                         (dds.bench:mem-per-sample :domain $dom :return-loans $ret))
+                         (dds.bench:mem-per-sample :domain $dom $kwargs))
                (error (e) (format t \"~&MEASURE-FAILED ~a~%\" e)))" \
     --eval '(uiop:quit 0)' 2>&1)"
   if grep -q "MEASURE-FAILED" <<<"$out"; then
@@ -153,17 +170,24 @@ ratchet () {
   }'
 }
 
-M_COPY="$(measure_arm nil 7)"   || { echo "gate-mem: FAIL — the COPY measurement itself did not run." >&2; exit 1; }
-M_RETURN="$(measure_arm t 8)"   || { echo "gate-mem: FAIL — the RETURN measurement itself did not run." >&2; exit 1; }
+M_COPY="$(measure_arm ':return-loans nil' 7)"  || { echo "gate-mem: FAIL — the COPY measurement itself did not run." >&2; exit 1; }
+M_RETURN="$(measure_arm ':return-loans t' 8)"  || { echo "gate-mem: FAIL — the RETURN measurement itself did not run." >&2; exit 1; }
+# ADR 0105: the third access shape — take-into, application-owned storage, no loan. ⚠️ IT MEASURES A
+# DIFFERENT TYPE (perf-fixed, fixed-size, 4-octet key) than COPY/RETURN do (perf-data), deliberately: a
+# sequence member would give the arm a floor belonging to the TYPE and the zero target could be neither met
+# nor falsified. So this number is NOT comparable to the other two and ratchets only against its own row.
+M_INTO="$(measure_arm ':mode :into' 9)"        || { echo "gate-mem: FAIL — the INTO measurement itself did not run." >&2; exit 1; }
 
 RC=0
 ratchet "COPY"   "$M_COPY"   "$CEILING_COPY"   "copy"   || RC=1
 ratchet "RETURN" "$M_RETURN" "$CEILING_RETURN" "return" || RC=1
+ratchet "INTO"   "$M_INTO"   "$CEILING_INTO"   "into"   || RC=1
 
 if [[ $RC -eq 0 ]]; then
-  awk -v c="$M_COPY" -v r="$M_RETURN" 'BEGIN {
+  awk -v c="$M_COPY" -v r="$M_RETURN" -v i="$M_INTO" 'BEGIN {
     printf "gate-mem: PASS — no regression. Returning the loan saves %.1f B/sample; still %.0f above the NFR-MEM target of ZERO.\n",
            c - r, r;
+    printf "gate-mem:        take-into (own type, not comparable to the two above) reads %.1f B/sample — ADR 0105 slice 1 did NOT reach 0.\n", i;
   }'
 fi
 exit $RC

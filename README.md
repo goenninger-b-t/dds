@@ -168,8 +168,16 @@ application a retained struct, and **you cannot pool an object whose lifetime th
 So `take-samples` now returns *loans* — give them back with `return-loan` and the reader recycles them
 (**−203 B/sample** measured, `bench/report/2026-07-28-…`). It is a **`should`, not a `must`**: an
 unreturned sample is simply never recycled, so existing code keeps working and only forgoes the win.
-Current position: **1738 B/sample** on the measured DCPS path (arm64), **1535** with returns — and
-`make gate-mem` now ratchets **both** workloads, so neither can regress unnoticed.
+ADR 0105 adds the third access shape, `take-into` / `read-into` — DDS 1.4 §2.2.2.5.3.8's `max_len > 0 /
+owns == TRUE` variant, where the application owns the collections, allocates them once and there is nothing
+to give back, so the middleware recycles its own struct inside the call.
+
+Current position on the measured DCPS path (arm64, `make gate-mem`, which ratchets **all three** workloads
+so none can regress unnoticed): **464 B/sample** dropping the samples, **257** returning the loans, and
+**225** through `take-into`. From 1738 / 1535 when the campaign's ratchet was set up. ⚠️ **`take-into` is
+not zero-allocation**: measured against the *same type* through `take-samples` (~463), the access path is
+worth ~239 B/sample and the remaining ~224 is something else — write path or engine — and is not yet
+attributed. The gate states that number rather than rounding it away.
 
 ### ASDF systems
 

@@ -261,6 +261,21 @@ collections: allocate them once, reuse them forever, and there is nothing to giv
   no allocation either — it simply recovers none. Only `take-into` recycles, and only for a wrapper no
   earlier `read-samples` handed you: a sample you are still holding is *taken* but not recycled.
 
+**What it actually costs, measured** (`make gate-mem`, 60 000 samples, macOS/arm64, SBCL). The `into`
+column measures a fixed-size type (`perf-fixed`) and the other two measure `perf-data`, so **the arms are
+not comparable to each other**; the comparison that means something is the same type through both access
+paths:
+
+| access path | B/sample |
+|---|---|
+| `take-samples`, samples dropped (same type) | ~463 |
+| `take-into` | **~224** |
+
+So the access path itself is worth about **239 B/sample**. ⚠️ **And ~224 B/sample remains — `take-into` is
+not zero-allocation today.** That residue is *not* the access path (an identical measurement on the same
+type isolates it) and is not yet attributed; it lives in the write path or the engine. The gate ratchets the
+number so it can only go down, and the honest claim is the one on this line rather than "zero-copy".
+
 Slice 1 refuses a **loan-capable** reader (Zero-Copy / FlatData / secured) with
 `+retcode-precondition-not-met+` — a FlatData sample *is* a buffer, and copying a `flatdata-view` into the
 struct pool would never `%zc-release` its slot. Widening to those arms is a later slice, as is growing a
