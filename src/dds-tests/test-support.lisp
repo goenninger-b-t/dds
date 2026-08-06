@@ -267,3 +267,8 @@
    dispose changes in two SEPARATE passes and then asserts a third pass delivers NOTHING, so any foreign
    participant's dispose on the domain would put a genuine third change in the store and the
    no-resurrection assertion would fail for a reason that is not the defect.")
+
+(defconstant +td-writer-handle-intern+ 63
+  "ADR 0106 isolation offset: the writer's interned instance handle. The arm asserts EQ identity of the
+   handles a writer hands out across writes and a finite offered DEADLINE arming per instance, so a foreign
+   participant's traffic on the domain would add instances the EQ and per-instance assertions do not expect.")

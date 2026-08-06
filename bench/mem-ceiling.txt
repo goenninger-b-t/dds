@@ -288,6 +288,21 @@
 # ⚠️ The x86_64 RETURN column stays a DASH even though its neighbours are now banked — that dash is the open
 # CI question recorded below, not a gap in this task.
 #
+# LOWERED 2026-08-06 (ADR 0106 — the writer's instance handle is INTERNED per instance instead of allocated
+# per write. It is RETAINED by three consumers (the CacheChange's KEEP_LAST eviction key, the dw-instances
+# key, and the offered-DEADLINE timer key), so it could never be a recycled scratch — but it does not have
+# to be FRESH either: a per-instance write-once handle satisfies every retainer, which is the ADR 0076
+# stable-handle indirection %write-key-hash's own docstring already named as the fix for exactly this 32 B.
+# Located by a NO-PEER bisect (bench/report/2026-08-06-where-the-remaining-224-bytes-live.md): keyed+reliable
+# 122.3 vs unkeyed+reliable 79.7 said ~43 B was the keyed path. Predicted 32, measured -32 on ALL THREE arms:
+#   arm64 COPY    431.4 /  431.4 /  431.4   -> LOWERED 488 -> 453
+#   arm64 RETURN  221.7 /  223.9 /  223.9   -> LOWERED 269 -> 236
+#   arm64 INTO    192.2 /  192.2 /  193.3   -> LOWERED 237 -> 203
+# and re-measured on the box with strays verified absent before and after every run (4 runs):
+#   x86_64 COPY   465.1 / 464.9 / 466.0 / 465.2   -> LOWERED 522 -> 490   (was ~496: -31)
+#   x86_64 INTO   244.0 / 244.9 / 244.1 / 244.8   -> LOWERED 291 -> 258   (was ~276: -31)
+#   x86_64 RETURN 277.0 / 277.8 / 276.3           -> STAYS A DASH         (was ~307: -30)
+#
 # ⚠️ MEASURE WITH NOTHING ELSE RUNNING. A gate-mem run taken while the test suites were running in the
 # background read COPY 1710.8 and FAILED — a 160 B phantom regression from participant + CPU contention,
 # not from code. A benchmark is an instrument; give it the machine.
@@ -322,6 +337,40 @@
 # happens, and reliable retransmission multiplies the per-sample work. Chase it with a CI run that PRINTS
 # the pool hit/miss counts, not with another local measurement.
 #
+# ⛔⛔ RETRACTION, 2026-08-06 (LATER THE SAME DAY) — THE "CORRECTION" BELOW WAS MEASURED UNDER
+# CONTAMINATION I CREATED, AND ITS ATTRIBUTION IS WITHDRAWN. Read this before believing the block after it.
+#
+# A gate-mem measurement process was found WEDGED on the box: 12 minutes old, 143 % CPU, its command line
+# `mem-per-sample :domain 8 :return-loans t` — i.e. a live participant still squatting on the RETURN arm's
+# OWN domain. Every later run of that arm discovers it, and that is exactly the shape the readings had:
+# the arm sharing the stray's domain reads enormous while the other arms read perfectly normal. The "hits
+# one arm at a time, either arm" signature that made the intermittent look mysterious is simply WHICH
+# DOMAIN THE STRAY WAS HOLDING.
+#
+# ⚠️ AND THE KILL MADE MORE OF THEM: killing the wedged child let its parent `for i in 1 2 3` loop advance
+# to the next iteration, which wedged in turn. Several of the 11 runs behind the block below were taken
+# with one of these alive.
+#
+# RE-MEASURED with `pgrep -c sbcl` verified 0 BEFORE the batch and after EVERY run — 4 runs, x86_64:
+#   COPY    465.1 / 464.9 / 466.0 / 465.2      (spread 1.1 B)
+#   RETURN  277.0 / 336.3 / 277.8 / 276.3      (one outlier at x1.21)
+#   INTO    244.0 / 244.9 / 244.1 / 244.8      (spread 0.9 B)
+# No x16, no x196, no x435. The largest deviation is x1.21, a different phenomenon in kind and size.
+#
+# WHAT SURVIVES, AND WHAT DOES NOT:
+#   * WITHDRAWN: "it reproduces on the box at ~14 % of arm-runs" and "it is not RETURN-specific". Both were
+#     inferred from contaminated runs. A stray on ONE domain produces both appearances.
+#   * STILL OPEN: the ORIGINAL CI observation of RETURN 3632 on a run whose COPY read 593.7. CI starts a
+#     fresh container, so a stray of MINE cannot explain it. That is why the x86_64 RETURN column is still
+#     a dash — but the dash rests on that single CI reading again, not on the box evidence below.
+#   * NEW AND ACTIONABLE: **gate-mem can leave a wedged measurement process behind, and it then poisons
+#     every later run on that arm's domain.** Check `pgrep -c sbcl` on the box before and after a batch;
+#     a reading far above the band is a STRAY until proven otherwise. This is the likeliest reason the arm
+#     "could not be characterised" on the one platform that gates it.
+#
+# ⭐ THE METHOD LESSON: an anomaly that is 100x the signal is almost never the code under test. Look for a
+# process, a port or a file that outlived its run BEFORE writing a mechanism into a file like this one.
+#
 # ⛔⛔ CORRECTION, 2026-08-06 — THE BLOWUP REPRODUCES ON THE REAL BOX, AND IT IS **NOT** RETURN-SPECIFIC.
 # The two paragraphs above are wrong on both of their load-bearing claims, and the evidence is 11 gate-mem
 # runs (22 arm-runs) taken back-to-back on the box with NOTHING else on it — verified by ps: one sbcl, load
@@ -351,5 +400,5 @@
 # (retransmission, an empty-poll storm, a pool that never fills), not for a bigger object. Chase it with a
 # run that PRINTS the empty-poll count and the pool hit/miss counts; it can now be chased ON THE BOX, which
 # is the part that changed.
-arm64  488 269 237
-x86_64 522 - 291
+arm64  453 236 203
+x86_64 490 - 258

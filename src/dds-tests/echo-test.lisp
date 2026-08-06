@@ -4171,6 +4171,7 @@
                  ("cache-spine-unlink"       . run-cache-spine-unlink-test) ; ADR 0105 Task 6a in-place spine unlink
                  ("decode-cursor-reuse"      . run-decode-cursor-reuse-test) ; ADR 0105 Task 7 per-decode cursor
                  ("perf-fixed-shape"        . run-perf-fixed-shape-test) ; ADR 0105 Task 8 bench-type shape
+                 ("writer-handle-intern"    . run-writer-handle-intern-test) ; ADR 0106 interned writer handle
                  ("rtps-discovery-spdp"      . dds.rtps.discovery:run-discovery-test)
                  ("rtps-discovery-sedp"      . dds.rtps.discovery:run-sedp-test)
                  ("rtps-data-representation-wire" . dds.rtps.discovery:run-data-representation-wire-test)

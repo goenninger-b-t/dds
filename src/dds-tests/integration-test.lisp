@@ -14365,6 +14365,73 @@
       (dds.dcps:delete-participant pr))
     t))
 
+(defun* run-writer-handle-intern-test ()
+    (function () t)
+  "Test: ADR 0106 — a DataWriter INTERNS its instance handles. Writing the same instance twice must hand
+   back the SAME (EQ) 16-octet array, not two equal ones, because that array is RETAINED by three consumers
+   and reallocating it cost a measured ~32 B/sample.
+
+   ⚠️ THE OFFERED DEADLINE IS CONFIGURED FINITE ON PURPOSE, AND WITHOUT THAT THIS ARM TESTS TWO OF THE THREE
+   RETAINERS WHILE CLAIMING THREE. %DEADLINE-TOUCH-WRITER checks the period FIRST and is a complete no-op
+   under the default DURATION_INFINITE, so the deadline table retains nothing at all in a default writer: a
+   handle that was wrongly shared or recycled would look perfectly correct in every other test in this suite
+   and would only misbehave once an application offered a finite DEADLINE. %WRITE-KEY-HASH's own docstring
+   called this path 'the nastiest because it is CONDITIONAL'; this arm is that sentence made executable.
+
+   The three retainers are then checked through the API that reads each: GET-KEY-VALUE (the key holder, per
+   instance), LOOKUP-INSTANCE (presence), and the per-instance deadline arming (two instances, two timers).
+
+   Falsified by making %WRITER-INSTANCE-RECORD COPY-SEQ on every call instead of only on the miss: the EQ
+   check goes red while every value assertion stays green — which is exactly why the EQ check has to exist."
+  (let* ((ts (dds.types:find-type-support "tinto"))
+         (pw (dds.dcps:create-participant :domain (test-domain +td-writer-handle-intern+))))
+    (unwind-protect
+         (let* ((tw (dds.dcps:create-topic pw "HandleIntern" "tinto" ts))
+                (dw (dds.dcps:create-datawriter
+                     (dds.dcps:create-publisher pw) tw
+                     :qos (dds.qos:make-writer-qos
+                           :reliability :reliable :history-kind :keep-last :history-depth 1
+                           :deadline (dds.qos:make-qos-duration 5 0))))   ; FINITE — see the docstring
+                (s1a (make-tinto :k 1 :v 11 :tag "a"))
+                (s1b (make-tinto :k 1 :v 12 :tag "b"))
+                (s2  (make-tinto :k 2 :v 22 :tag "c")))
+           (dds.dcps:write-sample dw s1a)
+           (let ((h1 (dds.dcps:lookup-instance dw s1a)))
+             (dds.dcps:write-sample dw s1b)
+             (dds.dcps:write-sample dw s2)
+             (let ((h1b (dds.dcps:lookup-instance dw s1b))
+                   (h2  (dds.dcps:lookup-instance dw s2)))
+               ;; THE point, asserted where the intern actually happens: the WRITE path's own handle for one
+               ;; instance is the SAME OBJECT across writes, not merely an equal one. Observed through
+               ;; %write-key-hash directly, because nothing in the public API returns the handle the write
+               ;; path threaded onto the CacheChange — and that is the retainer this ADR exists for.
+               (%check :whi-interned (eq (dds.dcps::%write-key-hash dw s1a)
+                                         (dds.dcps::%write-key-hash dw s1b))
+                       "two writes of one instance must yield the SAME handle object (EQ), or the writer is still allocating one per write")
+               (%check :whi-lookup-canonical (and (eq h1 h1b)
+                                                  (eq h1 (dds.dcps::%write-key-hash dw s1a)))
+                       "lookup_instance must hand back that same canonical handle, not a fresh equal one")
+               (%check :whi-distinct (not (equalp h1 h2))
+                       "two different keys must be two different instances (oracle sanity)")
+               ;; retainer (b): presence, per instance
+               (%check :whi-known (and (not (equalp h1 dds.dcps:+instance-handle-nil+))
+                                       (not (equalp h2 dds.dcps:+instance-handle-nil+)))
+                       "both instances must be registered by the auto-register on write")
+               ;; the key holder must still be the FIRST sample each instance was known by
+               (%check :whi-key-1 (eql 11 (tinto-v (dds.dcps:get-key-value dw h1)))
+                       (format nil "get_key_value must return the holder the instance was FIRST known by; got ~s"
+                               (dds.dcps:get-key-value dw h1)))
+               (%check :whi-key-2 (eql 22 (tinto-v (dds.dcps:get-key-value dw h2)))
+                       (format nil "get_key_value must return instance 2's own holder; got ~s"
+                               (dds.dcps:get-key-value dw h2)))
+               ;; retainer (c): the FINITE deadline armed a timer per instance, keyed by the handle
+               (let ((tbl (dds.dcps::%endpoint-deadline-table dw)))
+                 (%check :whi-deadline-armed (and tbl (gethash h1 tbl) (gethash h2 tbl) t)
+                         (format nil "a finite offered DEADLINE must arm a timer per instance keyed by the ~
+                                      interned handle; table=~s" (and tbl (hash-table-count tbl))))))))
+      (dds.dcps:delete-participant pw))
+    t))
+
 ;;; ---- ADR 0105 Task 8: the fixed-size bench type the zero-arm is measured on ----
 
 (defun* run-perf-fixed-shape-test ()

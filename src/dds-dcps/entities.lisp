@@ -115,7 +115,7 @@
    (alive :initform t :accessor dw-alive-p)                            ; LIVELINESS_LOST loss-transition flag
    (listener :initform nil :accessor dw-listener)
    (listener-mask :initform '() :accessor dw-listener-mask)
-   (instances :initform (make-hash-table :test 'equalp) :accessor dw-instances) ; 16-octet handle -> :alive (DDS 1.4 §2.2.2.4.2)
+   (instances :initform (make-hash-table :test 'equalp) :accessor dw-instances) ; ADR 0106: 16-octet handle -> WRITER-INSTANCE (the STABLE handle + the get_key_value key holder). Presence = registered (DDS 1.4 §2.2.2.4.2)
    (loans :initform '() :accessor dw-loans)                ; WP-FLATDATA-LOAN-WRITE (R6, ADR 0042): outstanding writer-loans (writer-close safety sweep)
    (loan-freelist :initform '() :accessor dw-loan-freelist) ; WP-FLATDATA-LOAN-WRITE: recycled writer-loan structs (the struct+view recycle; the registry cell + retained payload are the documented v1 per-write cost)
    (loan-encap :initform nil :accessor dw-loan-encap)      ; WP-FLATDATA-LOAN-WRITE (ADR 0042): the type's 4-octet encap header+options, cached once from the FlatData ctor (%loan-encap-header) — written into every slot-backed loan's slot
@@ -128,6 +128,7 @@
    (rw-armed :initform nil :accessor dw-rw-armed) ; ADR 0089: T while a BACKPRESSURE EPISODE is open — set when the send window rises to the high watermark, cleared when it falls back to the low one. Without it the low and empty transitions fire on ordinary traffic (a 1-deep exchange drains to zero on every sample), which is the flood the watermarks exist to prevent
    (active-readers :initform (make-hash-table :test 'equalp) :accessor dw-active-readers) ; remote reader GUID -> T while it is acknowledging; the SET is the truth, so a repeated ACKNACK cannot inflate active-count
    (keyhash-scratch :initform nil :accessor dw-keyhash-scratch) ; TX-KEYHASH (ADR 0087): reusable :big cursor over a 256-octet buffer for the per-write instance-handle key serialization — the writer twin of dr-keyhash-scratch (ADR 0075), created once, zero per-sample make-octet-buffer/cursor/free-static (NFR-MEM)
+   (keyhash-out :initform nil :accessor dw-keyhash-out) ; ADR 0106: reusable 16-octet TRANSIENT result array for the per-write instance handle — used only to look the instance up, then the STABLE handle is read off the writer-instance record (the TX twin of dr-keyhash-out, ADR 0076); guarded by KEYHASH-BUSY with the scratch it accompanies
    (keyhash-busy :initform (dds.pal:make-atomic-cell) :accessor dw-keyhash-busy) ; TX-KEYHASH (ADR 0087): CAS try-lock guarding KEYHASH-SCRATCH — a DataWriter may be written CONCURRENTLY (DDS 1.4 §2.2.2.4.2.11 places no single-thread restriction on write), and two threads serializing keys through one buffer would interleave into a WRONG instance handle; the loser allocates instead, byte-identically
    (payload-cursor :initform nil :accessor dw-payload-cursor) ; NFR-MEM: the cursor the per-write payload serializer writes through, reused instead of consed (48 B/write). Keyed by an EQ test on the pooled buffer, which is what makes it SAFE UNDER CONCURRENT WRITE without the CAS lock KEYHASH-SCRATCH needs: writer-acquire-payload-buffer pops a DISTINCT buffer per caller, so two threads can never be handed the same cursor — the second's EQ test fails and it allocates, exactly as before. The pool is a LIFO stack, so a single slot hits in steady state (acquire -> release -> acquire returns the same buffer)
    (status-lock :initform (dds.pal:make-lock "dw-status") :accessor dw-status-lock))
@@ -1858,25 +1859,37 @@
    instead of a fresh 256-octet buffer per write — measured 112.0 -> 32.1 B/call, i.e. ~80 B/sample off
    the TX path, byte-identical handles (the RX drain has done this since ADR 0075; this is its TX twin).
 
-   The RESULT array is still allocated fresh, deliberately: the handle is RETAINED on THREE paths —
-   threaded onto the CacheChange for KEEP_LAST per-instance eviction; used as a dw-instances EQUALP hash
-   key; and, when the offered DEADLINE is finite, passed on by %deadline-touch-writer as the
-   dw-deadline-timers key. Recycling it would alias every change's handle and mutate live keys. The
-   deadline path is the nastiest because it is CONDITIONAL — under the default DURATION_INFINITE it arms
-   nothing, so a recycled array would look correct until someone configured a DEADLINE. Only the SCRATCH
-   is reusable; closing the remaining 32 B needs the ADR 0076 stable-handle indirection on the writer side.
+   ADR 0106: THE RESULT IS NOW INTERNED, NOT ALLOCATED PER WRITE — the remaining ~32 B/sample the note
+   above used to promise. The handle is RETAINED on THREE paths (threaded onto the CacheChange for KEEP_LAST
+   per-instance eviction; used as a dw-instances EQUALP hash key; and, when the offered DEADLINE is finite,
+   passed on by %deadline-touch-writer as the dw-deadline-timers key), so it may never be a recycled
+   scratch. It does not have to be a FRESH array either: a per-instance WRITE-ONCE handle satisfies every
+   retainer, because what they hold is then permanent and immutable rather than reused. The transient
+   scratch is filled, used to find the instance, and the record's STABLE handle is returned; a new instance
+   copies once. All three retainers now share ONE array where they previously held three equal ones.
+
+   ⚠️ THE DEADLINE PATH IS THE ONE TO BE CAREFUL OF, BECAUSE IT IS CONDITIONAL: %deadline-touch-writer
+   checks the period FIRST and is a complete no-op under the default DURATION_INFINITE, so it retains
+   nothing at all in any default configuration. A handle that was wrongly shared would look correct in every
+   test until an application configured a finite offered DEADLINE — which is why RUN-WRITER-HANDLE-INTERN-TEST
+   configures one rather than trusting the default path.
 
    Concurrency: guarded by a CAS try-lock, NOT a lock. A DataWriter may be written concurrently, and a
    shared serialization buffer would interleave into a WRONG instance handle — a silent mis-attribution,
-   not a crash. The thread that wins KEYHASH-BUSY uses the scratch; a concurrent writer takes the
-   allocating path, which is exactly today's behaviour and byte-identical. Never blocks the write path."
+   not a crash. The thread that wins KEYHASH-BUSY uses the scratch AND the out array; a concurrent writer
+   takes the allocating path, which is exactly today's behaviour and byte-identical — and then interns
+   through the same choke, so both threads still end up handing out the one stable handle."
   (when (%writer-keeplast-p dw)
     (let ((ts (topic-type-support (dw-topic dw)))
           (busy (dw-keyhash-busy dw)))
-      (if (zerop (dds.pal:cas busy 0 1))
-          (unwind-protect (%instance-handle ts sample (%writer-keyhash-scratch dw))
-            (dds.pal:cas busy 1 0))
-          (%instance-handle ts sample)))))
+      (writer-instance-handle
+       (%writer-instance-record
+        dw
+        (if (zerop (dds.pal:cas busy 0 1))
+            (unwind-protect (%instance-handle ts sample (%writer-keyhash-scratch dw)
+                                              (%writer-keyhash-out dw))
+              (dds.pal:cas busy 1 0))
+            (%instance-handle ts sample)))))))
 
 (defun* write-sample (dw sample &optional source-timestamp)
     (function (data-writer t &optional (or null integer))
@@ -1940,9 +1953,10 @@
     (assert-liveliness dw)
     (%app-ack-deadline-arm dw)   ; ADR 0090 A4: (re)arm the acknowledgment watchdog (no-op unless APPLICATION-acked with a finite deadline)
     (%deadline-touch-writer dw kh sample)   ; WP-DCPS-API-COMPLETION S4: (re)arm this instance's offered DEADLINE (no-op + 0-alloc when DEADLINE is INFINITE; reuses the KEEP_LAST keyhash)
-    (let ((h (or kh (%instance-handle (topic-type-support (dw-topic dw)) sample))))   ; S5.T1: write auto-registers the instance (DDS 1.4 §2.2.2.4.2.2)
-      (unless (gethash h (dw-instances dw))                                            ; first write of this instance -> record its key holder (get_key_value); steady state is a lock-free gethash
-        (dds.pal:with-lock ((dw-status-lock dw)) (setf (gethash h (dw-instances dw)) sample))))
+    ;; S5.T1: write auto-registers the instance (DDS 1.4 §2.2.2.4.2.2). ADR 0106: KH is already interned by
+    ;; %write-key-hash, so a KEEP_LAST writer only fills the key holder; KEEP_ALL still computes a handle
+    ;; here — see ADR 0106 §5, that path is unimproved and deliberately out of this slice's scope.
+    (%writer-instance-record dw (or kh (%instance-handle (topic-type-support (dw-topic dw)) sample)) sample)
     +retcode-ok+))
 
 ;;; ---- Timestamped writes (S5.T4, DDS 1.4 §2.2.2.4.2.11/§2.2.2.4.2.9/§2.2.2.4.2.8): supply the
@@ -2222,6 +2236,62 @@
   (or (dw-keyhash-scratch dw)
       (setf (dw-keyhash-scratch dw) (%make-keyhash-scratch))))
 
+(defstruct* (writer-instance (:constructor %make-writer-instance))
+  "ADR 0106: a DataWriter's per-instance record — the value side of DW-INSTANCES, whose KEY is the same
+   16-octet handle HANDLE holds. Two slots, for two different reasons.
+
+   HANDLE is the instance's STABLE handle, and it exists in the value because Common Lisp offers no way to
+   read a hash entry's stored KEY back. Without it every write would have to keep the array it just computed
+   — 32 B/sample — because that array is RETAINED by three consumers (the CacheChange's KEEP_LAST eviction
+   key, this table's own key, and the offered-DEADLINE timer key). Interning hands all three the SAME
+   permanent, immutable array instead of three equal ones.
+
+   KEY-SAMPLE is the get_key_value key holder (DDS 1.4 §2.2.2.4.2.12), unchanged in meaning from when it was
+   the whole value: the sample the application registered or first wrote for this instance."
+  (handle nil :type (or null (simple-array (unsigned-byte 8) (16))))
+  (key-sample nil :type t))
+
+(defun* %writer-instance-record (dw handle &optional key-sample)
+    (function (data-writer (simple-array (unsigned-byte 8) (16)) &optional t) writer-instance)
+  "DW's WRITER-INSTANCE for HANDLE, created on first sight — the single intern point for a writer's instance
+   handles (ADR 0106). Returns the record whose HANDLE slot is the STABLE array every retainer should use;
+   HANDLE itself may be a TRANSIENT scratch and is COPY-SEQ'd before it is stored, never aliased.
+
+   KEY-SAMPLE fills the get_key_value holder when the record is created, and updates it on an existing
+   record only when it was NIL — so a re-registration or a later write never overwrites the holder the
+   instance was first known by, which is the pre-ADR-0106 behaviour of the (UNLESS (GETHASH …) …) guard.
+
+   The lookup is lock-free (the steady state is a hit); only the CREATE takes DW-STATUS-LOCK, and it
+   re-checks under the lock so two threads first-writing one instance intern exactly one handle — otherwise
+   they would hand out two different STABLE arrays for one instance and the eviction/deadline tables would
+   disagree about which is the instance."
+  (let ((rec (gethash handle (dw-instances dw))))
+    (cond (rec
+           (when (and key-sample (null (writer-instance-key-sample rec)))
+             (setf (writer-instance-key-sample rec) key-sample))
+           rec)
+          (t
+           (dds.pal:with-lock ((dw-status-lock dw))
+             (or (gethash handle (dw-instances dw))     ; re-check: another thread may have interned it
+                 ;; ⚠️ AN UNKEYED WRITER'S HANDLE IS THE SHARED +INSTANCE-HANDLE-NIL+ AND MUST STAY EQ TO IT.
+                 ;; %INSTANCE-HANDLE returns that constant itself for an unkeyed type — never a scratch — so
+                 ;; there is nothing to copy, and copying it would hand the CacheChange a private all-zero
+                 ;; array instead of the shared one. RUN-KEEPLAST-KEYHASH-THREADED-TEST asserts that EQ and
+                 ;; caught exactly this. Everything else arrives in a TRANSIENT scratch and must be copied.
+                 (let* ((stable (if (eq handle +instance-handle-nil+) handle (copy-seq handle)))
+                        (new (%make-writer-instance :handle stable :key-sample key-sample)))
+                   (setf (gethash stable (dw-instances dw)) new))))))))
+
+(defun* %writer-keyhash-out (dw)
+    (function (data-writer) (simple-array (unsigned-byte 8) (16)))
+  "DW's reusable 16-octet key-hash RESULT array, created on first use — the TX twin of %READER-KEYHASH-OUT
+   (ADR 0106/0076). The write path fills it TRANSIENTLY, uses it only to look the instance up, and then
+   hands out the STABLE handle from the record, so a write to a known instance allocates no handle.
+   Guarded by DW-KEYHASH-BUSY together with the serialization scratch it accompanies: a writer that loses
+   that CAS must not touch this array either, and takes the allocating path instead."
+  (or (dw-keyhash-out dw)
+      (setf (dw-keyhash-out dw) (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0))))
+
 (defun* %reader-keyhash-out (dr)
     (function (data-reader) (simple-array (unsigned-byte 8) (16)))
   "DR's reusable 16-octet key-hash RESULT array, created on first use — the drain writes the per-sample
@@ -2261,9 +2331,9 @@
    §2.2.2.1.1.7, S2.T3)."
   (unless (entity-enabled-p dw) (return-from register-instance +retcode-not-enabled+))
   (let ((handle (%instance-handle (topic-type-support (dw-topic dw)) sample)))
-    (dds.pal:with-lock ((dw-status-lock dw))
-      (setf (gethash handle (dw-instances dw)) sample))   ; S5.T1: the value is the key holder (get_key_value); presence = registered
-    handle))
+    ;; ADR 0106: intern through the ONE choke, so register_instance and the auto-register on write agree on
+    ;; the instance's stable handle. Returns the STABLE one — the application may retain it (§2.2.2.4.2.5).
+    (writer-instance-handle (%writer-instance-record dw handle sample))))
 
 (defun* dispose-instance (dw sample-or-handle &optional source-timestamp)
     (function (data-writer t &optional (or null integer)) (or (simple-array (unsigned-byte 8) (16)) (member :timeout :not-enabled)))
@@ -2326,11 +2396,16 @@
    knows no such instance. The handle is the type-support keyhash; 'known' means the instance has been
    registered/written (writer, dw-instances) or delivered (reader, dr-instance-recs)."
   (let ((handle (%instance-handle (%endpoint-type-support endpoint) key-holder)))
-    (if (typecase endpoint
-          (data-writer (nth-value 1 (gethash handle (dw-instances endpoint))))
-          (data-reader (nth-value 1 (gethash handle (dr-instance-recs endpoint)))))
-        handle
-        +instance-handle-nil+)))
+    (typecase endpoint
+      ;; ADR 0106: return the writer's STABLE handle, not the one just computed to look it up — the
+      ;; application may retain what lookup_instance hands back (§2.2.2.4.2.5), and handing out the canonical
+      ;; object keeps every holder of this instance's handle pointing at one array.
+      (data-writer (let ((rec (gethash handle (dw-instances endpoint))))
+                     (if rec (writer-instance-handle rec) +instance-handle-nil+)))
+      (data-reader (if (nth-value 1 (gethash handle (dr-instance-recs endpoint)))
+                       handle
+                       +instance-handle-nil+))
+      (t +instance-handle-nil+))))
 
 (defun* get-key-value (endpoint handle)
     (function (t (simple-array (unsigned-byte 8) (16))) t)
@@ -2339,7 +2414,8 @@
    (the caller's BAD_PARAMETER). The handle is a one-way keyhash, so the key holder is the sample the
    writer registered/wrote (dw-instances value) or the reader's retained per-instance key sample."
   (typecase endpoint
-    (data-writer (values (gethash handle (dw-instances endpoint))))
+    (data-writer (let ((rec (gethash handle (dw-instances endpoint))))   ; ADR 0106: the value HAS the key holder, it no longer IS it
+                   (and rec (writer-instance-key-sample rec))))
     (data-reader (let ((rec (gethash handle (dr-instance-recs endpoint))))
                    (and rec (instance-rec-key-sample rec))))))
 
