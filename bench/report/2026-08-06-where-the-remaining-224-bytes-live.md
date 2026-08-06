@@ -82,29 +82,30 @@ sites account for it, split roughly **~47 B** and **~31 B**.
 BYTES ([[dds-allocation-campaign-lessons]]); with only two frames the list is trustworthy as a *list*, and
 nothing here is sized from its ordering.
 
-### The leading candidate, and a gate that does not catch it
+### ⛔ A CANDIDATE I RAISED AND THEN REFUTED BY READING THE SCANNER — recorded, not quietly deleted
 
-`publish-sample-into`'s pooled arm is **`handler-case` nested inside `unwind-protect`**:
+I first wrote that `publish-sample-into`'s pooled arm — `handler-case` nested inside `unwind-protect` — was
+the leading candidate, that this is "precisely the ADR 0098 shape", and that **`gate-nlx` has a gap because
+it does not flag it**. ⛔ **All three claims are wrong, and `nlx-scan.py`'s own docstring says so:**
 
-```lisp
-(unwind-protect
-     (handler-case (let ((len (funcall serialize-fn buf))) …)
-       (dds.core.buffer:buffer-overflow () …))
-  (unless committed (writer-release-payload-buffer writer buf)))
-```
+> *"A RETURN-FROM targeting a block OUTSIDE the intervening UNWIND-PROTECT means the exit must be able to
+> run through the unwind, so the closure loses dynamic extent…* **`with-lock` alone, `handler-case` alone,
+> and `handler-case` containing a `return-from` alone all measure 0.0000 B/call. Only the NESTING costs.**"
 
-That is precisely the ADR 0098 shape — *"no single construct allocates; only the NESTING does"*, measured
-there at 16 B/call, and the reason `%ensure-secured-payload-pool` a few lines below carries a comment about
-an NLX through a writer lock heap-allocating the handler closure **on every call**.
+The ADR 0098 defect needs **three** ingredients: the unwind-protect, the handler-case, **and a `return-from`
+that escapes through the unwind**. `publish-sample-into` has the first two and **no escaping exit at all**,
+so it is not that defect — and `gate-nlx` is *correct* not to flag it. `src/dds-disc` is in its STRICT set,
+not its ratcheted one, so a real instance there would fail the gate outright.
 
-⛔ **`make gate-nlx` — the gate built for exactly this defect — does NOT flag this site.** It passes with
-*"26 to go in the ratcheted set"* and its output names no `dataplane.lisp` line. So either the site is
-outside the gate's scanned set or its form-walker does not match this shape. **That gap is worth more than
-the bytes**: the gate exists so this pattern cannot reappear, and here it is on the hottest write path.
+⚠️ **And the enumeration does not say what I read into it.** The profiler charges **callee** allocation to
+**caller** frames — I wrote that caveat down and then reasoned as though the 60.4 % were code *in*
+`publish-sample-into`. It is the **publish subtree**: `publish-sample-into` calls `publish-sample`, which
+does the inline-QoS, the destination planning and the send. The honest reading of the enumeration is
+**"the publish subtree ~47 B vs `hc-add-change` ~31 B"**, two call chains, not two sites.
 
-**Not yet verified as the cause** — it is a hypothesis with two independent supports (the profiler ranks the
-frame first; the shape is a documented, measured defect). Confirm by A/B, per the campaign rule that the
-source sizes and `gate-mem` confirms.
+**Nothing here is yet attributed to a line.** The next step is an A/B on the subtree, not another hypothesis
+off a profiler ranking — which is precisely what [[dds-allocation-campaign-lessons]] says the profiler
+cannot support: *"three hypotheses taken off its ranking were false."* Make that four.
 
 ## Where in the write path it is *not*
 
