@@ -205,8 +205,16 @@
 # background read COPY 1710.8 and FAILED — a 160 B phantom regression from participant + CPU contention,
 # not from code. A benchmark is an instrument; give it the machine.
 #
-# x86_64 is NOT re-measured here; its COPY row stays 1740 and will simply not bite until someone measures
-# it on that arch. Never derive it from arm64.
-#   x86_64 not measured here — the dash is honest, not lazy.
+# x86_64 IS now measured, on the real Linux box (192.168.2.180, SBCL 2.2.9.debian — the same distro build
+# CI runs), 2026-08-06. Both columns are real measurements; neither is derived from arm64, which remains
+# forbidden. COPY 593.0 / 594.2 / 594.3 over three runs and CI's own 594.4; RETURN 401.6 / 401.9 / 402.5
+# and CI's 404.3. The ceilings below are the HIGHEST observed value plus the gate's 5% headroom, so a
+# normal run cannot flap.
+#
+# ⚠️ DO NOT MEASURE THIS ARCH UNDER EMULATION. The same two arms in the linux/amd64 Docker harness read
+# 603.9 / 411.0 — about 10 B/sample HIGH on both. The image runs the same distro SBCL, so the version is
+# not the cause; the likely mechanism is that allocation here is TIMING-DEPENDENT (a slower CPU changes how
+# many heartbeats/ACKNACKs are processed per sample), which emulation perturbs. Unconfirmed as to cause,
+# but decisive as to practice: emulated numbers are not this gate's oracle. Use the real box.
 arm64  590 385
-x86_64 1740 -
+x86_64 625 425
