@@ -8456,8 +8456,15 @@
              (%check :async-fault-hook-context
                      (every (lambda (e) (eq 'dds.disc:sender-emit-test-fault (cdr e))) mine)
                      (format nil "every :ASYNC-SENDER fire must carry the INJECTED condition; got ~a" mine)))
-           (%check :async-fault-delivered (>= (dds.disc:node-sample-count r) 6)
-                   "all 6 samples must still be delivered (the 3 dropped DATAs repaired via HEARTBEAT/ACKNACK)"))
+           ;; PRINTS THE COUNT because the shortfall is the whole diagnosis: 1 of 6 is a wedge (the sample
+           ;; left the writer and never arrived), 5 of 6 is a timing near-miss. See the sibling hook checks.
+           (let ((got (dds.disc:node-sample-count r)))
+             (%check :async-fault-delivered (>= got 6)
+                     (format nil "all 6 samples must still be delivered (the 3 dropped DATAs repaired via HEARTBEAT/ACKNACK); got ~d of 6, short by ~d — ~a"
+                             got (max 0 (- 6 got))
+                             (cond ((<= got 1) "WEDGED: this is the Mode-2 signature — the repair never completed. Restart the hunt at: does the reader RECEIVE the heartbeats, does it ACKNACK, does %on-user-acknack plan a repair")
+                                   ((>= got 5) "NEAR MISS: timing, not a wedge — suspect the settle window before suspecting the protocol")
+                                   (t "PARTIAL: neither the wedge nor a near miss — capture this, it is a shape not seen before"))))))
       (setf dds.disc:*debug-emit-fault* nil
             dds.disc:*sender-emit-error-hook* saved-hook)
       (dds.disc:stop-node w) (dds.disc:stop-node r)))
