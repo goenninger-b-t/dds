@@ -43,6 +43,7 @@ HOTPATH_FILES=(
   "src/dds-xport/shmem.lisp"
   "src/dds-xport/zerocopy-pool.lisp"
   "src/dds-disc/flow-control.lisp"
+  "src/dds-gen/runtime.lisp"
 )
 # Generated-codec output dir is scanned too, once it exists.
 if [[ -d src/dds-gen/generated ]]; then

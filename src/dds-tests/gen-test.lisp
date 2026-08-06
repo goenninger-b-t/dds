@@ -388,6 +388,130 @@
     (dds.core.arena:teardown-arena arena)
     t))
 
+(defun* %copy-into-decoded-gseq (vals tag)
+    (function (vector string) t)
+  "Round-trip a gseq through its XCDR codec and return the DECODED struct, so the sequence/string slots
+   carry the PRODUCTION representation (%seq-get-form specialises the vector to the element's Lisp type;
+   a hand-written #(...) literal is a simple-vector and would silently exercise a different branch of
+   %COPY-SEQ-INTO's element-type test than the engine ever takes)."
+  (let* ((arena (dds.core.arena:init-arena :bytes (* 64 1024)))
+         (pool (dds.core.arena:make-buffer-pool arena 512 1))
+         (b (dds.core.arena:pool-acquire pool))
+         (wc (dds.core.buffer:cursor b :endianness :little)))
+    (serialize-gseq (make-gseq :n 3 :vals vals :tag tag) wc :xcdr2)
+    (let ((q (deserialize-gseq (dds.core.buffer:cursor b :endianness :little) :xcdr2)))
+      (dds.core.arena:pool-release pool b)
+      (dds.core.arena:teardown-arena arena)
+      q)))
+
+(defun* run-copy-into-test ()
+    (function () t)
+  "Test: the generated copy-into-<name> fills its destination IN PLACE and DEEP, across ALL THREE member
+   kinds the emitter branches on — nested struct, string, and sequence.
+
+   ⚠️ mline ALONE CANNOT TEST THIS. It is (a mpoint) (b mpoint) (n :i32): no string, no sequence, so a
+   build that ALIASED every string and every sequence slot passed the first version of this test and the
+   whole suite stayed green. gseq — (n :u16) (vals (:sequence :i32)) (tag :string) — is what reaches
+   %COPY-SEQ-INTO at all, and gseg pairs a nested member with a string in one type.
+
+   The four independent properties, each with its own falsification:
+
+   (1) DEEP — the source is mutated IN PLACE (never rebound) after the copy; nothing may show through.
+       Falsify by emitting (setf (slot dst) (slot src)) for the :nested, the :scalar/:var (string) or the
+       t (sequence) branch of the emitter: :copy-into-deep-nested / -string / -seq goes red.
+   (2) IN PLACE — the destination's nested sub-struct and its already-correctly-sized sequence/string
+       storage are FILLED, not replaced. Falsify with a CORRECT but allocating copier
+       ((setf (slot dst) (copy-mpoint (slot src))), or a %COPY-SEQ-INTO that always COPY-SEQs): the
+       values stay right and every other check stays green, but :copy-into-in-place-* goes red.
+   (3) ZERO ALLOCATION on that reuse path, measured with the NFR-PERF-8 oracle (dds.pal:bytes-consed;
+       constant on Clasp by the documented NFR-PORT gap, so this arm is SBCL-effective).
+   (4) NO CONDITION ESCAPES for a destination whose sequence slot holds a different representation —
+       legal, because the slot type is the unspecialised VECTOR. Falsify by REPLACEing without the
+       element-type guard: an (unsigned-byte 8) destination raises a TYPE-ERROR out of src/."
+  ;; --- mline: the nested branch, filled in place ---
+  (let* ((ts (dds.types:find-type-support "mline"))
+         (src (make-mline :a (make-mpoint :x 1 :y 2) :b (make-mpoint :x 3 :y 4) :n 5))
+         (dst (make-mline :a (make-mpoint :x 0 :y 0) :b (make-mpoint :x 0 :y 0) :n 0))
+         (old-a (mline-a dst))
+         (old-b (mline-b dst)))
+    (%check :copy-into-bound (functionp (dds.types:type-support-copy-into ts))
+            "copy-into must be bound for a non-FlatData type")
+    (let ((r (funcall (dds.types:type-support-copy-into ts) src dst)))
+      (%check :copy-into-returns-dst (eq r dst) "copy-into must return its destination")
+      (%check :copy-into-values (and (= (mpoint-x (mline-a dst)) 1) (= (mpoint-y (mline-a dst)) 2)
+                                     (= (mpoint-x (mline-b dst)) 3) (= (mpoint-y (mline-b dst)) 4)
+                                     (= (mline-n dst) 5))
+              "copy-into did not fill every slot"))
+    (%check :copy-into-in-place-nested (and (eq old-a (mline-a dst)) (eq old-b (mline-b dst)))
+            "copy-into REPLACED the destination's nested struct instead of filling it — an allocation per member per sample")
+    (setf (mpoint-x (mline-a src)) 99)
+    (%check :copy-into-deep-nested (= (mpoint-x (mline-a dst)) 1)
+            "copy-into aliased a nested slot instead of copying it"))
+  ;; --- gseq: the string and sequence branches, on the PRODUCTION representation ---
+  (let* ((cp (dds.types:type-support-copy-into (dds.types:find-type-support "gseq")))
+         (src (%copy-into-decoded-gseq #(10 -20 30) "seq"))
+         (dst (make-gseq :n 0 :vals (copy-seq (gseq-vals src)) :tag (copy-seq (gseq-tag src))))
+         (old-vals (gseq-vals dst))
+         (old-tag  (gseq-tag dst)))
+    (%check :copy-into-gseq-bound (functionp cp) "gseq must have a bound copy-into")
+    (fill old-vals 0)
+    (fill old-tag #\.)
+    (funcall cp src dst)
+    (%check :copy-into-seq-values (and (= (gseq-n dst) 3)
+                                       (equalp (gseq-vals dst) (gseq-vals src))
+                                       (string= (gseq-tag dst) "seq"))
+            "copy-into did not fill the sequence and string members")
+    (%check :copy-into-not-aliased (and (not (eq (gseq-vals src) (gseq-vals dst)))
+                                        (not (eq (gseq-tag src) (gseq-tag dst))))
+            "copy-into ALIASED the source's sequence/string into the destination")
+    (%check :copy-into-in-place-seq (and (eq old-vals (gseq-vals dst)) (eq old-tag (gseq-tag dst)))
+            "copy-into discarded the destination's correctly-sized sequence/string storage instead of reusing it")
+    ;; DEEP: mutate the SOURCE in place — a rebinding check cannot tell an alias from a copy
+    (setf (aref (gseq-vals src) 0) 999
+          (char (gseq-tag src) 0) #\Z)
+    (%check :copy-into-deep-seq (= (aref (gseq-vals dst) 0) 10)
+            "copy-into aliased the sequence member instead of copying it")
+    (%check :copy-into-deep-string (string= (gseq-tag dst) "seq")
+            "copy-into aliased the string member instead of copying it")
+    ;; ZERO ALLOCATION on the reuse path (NFR-MEM)
+    (setf (aref (gseq-vals src) 0) 10
+          (char (gseq-tag src) 0) #\s)
+    (dotimes (i 100) (funcall cp src dst))
+    (let ((before (dds.pal:bytes-consed)))
+      (dotimes (i 2000) (funcall cp src dst))
+      (let ((per (/ (float (- (dds.pal:bytes-consed) before) 1.0d0) 2000)))
+        (%check :copy-into-zero-alloc (< per 0.5d0)
+                (format nil "copy-into into a correctly-sized destination allocated ~,3f B/call" per))))
+    ;; NO CONDITION ESCAPES: a legal but differently-represented destination must fall back, not fault
+    (setf (gseq-vals dst) (make-array 3 :element-type '(unsigned-byte 8) :initial-element 0)
+          (gseq-tag dst) (make-array 3 :element-type 'base-char :initial-element #\.))
+    (funcall cp src dst)
+    (%check :copy-into-repr-mismatch (and (equalp (gseq-vals dst) (gseq-vals src))
+                                          (string= (gseq-tag dst) "seq"))
+            "copy-into did not survive a destination of a different array representation")
+    ;; A SHORTER or LONGER destination must still yield exactly the source's contents
+    (setf (gseq-vals dst) (make-array 8 :element-type '(signed-byte 32) :initial-element 0)
+          (gseq-tag dst) (copy-seq "xxxxxxxx"))
+    (funcall cp src dst)
+    (%check :copy-into-length-change (and (equalp (gseq-vals dst) (gseq-vals src))
+                                          (string= (gseq-tag dst) "seq")
+                                          (not (eq (gseq-vals dst) (gseq-vals src)))
+                                          (not (eq (gseq-tag dst) (gseq-tag src))))
+            "copy-into left the destination reading at the WRONG length, or aliased the source to reach the right one"))
+  ;; --- gseg: a nested member and a string member in ONE type ---
+  (let* ((cp (dds.types:type-support-copy-into (dds.types:find-type-support "gseg")))
+         (src (make-gseg :a (make-gpoint :x 1 :y 2) :b (make-gpoint :x -3 :y 4) :tag (copy-seq "seg")))
+         (dst (make-gseg :a (make-gpoint :x 0 :y 0) :b (make-gpoint :x 0 :y 0) :tag (copy-seq "abc")))
+         (old-a (gseg-a dst)))
+    (funcall cp src dst)
+    (setf (gpoint-x (gseg-a src)) 77
+          (char (gseg-tag src) 0) #\Q)
+    (%check :copy-into-gseg (and (eq old-a (gseg-a dst))
+                                 (= (gpoint-x (gseg-a dst)) 1)
+                                 (string= (gseg-tag dst) "seg"))
+            "a type mixing a nested member with a string member did not copy both in place and deep"))
+  t)
+
 (defun* run-sample-pool-overflow-test ()
     (function () t)
   "Test: SAMPLE-POOL-RELEASE REFUSES an over-release instead of writing past the end of its backing vector.

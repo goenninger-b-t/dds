@@ -171,6 +171,8 @@
                :ser (%sym tpkg "SERIALIZE-" (string dds-type))
                :des (%sym tpkg "DESERIALIZE-" (string dds-type))
                :des-into (%sym tpkg "DESERIALIZE-INTO-" (string dds-type))
+               ;; ADR 0105: the nested type's own copy-into, so a nested member is copied, never aliased
+               :copy-into (%sym tpkg "COPY-INTO-" (string dds-type))
                :ssize (%sym tpkg "%SSIZE-" (string dds-type))
                :key (getf opts :key))))
       ;; NOCOND(MACRO): macroexpansion-time — compile-time rejection
@@ -693,6 +695,9 @@
                collect `(dds.pal:store-sap-u8 ,sap (+ ,base ,i) (ldb (byte 8 ,(* 8 i)) u)))
        ,val)))
 
+;;;; The per-sample runtime helper the emitter below calls, %COPY-SEQ-INTO, lives in runtime.lisp —
+;;;; that file is scanned by scripts/gate-hotpath.sh, this one cannot be.
+
 (defmacro define-dds-type (name options &body members)
   "Define a DDS topic type NAME from an s-expr spec. OPTIONS is a plist; :extensibility is
    :final (default), :appendable or :mutable, and :flatdata requires :final. Each MEMBER is
@@ -757,6 +762,7 @@
          (ssz  (%sym pkg "SERIALIZED-SIZE-" (string name)))
          (sszi (%sym pkg "%SSIZE-" (string name)))
          (dnto (%sym pkg "DESERIALIZE-INTO-" (string name)))
+         (cpto (%sym pkg "COPY-INTO-" (string name)))
          (khf  (%sym pkg "KEY-HASH-" (string name)))
          (khf-fd (%sym pkg "KEY-HASH-" (string name) "-FD"))
          (keys (remove-if-not (lambda (m) (getf m :key)) parsed))
@@ -989,6 +995,26 @@
                        (when ,end (dds.core.buffer:cursor-set-position cursor ,end))))
                    forms)))
            ,(if (eq ext :mutable) '(values sample nil) 'sample))
+         (declaim (ftype (function (,name ,name) ,name) ,cpto))
+         (defun ,cpto (src dst)
+           "Fill DST from SRC in place (ADR 0105), returning DST. DEEP for every reference slot: a later
+   mutation of SRC — in place or by rebinding one of its slots — is never visible through DST.
+
+   A NESTED member is filled through the nested type's own COPY-INTO, so DST keeps the sub-struct it
+   already had: no allocation, and a caller holding that sub-struct keeps seeing DST's current value.
+
+   A STRING or SEQUENCE member goes through %COPY-SEQ-INTO (dds-gen/runtime.lisp), which reuses DST's
+   storage only when it already has exactly SRC's length AND element type. See that function for why a
+   LONGER destination deliberately does not reuse, and where slice 2's growth rule lands."
+           ;; A STRING member is :kind :scalar with :var T — a reference slot, so it is COPIED, not assigned.
+           ,@(loop for m in parsed collect
+                   (case (getf m :kind)
+                     (:scalar (if (getf m :var)
+                                  `(setf (,(acc m) dst) (%copy-seq-into (,(acc m) src) (,(acc m) dst)))
+                                  `(setf (,(acc m) dst) (,(acc m) src))))
+                     (:nested `(,(getf m :copy-into) (,(acc m) src) (,(acc m) dst)))
+                     (t       `(setf (,(acc m) dst) (%copy-seq-into (,(acc m) src) (,(acc m) dst))))))
+           dst)
          (declaim (ftype (function (,name (integer 0) &optional symbol) (integer 0)) ,sszi))
          (defun ,sszi (sample pos &optional (mode :xcdr2))
            (declare (type (integer 0) pos) (ignorable sample))
@@ -1292,6 +1318,9 @@
              ;; ADR 0093 slice 4: the in-place decode target for the pooled RX copy path. NOT bound for a
              ;; FlatData type — its into-variant fills a BUFFER, not a struct, so the copy path allocates.
              :deserialize-into ,(unless flatp `(function ,dnto))
+             ;; ADR 0105: the app-destination copier for take-into. NOT bound for a FlatData type — its
+             ;; sample IS a buffer, so take-into refuses such a reader in slice 1.
+             :copy-into ,(unless flatp `(function ,cpto))
              :serialized-size (function ,(if flatp fd-ssz ssz))
              :key-hash ,(when keys `(function ,(if flatp khf-fd khf)))
              ;; WP-DATA-REPRESENTATION (R6): the FlatData TX-transcode for a non-XCDR2 offered rep

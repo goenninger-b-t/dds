@@ -96,6 +96,15 @@ for exactly this reason.
 any read/take path. `take-into` recycles only structs whose bit is clear. State-mask semantics are untouched;
 a previously-read sample is still *taken*, merely not recycled, so that one allocates.
 
+⚠️ **It is a BIT, not a slot, and that is measured rather than stylistic.** It shares one packed `flags` slot
+with ADR 0093's `data-pinned` (`+cs-flag-was-exposed+` / `+cs-flag-data-pinned+`). Added as its own boolean
+slot it took `cached-sample` from **47.8 B to 63.9 B** on SBCL/arm64 (4-slot vs 5-slot defstruct, measured),
+and the **COPY arm allocates one wrapper per sample** — it never returns a loan, so it never recycles — which
+cost a measured **+17 B/sample on precisely the arm this ECR exists to drive to zero**, while RETURN (which
+recycles) was unaffected. **A future third per-wrapper boolean is free as a flag and costs 16 B/sample as a
+slot.** The asymmetry between the two arms is the diagnostic: a per-wrapper cost shows up only where wrappers
+are not recycled.
+
 ### 4.2 Copy and recycle happen INSIDE the reader cache lock
 
 `%rx-data-pop` / `%rx-data-push` (`558-583`) are unsynchronised read-modify-writes on plain slots, and every
@@ -135,6 +144,21 @@ purged on the last drain via the `disc-node-sample-consumers` refcount (`datapla
 Growth is **whole chunks, never exact-fit** (ADR 0102 rejected exact-fit because the budget then creeps up
 one allocation at a time until the ceiling means nothing), monotone, never shrinking, to a per-reader ceiling.
 Past the ceiling the sample is **refused and counted** (ADR 0101's reject-don't-fall-back ruling).
+
+⚠️ **"Never shrinking" is not implementable in slice 1's representation, and slice 1 does not pretend it is.**
+A `:sequence` member's slot type is the unspecialised `vector` and a `:string` member's is `string`
+(`dsl.lisp` `%parse-member`) — **no fill pointer, so capacity and logical length are the same number.** A
+destination longer than the source can therefore be made to *read* at the source's length only by allocating.
+Slice 1's `%copy-seq-into` (`src/dds-gen/runtime.lisp`) consequently reuses **only** on an exact length +
+element-type match and allocates once otherwise, and says so; it does **not** claim a longer destination is
+free. Splitting capacity from length — a fill-pointered/adjustable slot representation, or a companion length
+slot — is **part of slice 2's work**, not a detail of it, because monotone growth is meaningless without it.
+
+⚠️ **The element-type test in that function is a correctness guard, not a tuning knob.** Because the slot type
+is the unspecialised `vector`, an application may legally pre-size a destination as `(unsigned-byte 8)`;
+`replace`-ing a `(signed-byte 32)` source into it signals a `TYPE-ERROR` **after partially overwriting the
+destination** — a Lisp condition escaping `src/`, which the standing order forbids outright. A representation
+mismatch falls to the allocating branch instead.
 
 ⚠️ **The growth is remote-drivable** — a peer chooses the payload sizes and therefore our high-water mark.
 The ceiling is the security control, not a tuning knob (NFR-SEC-POSTURE resource-exhaustion class).

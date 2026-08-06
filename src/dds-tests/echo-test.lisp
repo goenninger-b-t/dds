@@ -4097,6 +4097,7 @@
                  ("writer-unmatch-proxy"    . run-writer-unmatch-proxy-test)
                  ("tce-disallow-default"     . run-tce-disallow-default-test)
                  ("zero-alloc-into"          . run-generated-into-test)
+                 ("copy-into"                . run-copy-into-test)
                  ("sample-pool-overflow"     . run-sample-pool-overflow-test)
                  ("rtps-wire-byte-exact"     . run-rtps-wire-test)
                  ("rtps-seqnum-bitmap"       . run-rtps-seqnum-test)

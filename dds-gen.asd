@@ -5,5 +5,6 @@
   :pathname "src/dds-gen"
   :serial t
   :components ((:file "packages")
+               (:file "runtime")
                (:file "dsl"))
   :in-order-to ((test-op (test-op "dds-tests"))))

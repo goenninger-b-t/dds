@@ -449,7 +449,45 @@
   (data nil :type t)
   (loan nil :type t)
   (info nil :type (or null sample-info))
-  (data-pinned nil :type boolean))   ; ADR 0093 slice 4: T when DATA was retained as an instance's get_key_value key sample, so it belongs to the instance-rec FOREVER and must NEVER go back to the reader's data pool
+  (flags 0 :type (unsigned-byte 8)))   ; the two per-wrapper booleans PACKED — see +cs-flag-*+; a 5th slot costs 16 B/sample on the copy arm
+
+(defconstant +cs-flag-data-pinned+ 1
+  "CACHED-SAMPLE-FLAGS bit: DATA was retained as an instance's get_key_value key sample (ADR 0093 slice 4),
+   so it belongs to the instance-rec FOREVER and must NEVER go back to the reader's data pool.")
+
+(defconstant +cs-flag-was-exposed+ 2
+  "CACHED-SAMPLE-FLAGS bit: the application has been handed this wrapper by a list-returning read/take
+   (ADR 0105), so TAKE-INTO must never recycle its struct — the application may still be reading it.")
+
+;;; ⚠️ THESE TWO BOOLEANS SHARE ONE SLOT, AND THAT IS A MEASURED DECISION, NOT TIDINESS. They were separate
+;;; BOOLEAN slots until 2026-08-06. On SBCL/arm64 a 4-slot defstruct is 47.8 B and a 5-slot one is 64.2 B
+;;; (measured), and the COPY arm allocates one wrapper PER SAMPLE because it never returns a loan and so
+;;; never recycles — so the fifth slot cost a measured +17 B/sample on the very arm this ECR exists to drive
+;;; to zero, while RETURN (which recycles) was unaffected. Packing restores 4 slots. A THIRD flag is free;
+;;; a third SLOT would not be.
+
+(declaim (inline cached-sample-data-pinned cached-sample-was-exposed %cs-set-flag))
+
+(defun* cached-sample-data-pinned (cs)
+    (function (cached-sample) boolean)
+  "T when CS's DATA is an instance's pinned get_key_value key sample (ADR 0093 slice 4). Reads the packed
+   FLAGS slot; see the note above for why it is packed."
+  (logtest (cached-sample-flags cs) +cs-flag-data-pinned+))
+
+(defun* cached-sample-was-exposed (cs)
+    (function (cached-sample) boolean)
+  "T once CS has been handed to the application by a list-returning read/take (ADR 0105). TAKE-INTO recycles
+   only wrappers whose bit is CLEAR, because the application may still be holding an exposed one."
+  (logtest (cached-sample-flags cs) +cs-flag-was-exposed+))
+
+(defun* %cs-set-flag (cs bit on)
+    (function (cached-sample (unsigned-byte 8) t) (unsigned-byte 8))
+  "Set (ON non-NIL) or clear BIT in CS's packed FLAGS, returning the new flags. The write half of the two
+   readers above — this codebase has no (setf name) function precedent, so the setter is named."
+  (setf (cached-sample-flags cs)
+        (if on
+            (logior (cached-sample-flags cs) bit)
+            (logandc2 (cached-sample-flags cs) bit))))
 
 (defparameter *rx-wrapper-pool-enabled* t
   "ADR 0093 slice 1 — the RX copy path's WRAPPER pooling (cached-sample + sample-info), on by default.
@@ -539,7 +577,7 @@
           (sample-info-sequence-number si) sequence-number)
     (setf (cached-sample-data cs) data
           (cached-sample-loan cs) nil
-          (cached-sample-data-pinned cs) nil
+          (cached-sample-flags cs) 0   ; ADR 0105: a RECYCLED wrapper carries stale bits; this delivery is unpinned and unexposed
           (cached-sample-info cs) si)
     cs))
 
@@ -609,8 +647,8 @@
     (unless (cached-sample-data-pinned cs)
       (%rx-data-push dr (cached-sample-data cs)))
     (setf (cached-sample-data cs) nil
-          (cached-sample-loan cs) nil
-          (cached-sample-data-pinned cs) nil)   ; INFO stays attached — the pair is pooled as one object
+          (cached-sample-loan cs) nil)
+    (%cs-set-flag cs +cs-flag-data-pinned+ nil)   ; INFO stays attached — the pair is pooled as one object
     (let ((pool (or (dr-wrapper-pool dr)
                     (setf (dr-wrapper-pool dr)
                           (make-array *rx-wrapper-pool-capacity* :initial-element nil))))   ; HOTPATH-ALLOC(COLD): once per reader, on its first return
@@ -3256,7 +3294,7 @@
                                                 (dds.disc:node-sample-timestamp node key)   ; S5.T4
                                                 (instance-rec-disposed-gen-count rec)
                                                 (instance-rec-no-writers-gen-count rec))))
-                                       (setf (cached-sample-data-pinned cs) pinned)
+                                       (%cs-set-flag cs +cs-flag-data-pinned+ pinned)
                                        cs)))))))))
         ;; ADR 0093 slice 4: EVERY non-delivery outcome hands the struct straight back — a decode failure, a
         ;; content-filter miss, a RESOURCE_LIMITS reject, and both EXCLUSIVE-ownership drops. Missing one
@@ -3454,6 +3492,7 @@
            (%note-accessed dr info)   ; ADR 0090 A3b: accessed is what makes a sample acknowledgeable
            (%release-secured-copy-loan dr node cs)   ; release the secured decode loan (data struct is independent); FlatData view untouched
            (incf n)
+           (%cs-set-flag cs +cs-flag-was-exposed+ t)   ; ADR 0105: the app is about to hold this wrapper
            (push cs out))
           (t (when take-p (push cs keep))))))     ; take keeps only the UN-selected; read leaves the cache intact
     (dolist (h touched) (setf (gethash h (dr-instances dr)) t))   ; mark accessed after snapshot

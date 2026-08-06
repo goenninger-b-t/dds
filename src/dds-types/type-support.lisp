@@ -41,6 +41,9 @@
   ;; recycled sample never keeps the previous occupant's value. NIL for a FlatData type — its own
   ;; deserialize-into-<name>-fd targets a BUFFER, not a struct, so the copy path falls back to allocating.
   (deserialize-into nil :type (or null function))
+  ;; ADR 0105: (src dst) -> fills DST from SRC in place, DEEP for every reference slot, returns DST. NIL for
+  ;; a FlatData type, whose sample IS a buffer — take-into refuses such a reader in slice 1.
+  (copy-into nil :type (or null function))
   (serialized-size nil :type (or null function))
   (key-hash nil :type (or null function))
   (typeobject nil :type t)

@@ -13346,7 +13346,11 @@
    (3) RETURNING IS OPTIONAL. With pooling OFF the same traffic delivers correctly and recycles nothing,
        so an application that ignores return-loan gets exactly the pre-slice behaviour — the graceful
        degradation ADR 0093 §6 promises, not a failure mode.
-   (4) A RETURNED SAMPLE IS GONE, never stale-readable — the rule the ZC arm already sets."
+   (4) A RETURNED SAMPLE IS GONE, never stale-readable — the rule the ZC arm already sets.
+   (5) ADR 0105 — the WAS-EXPOSED latch is SET when the wrapper escapes to the application and CLEAR
+       again on the very same wrapper once it is recycled. Both halves are silent otherwise: a missing
+       set lets take-into recycle a struct the application still holds; a stale T makes the recycle
+       permanently unreachable. Neither changes a byte count, so no allocation gate can see either."
   (let* ((ts (dds.types:find-type-support "dcps-msg"))
          (p1 (dds.dcps:create-participant :domain (test-domain)))
          (p2 (dds.dcps:create-participant :domain (test-domain))))
@@ -13362,6 +13366,9 @@
            ;; --- (1) + (2): recycle, then prove the reinit erases a poisoned predecessor ---
            (let ((cs1 (%adr93-write-and-take dw dr 1 "first")))
              (%check :adr93-first-arrived (and cs1 t) "the first sample never arrived")
+             ;; ADR 0105: take-samples handed cs1 to the application, so the wrapper is EXPOSED
+             (%check :adr105-exposed-set (dds.dcps::cached-sample-was-exposed cs1)
+                     "the read/take escape point did not mark the wrapper exposed — take-into would recycle a struct the application still holds")
              (let ((si1 (dds.dcps:cached-sample-info cs1)))
                (dds.dcps:return-loan dr (list cs1))
                (%check :adr93-parked-cs (plusp (dds.dcps::dr-wrapper-pool-top dr))
@@ -13375,6 +13382,10 @@
                  (%check :adr93-second-arrived (and cs2 t) "the second sample never arrived")
                  (%check :adr93-reused (eq cs2 cs1)
                          "the second delivery did NOT reuse the returned wrapper — no recycling happened")
+                 ;; ADR 0105: the SAME wrapper came back from the pool — a stale T would permanently
+                 ;; block Task 3 from recycling, and the byte count is identical either way
+                 (%check :adr105-exposed-cleared (null (dds.dcps::cached-sample-was-exposed cs2))
+                         "a recycled wrapper kept a stale was-exposed latch")
                  (let ((si2 (dds.dcps:cached-sample-info cs2)))
                    (%check :adr93-reused-info (eq si2 si1)
                            "the second delivery did NOT reuse the returned SampleInfo")
