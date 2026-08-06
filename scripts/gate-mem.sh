@@ -108,9 +108,24 @@ measure_arm () {
 ratchet () {
   awk -v label="$1" -v m="$2" -v c="$3" -v col="$4" -v a="$ARCH" '
   BEGIN {
+    # ONE suggestion formula, used by BOTH branches so they can never drift apart again: the measurement
+    # plus 5% headroom, rounded up to the next whole byte so it is STRICTLY ABOVE the measurement.
+    #
+    # Both halves are load-bearing. Suggesting the measurement itself (what this used to do) sets a ceiling
+    # the very next run trips as a REGRESSION — the advice broke the build in the other direction. And a
+    # FIXED headroom (the old "m + 30") stops working as the number shrinks: this gate re-fires whenever
+    # m < 0.90*ceiling, so any ceiling above m/0.90 = 1.111*m is immediately "too high" again. m+30 leaves
+    # that window once m < 270, which loops forever demanding a lower ceiling — and the NFR-MEM target is
+    # ZERO, so the numbers are heading straight through that point. 5% is proportional and always lands
+    # inside (m, 1.111*m]; the ratchet workload is 60000 samples and repeats to well under 1%.
+    #
+    # NOTE: NO RAW APOSTROPHES ANYWHERE BELOW. This whole program is one single-quoted shell string, so a
+    # stray quote silently ends it and everything after is parsed as SHELL — the failure is a bash syntax
+    # error pointing at an awk line, which reads like nonsense. Use the escape the PEER line below uses.
+    sug = int(m * 1.05) + 1;
     if (c == "-") {
       printf "gate-mem: %-6s allocation = %.1f bytes/sample  (NOT RATCHETED on %s — no %s ceiling yet)\n", label, m, a, col;
-      printf "gate-mem:        ^ to start ratcheting it, put %.0f in the %s column of the %s row.\n", m + 30, col, a;
+      printf "gate-mem:        ^ to start ratcheting it, put %d in the %s column of the %s row.\n", sug, col, a;
       exit 0;
     }
     lo = c * 0.90;
@@ -120,10 +135,18 @@ ratchet () {
       print  "          Every byte here feeds the PEER'"'"'s GC, which owns the whole ~10 ms tail (ADR 0062)." > "/dev/stderr";
       exit 1;
     }
+    if (m == 0) {
+      printf "gate-mem: %s is at ZERO — NFR-MEM'"'"'s target is MET on %s. Leave the ceiling where it is.\n", label, a;
+      exit 0;
+    }
     if (m < lo) {
-      printf "gate-mem: FAIL — you IMPROVED %s (%.1f, well under the %d ceiling). LOWER THE CEILING:\n", label, m, c > "/dev/stderr";
-      printf "          Set the %s column of the %s row in bench/mem-ceiling.txt to %.0f and commit it.\n", col, a, m > "/dev/stderr";
-      print  "          A ceiling that is never lowered stops constraining anything. The ratchet only moves DOWN." > "/dev/stderr";
+      printf "gate-mem: FAIL — %s IMPROVED on %s: %.1f vs a ceiling of %d (%.0f%% below it). LOWER THE CEILING.\n", label, a, m, c, (1 - m / c) * 100 > "/dev/stderr";
+      printf "          FIX: in bench/mem-ceiling.txt, set the %s column of the %s row to %d, then commit.\n", col, a, sug > "/dev/stderr";
+      printf "          WHY %d and not %.0f: a ceiling set AT the measurement fails the NEXT run as a\n", sug, m > "/dev/stderr";
+      print  "          regression. This is the measurement plus 5% headroom — above it, but still inside" > "/dev/stderr";
+      print  "          the 10% band, so it does not trip this same check again." > "/dev/stderr";
+      print  "          This is not a test failure. The ratchet only moves DOWN: a ceiling that is never" > "/dev/stderr";
+      print  "          lowered stops constraining anything, so banking a win is how the gate keeps working." > "/dev/stderr";
       exit 1;
     }
     exit 0;
