@@ -216,5 +216,23 @@
 # not the cause; the likely mechanism is that allocation here is TIMING-DEPENDENT (a slower CPU changes how
 # many heartbeats/ACKNACKs are processed per sample), which emulation perturbs. Unconfirmed as to cause,
 # but decisive as to practice: emulated numbers are not this gate's oracle. Use the real box.
+#
+# ⛔⛔ x86_64 RETURN IS BACK TO A DASH, AND THAT IS AN OPEN QUESTION, NOT A CLEANUP. It was banked at 425
+# on 2026-08-06 from box measurements (401.6 / 401.9 / 402.5) plus one CI observation of 404.3. The very
+# next CI run reported **3632.0** — a 9x jump — while COPY on the SAME run read 593.7, i.e. exactly normal.
+# Generic contention would inflate BOTH arms, so this is specific to the RETURN path (:return-loans t is
+# the only difference between them).
+#
+# NOT REPRODUCED in three environments: the box 402.1, the box PINNED TO 2 CORES 400.3 (so it is not the
+# runner's core count), and the linux/amd64 Docker image 411.0. Since the platform that gates this arm is
+# the one platform where its behaviour cannot be characterised, gating it was premature — banking a ceiling
+# from a quiet 16-core box for an arm never observed under CI load was the error, not the dash.
+#
+# ⚠️ DO NOT read the dash as "3632 was noise". It may be a REAL defect only CI can see — this repo has
+# found six of those (uninitialised memory on the wire, a stack that could not shut down on Linux). The
+# open question is why RETURN alone explodes there; a plausible starting hypothesis is that under CI's
+# conditions the app falls behind the receiver, the data pool is empty at drain time so recycling never
+# happens, and reliable retransmission multiplies the per-sample work. Chase it with a CI run that PRINTS
+# the pool hit/miss counts, not with another local measurement.
 arm64  590 385
-x86_64 625 425
+x86_64 625 -
