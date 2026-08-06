@@ -78,7 +78,41 @@ not the pool's discipline but **who retains the buffer**:
 | RX decode cursor | "the EQ test will miss" | **hits** | nothing retains the store buffer across the next acquire |
 | TX payload cursor | "one slot hits in steady state" | **misses 100 %** | the HistoryCache retains the buffer until eviction |
 
+## The other half: `writer-write` = 32.8 B/sample
+
+A second window, around `publish-sample`'s call to `writer-write`, closes the write path:
+
+```
+SPLIT3 total=80.3  writer-write=32.8  everything-else=47.5
+SPLIT3 total=81.9  writer-write=32.8  everything-else=49.1
+```
+
+So the ~80 B core is **fully attributed**: ~47.5 B the payload cursor, ~32.8 B the HistoryCache add. That
+also cross-checks the profiler's split (60.4 % / 39.6 %) by a second, independent method.
+
+Reading `hc-add-change` → `%hc-store` → **`%hc-index-append`**:
+
+```lisp
+(setf (gethash key (history-cache-instances hc))
+      (nconc (gethash key (history-cache-instances hc)) (list sn)))
+```
+
+**`(list sn)` is one cons per write, `nconc`'d onto the per-instance bucket's tail** — 16 B, and *exactly*
+the defect fixed on the reader side hours earlier in ADR 0105 Task 6a (`dr-cache`'s spine cell, appended
+with `(nconc … (list cs))`). The writer-side twin was never looked at. ⭐ The fix pattern is already proven
+and its hazards already written down: unlink in place, pool the cells, and only the site that unlinks may
+park one.
+
+⚠️ **The other ~16 B of the 32.8 is NOT yet pinned to a line** and is not being guessed at here. The
+change struct itself is already pooled (`change-freelist`, ADR 0077) and a steady-state hash insert/remove
+pair should not allocate, so it is something else in the `writer-write` subtree.
+
 ## Status
 
-Measured and attributed; **not fixed**. The remaining `publish-sample` 31.1 B/sample (which contains
-`hc-add-change`) is not yet attributed to a line.
+The write path is fully attributed and **nothing is fixed**:
+
+| item | B/sample | state |
+|---|---|---|
+| TX payload cursor, 100 % cache miss | ~47.5 | diagnosed; fix wants an ADR (a cursor per POOLED BUFFER — a repoint would be a race) |
+| `%hc-index-append`'s `(list sn)` | ~16 | diagnosed; the ADR 0105 Task 6a pattern applies directly |
+| the rest of `writer-write` | ~16 | **not attributed** |
