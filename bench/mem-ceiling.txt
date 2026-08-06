@@ -201,6 +201,25 @@
 #   arm64 COPY    560.2 /  558.0 /  560.2   -> LOWERED 625 -> 590
 #   arm64 RETURN  349.5 /  352.8 /  350.6   -> LOWERED 415 -> 385
 #
+# LOWERED 2026-08-06 (ADR 0105 Task 5 — the deferred view-state marking stops consing a TOUCHED list. All
+# four access paths (%select-samples-unlocked list-mode and into-mode, take-loaned, read-loaned) collected
+# the instance handles they had selected into a fresh list with PUSHNEW :TEST EQUALP, then walked it after
+# the pass to mark DR-INSTANCES — one cons per selected INSTANCE per call, plus an EQUALP list scan per
+# selected sample. The DEFERRAL is load-bearing and was kept exactly (DDS 1.4 §2.2.2.5.1.4: every sample of
+# a not-yet-accessed instance must read NEW within the one call that first accesses it); only the SCRATCH
+# went. The marking is idempotent, so each path now walks the set it had ALREADY materialised — the wrapper
+# list it returns, the SampleInfo vector it just filled, or DR-CACHE itself. Predicted 16 B/sample (one
+# cons; the bench writes one sample of one instance per take), measured -16.2 / -14.2:
+#   arm64 COPY    543.8 /  543.8 /  542.7   -> LOWERED 590 -> 571
+#   arm64 RETURN  337.5 /  337.5 /  335.3   -> LOWERED 385 -> 355
+# and measured DIRECTLY on the real x86_64 box the same day (never derived from arm64, and never emulated):
+#   x86_64 COPY   579.1 /  578.1 /  578.1   -> LOWERED 625 -> 609   (was 593.0 / 594.2 / 594.3: -15.4)
+#   x86_64 RETURN 386.7 /  385.6 /  386.8   -> STAYS A DASH         (was 401.6 / 401.9 / 402.5: -15.4)
+# The x86_64 RETURN row is NOT re-banked off these numbers. The dash is an OPEN QUESTION about CI, not a
+# missing measurement (see below); three more quiet-box readings do not answer it, and re-banking would
+# repeat exactly the error the dash records. The x86_64 COPY row IS lowered: that arm has been stable in CI
+# (593.7 on the run whose RETURN read 3632) and the box has agreed with CI on it to 0.2 %.
+#
 # ⚠️ MEASURE WITH NOTHING ELSE RUNNING. A gate-mem run taken while the test suites were running in the
 # background read COPY 1710.8 and FAILED — a 160 B phantom regression from participant + CPU contention,
 # not from code. A benchmark is an instrument; give it the machine.
@@ -234,5 +253,5 @@
 # conditions the app falls behind the receiver, the data pool is empty at drain time so recycling never
 # happens, and reliable retransmission multiplies the per-sample work. Chase it with a CI run that PRINTS
 # the pool hit/miss counts, not with another local measurement.
-arm64  590 385
-x86_64 625 -
+arm64  571 355
+x86_64 609 -

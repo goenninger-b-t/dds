@@ -250,3 +250,9 @@
 (defconstant +td-take-into-listener+ 59
   "ADR 0105 §8 isolation offset: TAKE-INTO called from an ON_DATA_AVAILABLE listener. The arm counts
    listener entries against listener exits, and a foreign participant's traffic fires the same listener.")
+
+(defconstant +td-view-state-snapshot+ 60
+  "DDS 1.4 §2.2.2.5.1.4 isolation offset: the view-state SNAPSHOT ordering. Every arm asserts the exact
+   view_state of the exact samples ONE access call returned for ONE instance, so a foreign participant's
+   sample arriving mid-arm would add an instance whose first access falls in a different call and the
+   NEW/NOT_NEW pattern being asserted would stop describing what the test says it does.")

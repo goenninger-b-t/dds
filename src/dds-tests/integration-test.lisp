@@ -14253,3 +14253,114 @@
         (dds.dcps:delete-participant pw)
         (dds.dcps:delete-participant pr))))
   t)
+
+;;; ---- DDS 1.4 §2.2.2.5.1.4: the view state is a SNAPSHOT taken at the start of an access call ----
+
+(defun* %vss-states (samples)
+    (function (list) list)
+  "The view_state stamped on each cached-sample in SAMPLES, in order — the value every assertion below
+   compares, and the value its failure message prints (a bare PASS/FAIL here names a keyword without
+   showing which one arrived)."
+  (mapcar (lambda (cs) (dds.dcps:sample-info-view-state (dds.dcps:cached-sample-info cs))) samples))
+
+(defun* %vss-of-key (samples k)
+    (function (list integer) t)
+  "The view_state of the one sample in SAMPLES whose tinto key is K, or NIL when there is none — used
+   where a call returns several instances' samples and only one instance's state is the subject."
+  (let ((cs (find k samples :key (lambda (c) (tinto-k (dds.dcps:cached-sample-data c))))))
+    (and cs (dds.dcps:sample-info-view-state (dds.dcps:cached-sample-info cs)))))
+
+(defun* run-view-state-snapshot-test ()
+    (function () t)
+  "Test: DDS 1.4 §2.2.2.5.1.4 — THE VIEW STATE IS A SNAPSHOT TAKEN AT THE START OF AN ACCESS CALL, not a
+   running flag updated as the call walks the cache. Every sample of a not-yet-accessed instance returned
+   by ONE read/take reads NEW — the second as much as the first — and the instance turns NOT_NEW only for
+   the NEXT call. Asserted on all four access paths that mark an instance accessed: the list-returning
+   selection core, its ADR 0105 into-mode, and READ-LOANED / TAKE-LOANED.
+
+   ⚠️ THE SUITE HAD NO ARM FOR THIS, AND THE MISTAKE IT GUARDS IS AN INVITING ONE. Each path marks the
+   instance ACCESSED in a SECOND pass, after its selection pass has finished, precisely so
+   %SNAPSHOT-VIEW-STATE reads the state as it stood on entry. The obvious simplification — mark inside the
+   selection loop and delete the second pass — mis-reports every sample after the first of a newly-accessed
+   instance. Every other view-state assertion in the suite returns ONE sample per instance per call, so all
+   of them stay GREEN while it is broken. FALSIFIED by marking inside the loop: :VSS-LIST-BOTH-NEW and
+   :VSS-INTO-BOTH-NEW go RED.
+
+   THE MARKING MUST ALSO STILL HAPPEN — the other half of every arm. A path that simply never marked would
+   satisfy the both-NEW checks and fail the NOT_NEW ones, so neither deleting a second pass nor moving it
+   into the loop can be green.
+
+   ⚠️ THE TWO LOAN PATHS ARE ASSERTED ONE-SIDED, DELIBERATELY. TAKE-LOANED / READ-LOANED return DATA and
+   LOANS and never a SampleInfo, so the view_state they stamp is not observable through their own return
+   value; what is observable is the marking's effect on the FOLLOWING call, which is exactly what a deleted
+   second pass would break. Both run on a plain copy-backed reader — which they support, a struct sample
+   simply yielding a NIL loan — so the arm needs no Zero-Copy transport and never skips."
+  (multiple-value-bind (pw pr dw dr) (%ti-pair +td-view-state-snapshot+)
+    (unwind-protect
+         (let ((data  (vector (make-tinto :k 0 :v 0 :tag "") (make-tinto :k 0 :v 0 :tag "")))
+               (infos (vector (dds.dcps:make-sample-info) (dds.dcps:make-sample-info))))
+           (%check :vss-matched (plusp (dds.dcps:matched-count pr)) "writer/reader never matched")
+           ;; (a) the LIST path — two samples of ONE previously-unseen instance in ONE read-samples call
+           (dds.dcps:write-sample dw (make-tinto :k 1 :v 11 :tag "a"))
+           (dds.dcps:write-sample dw (make-tinto :k 1 :v 12 :tag "b"))
+           (%ti-settle pw pr dr 2)
+           (let ((r (dds.dcps:read-samples dr)))
+             (%check :vss-list-two (= 2 (length r))
+                     (format nil "the arm needs BOTH samples of instance k=1 in ONE call or it proves nothing; got ~d"
+                             (length r)))
+             (%check :vss-list-both-new (equal '(:new :new) (%vss-states r))
+                     (format nil "every sample of a not-yet-accessed instance must read NEW within the one call that first accesses it; got ~s"
+                             (%vss-states r))))
+           (let ((r (dds.dcps:read-samples dr)))
+             (%check :vss-list-then-not-new (equal '(:not-new :not-new) (%vss-states r))
+                     (format nil "the NEXT call must read NOT_NEW — the first call has to have marked the instance accessed; got ~s"
+                             (%vss-states r))))
+           ;; (b) the ADR 0105 INTO path — same property, its own second pass over the filled SampleInfos
+           (%ti-drain-empty dr data infos)
+           (dds.dcps:write-sample dw (make-tinto :k 2 :v 21 :tag "c"))
+           (dds.dcps:write-sample dw (make-tinto :k 2 :v 22 :tag "d"))
+           (%ti-settle pw pr dr 2)
+           (multiple-value-bind (n st) (dds.dcps:take-into dr data infos)
+             (%check :vss-into-two (and (= n 2) (null st))
+                     (format nil "the arm needs BOTH samples of instance k=2 in ONE take-into; got ~d / ~s" n st))
+             (%check :vss-into-both-new
+                     (and (eq :new (dds.dcps:sample-info-view-state (svref infos 0)))
+                          (eq :new (dds.dcps:sample-info-view-state (svref infos 1))))
+                     (format nil "take-into must stamp NEW on every sample of a not-yet-accessed instance; got ~s / ~s"
+                             (dds.dcps:sample-info-view-state (svref infos 0))
+                             (dds.dcps:sample-info-view-state (svref infos 1)))))
+           (dds.dcps:write-sample dw (make-tinto :k 2 :v 23 :tag "e"))
+           (%ti-settle pw pr dr 1)
+           (multiple-value-bind (n st) (dds.dcps:take-into dr data infos)
+             (%check :vss-into-then-not-new
+                     (and (= n 1) (null st) (eq :not-new (dds.dcps:sample-info-view-state (svref infos 0))))
+                     (format nil "the take-into after the one that first accessed k=2 must read NOT_NEW; got ~d / ~s / ~s"
+                             n st (dds.dcps:sample-info-view-state (svref infos 0)))))
+           ;; (c) READ-LOANED marks too — observed through the FOLLOWING read, plus a fresh instance as the
+           ;;     positive control that the reader has not simply gone NOT_NEW for everything
+           (dds.dcps:write-sample dw (make-tinto :k 3 :v 31 :tag "f"))
+           (%ti-settle pw pr dr 1)
+           (dds.dcps:read-loaned dr)
+           (dds.dcps:write-sample dw (make-tinto :k 4 :v 41 :tag "g"))
+           (%ti-settle pw pr dr 2)
+           (let ((r (dds.dcps:read-samples dr)))
+             (%check :vss-loaned-read-marked (eq :not-new (%vss-of-key r 3))
+                     (format nil "read-loaned must mark its instance accessed, so the next read reads NOT_NEW; got ~s"
+                             (%vss-of-key r 3)))
+             (%check :vss-loaned-read-control (eq :new (%vss-of-key r 4))
+                     (format nil "a fresh instance in that same call must still read NEW, or the arm above proves nothing; got ~s"
+                             (%vss-of-key r 4))))
+           ;; (d) TAKE-LOANED marks too — it empties the cache, so the evidence is the NEXT sample of the key
+           (dds.dcps:take-loaned dr)
+           (dds.dcps:write-sample dw (make-tinto :k 5 :v 51 :tag "h"))
+           (%ti-settle pw pr dr 1)
+           (dds.dcps:take-loaned dr)
+           (dds.dcps:write-sample dw (make-tinto :k 5 :v 52 :tag "i"))
+           (%ti-settle pw pr dr 1)
+           (let ((r (dds.dcps:read-samples dr)))
+             (%check :vss-loaned-take-marked (eq :not-new (%vss-of-key r 5))
+                     (format nil "take-loaned must mark its instance accessed, so the next sample of k=5 reads NOT_NEW; got ~s"
+                             (%vss-of-key r 5)))))
+      (dds.dcps:delete-participant pw)
+      (dds.dcps:delete-participant pr))
+    t))

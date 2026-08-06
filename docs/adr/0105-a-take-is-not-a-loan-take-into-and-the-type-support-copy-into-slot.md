@@ -289,7 +289,7 @@ five further per-sample allocations remain, measured on arm64 SBCL 2.6.5:
 | `entities.lisp:800` | fresh 4-slot `cursor` per decode | 48.16 |
 | `entities.lisp:3251-3253` | `(list …)` cell `nconc`'d onto `dr-cache` | 16.05 |
 | `entities.lisp:3457` | `(push cs out)` per selected sample | 16.05 |
-| `entities.lisp:3452` | `(pushnew h touched :test #'equalp)` | 16.05 |
+| ~~`entities.lisp:3452`~~ | ~~`(pushnew h touched :test #'equalp)`~~ — **DONE, Task 5**: measured **−16.2 COPY / −14.2 RETURN** | ~~16.05~~ |
 
 ≈**112 B/sample**, of which only the `out` cons falls out of `take-into` itself. The cursor needs a
 **repoint-in-place** variant: `cursor-reuse`'s `EQ` test misses here because the ADR 0078 pool hands out a
@@ -366,6 +366,43 @@ inside the reader cache lock — but `%on-writer-vanished` fired that notificati
 sites are outside the lock and nothing exercised this one. The notification is now collected inside the
 critical section and fired after it — the discipline `%prune-participant-locked` already uses for the node
 lock — and both firing paths are exercised.
+
+### 8.2 Task 5 — the `touched` cons, and the spec violation its obvious fix would have been
+
+The scratch list existed only to **defer** the `dr-instances` marking past the selection pass, and that
+deferral *is* DDS 1.4 §2.2.2.5.1.4: `%snapshot-view-state` reads what the marking writes, so marking inside
+the loop makes the **second** sample of a newly-accessed instance report `NOT_NEW` within the one call that
+first accessed it, and changes what a `view_states` mask selects half-way through that same call. Deleting
+the pass and the scratch together — the obvious simplification — is therefore a conformance regression, and
+it was **checked, not assumed**: the sabotage printed `(:NEW :NOT-NEW)`.
+
+**Nothing in the suite covered it.** Every other view-state assertion returns one sample per instance per
+call, so all of them stay green while the ordering is broken. `run-view-state-snapshot-test` is new and
+covers all four access paths in both directions:
+
+| arm | falsified by | observed red |
+|---|---|---|
+| the ordering, list path | marking inside the selection loop | `:vss-list-both-new` — `(:NEW :NOT-NEW)` |
+| the ordering, into path | the same, with the list arm suppressed | `:vss-into-both-new` — `:NEW / :NOT-NEW` |
+| the marking still happens, list path | deleting its second pass | `:vss-list-then-not-new` |
+| the marking still happens, into path | deleting its second pass | `:vss-into-then-not-new` |
+| `take-loaned` marks | deleting its second pass | `:vss-loaned-take-marked` |
+| `read-loaned` marks | deleting its second pass | `:vss-loaned-read-marked` |
+
+The first two and the last four are **opposite** failures, so neither moving the pass into the loop nor
+deleting it can be green.
+
+**The per-reader scratch vector the slice plan prescribed was not needed.** The marking is idempotent, so
+each path walks the set it has **already materialised** — the wrapper list it is about to return, the
+SampleInfo vector it has just filled, or `dr-cache` itself for the loan paths, whose selection *is* the whole
+cache. That leaves no new reader state and no growth bound to argue about. Residue, recorded in
+`%mark-instance-accessed`'s docstring rather than checked: into-mode reads back **application-owned**
+storage, so an application that puts the same `sample-info` object at two indices loses the first instance's
+marking — already-broken usage (two indices cannot hold two samples), and enforcing distinctness would cost
+an O(n²) `EQ` scan per call.
+
+The same edit removed a real duplication: both loan paths carried their own inline copy of the view-state
+rule instead of calling `%snapshot-view-state`, whose docstring already claimed to be its single definition.
 
 **Cross-DDS interop:** `take-into` changes **no wire surface**. The per-feature interop rule is discharged by
 no-regression against the existing Connext 7.3.1 and Fast DDS legs, stated rather than skipped.

@@ -3106,19 +3106,18 @@
   ;; rather than through %select-samples, so the drain and the cache walk share the lock here.
   (%with-reader-cache (dr)
    (%drain-unlocked dr)
-   (let ((data '()) (loans '()) (touched '()))
+   (let ((data '()) (loans '()))
     (dolist (cs (dr-cache dr))
-      (let* ((info (cached-sample-info cs)) (d (cached-sample-data cs))
-             (handle (sample-info-instance-handle info)))
-        (setf (sample-info-view-state info) (if (gethash handle (dr-instances dr)) :not-new :new))
-        (pushnew handle touched :test #'equalp)
+      (let ((info (cached-sample-info cs)) (d (cached-sample-data cs)))
+        (setf (sample-info-view-state info) (%snapshot-view-state dr info))
         (setf (sample-info-sample-state info) :read)
         (%note-accessed dr info)   ; ADR 0090 A3b: accessed is what makes a sample acknowledgeable
         (%cs-set-flag cs +cs-flag-was-exposed+ t)   ; ADR 0105 §4.1: D leaves the middleware here
         (push d data)
         (cond ((dds.types:flatdata-view-p d) (push d loans))     ; FlatData: the view is both DATA and loan (ADR 0017)
               ((dds.disc:secured-loan-handle-p (cached-sample-loan cs)) (push (cached-sample-loan cs) loans)))))   ; secured: the pooled-buffer handle (ADR 0038 (i)); NIL otherwise
-    (dolist (h touched) (setf (gethash h (dr-instances dr)) t))
+    ;; phase two: mark accessed AFTER the snapshot, off DR-CACHE — this path's selection IS the whole cache
+    (dolist (cs (dr-cache dr)) (%mark-instance-accessed dr (cached-sample-info cs)))
     (setf (dr-cache dr) '())                                    ; take removes ALL drained samples
     (values (nreverse data) (nreverse loans)))))
 
@@ -3141,19 +3140,18 @@
   ;; rather than through %select-samples, so the drain and the cache walk share the lock here.
   (%with-reader-cache (dr)
    (%drain-unlocked dr)
-   (let ((data '()) (loans '()) (touched '()))
+   (let ((data '()) (loans '()))
     (dolist (cs (dr-cache dr))
-      (let* ((info (cached-sample-info cs)) (d (cached-sample-data cs))
-             (handle (sample-info-instance-handle info)))
-        (setf (sample-info-view-state info) (if (gethash handle (dr-instances dr)) :not-new :new))
-        (pushnew handle touched :test #'equalp)
+      (let ((info (cached-sample-info cs)) (d (cached-sample-data cs)))
+        (setf (sample-info-view-state info) (%snapshot-view-state dr info))
         (setf (sample-info-sample-state info) :read)
         (%note-accessed dr info)   ; ADR 0090 A3b: accessed is what makes a sample acknowledgeable
         (%cs-set-flag cs +cs-flag-was-exposed+ t)   ; ADR 0105 §4.1: D leaves the middleware here and the wrapper STAYS cached
         (push d data)
         (cond ((dds.types:flatdata-view-p d) (push d loans))     ; FlatData: the view is both DATA and loan (ADR 0017)
               ((dds.disc:secured-loan-handle-p (cached-sample-loan cs)) (push (cached-sample-loan cs) loans)))))   ; secured: the pooled-buffer handle (ADR 0038 (i))
-    (dolist (h touched) (setf (gethash h (dr-instances dr)) t))
+    ;; phase two: mark accessed AFTER the snapshot, off DR-CACHE — this path's selection IS the whole cache
+    (dolist (cs (dr-cache dr)) (%mark-instance-accessed dr (cached-sample-info cs)))
     (values (nreverse data) (nreverse loans)))))
 
 (defun* %return-loan-unlocked (dr loans)
@@ -3479,10 +3477,39 @@
     (function (data-reader sample-info) (member :new :not-new))
   "The VIEW_STATE of INFO's instance as DR sees it right now (DDS 1.4 §2.2.2.5.1.4): NEW until the
    application has accessed that instance (via a read/take), NOT_NEW afterwards. Read from DR-INSTANCES,
-   which %select-samples marks only AFTER its selection pass — so every sample of a not-yet-accessed
-   instance reads NEW within one call (the DDS snapshot semantics). The single definition of the view
-   state: both the view_states FILTER and the view-state STAMPED on a returned sample use it."
+   which every access path marks only AFTER its selection pass (%MARK-INSTANCE-ACCESSED) — so every sample
+   of a not-yet-accessed instance reads NEW within one call (the DDS snapshot semantics). The single
+   definition of the view state: the view_states FILTER, the view-state STAMPED on a returned sample, and
+   both loan paths use it."
   (if (gethash (sample-info-instance-handle info) (dr-instances dr)) :not-new :new))
+
+(defun* %mark-instance-accessed (dr info)
+    (function (data-reader sample-info) t)
+  "Record INFO's instance as ACCESSED in DR-INSTANCES — the WRITE half of the DDS 1.4 §2.2.2.5.1.4 view
+   state, whose READ half is %SNAPSHOT-VIEW-STATE.
+
+   ⚠️ CALL IT ONLY AFTER AN ACCESS CALL'S SELECTION PASS HAS FINISHED, NEVER FROM INSIDE ONE. It writes
+   exactly what %SNAPSHOT-VIEW-STATE reads, so marking inside the loop makes the SECOND sample of a
+   newly-accessed instance report NOT_NEW within the one call that first accessed it, and changes what a
+   VIEW-STATES mask selects half-way through that same call. Every sample an access call returns must see
+   the state as it stood on entry. RUN-VIEW-STATE-SNAPSHOT-TEST is what holds the ordering, and it is the
+   only arm that does: every other view-state assertion in the suite returns one sample per instance per
+   call, so all of them stay green while the ordering is broken.
+
+   IT IS IDEMPOTENT, and that is what lets the deferral cost NO allocation. Rather than accumulating a
+   TOUCHED list during the pass and walking it afterwards — one cons per selected instance, plus an EQUALP
+   list scan per selected sample — each caller walks the set it has ALREADY materialised: the wrapper list
+   it is about to return, the SampleInfo vector it has just filled (ADR 0105 into-mode), or DR-CACHE itself
+   for the loan paths, whose selection IS the whole cache.
+
+   RECORDED RESIDUE, one-sided and only in into-mode: walking the FILLED destination vector reads back
+   APPLICATION-OWNED storage, so an application that puts the SAME SampleInfo object at two indices loses
+   the first instance's marking (index i's fields were overwritten by index i+1's before this pass sees
+   them) and that instance reads NEW once more. Distinct destination elements are already implicit in the
+   §2.2.2.5.3.8 collections — two indices sharing one struct cannot hold two samples, so such a call has
+   already lost a sample to the application — and enforcing it would cost an O(n^2) EQ scan per call to
+   turn a wrong ANSWER into a refusal. Recorded rather than checked."
+  (setf (gethash (sample-info-instance-handle info) (dr-instances dr)) t))
 
 (defun* %snapshot-instance-state (dr info)
     (function (data-reader sample-info) (member :alive :not-alive-disposed :not-alive-no-writers))
@@ -3571,8 +3598,8 @@
    wrappers, and returns (values NIL COUNT). The mode is a BRANCH INSIDE THIS FUNCTION and not a private
    loop of its own, deliberately (ADR 0105 §4.3): a separate implementation would have to replicate the
    three-mask predicate, the §2.2.2.5.4 view/instance-state snapshot stamping, %NOTE-ACCESSED for APP-ACK,
-   %RELEASE-SECURED-COPY-LOAN and the two-phase touched -> DR-INSTANCES marking — and any omission is a
-   silent correctness regression that no allocation gate measures.
+   %RELEASE-SECURED-COPY-LOAN and the deferred %MARK-INSTANCE-ACCESSED pass — and any omission is a silent
+   correctness regression that no allocation gate measures.
 
    ⚠️ CALLER CONTRACT FOR INTO-MODE, all five checked by TAKE-INTO / READ-INTO before they get here:
    MAX is <= (length INTO-DATA) so the write index can never run off the end; the two vectors are the same
@@ -3602,7 +3629,7 @@
    Copy and recycle both run under the caller's cache lock (§4.2): %RX-DATA-POP / -PUSH are unsynchronised
    read-modify-writes, and shipped code calls take from an ON_DATA_AVAILABLE listener on the receiver
    thread, so recycling outside the lock would race two threads onto one struct (the ADR 0085 shape)."
-  (let ((out '()) (keep '()) (touched '()) (n 0)
+  (let ((out '()) (keep '()) (n 0)
         (copy-into (and into-data
                         (dds.types:type-support-copy-into (topic-type-support (dr-topic dr)))))
         (node (dp-node (sub-participant (dr-subscriber dr)))))
@@ -3614,10 +3641,8 @@
                        (funcall where (cached-sample-data cs)))))
         (cond
           (sel
-           (let ((h (sample-info-instance-handle info)))
-             (setf (sample-info-view-state info) (%snapshot-view-state dr info))
-             (setf (sample-info-instance-state info) (%snapshot-instance-state dr info))
-             (pushnew h touched :test #'equalp))
+           (setf (sample-info-view-state info) (%snapshot-view-state dr info))
+           (setf (sample-info-instance-state info) (%snapshot-instance-state dr info))
            (setf (sample-info-sample-state info) :read)
            (%note-accessed dr info)   ; ADR 0090 A3b: accessed is what makes a sample acknowledgeable
            (%release-secured-copy-loan dr node cs)   ; release the secured decode loan (data struct is independent); FlatData view untouched
@@ -3633,7 +3658,10 @@
               (push cs out)))
            (incf n))
           (t (when take-p (push cs keep))))))     ; take keeps only the UN-selected; read leaves the cache intact
-    (dolist (h touched) (setf (gethash h (dr-instances dr)) t))   ; mark accessed after snapshot
+    ;; phase two: mark accessed AFTER the snapshot, off the set this pass already materialised
+    (if into-data
+        (dotimes (i n) (%mark-instance-accessed dr (svref into-infos i)))
+        (dolist (cs out) (%mark-instance-accessed dr (cached-sample-info cs))))
     (when take-p (setf (dr-cache dr) (nreverse keep)))
     (values (nreverse out) n)))
 

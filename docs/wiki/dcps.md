@@ -631,6 +631,12 @@ DDS triple. A mask is a *list of kinds*, not a bitmask; `member` is the test:
 read time: a sample received while its instance was ALIVE reports `:not-alive-disposed` if it is read
 after the instance was disposed.
 
+`view_state` is snapshot **per call, not per sample** (DDS 1.4 §2.2.2.5.1.4). An instance is marked
+*accessed* only after the whole selection pass has finished, so **every** sample of a not-yet-accessed
+instance that one `read`/`take`/`take-into` returns reads `:new` — the second and third as much as the
+first — and the instance turns `:not-new` for the *next* call. The example below depends on it: two of
+its three samples belong to one instance, and all three read `:new`.
+
 ```lisp
 (dds.gen:define-dds-type shape-type (:extensibility :final)
   (color :string :key t)

@@ -4166,6 +4166,7 @@
                  ("take-into-truncate"       . run-take-into-truncate-test) ; ADR 0105 the destination bound
                  ("take-into-exposure"       . run-take-into-exposure-test) ; ADR 0105 §4.1 via read-loaned
                  ("take-into-listener"       . run-take-into-listener-test) ; ADR 0105 §8 listener re-entry
+                 ("view-state-snapshot"      . run-view-state-snapshot-test) ; DDS 1.4 §2.2.2.5.1.4 snapshot ordering
                  ("rtps-discovery-spdp"      . dds.rtps.discovery:run-discovery-test)
                  ("rtps-discovery-sedp"      . dds.rtps.discovery:run-sedp-test)
                  ("rtps-data-representation-wire" . dds.rtps.discovery:run-data-representation-wire-test)
