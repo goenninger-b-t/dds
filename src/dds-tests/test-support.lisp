@@ -256,3 +256,9 @@
    view_state of the exact samples ONE access call returned for ONE instance, so a foreign participant's
    sample arriving mid-arm would add an instance whose first access falls in a different call and the
    NEW/NOT_NEW pattern being asserted would stop describing what the test says it does.")
+
+(defconstant +td-lifecycle-drained-identity+ 61
+  "ADR 0105 Task 6 isolation offset: the lifecycle drained-set key identity. The arm drains exactly two
+   dispose changes in two SEPARATE passes and then asserts a third pass delivers NOTHING, so any foreign
+   participant's dispose on the domain would put a genuine third change in the store and the
+   no-resurrection assertion would fail for a reason that is not the defect.")

@@ -4675,48 +4675,84 @@
      (loop for inner being the hash-values of (disc-node-samples node)
            thereis (gethash sn inner)))))
 
+(defun* %collect-pending-keys (node table pending-p out reuse-cells)
+    (function (disc-node hash-table function (array t (*)) t) (array t (*)))
+  "The shared body of NODE-COLLECT-PENDING-SAMPLES and NODE-COLLECT-PENDING-LIFECYCLE: reset OUT, walk
+   TABLE's two levels (16-octet GUID -> SN -> value, §8.3.5.4) and push the composite (GUID . SN) key of
+   every entry PENDING-P accepts, returning OUT. PENDING-P is called as (GUID SN) — the raw pair, never a
+   key — so the DECIDING walk conses nothing; a key exists only for an entry actually being drained.
+
+   TABLE is passed in rather than selected here because both of its slots are constructed once and never
+   reassigned, so reading the slot outside the lock cannot race; only the CONTENTS are lock-protected.
+
+   ⚠️ REUSE-CELLS IS A MEMORY-SAFETY SWITCH, NOT A TUNING KNOB, AND THE TWO CALLERS DIFFER ON PURPOSE.
+   With it true the key at index i is the SAME CONS this vector held at index i on the previous call, with
+   its CAR and CDR overwritten (ADR 0105 Task 6) — so the steady-state drain conses nothing at all, but any
+   consumer that RETAINED a key from an earlier call now silently sees a different sample's identity.
+   Within ONE call every index still has its own cons, so a multi-key drain is unaffected either way.
+     * NODE-COLLECT-PENDING-SAMPLES passes T. Verified exhaustively: every consumer of a data key
+       (NODE-SAMPLE-RAW / -WRITER / -WRITER-GUID / -TIMESTAMP / -KEY-HASH / -KEY-SN, %ARBITRATE-OWNER,
+       %DRAIN-ONE-LOAN, %DRAIN-ONE-SECURED) uses it only as (CAR KEY) / (CDR KEY) for a two-level lookup
+       and none stores it. The data stream's exactly-once record is DR-DRAINED, a GUID-keyed table of
+       fixnum high-water marks — it does not hold keys.
+     * NODE-COLLECT-PENDING-LIFECYCLE passes NIL, and MUST. %DRAIN-ONE-LIFECYCLE does
+       (PUSH KEY (DR-LIFECYCLE-DRAINED DR)) — the lifecycle stream's exactly-once record IS a list of these
+       very conses, held for the reader's lifetime. Reusing one rewrites an already-drained entry to name a
+       different change, so the old change reads as pending again and is re-delivered as a second
+       invalid-data sample. A dispose or unregister is rare, so this costs a cons on a path that is not the
+       steady state.
+
+   DEADLOCK CONTRACT: PENDING-P RUNS UNDER THE NODE LOCK, and that lock is a plain NON-RECURSIVE mutex. A
+   predicate that calls a public lock-taking node accessor therefore SELF-DEADLOCKS the drain — and with it
+   every take-samples on the participant. Use the -UNLOCKED accessors:
+   node-reader-matches-writer-p-unlocked, node-reader-join-watermark-unlocked."
+  (setf (fill-pointer out) 0)
+  (dds.pal:with-lock ((disc-node-lock node))
+    (maphash (lambda (guid inner)
+               (loop for sn being the hash-keys of inner
+                     do (when (funcall pending-p guid sn)
+                          ;; AREF ignores the fill pointer (CLHS 15.1.2), so index i may still hold the cons
+                          ;; this vector carried there before the reset — the one grow-once allocation.
+                          (let* ((i (fill-pointer out))
+                                 (cell (and reuse-cells
+                                            (< i (array-total-size out))
+                                            (aref out i))))
+                            (if (consp cell)
+                                (setf (car cell) guid
+                                      (cdr cell) sn
+                                      (fill-pointer out) (1+ i))
+                                (vector-push-extend (cons guid sn) out))))))
+             table))
+  out)
+
 (defun* node-collect-pending-samples (node pending-p out)
     (function (disc-node function (array t (*))) (array t (*)))
   "WP-PERF (NFR-MEM / NFR-PERF-8): push the composite (GUID . SN) key of every stored user sample the
    caller still considers PENDING into OUT (a caller-owned adjustable vector, REUSED across calls), and
    return OUT. PENDING-P is called as (GUID SN) — with the raw guid and sn, NOT a key — so the deciding
-   walk conses NOTHING; a key cons is created ONLY for a sample that is actually pending.
+   walk conses NOTHING.
 
    WHY. node-sample-sns builds a fresh key cons for EVERY sample in the store, and %drain called it on
    EVERY take-samples, then filtered. So the drain consed O(STORED) per call while delivering O(PENDING)
    samples — normally ONE. Measured: 3716 B/sample of GC garbage on the receive path, the single largest
    remaining allocation there. This makes the drain O(pending) in both time and allocation.
 
-   DEADLOCK CONTRACT: PENDING-P RUNS UNDER THE NODE LOCK (unlike the old filter, which ran after
-   node-sample-sns had released it), and that lock is a plain NON-RECURSIVE mutex. A predicate that calls a
-   public lock-taking node accessor therefore SELF-DEADLOCKS the drain — and with it every take-samples on
-   the participant. Use the -UNLOCKED accessors: node-reader-matches-writer-p-unlocked,
-   node-reader-join-watermark-unlocked."
-  (setf (fill-pointer out) 0)
-  (dds.pal:with-lock ((disc-node-lock node))
-    (maphash (lambda (guid inner)
-               (loop for sn being the hash-keys of inner
-                     do (when (funcall pending-p guid sn)
-                          (vector-push-extend (cons guid sn) out))))
-             (disc-node-samples node)))
-  out)
+   ADR 0105 Task 6 takes the remaining O(pending) to ZERO: the key conses are the vector's own and are
+   REWRITTEN in place rather than reallocated, which is sound here and NOT for the lifecycle twin. See
+   %COLLECT-PENDING-KEYS, which carries that argument and the DEADLOCK CONTRACT on PENDING-P."
+  (%collect-pending-keys node (disc-node-samples node) pending-p out t))
 
 (defun* node-collect-pending-lifecycle (node pending-p out)
     (function (disc-node function (array t (*))) (array t (*)))
   "The lifecycle-change twin of node-collect-pending-samples: push the (GUID . SN) key of every stored
-   dispose/unregister change the caller still considers PENDING into the reused vector OUT. PENDING-P is
-   called as (GUID SN), so the walk conses nothing for an already-drained change. Replaces
+   dispose/unregister change the caller still considers PENDING into the reused vector OUT. Replaces
    node-lifecycle-sns + a SET-DIFFERENCE (which was O(stored x drained) with an EQUALP test, and consed
-   both lists) on the %drain path. Same DEADLOCK CONTRACT as node-collect-pending-samples: PENDING-P runs
-   under the non-recursive node lock — it must use the -UNLOCKED node accessors, never the public ones."
-  (setf (fill-pointer out) 0)
-  (dds.pal:with-lock ((disc-node-lock node))
-    (maphash (lambda (guid inner)
-               (loop for sn being the hash-keys of inner
-                     do (when (funcall pending-p guid sn)
-                          (vector-push-extend (cons guid sn) out))))
-             (disc-node-lifecycle-changes node)))
-  out)
+   both lists) on the %drain path.
+
+   ⚠️ IT DOES NOT REUSE ITS KEY CONSES AND MUST NOT: %DRAIN-ONE-LIFECYCLE RETAINS each one in
+   DR-LIFECYCLE-DRAINED as the stream's exactly-once record. See %COLLECT-PENDING-KEYS for the full
+   argument, and for the DEADLOCK CONTRACT on PENDING-P."
+  (%collect-pending-keys node (disc-node-lifecycle-changes node) pending-p out nil))
 
 (defun* node-sample-sns (node)
     (function (disc-node) list)

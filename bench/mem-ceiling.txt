@@ -220,6 +220,15 @@
 # repeat exactly the error the dash records. The x86_64 COPY row IS lowered: that arm has been stable in CI
 # (593.7 on the run whose RETURN read 3632) and the box has agreed with CI on it to 0.2 %.
 #
+# LOWERED 2026-08-06 (ADR 0105 Task 6b — the drain's pending-key cons. NODE-COLLECT-PENDING-SAMPLES built a
+# fresh (GUID . SN) cons for every sample it collected, i.e. one per delivered sample; its output vector was
+# already reader-owned and reused, so now its ELEMENTS are too — index i's cons is rewritten in place (AREF
+# ignores the fill pointer, CLHS 15.1.2). ⚠️ THE LIFECYCLE TWIN DELIBERATELY DOES NOT: %DRAIN-ONE-LIFECYCLE
+# RETAINS its key in DR-LIFECYCLE-DRAINED as that stream's exactly-once record, so reusing one re-delivers an
+# already-consumed dispose. Predicted 16 B/sample, measured -15.3 / -16.4:
+#   arm64 COPY    522.3 /  528.5 /  528.5   -> LOWERED 571 -> 555
+#   arm64 RETURN  320.0 /  318.9 /  320.0   -> LOWERED 355 -> 337
+#
 # ⚠️ MEASURE WITH NOTHING ELSE RUNNING. A gate-mem run taken while the test suites were running in the
 # background read COPY 1710.8 and FAILED — a 160 B phantom regression from participant + CPU contention,
 # not from code. A benchmark is an instrument; give it the machine.
@@ -253,5 +262,35 @@
 # conditions the app falls behind the receiver, the data pool is empty at drain time so recycling never
 # happens, and reliable retransmission multiplies the per-sample work. Chase it with a CI run that PRINTS
 # the pool hit/miss counts, not with another local measurement.
-arm64  571 355
+#
+# ⛔⛔ CORRECTION, 2026-08-06 — THE BLOWUP REPRODUCES ON THE REAL BOX, AND IT IS **NOT** RETURN-SPECIFIC.
+# The two paragraphs above are wrong on both of their load-bearing claims, and the evidence is 11 gate-mem
+# runs (22 arm-runs) taken back-to-back on the box with NOTHING else on it — verified by ps: one sbcl, load
+# average 1.00, no strays from the suite that had finished earlier.
+#
+#   COPY    10 clean: 561.3 .. 562.5  (spread 1.2 B)   1 BLOWUP: 109883.6   (x196)
+#   RETURN   9 clean: 369.0 .. 370.9  (spread 1.9 B)   2 BLOWUPS: 896.1, 5892.8  (x2.4, x16)
+#
+# So: (1) it is NOT "not reproduced on the box" — it reproduces there at roughly 3 in 22 arm-runs, ~14%;
+# and (2) it is NOT specific to the RETURN path — COPY blew up by a factor of 196 on a run whose RETURN
+# read a perfectly normal 370.0, and RETURN blew up on runs whose COPY read a perfectly normal 562.
+#
+# ⭐ THE INFERENCE THAT WAS WRONG IS WORTH NAMING, because it is the one that produced the dash: "generic
+# contention would inflate BOTH arms, so this is specific to the RETURN path". Each arm runs in its OWN
+# SBCL PROCESS (measure_arm spawns one per arm), so a per-process intermittent inflates exactly ONE arm and
+# looks arm-specific from a single observation. One CI sample could not distinguish "the RETURN code path
+# is pathological" from "some per-run event lands on whichever arm it lands on". Eleven runs can, and it is
+# the second.
+#
+# WHAT THIS MEANS FOR THE CEILINGS. Any x86_64 ceiling — COPY's 609 as much as a RETURN one — goes red on
+# roughly 1 CI run in 7, for a reason that has nothing to do with the change under test. The dash is still
+# right for RETURN, but it was right for the wrong reason, and COPY is exposed to the same thing.
+#
+# ⚠️ STILL OPEN, AND THE QUESTION IS NOW SHARPER: what per-run event costs a measured process anywhere from
+# 2x to 196x its steady-state allocation, on an idle machine, in ~14% of runs? 109883.6 B/sample over 60000
+# samples is ~6.6 GB in one run, which no per-sample cons explains — so look for something that repeats
+# (retransmission, an empty-poll storm, a pool that never fills), not for a bigger object. Chase it with a
+# run that PRINTS the empty-poll count and the pool hit/miss counts; it can now be chased ON THE BOX, which
+# is the part that changed.
+arm64  555 337
 x86_64 609 -

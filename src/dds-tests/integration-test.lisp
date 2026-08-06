@@ -14364,3 +14364,99 @@
       (dds.dcps:delete-participant pw)
       (dds.dcps:delete-participant pr))
     t))
+
+;;; ---- ADR 0105 Task 6: the drain's pending-key conses, and which stream may reuse them ----
+
+(defun* %ldi-invalid (samples)
+    (function (list) list)
+  "The INVALID-DATA (valid_data FALSE) cached-samples in SAMPLES — the dispose/unregister notifications,
+   which is what the lifecycle stream delivers and what a re-drained change would duplicate."
+  (remove-if (lambda (cs) (dds.dcps:sample-info-valid-data (dds.dcps:cached-sample-info cs))) samples))
+
+(defun* run-lifecycle-drained-identity-test ()
+    (function () t)
+  "Test: ADR 0105 Task 6 — %DRAIN-ONE-LIFECYCLE RETAINS its (GUID . SN) key cons in DR-LIFECYCLE-DRAINED
+   as the lifecycle stream's exactly-once record, so NODE-COLLECT-PENDING-LIFECYCLE must NOT reuse the key
+   conses in its output vector the way NODE-COLLECT-PENDING-SAMPLES now does.
+
+   ⚠️ THIS TEST EXISTS BECAUSE THE SUITE COULD NOT SEE THE DEFECT. Task 6 made the DATA collector rewrite
+   its key conses in place — sound there, because every data-key consumer only does (CAR KEY) / (CDR KEY)
+   lookups and that stream's exactly-once record is DR-DRAINED, a GUID-keyed table of fixnums. Applying the
+   same change to the LIFECYCLE collector is a silent corruption, and with it applied ALL EIGHT existing
+   dispose/unregister/instance-state arms stayed GREEN. A safety claim nothing can falsify is not a safety
+   claim.
+
+   THE MECHANISM, which is why the arm is shaped as it is. Drain 1 collects dispose D1 into a fresh cons K
+   and %DRAIN-ONE-LIFECYCLE pushes K onto DR-LIFECYCLE-DRAINED. A later drain collects dispose D2 at the
+   SAME index; reusing the cell rewrites K to name D2 — and K is the very object recording that D1 was
+   drained, so D1 reads as pending again and is applied a second time.
+
+   ⚠️ INSTANCE k=1 IS REVIVED IN BETWEEN, AND WITHOUT THAT STEP THIS TEST IS BLIND — the first version of
+   it was. %DRAIN-ONE-LIFECYCLE enqueues an invalid-data notification ONLY when the instance_state actually
+   TRANSITIONS (DDS 1.4 §2.2.2.5.1.4 — these no-data samples surface a CHANGE of state), so re-applying a
+   dispose to an already-disposed instance is a silent no-op and the corruption leaves no trace at the API.
+   Written back to :alive first, the re-applied dispose transitions the instance and the notification is
+   observable. That also makes the assertion a real DDS property rather than an internal-identity check: a
+   dispose the reader already consumed must never come back and re-dispose a revived instance.
+
+   WHICH pass shows it depends on MAPHASH's unspecified iteration order — within the D2 drain if D2 is
+   visited first, otherwise in the pass after it — so BOTH are pinned: the D2 drain must deliver exactly
+   ONE notification, and the pass after it must deliver NOTHING and leave k=1 ALIVE.
+
+   The disposes are deliberately drained in SEPARATE passes: one pass collecting both would give each its
+   own index, and the reuse is across calls, not within one."
+  (multiple-value-bind (pw pr dw dr) (%ti-pair +td-lifecycle-drained-identity+)
+    (unwind-protect
+         (let* ((ts (dds.types:find-type-support "tinto"))
+                (h1 (funcall (dds.types:type-support-key-hash ts) (make-tinto :k 1 :v 0 :tag "")))
+                (h2 (funcall (dds.types:type-support-key-hash ts) (make-tinto :k 2 :v 0 :tag ""))))
+           (%check :ldi-matched (plusp (dds.dcps:matched-count pr)) "writer/reader never matched")
+           (%check :ldi-handles-distinct (not (equalp h1 h2))
+                   "k=1 and k=2 must be distinct instances, or the arm tests nothing")
+           ;; pass 1 — k=1 written then disposed, drained and consumed together
+           (dds.dcps:write-sample dw (make-tinto :k 1 :v 11 :tag "a"))
+           (%ti-settle pw pr dr 1)
+           (dds.dcps:dispose-instance dw h1)
+           (%ti-settle pw pr dr 2)
+           (let ((inv (%ldi-invalid (dds.dcps:take-samples dr))))
+             (%check :ldi-first-dispose (= 1 (length inv))
+                     (format nil "the first dispose must deliver exactly one invalid-data sample; got ~d"
+                             (length inv)))
+             (%check :ldi-first-handle (equalp h1 (dds.dcps:sample-info-instance-handle
+                                                   (dds.dcps:cached-sample-info (first inv))))
+                     "the first notification must carry k=1's instance handle"))
+           ;; pass 2 — REVIVE k=1. Without this the arm cannot see the defect at all (see the docstring).
+           (dds.dcps:write-sample dw (make-tinto :k 1 :v 12 :tag "revive"))
+           (%ti-settle pw pr dr 1)
+           (dds.dcps:take-samples dr)
+           (%check :ldi-revived (eq :alive (%instance-rec-state dr h1))
+                   (format nil "k=1 must be ALIVE again before the arm below, or it observes nothing; state is ~s"
+                           (%instance-rec-state dr h1)))
+           ;; pass 3 — k=2 written then disposed: the drain that would rewrite the retained cons
+           (dds.dcps:write-sample dw (make-tinto :k 2 :v 22 :tag "b"))
+           (%ti-settle pw pr dr 1)
+           (dds.dcps:dispose-instance dw h2)
+           (%ti-settle pw pr dr 2)
+           (let ((inv (%ldi-invalid (dds.dcps:take-samples dr))))
+             (%check :ldi-second-dispose (= 1 (length inv))
+                     (format nil "the second dispose must deliver exactly one invalid-data sample, not also a ~
+                                  re-applied first one; got ~d, of which ~d carry k=1's handle"
+                             (length inv)
+                             (count-if (lambda (cs) (equalp h1 (dds.dcps:sample-info-instance-handle
+                                                                (dds.dcps:cached-sample-info cs))))
+                                       inv)))
+             (%check :ldi-second-handle (equalp h2 (dds.dcps:sample-info-instance-handle
+                                                    (dds.dcps:cached-sample-info (first inv))))
+                     "the second notification must carry k=2's instance handle, not k=1's"))
+           ;; the falsifier — every change is drained, so a further pass must deliver NOTHING
+           (let ((r (dds.dcps:take-samples dr)))
+             (%check :ldi-no-resurrection (null r)
+                     (format nil "a drained lifecycle change must never be re-delivered; a further take ~
+                                  returned ~d sample(s), ~d of them invalid-data"
+                             (length r) (length (%ldi-invalid r)))))
+           (%check :ldi-still-alive (eq :alive (%instance-rec-state dr h1))
+                   (format nil "a dispose the reader already consumed must never re-dispose the revived ~
+                                instance; k=1 is ~s" (%instance-rec-state dr h1))))
+      (dds.dcps:delete-participant pw)
+      (dds.dcps:delete-participant pr))
+    t))

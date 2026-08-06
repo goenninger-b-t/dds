@@ -285,7 +285,7 @@ five further per-sample allocations remain, measured on arm64 SBCL 2.6.5:
 
 | site | what | B/sample |
 |---|---|---|
-| `dataplane.lisp:4700` | `(cons guid sn)` per pending key | 16.05 |
+| ~~`dataplane.lisp:4700`~~ | ~~`(cons guid sn)` per pending key~~ — **DONE, Task 6b**: measured **−15.3 COPY / −16.4 RETURN** | ~~16.05~~ |
 | `entities.lisp:800` | fresh 4-slot `cursor` per decode | 48.16 |
 | `entities.lisp:3251-3253` | `(list …)` cell `nconc`'d onto `dr-cache` | 16.05 |
 | `entities.lisp:3457` | `(push cs out)` per selected sample | 16.05 |
@@ -403,6 +403,35 @@ an O(n²) `EQ` scan per call.
 
 The same edit removed a real duplication: both loan paths carried their own inline copy of the view-state
 rule instead of calling `%snapshot-view-state`, whose docstring already claimed to be its single definition.
+
+### 8.3 Task 6b — the pending-key cons, and the stream that may not reuse it
+
+§7's "check whether the cons is **retained** before reusing it" had a per-stream answer, and the two streams
+were running the *same code*:
+
+| stream | exactly-once record | retains the key? | reuses its conses |
+|---|---|---|---|
+| data (`node-collect-pending-samples`) | `dr-drained` — GUID → fixnum high-water | **no**; every consumer only does `(car key)` / `(cdr key)` | **yes** |
+| lifecycle (`node-collect-pending-lifecycle`) | `dr-lifecycle-drained` — *a list of these very conses* | **yes**, for the reader's lifetime | **no** |
+
+`%drain-one-lifecycle` opens with `(push key (dr-lifecycle-drained dr))`, so rewriting a key makes an
+already-consumed dispose read as pending and be applied a second time. The shared helper takes the decision
+as an explicit argument and both call sites carry the reason.
+
+⚠️ **THE EXISTING SUITE COULD NOT SEE THE CORRUPTION** — with the lifecycle collector flipped to reuse, all
+eight dispose / unregister / instance-state arms stayed green.
+
+⚠️ **AND THE FIRST NEW TEST WAS BLIND TOO, for a reason worth recording.** `%drain-one-lifecycle` enqueues an
+invalid-data notification **only when the instance state actually transitions** (§2.2.2.5.1.4 — these no-data
+samples surface a *change* of state), so re-applying a dispose to an already-disposed instance leaves no
+trace at the API: the corruption was really happening and nothing could observe it. The arm now **revives**
+instance k=1 with a fresh write between the two disposes, and reads red as
+`:ldi-second-dispose — got 2, of which 1 carry k=1's handle`. Which pass shows it depends on `maphash`'s
+unspecified iteration order, so both are pinned: the second dispose's drain must deliver exactly one
+notification, and the pass after it must deliver nothing and leave k=1 `ALIVE`.
+
+That last assertion is the honest statement of what this protects — a DDS property, not an internal identity
+check: **a dispose the reader has already consumed must never come back and re-dispose a revived instance.**
 
 **Cross-DDS interop:** `take-into` changes **no wire surface**. The per-feature interop rule is discharged by
 no-regression against the existing Connext 7.3.1 and Fast DDS legs, stated rather than skipped.
