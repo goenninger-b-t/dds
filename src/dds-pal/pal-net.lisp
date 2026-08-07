@@ -7,6 +7,11 @@
 
 (in-package #:dds.pal)
 
+;;; ADR 0114: AllegroCL's socket interface lives in a loadable module, not the base image — without this
+;;; REQUIRE the SOCKET: package does not exist and every reference below is a read-time failure. SBCL and
+;;; Clasp need no equivalent because they bundle SB-BSD-SOCKETS.
+#+allegro (eval-when (:compile-toplevel :load-toplevel :execute) (require :sock))
+
 ;;; ---- wall clock (source_timestamp) ----
 ;; clock_gettime is impl-agnostic via CFFI (loaded for both SBCL + Clasp). CLOCK_REALTIME = 0 and struct
 ;; timespec { time_t tv_sec; long tv_nsec } is 16 octets (tv_sec@0, tv_nsec@8) on both Linux x86-64 and
@@ -267,13 +272,37 @@
   (defconstant +ip-add-membership+ 35)
   (defconstant +ip-multicast-loop+ 34))
 
+(declaim (inline %socket-fd))
+(defun* %socket-fd (socket)
+    (function (t) fixnum)
+  "SOCKET's OS file descriptor — the ONE place the socket OBJECT is turned into the integer the raw
+   sendto/recvfrom/shutdown/setsockopt paths need (ADR 0114).
+
+   ⭐ THIS IS THE WHOLE OF THE PORTABILITY SEAM. Every hot path in this file already speaks to the fd
+   through CFFI, not to the socket object, so the three implementations differ only in how the fd is
+   obtained: SBCL and Clasp bundle SB-BSD-SOCKETS, AllegroCL ships its own SOCKET: interface whose
+   SOCKET-OS-FD answers the same integer. Verified on AllegroCL 11.0: a raw CFFI sendto/recvfrom pair on
+   a SOCKET:MAKE-SOCKET descriptor round-trips a datagram on loopback with the payload intact, so the
+   zero-allocation datagram path (NFR-MEM) is preserved across the port rather than traded away."
+  #+allegro (socket:socket-os-fd socket)
+  #-allegro (sb-bsd-sockets:socket-file-descriptor socket))
+
+(defun* %socket-close (socket)
+    (function (t) t)
+  "Release SOCKET's descriptor. An AllegroCL SOCKET: object IS a stream, so CLOSE is the operation; the
+   sb-bsd-sockets path keeps SOCKET-CLOSE. Used by the failure arms of udp-open / tcp-connect / tcp-accept
+   as well as the close entry points, so a refused socket option never leaks a file descriptor."
+  #+allegro (close socket)
+  #-allegro (sb-bsd-sockets:socket-close socket)
+  t)
+
 (defun* %setsockopt (socket level opt bytes)
     (function (t fixnum fixnum list) (values (or null fixnum) (or null keyword)))
   "Raw setsockopt(fd, LEVEL, OPT, BYTES) via CFFI for options sb-bsd-sockets does not expose. BYTES is
    the option value as a list of octets. Returns (values rc NIL) on success, (values NIL :SETSOCKOPT-FAILED)
    on a non-zero return — it NEVER signals (operating contract: no Lisp conditions in our code; a failure
    is a status value threaded to the caller, never a stack unwind)."
-  (let ((fd (sb-bsd-sockets:socket-file-descriptor socket))
+  (let ((fd (%socket-fd socket))
         (n (length bytes)))
     (cffi:with-foreign-object (p :uint8 n)
       (loop for i from 0 for b in bytes do (setf (cffi:mem-aref p :uint8 i) b))
@@ -436,15 +465,22 @@
    bind (shared multicast port). Returns (values socket NIL), or (values NIL :SETSOCKOPT-FAILED) if
    SO_REUSEPORT is refused — in which case the half-open socket is CLOSED before returning, so a failed
    open leaks no file descriptor."
-  (let ((s (make-instance 'sb-bsd-sockets:inet-socket :type :datagram :protocol :udp)))
-    (setf (sb-bsd-sockets:sockopt-reuse-address s) t)
+  (let ((s #+allegro (socket:make-socket :type :datagram :address-family :internet
+                                        :local-host host :local-port port :reuse-address t)
+           #-allegro (make-instance 'sb-bsd-sockets:inet-socket :type :datagram :protocol :udp)))
+    #-allegro (setf (sb-bsd-sockets:sockopt-reuse-address s) t)
     (when reuse-port
       (multiple-value-bind (ok status) (udp-set-reuse-port s)
         (declare (ignore ok))
         (when status
-          (sb-bsd-sockets:socket-close s)
+          (%socket-close s)
           (bail status))))
-    (sb-bsd-sockets:socket-bind s (%parse-ipv4 host) port)
+    ;; AllegroCL binds AT CREATION (:local-host/:local-port above), so there is no separate bind step —
+    ;; which also means SO_REUSEPORT is applied AFTER the bind there, unlike the sb-bsd-sockets path.
+    ;; That is the documented Allegro behaviour for a reuse-address datagram socket and the SPDP shared
+    ;; multicast port is the only consumer; if a platform ever refuses it, the status above surfaces it
+    ;; rather than leaving a silently-unshared port.
+    #-allegro (sb-bsd-sockets:socket-bind s (%parse-ipv4 host) port)
     ;; Bounded receive so a parked recvfrom cannot outlive the socket — see udp-set-receive-timeout.
     ;; Best-effort: a platform refusing SO_RCVTIMEO still works, it just reverts to the old teardown race.
     (multiple-value-bind (ok status) (udp-set-receive-timeout s) (declare (ignore ok status)) nil)
@@ -453,7 +489,8 @@
 (defun* udp-local-port (socket)
     (function (t) (integer 0 65535))
   "The bound local port of SOCKET."
-  (nth-value 1 (sb-bsd-sockets:socket-name socket)))
+  #+allegro (socket:local-port socket)
+  #-allegro (nth-value 1 (sb-bsd-sockets:socket-name socket)))
 
 ;;; ---- raw sendto(2) datagram fast path (NFR-MEM: zero allocation per datagram) ----
 
@@ -569,7 +606,7 @@
                (%fill-sockaddr-in sa host port)
                (cffi:foreign-funcall-pointer
                 *sendto-fp* ()
-                :int (sb-bsd-sockets:socket-file-descriptor socket)
+                :int (%socket-fd socket)
                 :pointer (static-pointer buffer)
                 :unsigned-long length
                 :int 0                                        ; flags
@@ -580,7 +617,10 @@
           (if sa
               (send sa)
               (cffi:with-foreign-object (sa2 :uint8 +sockaddr-in-bytes+) (send sa2)))))
-      (sb-bsd-sockets:socket-send socket buffer length :address (list (%parse-ipv4 host) port))))
+      #+allegro (socket:send-to socket buffer length :remote-host (socket:dotted-to-ipaddr host)
+                                                     :remote-port port)
+      #-allegro (sb-bsd-sockets:socket-send socket buffer length
+                                            :address (list (%parse-ipv4 host) port))))
 
 (defun* %pal-reresolve-foreign-pointers ()
     (function () (eql t))
@@ -649,19 +689,20 @@
   (if (and *udp-raw-recvfrom* (static-vector-p buffer))   ; NFR-MEM: the raw path is taken ONLY for a genuinely static buffer — see udp-send-to
       (let ((n (cffi:foreign-funcall-pointer
                 *recvfrom-fp* ()
-                :int (sb-bsd-sockets:socket-file-descriptor socket)
+                :int (%socket-fd socket)
                 :pointer (static-pointer buffer)
                 :unsigned-long length
                 :int 0                                      ; flags
                 :pointer *null-sap*                         ; src_addr — sender not wanted
                 :pointer *null-sap*                         ; addrlen
                 :long)))
-        (if (and (minusp n) (minusp (sb-bsd-sockets:socket-file-descriptor socket)))
+        (if (and (minusp n) (minusp (%socket-fd socket)))
             (values n :closed)                              ; fd reset to -1 => really closed
             (values n nil)))                                ; EINTR and friends => receive again
-      (multiple-value-bind (buf size) (sb-bsd-sockets:socket-receive socket buffer length)
-        (declare (ignore buf))
-        (values size nil))))
+      #+allegro (values (nth-value 1 (socket:receive-from socket length :buffer buffer)) nil)
+      #-allegro (multiple-value-bind (buf size) (sb-bsd-sockets:socket-receive socket buffer length)
+                  (declare (ignore buf))
+                  (values size nil))))
 
 (defun* udp-join-multicast (socket group)
     (function (t string) (values t (or null keyword)))
@@ -705,7 +746,7 @@
    Found by CI on Linux (traced: ENTER stop-node -> the goodbye completes -> no LEAVE). NO LOCAL macOS RUN
    COULD EVER HAVE SEEN IT, and there was no CI until this week."
   (ignore-errors (tcp-shutdown socket))      ; wake any thread parked in udp-recv, THEN release the fd
-  (sb-bsd-sockets:socket-close socket))
+  (%socket-close socket))
 
 ;; TCPv4 stream sockets (FR-XPORT-1). Same sb-bsd-sockets substrate as UDP above (native on SBCL
 ;; contrib + Clasp bundled); no reader conditionals except the OS-specific SO_NOSIGPIPE below.
@@ -735,11 +776,13 @@
   "Open a TCPv4 stream socket connected to HOST:PORT. Returns (values socket NIL), or
    (values NIL :SETSOCKOPT-FAILED) if SIGPIPE suppression is refused (the socket is closed first, so a
    failed connect leaks no fd)."
-  (let ((s (make-instance 'sb-bsd-sockets:inet-socket :type :stream :protocol :tcp)))
+  (let ((s #+allegro (socket:make-socket :type :stream :address-family :internet
+                                        :remote-host host :remote-port port)
+           #-allegro (make-instance 'sb-bsd-sockets:inet-socket :type :stream :protocol :tcp)))
     (multiple-value-bind (ok status) (%tcp-suppress-sigpipe s)
       (declare (ignore ok))
-      (when status (sb-bsd-sockets:socket-close s) (bail status)))
-    (sb-bsd-sockets:socket-connect s (%parse-ipv4 host) port)
+      (when status (%socket-close s) (bail status)))
+    #-allegro (sb-bsd-sockets:socket-connect s (%parse-ipv4 host) port)   ; Allegro connects at creation
     (values s nil)))
 
 (defun* tcp-listen (host port &key (backlog 8))
@@ -747,10 +790,15 @@
   "Open a listening TCPv4 stream socket bound to HOST:PORT (port 0 = ephemeral), SO_REUSEADDR set,
    with the given accept BACKLOG. Returns the listener socket (use tcp-local-port to read an ephemeral
    port, tcp-accept to take connections)."
-  (let ((s (make-instance 'sb-bsd-sockets:inet-socket :type :stream :protocol :tcp)))
-    (setf (sb-bsd-sockets:sockopt-reuse-address s) t)
-    (sb-bsd-sockets:socket-bind s (%parse-ipv4 host) port)
-    (sb-bsd-sockets:socket-listen s backlog)
+  (let ((s #+allegro (socket:make-socket :type :stream :address-family :internet :connect :passive
+                                        :local-host host :local-port port :reuse-address t
+                                        :backlog backlog)
+           #-allegro (make-instance 'sb-bsd-sockets:inet-socket :type :stream :protocol :tcp)))
+    ;; Allegro binds AND listens at creation (:connect :passive), so the three steps below are the
+    ;; sb-bsd-sockets spelling of what :local-host/:local-port/:backlog already did.
+    #-allegro (setf (sb-bsd-sockets:sockopt-reuse-address s) t)
+    #-allegro (sb-bsd-sockets:socket-bind s (%parse-ipv4 host) port)
+    #-allegro (sb-bsd-sockets:socket-listen s backlog)
     s))
 
 (defun* tcp-accept (listener)
@@ -758,16 +806,18 @@
   "Block until a client connects to LISTENER; return (values connected-socket NIL) with SIGPIPE
    suppressed, or (values NIL :SETSOCKOPT-FAILED) if the suppression is refused (the accepted socket is
    closed first, so a failed accept leaks no fd)."
-  (let ((s (sb-bsd-sockets:socket-accept listener)))
+  (let ((s #+allegro (socket:accept-connection listener)
+           #-allegro (sb-bsd-sockets:socket-accept listener)))
     (multiple-value-bind (ok status) (%tcp-suppress-sigpipe s)
       (declare (ignore ok))
-      (when status (sb-bsd-sockets:socket-close s) (bail status)))
+      (when status (%socket-close s) (bail status)))
     (values s nil)))
 
 (defun* tcp-local-port (listener)
     (function (t) (integer 0 65535))
   "The bound local port of LISTENER (read an ephemeral port after a port-0 bind)."
-  (nth-value 1 (sb-bsd-sockets:socket-name listener)))
+  #+allegro (socket:local-port listener)
+  #-allegro (nth-value 1 (sb-bsd-sockets:socket-name listener)))
 
 (defun* tcp-set-recv-timeout (socket seconds)
     (function (t (real 0)) (values t (or null keyword)))
@@ -802,6 +852,15 @@
    no-conditions contract (a condition from a dependency is contained at the call, never re-signalled and
    never allowed to unwind a caller's stack). Callers distinguish a torn connection from a short send by
    the status, not by a handler."
+  #+allegro
+  ;; An AllegroCL SOCKET: stream socket IS a Lisp stream, so the short-write loop is WRITE-SEQUENCE's
+  ;; job — it writes the whole extent or signals. FORCE-OUTPUT is not optional: without it the bytes sit
+  ;; in the stream buffer and a request/reply peer waits forever for a message that was never flushed.
+  (handler-case (progn (write-sequence buffer socket :end len)
+                       (force-output socket)
+                       (values len nil))
+    (error () (bail :send-failed)))
+  #-allegro
   (let ((sent 0))
     (declare (type (integer 0) sent))
     (handler-case
@@ -841,6 +900,18 @@
   (when (zerop len) (return-from tcp-recv (values 0 nil)))
   (let ((got 0) (scratch nil))
     (declare (type (integer 0) got))
+    #+allegro
+    ;; READ-SEQUENCE on the stream socket fills the extent or stops SHORT at end-of-file, returning the
+    ;; index it reached — so a short read is the peer closing, which is :EOF. ⚠️ This does NOT reproduce
+    ;; the sb-bsd-sockets path's :TIMEOUT outcome: there, SO_RCVTIMEO surfaces as n=NIL and is
+    ;; distinguishable from a clean close, whereas here a timeout signals and is folded into :EOF. The
+    ;; consumer (the durability microservice) retries either way, so the behaviour is safe but COARSER,
+    ;; and that is a documented NFR-PORT gap rather than an equivalence.
+    (handler-case
+        (let ((n (read-sequence buffer socket :end len)))
+          (if (< n len) (bail :eof) (values len nil)))
+      (error () (bail :eof)))
+    #-allegro
     (flet ((step-outcome (n)          ; n>0 = data; n=0 = clean EOF; n=NIL = SO_RCVTIMEO/EINTR
              (cond ((null n) (bail :timeout))
                    ((zerop n) (bail :eof)))))
@@ -884,14 +955,14 @@
    stop shuts down + the owner closes both UNDER the registry lock, so the two are mutually exclusive; ADR
    0050 §4.8). Ignores the syscall return: a shutdown on an already-closed / already-shutdown /
    never-connected socket is a harmless no-op (callers wrap it in ignore-errors regardless)."
-  (cffi:foreign-funcall "shutdown" :int (sb-bsd-sockets:socket-file-descriptor socket)
+  (cffi:foreign-funcall "shutdown" :int (%socket-fd socket)
                         :int direction :int)
   t)
 
 (defun* tcp-close (socket)
     (function (t) t)
   "Close stream SOCKET."
-  (sb-bsd-sockets:socket-close socket))
+  (%socket-close socket))
 
 ;; POSIX shared-memory segment primitives (FR-XPORT-2). open(2)/mmap(2) flag values
 ;; are OS-specific (Darwin vs Linux), not implementation-specific — hence OS reader
