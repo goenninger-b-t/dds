@@ -1,6 +1,6 @@
 # ADR 0107 — The TX payload cursor: three options, one measurement, and a safety obligation
 
-- **Status:** Proposed — **not implemented.** It carries an obligation that must be discharged first (§5).
+- **Status:** Accepted in principle — the §5 obligation is DISCHARGED (§7). Not yet implemented: one test gate remains (§7 tail).
 - **Date:** 2026-08-07
 - **Requirement:** NFR-MEM (0 bytes/sample steady state)
 - **Evidence:** `bench/report/2026-08-06-the-tx-payload-cursor-misses-100-percent.md`
@@ -92,3 +92,39 @@ or fall back to option B.
   writer's bytes arrive intact), because a cursor lifetime bug corrupts payloads rather than handles.
 - A falsification that a reviewer can check: with the `dynamic-extent` removed, the win disappears; with a
   serializer that deliberately retains the cursor, the arm must fail.
+
+---
+
+## 7. The §5 obligation, DISCHARGED
+
+Every implementation reachable through the `type-support :serialize` vtable slot was read. **None retains
+the cursor.**
+
+| # | implementation | retains the cursor? |
+|---|---|---|
+| 1 | generated classic-struct `serialize-<name>`, including the `:appendable` / `:mutable` DHEADER backpatching | **no** — the cursor is passed down to the `put-*` forms and nested serializers; the backpatch captures `cursor-position` **integers**, never the cursor |
+| 2 | generated FlatData `serialize-<name>-fd` | **no** — one `put-octets`, then it returns the *sample* |
+| 3 | secured `encode-serialized-payload-into` | **never receives a cursor at all** — its signature is `(octet-buffer key-material (simple-array (unsigned-byte 8) (*)))`; it works from the finished plaintext, outside the cursor's extent |
+| 4 | `make-encapsulation-header` / `finalize-encapsulation-options` | **no** — they *return* the cursor, which is not retaining it |
+| 5 | the `dds.cdr` / `dds.core.buffer` `put-*` primitives | **no** — a tree-wide grep for a cursor variable stored into a slot, pushed onto a list, or assigned to a global finds nothing |
+
+Also checked: every `lambda` in `dds-gen/dsl.lisp` is **macroexpansion-time** (`mapcar`/`every`/`find-if`
+over the parsed member list) or a vtable closure over the sample **pool** — none closes over a cursor, so
+no emitted serializer can smuggle one out in a retained closure.
+
+### ⭐ The one escape that exists is the cache that does not work
+
+`%ser-into` itself stores the cursor:
+
+```lisp
+(let ((wc (setf (dw-payload-cursor ,w) (cursor-reuse (dw-payload-cursor ,w) buf)))) …)
+```
+
+That `setf` **is** the escape — and it is precisely the 100 %-missing cache option C deletes. So the
+obligation is not merely discharged; **the change that makes the cursor stack-allocatable is the same change
+that removes the only thing keeping it alive.** Nothing else has to move.
+
+**Status → Accepted in principle.** One gate remains before implementation, from §6: extend
+`run-writer-handle-race-test` to assert **payload correctness** under concurrent writers (each writer's
+bytes arrive intact), because a cursor-lifetime bug corrupts payloads rather than handles and would
+otherwise be quieter than the ADR 0106 race was.
