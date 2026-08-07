@@ -60,6 +60,10 @@ The tracked follow-up above is no longer blocked on availability. Owner, 2026-08
 is the working form. Worth stating because the wrong conclusion here is "Allegro is not installed", and that
 conclusion would re-defer this ADR indefinitely.
 
+**Superseded by ADR 0113, 2026-08-07:** all **36** per-implementation PAL-contract symbols are now
+implemented and verified on the real build; the **16 socket functions** of `pal-net.lisp` remain. The
+paragraph below records the first increment.
+
 **What has landed:** `src/dds-pal/pal-allegro.lisp`, wired into `dds-pal.asd` as
 `(:file "pal-allegro" :if-feature :allegro)`, implementing the four IEEE 754 conversions required by
 ADR 0111 slice 1. They were **verified on the real implementation** against the identical byte-exact vectors
