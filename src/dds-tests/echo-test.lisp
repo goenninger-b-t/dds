@@ -4173,6 +4173,7 @@
                  ("perf-fixed-shape"        . run-perf-fixed-shape-test) ; ADR 0105 Task 8 bench-type shape
                  ("writer-handle-intern"    . run-writer-handle-intern-test) ; ADR 0106 interned writer handle
                  ("writer-handle-race"      . run-writer-handle-race-test) ; ADR 0106 review: concurrent writers
+                 ("drain-window"            . run-drain-window-test) ; ADR 0108: the drain record tolerates reordering, exactly once
                  ("rtps-discovery-spdp"      . dds.rtps.discovery:run-discovery-test)
                  ("rtps-discovery-sedp"      . dds.rtps.discovery:run-sedp-test)
                  ("rtps-data-representation-wire" . dds.rtps.discovery:run-data-representation-wire-test)

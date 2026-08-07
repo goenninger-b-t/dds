@@ -107,7 +107,13 @@
     (function (t (integer 0) (integer 8) (simple-array (unsigned-byte 8) (*)) (integer 0) (integer 0)) t)
   "Single-producer enqueue of PAYLOAD[off,off+len) as one ring record into LANE. T on success, NIL if it
    does not fit (caller maps NIL to RESOURCE_LIMITS / UDP fallback). Publishes the advanced write-cursor
-   with a RELEASE fence so the consumer's ACQUIRE load sees the payload."
+   with a RELEASE fence so the consumer's ACQUIRE load sees the payload.
+
+   ⛔ SINGLE-PRODUCER IS A PRECONDITION THE CALLER MUST ENFORCE, not a property of the deployment (ADR
+   0109). Read-cursor, memcpy and cursor-publish are three separate steps with no atomicity between them,
+   so two threads on ONE lane resolve the same position and the second overwrites the first. %SHMEM-SEND
+   holds SHMEM-DEST-SEND-LOCK across this call for exactly that reason. Cross-PROCESS single-producer is
+   structural — a lane is owned by one sender token (%claim-lane) — but a sender is many THREADS."
   (when (> (+ 4 len) capacity) (return-from %lane-enqueue nil))
   (let* ((base (%lane-desc-off lane))
          (data (%lane-data-off (%ring-lane-count sap) lane capacity))
@@ -287,7 +293,11 @@
    it would leak), while the NIL lane makes the next send re-attempt the claim."
   (segment nil :type t)
   (sap nil :type t)
-  (lane nil :type (or null (integer 0))))
+  (lane nil :type (or null (integer 0)))
+  ;; ADR 0109: %LANE-ENQUEUE IS SINGLE-PRODUCER AND THIS LANE HAS MANY PRODUCER THREADS. One lock per
+  ;; DESTINATION (== per lane: a sender holds exactly one lane per destination segment), so sends to
+  ;; different peers stay concurrent. Restores the ring's stated contract; it is not a new one.
+  (send-lock (dds.pal:make-lock "shmem-lane-enqueue") :type t))   ; HOTPATH-ALLOC(COLD): defstruct initform — one lock per destination, not per datagram
 
 (defun* %attach-for (st locator)
     (function (shmem-transport shmem-locator) (values t (or null keyword)))
@@ -339,8 +349,20 @@
                      (or (shmem-dest-lane dest)
                          (setf (shmem-dest-lane dest) (%claim-lane sap (shmem-transport-token st))))
                      (%claim-lane sap (shmem-transport-token st)))))
-      (if (and lane (%lane-enqueue sap lane (shmem-locator-capacity locator)
-                                   (dds.core.buffer:octet-buffer-vec buffer) 0 len))
+      (if (and lane
+               ;; ADR 0109: SERIALISE THE ENQUEUE. %lane-enqueue is a single-producer ring — it loads the
+               ;; write cursor, writes the record at that position and publishes cursor+span — and this
+               ;; path is entered concurrently by the publisher, the async sender, the receiver thread's
+               ;; ACKNACK repair, the flow scheduler AND every application thread calling write on one
+               ;; DataWriter (DDS 1.4 §2.2.2.4.2.11 permits that). Unsynchronised, two producers resolve
+               ;; the SAME position, the second memcpy destroys the first record, and the cursor advances
+               ;; by ONE span for TWO writes: a silently dropped datagram, and a reader that resumes
+               ;; mid-record decodes the RTPS magic 'RT' as a representation id. The lock is per
+               ;; DESTINATION, so it costs one uncontended acquire per datagram and never serialises
+               ;; sends to different peers. It is NOT held across the futex wake below.
+               (dds.pal:with-lock ((shmem-dest-send-lock dest))
+                 (%lane-enqueue sap lane (shmem-locator-capacity locator)
+                                (dds.core.buffer:octet-buffer-vec buffer) 0 len)))
           (progn
             (dds.pal:fence :full)                          ; order the enqueue's cursor store before the parked load (StoreLoad)
             (when (= 1 (dds.pal:load-sap-u64 sap +parked-off+))   ; wake ONLY a parked receiver; skip the futex for a busy one

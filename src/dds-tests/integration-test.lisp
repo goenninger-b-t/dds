@@ -14428,15 +14428,10 @@
              (%check :whr-payload-intact (null torn)
                      (format nil "every delivered sample must satisfy k = v+1; ~d torn of ~d delivered: ~s"
                              (length torn) got (subseq torn 0 (min 3 (length torn)))))
-             ;; ⚠️ DELIVERY COMPLETENESS IS DELIBERATELY *NOT* ASSERTED HERE, and that is not an oversight.
-             ;; Concurrent writes on one DataWriter LOSE samples under RELIABLE — measured on this tree and
-             ;; on 43fa6e0 (before any of this campaign's work), so it is PRE-EXISTING, not a regression:
-             ;; baseline 4-thread runs delivered 119/102/112/115 and once 66 of 120, and a 30-second settle
-             ;; budget does not recover them. Asserting the count here would land a permanently-red gate for
-             ;; a defect this arm does not fix, and the standing order allows exactly two options — fix it or
-             ;; delete it, never gate it. It is recorded as an open finding with a standalone reproducer
-             ;; instead. What IS asserted is what this arm exists for: every sample that DOES arrive is
-             ;; internally consistent, which is the property a cursor-lifetime bug would break.
+             ;; DELIVERY COMPLETENESS IS ASSERTED BY RUN-CONCURRENT-WRITE-DELIVERY-TEST, NOT HERE. That arm
+             ;; pins ADR 0108 over UDP, where the property is deterministic; this arm runs on the default
+             ;; transport, whose remaining intermittent loss is a separate OPEN defect (see that arm's
+             ;; docstring). Splitting them keeps each assertion falsifiable instead of flaky.
              (%check :whr-delivered-some (plusp got)
                      "no sample arrived at all — the arm cannot judge payload integrity"))
            ;; EVERY registered instance must hold the key sample its own handle stands for
@@ -14458,6 +14453,66 @@
                              (length bad) (subseq bad 0 (min 3 (length bad)))))))
       (progn (dds.dcps:delete-participant pw) (dds.dcps:delete-participant pr)))
     t))
+
+(defun* run-drain-window-test ()
+    (function () t)
+  "Test: ADR 0108 — the DCPS drain's per-writer exactly-once record must tolerate REORDERING.
+
+   It used to be a bare HIGH-WATER MARK, which answers 'already delivered' for every SN below itself. A
+   sample that arrives out of order — what CONCURRENT writes on one DataWriter produce as a matter of
+   course (DDS 1.4 §2.2.2.4.2.11 permits them) — was therefore skipped forever, undrained in the reader's
+   node store, violating RELIABILITY (§2.2.3.14). It is now a circular window: a high-water plus a
+   +DRAIN-WINDOW-BITS+-wide delivered-set.
+
+   ⛔ THIS ARM TESTS THE RECORD DIRECTLY, NOT END-TO-END, ON PURPOSE. The end-to-end concurrent-writer
+   workload still loses samples intermittently from a SEPARATE OPEN defect (one sample delivered twice under
+   two sequence numbers while another never arrives — a TX-side fault the old high-water HID inside its own
+   loss, since the count never reached the total anyway). Asserting an end-to-end count would be a flaky
+   gate for a defect this fix does not address; the standing order allows exactly two options, fix or
+   delete, never gate. Every property below is deterministic and each one goes red under a specific
+   regression, named per assertion."
+  (let ((rec (dds.dcps::%make-drain-record 10)))
+    ;; the mark itself, and the two neighbours
+    (%check :dw-self (dds.dcps::%drained-delivered-p rec 10) "the noted SN must read as delivered")
+    (%check :dw-above (not (dds.dcps::%drained-delivered-p rec 11))
+            "an SN above the high-water was never delivered")
+    ;; ⭐ THE DEFECT: a lower SN arriving late. A high-water answers T here and loses the sample forever.
+    (%check :dw-reordered-pending (not (dds.dcps::%drained-delivered-p rec 5))
+            "an SN BELOW the high-water that was never drained must still be PENDING — this is the whole ~
+             defect: a bare high-water reports it delivered and the sample is lost forever")
+    ;; exactly-once: once taken, never again
+    (dds.dcps::%drained-note rec 5)
+    (%check :dw-exactly-once (dds.dcps::%drained-delivered-p rec 5)
+            "a reordered SN must be delivered EXACTLY once — after noting, it must never be pending again")
+    (%check :dw-neighbour-unset (not (dds.dcps::%drained-delivered-p rec 6))
+            "noting one SN must not mark its neighbour")
+    ;; advancing the high-water must not resurrect nor forget
+    (dds.dcps::%drained-note rec 20)
+    (%check :dw-kept-below (dds.dcps::%drained-delivered-p rec 5)
+            "advancing the high-water must PRESERVE verdicts still inside the window")
+    (%check :dw-skipped-pending (not (dds.dcps::%drained-delivered-p rec 15))
+            "an SN the high-water jumped OVER was never delivered and must stay pending")
+    ;; older than the window: the pre-window behaviour, deliberately retained
+    (%check :dw-out-of-window
+            (dds.dcps::%drained-delivered-p rec (- 20 dds.dcps::+drain-window-bits+))
+            "an SN a full window below the high-water is treated as delivered (bounded memory, NFR-MEM)")
+    ;; ⭐ THE CIRCULAR-WRAP TRAP. Both advances stay STRICTLY INSIDE one window width, so the clear-on-
+    ;; advance loop is what must do the work — an advance of a full width or more takes the wholesale-reset
+    ;; branch instead and would exercise nothing. (Verified: with the clear loop deleted this goes RED, and
+    ;; an earlier version of this fixture that jumped a full width stayed GREEN under the same sabotage.)
+    ;; SN 5's bit and SN (5 + width)'s bit occupy the SAME slot; 5+width was never delivered.
+    (let* ((w dds.dcps::+drain-window-bits+)
+           (r2 (dds.dcps::%make-drain-record 5)))
+      (dds.dcps::%drained-note r2 (- (+ 5 w) 30))          ; advance by w-30: the LOOP branch, bit 5 survives
+      (dds.dcps::%drained-note r2 (+ 5 w 1))               ; advance by 31: the loop must clear slot (5+w)
+      (%check :dw-wrap-not-stale
+              (not (dds.dcps::%drained-delivered-p r2 (+ 5 w)))
+              "a circular window MUST clear the bits it scrolls past: an SN whose slot last held a ~
+               delivered verdict one full window earlier must read as PENDING, not delivered"))
+    ;; the width must stay a whole number of words, or %drain-bit-ref indexes past the vector
+    (%check :dw-geometry (= dds.dcps::+drain-window-bits+ (* 64 dds.dcps::+drain-window-words+))
+            "the window width must be exactly 64 x the word count"))
+  t)
 
 (defun* run-writer-handle-intern-test ()
     (function () t)

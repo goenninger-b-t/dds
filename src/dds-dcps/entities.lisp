@@ -148,7 +148,7 @@
    (cache-cells :initform '() :accessor dr-cache-cells)           ; ADR 0105 Task 6a: free list of SPINE conses %select-samples unlinked, reused by %cache-append
    (instances :initform (make-hash-table :test 'equalp) :accessor dr-instances) ; handle -> accessed-p
    (instance-recs :initform (make-hash-table :test 'equalp) :accessor dr-instance-recs) ; handle -> instance-rec (DDS 1.4 §2.2.2.5.1.3)
-   (drained :initform (make-hash-table :test 'equalp) :accessor dr-drained) ; 16-octet source GUID -> highest engine SN drained for that writer (§8.3.5.4: SN is per-writer)
+   (drained :initform (make-hash-table :test 'equalp) :accessor dr-drained) ; 16-octet source GUID -> (high-water . below-window bitmap), the per-writer exactly-once drain record (§8.3.5.4: SN is per-writer; ADR 0108 made it a WINDOW so a reordered lower SN is still delivered once)
    (lifecycle-drained :initform '() :accessor dr-lifecycle-drained) ; engine lifecycle (GUID . SN) composite keys already consumed (user thread)
    (app-acks :initform nil :accessor dr-app-acks) ; ADR 0090 A3b: 16-octet remote-writer GUID (equalp) -> dds.rtps.reliable:app-ack-state. LAZY — NIL until this reader's ACKNOWLEDGMENT_KIND is an APPLICATION kind, so a :PROTOCOL reader (the default, and everything gate-mem measures) never allocates the table and every APP-ACK site below is one NIL test. Per DATAREADER, deliberately NOT on the engine writer-proxy: two same-topic readers SHARE a proxy (ADR 0048) but acknowledge independently, and one speaking for the other is a FALSE ACK
    (sub-matched :initform (make-subscription-matched-status) :accessor dr-sub-matched)
@@ -3038,6 +3038,90 @@
   (let ((qos (entity-qos dr)))
     (and (typep qos 'dds.qos:qos) (eq :best-effort (dds.qos:qos-reliability qos)))))
 
+(defconstant +drain-window-bits+ 1024
+  "Width, in sequence numbers, of the per-writer drain record's delivered-set window (ADR 0108; DDS 1.4
+   §2.2.3.14 RELIABILITY).
+
+   An exactly-once drain record must answer 'has this SN been delivered?', and a bare high-water cannot:
+   once SN 50 is drained it reports SN 45 as delivered too, so a reordered lower SN — which CONCURRENT
+   writes on one DataWriter produce as a matter of course (§2.2.2.4.2.11 permits them) — was skipped
+   forever. This is how far below its own high-water the record can still answer 'no'.
+
+   1024 is chosen from MEASUREMENT, not taste: four threads writing one DataWriter were observed reordering
+   90 sequence numbers deep, and a 30-wide window (the first attempt, sized to keep a shifted mask inside a
+   fixnum) recovered only part of the loss for exactly that reason. An SN further than this below the
+   high-water is still treated as delivered — the pre-window behaviour, now confined to reordering deeper
+   than any plausible in-flight reliable window instead of applying to all reordering whatsoever.
+
+   The window is CIRCULAR (bit index = SN mod width), the standard anti-replay-window shape — cf. RFC 4303
+   Appendix A2 — so advancing the high-water clears the scrolled-out bits rather than shifting the bitmap.
+   In-order delivery, the single-threaded case, clears nothing and touches one bit.")
+
+(defconstant +drain-window-words+ 16
+  "+DRAIN-WINDOW-BITS+ / 64: the length of a drain record's bitmap vector. Per matched WRITER (128 octets),
+   never per sample — NFR-MEM's steady-state zero-bytes-per-sample is unaffected.")
+
+(deftype drain-bitmap ()
+  "The circular delivered-set bitmap of a per-writer drain record: a fixed 16-word vector of raw bits,
+   specialised so every access is a fixnum load/store with no boxing (ADR 0108)."
+  '(simple-array (unsigned-byte 64) (16)))
+
+(defun* %drain-bit-ref (bits pos)
+    (function (drain-bitmap (integer 0)) t)
+  "T iff the circular window bit at POS (an SN modulo +DRAIN-WINDOW-BITS+) is set."
+  (logbitp (logand pos 63) (aref bits (ash pos -6))))
+
+(defun* %drain-bit-put (bits pos on)
+    (function (drain-bitmap (integer 0) t) t)
+  "Set (ON true) or clear (ON false) the circular window bit at POS. The single place a window bit is
+   written, so set and clear cannot drift apart (DRY)."
+  (let ((w (ash pos -6))
+        (m (ash 1 (logand pos 63))))
+    (setf (aref bits w) (if on
+                            (logior (aref bits w) m)
+                            (logandc2 (aref bits w) m))))
+  t)
+
+(defun* %make-drain-record (sn)
+    (function (integer) cons)
+  "A fresh per-writer drain record (high-water . circular bitmap) with SN recorded as delivered."
+  (let ((bits (make-array +drain-window-words+ :element-type '(unsigned-byte 64) :initial-element 0)))   ; HOTPATH-ALLOC(COLD): one 128-octet window per matched writer, never per sample
+    (%drain-bit-put bits (logand sn (1- +drain-window-bits+)) t)
+    (cons sn bits)))
+
+(defun* %drained-delivered-p (rec sn)
+    (function (cons integer) t)
+  "T iff SN has already been drained for the writer whose drain record is REC (ADR 0108). The in-order
+   case — every single-threaded writer, which is the overwhelming majority of traffic — decides on the
+   first comparison and never touches the bitmap."
+  (let ((hw (car rec)))
+    (declare (type integer hw))
+    (cond ((> sn hw) nil)                                     ; above the high-water: never seen
+          ((>= (- hw sn) +drain-window-bits+) t)              ; older than the window: as before it existed
+          (t (%drain-bit-ref (cdr rec) (logand sn (1- +drain-window-bits+)))))))
+
+(defun* %drained-note (rec sn)
+    (function (cons integer) t)
+  "Record SN as drained in REC, in place and without consing.
+
+   Advancing the high-water does NOT shift the bitmap — it clears the bits the window scrolled PAST, which
+   still hold the verdicts of SNs one full window older and would otherwise read back as false positives.
+   The in-order step (SN = high-water + 1) scrolls past nothing and clears nothing."
+  (let ((hw (car rec))
+        (bits (cdr rec))
+        (mask (1- +drain-window-bits+)))
+    (declare (type integer hw) (type drain-bitmap bits))
+    (cond ((> sn hw)
+           (if (>= (- sn hw) +drain-window-bits+)
+               (fill bits 0)                                              ; the whole window scrolled out
+               (loop for k from (1+ hw) below sn                          ; the skipped-over SNs are NOT delivered
+                     do (%drain-bit-put bits (logand k mask) nil)))
+           (%drain-bit-put bits (logand sn mask) t)
+           (setf (car rec) sn))
+          ((< (- hw sn) +drain-window-bits+)
+           (%drain-bit-put bits (logand sn mask) t))))
+  t)
+
 (defun* %reader-advance-drained (dr sguid sn)
     (function (data-reader t integer) t)
   "Advance DR's per-source-writer delivered high-water for SGUID to SN (the exactly-once drain watermark,
@@ -3047,10 +3131,13 @@
    for them (DDS 1.4 §2.2.4.1). Pure reordering (a lower SN arriving late) never jumps forward, so it is
    conservatively not counted (a false SAMPLE_LOST is the worse error). The single chokepoint every drain
    path (plain / ZC-loan / secured-loan) advances the watermark through, so the detection is DRY + uniform."
-  (let ((prior (gethash sguid (dr-drained dr))))
-    (when (and prior (%reader-best-effort-p dr) (> sn (1+ prior)))
-      (%fire-sample-lost dr (- sn prior 1)))
-    (setf (gethash sguid (dr-drained dr)) (max sn (or prior 0))))
+  (let ((rec (gethash sguid (dr-drained dr))))
+    (when (and rec (%reader-best-effort-p dr) (> sn (1+ (the integer (car rec)))))
+      (%fire-sample-lost dr (- sn (the integer (car rec)) 1)))
+    ;; ADR 0108: mutate the record IN PLACE — one cons per matched WRITER, never per sample (NFR-MEM).
+    (if rec
+        (%drained-note rec sn)
+        (setf (gethash sguid (dr-drained dr)) (%make-drain-record sn))))
   t)
 
 ;;; ---- APPLICATION ACKNOWLEDGMENT (VENDOR EXTENSION, ADR 0090 slice A3b) ----
@@ -3590,11 +3677,19 @@
     ;; non-recursive mutex — the public lock-taking accessors would self-deadlock the drain.
     (flet ((%data-pending-p (g sn)
              (and (or (not multi) (dds.disc:node-reader-matches-writer-p-unlocked node rid g))
-                  ;; WP-N-ENDPOINT-2C3 (ADR 0048/0017; MEMORY-SAFETY): gate on max(per-writer dr-drained, the
-                  ;; ZC-joiner match-time high-water) so a mid-stream ZC joiner NEVER drains a marker delivered
-                  ;; before it joined (its %zc-release would underflow the refcount = a cross-reader UAF).
-                  (> sn (max (gethash g (dr-drained dr) 0)
-                             (dds.disc:node-reader-join-watermark-unlocked node rid g)))))
+                  ;; WP-N-ENDPOINT-2C3 (ADR 0048/0017; MEMORY-SAFETY): a mid-stream ZC joiner must NEVER drain a
+                  ;; marker delivered before it joined (its %zc-release would underflow the refcount = a
+                  ;; cross-reader UAF).
+                  ;; ⛔ THE JOIN-WATERMARK IS ITS OWN CONJUNCT AND MUST STAY ONE (ADR 0108 §3). dds.disc counts
+                  ;; eligible ZC drainers with (> sn wm) ALONE and is safe only because every DCPS drainer also
+                  ;; satisfies it, making that count a SUPERSET (disc.lisp:895). Folding the watermark into the
+                  ;; window below would break that argument SILENTLY — an under-count is a use-after-free.
+                  (> sn (dds.disc:node-reader-join-watermark-unlocked node rid g))
+                  ;; ADR 0108: a WINDOW, not a high-water. A bare high-water answers "delivered" for every SN
+                  ;; below it, so a reordered lower SN — what concurrent writes on one DataWriter produce as a
+                  ;; matter of course — was skipped forever. NIL record = nothing drained yet from this writer.
+                  (let ((rec (gethash g (dr-drained dr))))
+                    (or (null rec) (not (%drained-delivered-p rec sn))))))
            (%life-pending-p (g sn)
              (and (or (not multi) (dds.disc:node-reader-matches-writer-p-unlocked node rid g))
                   ;; comparing the (GUID, SN) pair against the drained list in place conses nothing per candidate.

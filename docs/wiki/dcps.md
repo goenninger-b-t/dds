@@ -44,7 +44,7 @@ slot). **Same-topic NON-loan multi-reader (Slice 2c-1, WP-N-ENDPOINT-2C1-READERS
 supported:** two or more SAME-topic NON-loan-capable `DataReader`s on one participant each receive the
 writer's FULL stream. The endpoint match route-adds ALL matching local readers (route-add-all — the
 delivery route holds a LIST), so both readers' EntityIds are routed to the writer's GUID; the per-reader
-`dr-drained` high-water over the shared NON-purged store gives each reader the complete stream with **no
+`dr-drained` record over the shared NON-purged store gives each reader the complete stream with **no
 cross-consumption** (reader-A taking a sample never denies it to reader-B), and the HEARTBEAT hook fans
 out one ACKNACK per matched reader-id (so a dropped sample is repaired for BOTH readers, each proxy's
 ACKNACK serviced). **Same-topic per-endpoint STATUS is now complete (Slice 2c-2):** the match/unmatch/
@@ -80,6 +80,26 @@ because `ELIGIBLE` omits the unreachable dcps `dr-drained` term (which only RAIS
 SUPERSET of the true drainers that can never UNDER-count a drainer — an under-count would be the very cross-reader
 UAF, strictly worse than the leak (`run-n-reader-2c3-zc-refcount-leak-test`, SBCL-only; ADR 0048 §17.7 now has no
 open residuals).
+
+### The drain record is a WINDOW, not a high-water mark (ADR 0108)
+
+`dr-drained` maps each matched writer's 16-octet GUID to a **(high-water . 1024-bit circular bitmap)**
+record, not to a single sequence number. A bare high-water answers *"already delivered"* for every SN below
+itself, so a sample that arrives **out of order** — which concurrent `write` calls on one `DataWriter`
+produce as a matter of course, and DDS 1.4 §2.2.2.4.2.11 permits them — was skipped **forever**: it sat
+undrained in the reader's node store while the application never saw it, violating RELIABILITY (§2.2.3.14).
+
+The window is the anti-replay shape of RFC 4303 Appendix A2 — bit index `SN mod 1024`, and advancing the
+high-water **clears the bits it scrolls past** instead of shifting the bitmap. In-order delivery, the
+single-threaded case, clears nothing and touches one bit, so the common path is the same single comparison
+it always was. The cost is per matched **writer** (one cons + 128 octets), never per sample. An SN more than
+one window below the high-water is still treated as delivered — bounded memory (NFR-MEM), and the
+pre-window behaviour, now confined to reordering deeper than any plausible in-flight reliable window.
+
+⛔ The ZC **join-watermark** stays a *separate* conjunct of the drain gate. `dds-disc` counts eligible
+Zero-Copy drainers using `SN > watermark` alone and is safe only because every DCPS drainer also satisfies
+it, which makes that count a superset; folding the watermark into the window would break a memory-safety
+argument silently.
 
 **Per-endpoint status/listener dispatch (WP-N-ENDPOINT-S5, ADR 0048) — the milestone is COMPLETE.**
 Every status counter, listener callback, and WaitSet/DATA_AVAILABLE wake is now delivered to the
