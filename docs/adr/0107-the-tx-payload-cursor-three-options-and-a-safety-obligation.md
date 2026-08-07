@@ -1,6 +1,6 @@
 # ADR 0107 — The TX payload cursor: three options, one measurement, and a safety obligation
 
-- **Status:** Accepted in principle — the §5 obligation is DISCHARGED (§7). Not yet implemented: one test gate remains (§7 tail).
+- **Status:** ⛔ **REJECTED (§8).** Its premise was measured on an unrepresentative workload. The cache it set out to replace hits **99.7 %** in a real drained workload, and implementing option C moved `gate-mem` by **zero**.
 - **Date:** 2026-08-07
 - **Requirement:** NFR-MEM (0 bytes/sample steady state)
 - **Evidence:** `bench/report/2026-08-06-the-tx-payload-cursor-misses-100-percent.md`
@@ -128,3 +128,53 @@ that removes the only thing keeping it alive.** Nothing else has to move.
 `run-writer-handle-race-test` to assert **payload correctness** under concurrent writers (each writer's
 bytes arrive intact), because a cursor-lifetime bug corrupts payloads rather than handles and would
 otherwise be quieter than the ADR 0106 race was.
+
+
+---
+
+## 8. ⛔ REJECTED — the premise was measured on a workload with no reader
+
+Option C was implemented in full (`%make-cursor` declaimed inline, the cache `setf` deleted, the cursor
+declared `dynamic-extent`). On the **no-peer** writer probe it did exactly what §4 predicted:
+
+| arm | before | after |
+|---|---|---|
+| keyed + reliable | 95.0 / 91.7 | **46.0 / 43.7** |
+| unkeyed + reliable | 80.8 / 79.7 | **31.7 / 31.7** |
+| keyed + best-effort | 79.7 / 80.8 | **31.7 / 32.8** |
+
+**And `gate-mem` did not move at all** — 431.4 / 223.9 / 192.2 before and after, identical to the decimal.
+
+The contradiction is the finding. Instrumenting the cache's hit rate in the **real** workload — write, then
+**take** each sample, which is what `gate-mem` and any application do:
+
+```
+HM-REAL (write+take) hits=20443 misses=57      ->  99.7 % HIT
+HM-REAL (:into)      hits=20433 misses=67      ->  99.7 % HIT
+```
+
+**The cache works.** §1's `hits=0 misses=20000` was real but came from a probe with **no reader**: nothing
+ever consumed a sample, so the HistoryCache held each change's pooled buffer until the *next* write evicted
+it, the pool alternated two buffers forever, and a one-slot identity cache could never hit. Give the samples
+a consumer and the buffer is released before the next acquire — so the pool returns the same buffer and the
+cache hits.
+
+⭐ **The 2026-07-29 "pool-acquire is a LIFO stack, so one slot hits in steady state" claim was RIGHT**, and
+my [[check-the-acquire-discipline-before-believing-a-buffer-is-fresh]] follow-up calling it "wrong at the TX
+site" was itself wrong. LIFO *plus a consumer* is the steady state; my probe removed the consumer.
+
+### What this invalidates, and what survives
+
+- ⛔ **Invalidated:** "the TX payload cursor costs 47.5 B/sample". It costs that only when samples are never
+  consumed. In a drained workload it costs ~0.
+- ⛔ **Invalidated:** the no-peer write-path split (serialize 47.5 + `writer-write` 32.8). Both halves were
+  measured without a reader.
+- ✅ **Survives:** the *real*-workload split — `SPLIT total=225 write=127.8 take=97.2` — because that probe
+  had a reader. The write path really is ~128 B/sample in the workload the gate measures; its **internal**
+  breakdown is now unknown again.
+- ✅ **Survives:** §4's measurement that inlining the constructor, not `dynamic-extent`, is what enables
+  stack allocation. That is a true and reusable fact about this build.
+
+**Not implemented, and not to be revived without a real-workload measurement first.** Replacing a
+99.7 %-effective cache with a `dynamic-extent` assertion the compiler cannot verify would trade a working
+mechanism for an unverifiable one and buy nothing.

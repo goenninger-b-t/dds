@@ -1,4 +1,18 @@
-# The TX payload cursor misses its cache 100 % of the time — and the obvious fix is a race
+# ⛔ RETRACTED — "the TX payload cursor misses 100 % of the time" was a probe artifact
+
+> **RETRACTION, 2026-08-07.** The headline below is wrong. The 100 % miss was measured with a writer and
+> **no reader**, so nothing ever consumed a sample: the HistoryCache held each pooled payload buffer until
+> the next write evicted it, the pool alternated two buffers, and a one-slot identity cache could never hit.
+> **In a real drained workload the cache hits 99.7 %** (`hits=20443 misses=57`, and `20433/67` on the
+> `:into` arm), and removing it moved `gate-mem` by **zero**. The 47.5 B/sample attributed to the cursor
+> below is therefore not a cost this system pays when samples are consumed, and the no-peer write-path split
+> (serialize 47.5 + writer-write 32.8) is invalid for the same reason. What survives is the *real*-workload
+> split — write ≈ 128 B/sample — whose internal breakdown is now unknown again. See ADR 0107 §8.
+>
+> ⭐ The 2026-07-29 note this report contradicted — *"pool-acquire is a LIFO stack, so one slot hits in
+> steady state"* — was **right**. LIFO *plus a consumer* is the steady state; my probe removed the consumer.
+
+# (retained for the record) The TX payload cursor misses its cache 100 % of the time — and the obvious fix is a race
 
 **NFR-MEM / ADR 0105 slice 2 · macOS/arm64, SBCL · no-peer writer, 20 000–40 000 writes**
 
