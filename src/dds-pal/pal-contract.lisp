@@ -27,6 +27,11 @@
    ;; foreign-SAP fixed-width unsigned reads — back the FlatData-ZC read-in-place
    ;; accessors (WP-FLATDATA-ZC-LOAN; R6, NOT cleared for ship — see ADR 0017).
    ;; IMPLEMENTED ON BOTH IMPLS (the Clasp stubs are gone — see the PAL-UNIMPLEMENTED note below).
+   ;; IEEE 754 bit-pattern conversion (ADR 0111 §2.3). The XCDR float codecs are built from these plus the
+   ;; existing u32/u64 writers, so endianness and MODE-capped alignment are inherited, never restated.
+   ;; Here because no portable ANSI CL spelling is both correct across denormals/NaN/Inf and fast — which
+   ;; is precisely what the PAL exists for, and the only place a reader conditional may live.
+   #:f32-bits #:f32-from-bits #:f64-bits #:f64-from-bits
    #:load-sap-u8 #:load-sap-u16 #:load-sap-u32
    ;; foreign-SAP 8-bit write — backs the FlatData loan-write SAP-mode Offset setters
    ;; (WP-FLATDATA-LOAN-WRITE; R6, NOT cleared for ship — see ADR 0042). Both impls.

@@ -4174,6 +4174,7 @@
                  ("writer-handle-intern"    . run-writer-handle-intern-test) ; ADR 0106 interned writer handle
                  ("writer-handle-race"      . run-writer-handle-race-test) ; ADR 0106 review: concurrent writers
                  ("drain-window"            . run-drain-window-test) ; ADR 0108: the drain record tolerates reordering, exactly once
+                 ("float-primitives"       . run-float-primitives-test) ; ADR 0111 slice 1: IEEE 754 binary32/binary64
                  ("rtps-discovery-spdp"      . dds.rtps.discovery:run-discovery-test)
                  ("rtps-discovery-sedp"      . dds.rtps.discovery:run-sedp-test)
                  ("rtps-data-representation-wire" . dds.rtps.discovery:run-data-representation-wire-test)

@@ -185,6 +185,31 @@
    (WP-FLATDATA-ZC-LOAN, R6 — NOT cleared for ship, see ADR 0017): a literal-0-copy
    field read straight off a SHMEM pool slot SAP, byte-exact to the aref accessor."
   (sb-sys:sap-ref-32 sap offset))
+
+;;; IEEE 754 bit-pattern conversion (ADR 0111 §2.3). SBCL's transforms compile these to a single register
+;;; move, so the codec pays no boxing on a declared double-float.
+(defun* f32-bits (x)
+    (function (single-float) (unsigned-byte 32))
+  "The IEEE 754 binary32 bit pattern of X as a 32-bit unsigned integer (XTypes 1.3 Table 31: Float32,
+   encoded size 4, alignment 4, [IEEE-754]). Total over every value including denormals, the infinities
+   and NaNs — it reinterprets bits and never rounds."
+  (ldb (byte 32 0) (sb-kernel:single-float-bits x)))
+(defun* f32-from-bits (b)
+    (function ((unsigned-byte 32)) single-float)
+  "The single-float whose IEEE 754 binary32 bit pattern is B. Exact inverse of F32-BITS."
+  (sb-kernel:make-single-float (if (>= b #x80000000) (- b #x100000000) b)))   ; make-single-float takes the SIGNED 32-bit pattern
+(defun* f64-bits (x)
+    (function (double-float) (unsigned-byte 64))
+  "The IEEE 754 binary64 bit pattern of X as a 64-bit unsigned integer (XTypes 1.3 Table 31: Float64,
+   encoded size 8, alignment 8, [IEEE-754]). Total, as F32-BITS."
+  (logior (ash (ldb (byte 32 0) (sb-kernel:double-float-high-bits x)) 32)
+          (sb-kernel:double-float-low-bits x)))
+(defun* f64-from-bits (b)
+    (function ((unsigned-byte 64)) double-float)
+  "The double-float whose IEEE 754 binary64 bit pattern is B. Exact inverse of F64-BITS."
+  (let ((hi (ldb (byte 32 32) b)))
+    (sb-kernel:make-double-float (if (>= hi #x80000000) (- hi #x100000000) hi)   ; high half is SIGNED, low half unsigned
+                                 (ldb (byte 32 0) b))))
 (defun* load-sap-u64 (sap offset)
     (function (t (integer 0)) (unsigned-byte 64))
   "Aligned 64-bit read of the foreign location at SAP+OFFSET (bytes)."

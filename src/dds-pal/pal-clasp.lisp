@@ -194,6 +194,30 @@
    contract as the SBCL PAL's sb-sys:sap-ref-32. (Was an unjustified PAL-UNIMPLEMENTED stub — see
    LOAD-SAP-U8.)"
   (cffi:mem-ref sap :uint32 offset))
+
+;;; IEEE 754 bit-pattern conversion (ADR 0111 §2.3). Clasp's EXT primitives already use the UNSIGNED
+;;; convention in both directions — probed, not assumed: (ext:single-float-to-bits -1.0f0) => 3212836864
+;;; = #xBF800000, and (ext:single-float-to-bits -0.0f0) => #x80000000. So unlike the SBCL PAL, which must
+;;; convert between its signed pattern and the wire's unsigned one, these are direct.
+(defun* f32-bits (x)
+    (function (single-float) (unsigned-byte 32))
+  "The IEEE 754 binary32 bit pattern of X as a 32-bit unsigned integer (XTypes 1.3 Table 31: Float32,
+   encoded size 4, alignment 4, [IEEE-754]). Total over denormals, the infinities and NaNs."
+  (ext:single-float-to-bits x))
+(defun* f32-from-bits (b)
+    (function ((unsigned-byte 32)) single-float)
+  "The single-float whose IEEE 754 binary32 bit pattern is B. Exact inverse of F32-BITS."
+  (ext:bits-to-single-float b))
+(defun* f64-bits (x)
+    (function (double-float) (unsigned-byte 64))
+  "The IEEE 754 binary64 bit pattern of X as a 64-bit unsigned integer (XTypes 1.3 Table 31: Float64,
+   encoded size 8, alignment 8, [IEEE-754]). Total, as F32-BITS."
+  (ext:double-float-to-bits x))
+(defun* f64-from-bits (b)
+    (function ((unsigned-byte 64)) double-float)
+  "The double-float whose IEEE 754 binary64 bit pattern is B. Exact inverse of F64-BITS."
+  (ext:bits-to-double-float b))
+
 (defun* load-sap-u64 (sap offset)
     (function (t (integer 0)) (unsigned-byte 64))
   "Aligned 64-bit read of the foreign location at SAP+OFFSET (bytes). Masked to unsigned

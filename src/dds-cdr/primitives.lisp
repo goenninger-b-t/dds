@@ -47,6 +47,35 @@
 (defun* cdr-get-u64 (c mode)
     (function (dds.core.buffer:cursor cdr-mode) (integer 0))   "Read a u64 from cursor C, MODE-capped alignment (8 for XCDR1, 4 for XCDR2)." (cdr-align c 8 mode) (dds.core.buffer:get-u64 c))
 
+;;; IEEE 754 floating point (ADR 0111 slice 1; XTypes 1.3 Table 31 §7.4.1.1.1, [IEEE-754]).
+;;;
+;;; DELIBERATELY BUILT ON THE INTEGER WRITERS, not on a parallel float path. The bit pattern goes on the
+;;; wire as a plain unsigned integer of the same width, so byte order comes from the cursor's endianness
+;;; and alignment comes from CDR-ALIGN's MODE cap — both already correct and tested. A separate float
+;;; writer would restate two rules that have exactly one right answer, which is how they drift apart.
+;;;
+;;; ⚠️ THE ALIGNMENT IS NOT THE SIZE. Float32 is size 4 / align 4, Float64 size 8 / align 8 (Table 31),
+;;; and Float64 therefore inherits the XCDR1-vs-XCDR2 divergence exactly as Int64 does:
+;;; MALIGN(O) = MIN(O.type.alignment, XCDR.maxalign) with MAXALIGN(VERSION1)=8, MAXALIGN(VERSION2)=4
+;;; (§7.4.2) — so a Float64 aligns to 8 under XCDR1 and to 4 under XCDR2. CDR-ALIGN applies that cap.
+(defun* cdr-put-f32 (c v mode)
+    (function (dds.core.buffer:cursor single-float cdr-mode) (integer 0))
+  "Write an IEEE 754 binary32 to cursor C, MODE-capped 4-byte alignment (XTypes Table 31: Float32)."
+  (cdr-put-u32 c (dds.pal:f32-bits v) mode))
+(defun* cdr-get-f32 (c mode)
+    (function (dds.core.buffer:cursor cdr-mode) single-float)
+  "Read an IEEE 754 binary32 from cursor C, MODE-capped 4-byte alignment (XTypes Table 31: Float32)."
+  (dds.pal:f32-from-bits (cdr-get-u32 c mode)))
+(defun* cdr-put-f64 (c v mode)
+    (function (dds.core.buffer:cursor double-float cdr-mode) (integer 0))
+  "Write an IEEE 754 binary64 to cursor C, MODE-capped alignment (8 for XCDR1, 4 for XCDR2 — Table 31
+   gives Float64 alignment 8, and §7.4.2's MAXALIGN caps it at 4 under version 2)."
+  (cdr-put-u64 c (dds.pal:f64-bits v) mode))
+(defun* cdr-get-f64 (c mode)
+    (function (dds.core.buffer:cursor cdr-mode) double-float)
+  "Read an IEEE 754 binary64 from cursor C, MODE-capped alignment (8 for XCDR1, 4 for XCDR2)."
+  (dds.pal:f64-from-bits (cdr-get-u64 c mode)))
+
 ;;; signed integers (two's complement)
 (declaim (inline %to-signed %to-unsigned))
 (defun* %to-signed (v bits)

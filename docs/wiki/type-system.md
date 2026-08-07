@@ -12,7 +12,7 @@ See also: [CDR codec, buffers & the arena](cdr-and-memory.md) for the codecs and
 
 - **`dds.gen:define-dds-enum`** — macro; defines the DDS enumerated type `NAME` from literals `(keyword value)`. Emits `NAME-TO-I32` and `NAME-FROM-I32`, each returning `(values result status)` with status `:unknown-enum-value` for an input this build does not declare, plus the codec pair `(:enum NAME)` members are wired to. Rejects at macroexpansion: no literals, a malformed literal, a duplicate keyword, and a duplicate *value* (two literals sharing a value would make the wire ambiguous — the receiver could not say which was meant).
 
-The DSL recognizes these member-type keywords (from `*dds-type-map*`): `:bool`, `:byte` (alias `:octet`), `:u8`, `:u16`, `:u32`, `:u64`, `:i8`, `:i16`, `:i32`, `:i64`, `:string`. `:u8`/`:i8` are the numeric 8-bit integers (`TK_UINT8`/`TK_INT8`); `:byte`/`:octet` is the opaque octet (`TK_BYTE`, IDL `octet`) — all three share the one-octet wire codec but carry distinct XTypes kinds (model an IDL `sequence<octet>` with `:byte`). A `(:sequence element)` member takes one of those keywords as its fixed-size primitive element (variable-size sequence elements, e.g. sequences of strings, are not supported in v1). `:extensibility` accepts `:final`, `:appendable` and `:mutable`; `@key` is restricted to scalar/string members. `:id` (`@id`) and `:must-understand` (`@must_understand`) are per-member wire properties that matter for `:mutable` — see §1.4.
+The DSL recognizes these member-type keywords (from `*dds-type-map*`): `:bool`, `:byte` (alias `:octet`), `:u8`, `:u16`, `:u32`, `:u64`, `:i8`, `:i16`, `:i32`, `:i64`, **`:f32`, `:f64`**, `:string`. `:u8`/`:i8` are the numeric 8-bit integers (`TK_UINT8`/`TK_INT8`); `:byte`/`:octet` is the opaque octet (`TK_BYTE`, IDL `octet`) — all three share the one-octet wire codec but carry distinct XTypes kinds (model an IDL `sequence<octet>` with `:byte`). A `(:sequence element)` member takes one of those keywords as its fixed-size primitive element (variable-size sequence elements, e.g. sequences of strings, are not supported in v1). `:extensibility` accepts `:final`, `:appendable` and `:mutable`; `@key` is restricted to scalar/string members. `:id` (`@id`) and `:must-understand` (`@must_understand`) are per-member wire properties that matter for `:mutable` — see §1.4.
 
 **Bounded strings — `(:string N)`.** `:string` alone is the unbounded IDL `string`; `(:string N)` is IDL `string<N>`. The bound is part of the *type*, not a local check (DDS-XTypes 1.3 §7.3.1.2.1), so a bounded and an unbounded string are structurally different types that do not match — which is why the bound must reach the TypeObject. A `(:string N)` member is emitted as `dds.types:string8-type-identifier` with bound `N` rather than the unbounded `primitive-type-identifier`; that is the identifier a foreign `rtiddsgen`-generated peer compares its own `string<N>` against (ADR 0009 is the defect from getting this wrong). The wire codec is unchanged — a bounded string serializes exactly like an unbounded one — so adding a bound is byte-neutral, and `N` counts **octets, not characters** (ADR 0083: strings are UTF-8, and one character can occupy four octets). The generated `set-NAME-SLOT` measures with `dds.cdr:utf8-octet-length` and returns `(values nil :string-bound-exceeded)` rather than truncating or signalling; the plain `defstruct` accessor remains and is unchecked, so the hot path keeps direct slot access. Bounds are a permanent part of a published type — widening one is a type change, so choose `N` deliberately.
 
@@ -66,6 +66,33 @@ The DSL recognizes these member-type keywords (from `*dds-type-map*`): `:bool`, 
 - **`dds.types:default-assignability-options`** — a fresh options struct carrying the XTypes §7.6.3.4.1 defaults.
 - **`dds.types:ti-assignable-from`** — `T1` is-assignable-from `T2` at the TypeIdentifier level (primitives by same kind; narrow strings under the bound rule; plain sequences when the element is strongly-assignable and the bound rule holds; nested structs by recursion). Unmodeled or mismatched kinds are not assignable.
 - **`dds.types:strongly-assignable-from`** — assignable-from **and** `T2` is a delimited type (required for collection elements and aggregated key members).
+### Floating point (`:f32` / `:f64`) — ADR 0111 slice 1
+
+`:f32` and `:f64` are IEEE 754 binary32 and binary64 — IDL `float` and `double`, XTypes Float32 and Float64
+(XTypes 1.3 Table 25). Their encoded sizes and alignments are pinned from **Table 31** (§7.4.1.1.1):
+Float32 size 4 / alignment 4, Float64 size 8 / alignment 8.
+
+⚠️ **A Float64's alignment differs between encoding versions**, exactly as `Int64`'s does.
+`MALIGN(O) = MIN(O.type.alignment, XCDR.maxalign)` with `MAXALIGN(VERSION1) = 8` and
+`MAXALIGN(VERSION2) = 4` (§7.4.2), so a `:f64` aligns to **8 under XCDR1** and to **4 under XCDR2**. The
+codec inherits this from `cdr-align` rather than restating it: `cdr-put-f64` converts to the bit pattern
+and hands it to `cdr-put-u64`, so byte order comes from the cursor's endianness and alignment from the
+existing MODE cap — two rules with one right answer, kept in one place.
+
+The generated `defstruct` slot is declared `single-float`/`double-float` and therefore **unboxed**, which is
+the property `gate-mem` checks.
+
+**IDL `long double` (Float128) is deliberately not supported.** Common Lisp has no portable 128-bit float
+and every target maps `long-float` to `double-float`, so carrying it would mean an opaque 16-octet value
+that cannot be used arithmetically — a different feature from supporting `long double`. Recorded as a
+decision, not an oversight (ADR 0111 §3). Note that Table 31 gives Float128 **size 16 but alignment 8**.
+
+The bit-pattern conversion itself lives in the PAL (`dds.pal:f32-bits` / `f32-from-bits` / `f64-bits` /
+`f64-from-bits`) because no portable ANSI CL spelling is both total — `integer-decode-float` is undefined on
+NaN and infinity, which are legal on the wire and must round-trip bit-exactly — and allocation-free. The
+three backends disagree on convention (SBCL returns a **signed** pattern, Clasp an **unsigned** one, Allegro
+a tuple of unsigned 16-bit **shorts**, most-significant first); absorbing that is what the PAL is for.
+
 - **`dds.types:struct-assignable-from`** — `STRUCTURE_TYPE` is-assignable-from (Table 19): same extensibility; name/id correspondence; ≥1 corresponding member; KeyErased member-type assignability; must_understand and key members present in both; key sub-bounds; the FINAL/APPENDABLE/MUTABLE member-matching rules; and `prevent_type_widening`.
 - **`dds.types:member-names-agree-p`** — the member-name identity behind the Table 19 name↔id correspondence: when **both** members carry a 4-octet NameHash it is compared (`equalp`) — a Minimal TypeObject erases names and carries only `MinimalMemberDetail.name_hash` (XTypes 1.3 §7.2.2.4.4.4.5: `MD5(UTF-8 name)[0:4]`) — and the string names are compared only when either hash is absent. This makes a wire-parsed (name-erased) model comparable against a locally built one; `ignore_member_names` still skips the correspondence entirely.
 - **`dds.types:ti-equivalent-p`** — structural MINIMAL-equivalence of two TypeIdentifiers (a verifiable stand-in for the deferred EquivalenceHash equality).

@@ -13,13 +13,22 @@
     (:i16    (signed-byte 16)   0   dds.cdr:cdr-put-i16    dds.cdr:cdr-get-i16    2 2)
     (:i32    (signed-byte 32)   0   dds.cdr:cdr-put-i32    dds.cdr:cdr-get-i32    4 4)
     (:i64    (signed-byte 64)   0   dds.cdr:cdr-put-i64    dds.cdr:cdr-get-i64    8 8)
+    (:f32    single-float       0.0f0 dds.cdr:cdr-put-f32  dds.cdr:cdr-get-f32    4 4)
+    (:f64    double-float       0.0d0 dds.cdr:cdr-put-f64  dds.cdr:cdr-get-f64    8 8)
     (:string string             ""  dds.cdr:cdr-put-string dds.cdr:cdr-get-string 4 :var))
   "Maps an s-expr DSL member type to its Lisp slot type, default, codec ops, CDR
    alignment, and serialized size (:var = data-dependent). Sizes/alignment follow
    REQUIREMENTS FR-CDR-1/2; string size = 4 (length) + octets + 1 (NUL). :u8/:i8 are the
    numeric 8-bit integers (TK_UINT8/TK_INT8); :byte (alias :octet) is the opaque octet
    (TK_BYTE, IDL `octet`) — all three share the one-octet wire codec but carry distinct
-   XTypes kinds (D1).")
+   XTypes kinds (D1).
+
+   :F32/:F64 are IEEE 754 binary32/binary64 — IDL `float`/`double`, XTypes Float32/Float64 (Table 25),
+   sizes and alignments pinned from Table 31 (ADR 0111 slice 1). The Lisp slot types SINGLE-FLOAT and
+   DOUBLE-FLOAT are declared, so the generated defstruct slot is UNBOXED and the codec reads it without
+   consing — which is the NFR-MEM property `gate-mem` checks. IDL `long double` (Float128) is
+   deliberately absent: Common Lisp has no portable 128-bit float and both targets map LONG-FLOAT to
+   DOUBLE-FLOAT, so carrying it would mean an opaque 16-octet value (ADR 0111 §3).")
 
 (defparameter *sample-pool-capacity* 64
   "Per-type sample-pool size, pre-allocated at registration (NFR-MEM). A later

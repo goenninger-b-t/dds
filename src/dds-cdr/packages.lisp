@@ -21,6 +21,7 @@
            #:cdr-mode #:cdr-align #:cdr-size-align
            #:cdr-put-u8 #:cdr-get-u8 #:cdr-put-u16 #:cdr-get-u16
            #:cdr-put-u32 #:cdr-get-u32 #:cdr-put-u64 #:cdr-get-u64
+           #:cdr-put-f32 #:cdr-get-f32 #:cdr-put-f64 #:cdr-get-f64
            #:cdr-put-i8 #:cdr-get-i8 #:cdr-put-i16 #:cdr-get-i16
            #:cdr-put-i32 #:cdr-get-i32 #:cdr-put-i64 #:cdr-get-i64
            #:cdr-put-bool #:cdr-get-bool #:cdr-put-enum #:cdr-get-enum

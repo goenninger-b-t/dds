@@ -76,6 +76,115 @@
   (id :i32 :key t)
   (hue (:enum genum-hue)))
 
+(dds.gen:define-dds-type gfloat-t (:extensibility :final)
+  (id :i32 :key t)
+  (f  :f32)
+  (d  :f64))
+
+(defun* run-float-primitives-test ()
+    (function () t)
+  "Test: ADR 0111 slice 1 — IEEE 754 binary32/binary64 members (IDL `float`/`double`, XTypes 1.3
+   Table 25; sizes and alignments from Table 31 §7.4.1.1.1).
+
+   ⛔ THIS ARM EXISTS BECAUSE THE STACK COULD NOT SERIALIZE A FLOAT AT ALL. There was no float codec in
+   dds-cdr and no float member type in the DSL, so every type this project could express was integer-and-
+   string only — which is why Connext Shapes interop (string + three long) never exposed it.
+
+   The BYTE-EXACT vectors are the point, not the round-trip: a round-trip passes even if both halves share
+   a wrong bit order or a wrong sign convention, and the two implementations' native primitives disagree
+   about signedness (SBCL's single-float-bits returns a SIGNED pattern, Clasp's ext:single-float-to-bits an
+   UNSIGNED one). Only fixed octets pin that down."
+  ;; 1. BYTE-EXACT, both endiannesses. -1.0f0 is IEEE binary32 #xBF800000; -1.0d0 is #xBFF0000000000000.
+  (let* ((arena (dds.core.arena:init-arena :bytes (* 64 1024)))
+         (pool (dds.core.arena:make-buffer-pool arena 512 2))
+         (b (dds.core.arena:pool-acquire pool)))
+    (dolist (e '(:little :big))
+      (let ((c (dds.core.buffer:cursor b :endianness e)))
+        (dds.cdr:cdr-put-f32 c -1.0f0 :xcdr2)
+        (let ((rc (dds.core.buffer:cursor b :endianness e))
+              (want (if (eq e :little) '(#x00 #x00 #x80 #xBF) '(#xBF #x80 #x00 #x00)))
+              (got '()))
+          (dotimes (i 4) (push (dds.core.buffer:get-u8 rc) got))
+          (setf got (nreverse got))
+          (%check :float-f32-byte-exact (equal got want)
+                  (format nil "~(~a~)-endian binary32 of -1.0 must be ~{~2,'0x ~}; got ~{~2,'0x ~}"
+                          e want got))))
+      (let ((c (dds.core.buffer:cursor b :endianness e)))
+        (dds.cdr:cdr-put-f64 c -1.0d0 :xcdr2)
+        (let ((rc (dds.core.buffer:cursor b :endianness e))
+              (want (if (eq e :little)
+                        '(#x00 #x00 #x00 #x00 #x00 #x00 #xF0 #xBF)
+                        '(#xBF #xF0 #x00 #x00 #x00 #x00 #x00 #x00)))
+              (got '()))
+          (dotimes (i 8) (push (dds.core.buffer:get-u8 rc) got))
+          (setf got (nreverse got))
+          (%check :float-f64-byte-exact (equal got want)
+                  (format nil "~(~a~)-endian binary64 of -1.0 must be ~{~2,'0x ~}; got ~{~2,'0x ~}"
+                          e want got)))))
+    ;; 2. ⭐ THE XCDR1/XCDR2 DIVERGENCE. MALIGN(O) = MIN(O.type.alignment, XCDR.maxalign) with
+    ;;    MAXALIGN(VERSION1)=8 and MAXALIGN(VERSION2)=4 (XTypes §7.4.2), and Table 31 gives Float64
+    ;;    alignment 8. So after a single u8 a Float64 starts at offset 8 under XCDR1 and offset 4 under
+    ;;    XCDR2. Getting this wrong is invisible to a round-trip and fatal on the wire.
+    (dolist (probe '((:xcdr1 8 16) (:xcdr2 4 12)))   ; start + 8, because a Float64 is EIGHT octets wide
+      (destructuring-bind (mode want-start want-end) probe
+        (let ((c (dds.core.buffer:cursor b :endianness :little)))
+          (dds.cdr:cdr-put-u8 c 1 mode)
+          (dds.cdr:cdr-put-f64 c 1.0d0 mode)
+          (%check :float-f64-mode-alignment (= (dds.core.buffer:cursor-position c) want-end)
+                  (format nil "under ~a a Float64 after one octet must start at ~d and end at ~d; ended at ~d"
+                          mode want-start want-end (dds.core.buffer:cursor-position c))))))
+    ;; 3. Round-trip TOTALITY: a wire codec must be exact for every value, not the pleasant ones.
+    ;;    -0.0 and the denormals are where a decode-via-arithmetic implementation breaks.
+    ;;
+    ;; ⛔ NEGATIVE ZERO IS BUILT BY MULTIPLICATION, NEVER FROM THE LITERAL -0.0. Probed on AllegroCL
+    ;; 11.0: the literal -0.0f0 READS AS +0.0 (bits 0) and (- 0.0f0) is +0.0 too, while (* -1.0f0 0.0f0)
+    ;; is a true negative zero (bits #x80000000). On SBCL the literal IS negative zero — so a test
+    ;; written with the literal passes on SBCL while silently testing +0.0 twice on Allegro, i.e. it
+    ;; stops covering the case exactly where coverage was the point. Asserted below, not assumed.
+    (let ((nz32 (* -1.0f0 0.0f0)) (nz64 (* -1.0d0 0.0d0)))
+      (%check :float-negative-zero-constructed
+              (and (= #x80000000 (dds.pal:f32-bits nz32))
+                   (= #x8000000000000000 (dds.pal:f64-bits nz64)))
+              (format nil "the negative-zero fixtures must really be negative zero; got f32 ~x f64 ~x"
+                      (dds.pal:f32-bits nz32) (dds.pal:f64-bits nz64)))
+      (let ((c (dds.core.buffer:cursor b :endianness :little)))
+        (dds.cdr:cdr-put-f32 c nz32 :xcdr2)
+        (%check :float-negative-zero-roundtrip
+                (= #x80000000 (dds.pal:f32-bits
+                               (dds.cdr:cdr-get-f32 (dds.core.buffer:cursor b :endianness :little) :xcdr2)))
+                "negative zero must survive the wire as negative zero, not collapse to +0.0")))
+    (dolist (v (list 0.0f0 1.0f0 -1.0f0 3.14159f0 least-positive-single-float
+                     most-positive-single-float most-negative-single-float))
+      (let ((c (dds.core.buffer:cursor b :endianness :little)))
+        (dds.cdr:cdr-put-f32 c v :xcdr2)
+        (let ((got (dds.cdr:cdr-get-f32 (dds.core.buffer:cursor b :endianness :little) :xcdr2)))
+          (%check :float-f32-roundtrip (eql (dds.pal:f32-bits v) (dds.pal:f32-bits got))
+                  (format nil "binary32 round-trip must be BIT-exact for ~s; got ~s" v got)))))
+    (dolist (v (list 0.0d0 1.0d0 -1.0d0 3.141592653589793d0 least-positive-double-float
+                     most-positive-double-float most-negative-double-float))
+      (let ((c (dds.core.buffer:cursor b :endianness :little)))
+        (dds.cdr:cdr-put-f64 c v :xcdr2)
+        (let ((got (dds.cdr:cdr-get-f64 (dds.core.buffer:cursor b :endianness :little) :xcdr2)))
+          (%check :float-f64-roundtrip (eql (dds.pal:f64-bits v) (dds.pal:f64-bits got))
+                  (format nil "binary64 round-trip must be BIT-exact for ~s; got ~s" v got)))))
+    ;; 4. Through the GENERATED codec, and serialized-size must agree with the bytes written.
+    (let* ((s (make-gfloat-t :id 7 :f -2.5f0 :d 1.0d-300))
+           (wc (dds.core.buffer:cursor b :endianness :little)))
+      (serialize-gfloat-t s wc :xcdr2)
+      (%check :float-serialized-size (= (dds.core.buffer:cursor-position wc)
+                                        (serialized-size-gfloat-t s :xcdr2))
+              "serialized-size must equal bytes written for a type with float members")
+      (let ((q (deserialize-gfloat-t (dds.core.buffer:cursor b :endianness :little) :xcdr2)))
+        (%check :float-generated-roundtrip
+                (and (= 7 (gfloat-t-id q))
+                     (eql (dds.pal:f32-bits -2.5f0) (dds.pal:f32-bits (gfloat-t-f q)))
+                     (eql (dds.pal:f64-bits 1.0d-300) (dds.pal:f64-bits (gfloat-t-d q))))
+                (format nil "generated codec float round-trip; got id ~s f ~s d ~s"
+                        (gfloat-t-id q) (gfloat-t-f q) (gfloat-t-d q)))))
+    (dds.core.arena:pool-release pool b)
+    (dds.core.arena:teardown-arena arena))
+  t)
+
 (defun* run-gen-enum-test ()
     (function () t)
   "Test: `(:enum name)` members (XTypes 1.3 §7.3.1.2.1 — an enum's default bit bound is 32, so the
