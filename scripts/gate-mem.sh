@@ -19,11 +19,11 @@
 # silently stops constraining anything — the same slow death as a gate that cannot fail. The ratchet only
 # moves DOWN, and the ceiling file is the record of how far NFR-MEM has actually got.
 #
-# The ceilings live in bench/mem-ceiling.txt — one row PER ARCH, with TWO ceilings on it:
-# "<arch> <ceiling-COPY> <ceiling-RETURN>". REVIEWABLE IN A DIFF, on purpose: lowering one is a claim
-# about the system, and it should be seen.
+# The ceilings live in bench/mem-ceiling.txt — one row PER ARCH, with THREE ceilings on it:
+# "<arch> <ceiling-COPY> <ceiling-RETURN> <ceiling-INTO>". REVIEWABLE IN A DIFF, on purpose: lowering one
+# is a claim about the system, and it should be seen.
 #
-# TWO ARMS SINCE ADR 0093 (2026-07-28), because there are now two honest workloads:
+# THREE ARMS SINCE ADR 0105 (2026-08-06); two of them since ADR 0093 (2026-07-28). The honest workloads:
 #
 #   COPY   — the application takes samples and DROPS them. The legacy arm; every historical ceiling row
 #            refers to it, so it stays comparable across the whole campaign.
@@ -65,8 +65,9 @@ ARCH="$(uname -m)"
 ROW="$(awk -v a="$ARCH" '$1==a {print; exit}' "$CEILING_FILE")"
 [[ -n "$ROW" ]] || {
   echo "gate-mem: FAIL — no ceiling row for arch '$ARCH' in $CEILING_FILE." >&2
-  echo "          Add a row: '$ARCH <copy-bytes> <return-bytes-or-dash>'. Do NOT reuse another arch's" >&2
-  echo "          numbers — they diverge materially and unpredictably." >&2
+  echo "          Add a row: '$ARCH <copy-bytes> <return-or-dash> <into-or-dash>'. Do NOT reuse another" >&2
+  echo "          arch's numbers — they diverge materially and unpredictably. A column omitted here reads" >&2
+  echo "          as '-' (measured, reported, NOT ratcheted), so leaving one off silently un-gates it." >&2
   exit 1; }
 CEILING_COPY="$(awk '{print $2}'   <<<"$ROW")"
 CEILING_RETURN="$(awk '{print $3}' <<<"$ROW")"

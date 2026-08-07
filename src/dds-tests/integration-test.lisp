@@ -14365,6 +14365,64 @@
       (dds.dcps:delete-participant pr))
     t))
 
+(defun* run-writer-handle-race-test ()
+    (function () t)
+  "Test: ADR 0106 review finding 1 — CONCURRENT writes on one DataWriter must not cross-attribute instance
+   handles. DDS 1.4 §2.2.2.4.2.11 places no single-thread restriction on write, which is the entire reason
+   %WRITE-KEY-HASH guards its scratches with a CAS try-lock.
+
+   ⛔ THIS ARM EXISTS BECAUSE THE SUITE HAD NO CONCURRENT-WRITER TEST AT ALL, and ADR 0106 shipped a race
+   through that hole: %INSTANCE-HANDLE with an out-scratch returns THAT ARRAY, and the intern was performed
+   AFTER the CAS was released (an unwind-protect cleanup runs before its value reaches the enclosing call),
+   so a second writer could refill the array with another instance's hash in between. The loser would then
+   thread a DIFFERENT instance's handle onto its CacheChange, its DEADLINE timer key and its key holder.
+   Found by review, not by a test — hence this one.
+
+   The invariant it pins is end-to-end and needs no internals: after N threads have each written their own
+   disjoint set of instances, EVERY registered instance's GET-KEY-VALUE holder must carry the key that
+   instance's handle stands for. A cross-attributed handle breaks that pairing, and a torn read produces a
+   handle matching no key at all — which shows up as an instance count that is not the number written."
+  (let* ((ts (dds.types:find-type-support "tinto"))
+         (pw (dds.dcps:create-participant :domain (test-domain +td-writer-handle-race+)))
+         (threads 4)
+         (per-thread 60))
+    (unwind-protect
+         (let* ((tw (dds.dcps:create-topic pw "HandleRace" "tinto" ts))
+                (dw (dds.dcps:create-datawriter
+                     (dds.dcps:create-publisher pw) tw
+                     :qos (dds.qos:make-writer-qos :reliability :reliable
+                                                   :history-kind :keep-last :history-depth 1)))
+                (ths '()))
+           (dotimes (tid threads)
+             (let ((tid tid))
+               (push (dds.pal:spawn
+                      (lambda ()
+                        (dotimes (i per-thread)
+                          (dds.dcps:write-sample
+                           dw (make-tinto :k (+ 1 (* tid 1000) i) :v (+ (* tid 1000) i) :tag "r"))))
+                      :name "handle-race")
+                     ths)))
+           (dolist (th ths) (dds.pal:join th))
+           ;; EVERY registered instance must hold the key sample its own handle stands for
+           (let ((bad '()) (n 0))
+             (maphash (lambda (h rec)
+                        (incf n)
+                        (let* ((holder (dds.dcps::writer-instance-key-sample rec))
+                               (want (and holder
+                                          (funcall (dds.types:type-support-key-hash ts) holder))))
+                          (unless (and holder (equalp want h))
+                            (push (list :handle-prefix (subseq h 0 4) :holder holder) bad))))
+                      (dds.dcps::dw-instances dw))
+             (%check :whr-count (= n (* threads per-thread))
+                     (format nil "~d threads x ~d instances must register exactly ~d instances; got ~d — a ~
+                                  wrong count means a torn/cross-attributed handle invented or merged one"
+                             threads per-thread (* threads per-thread) n))
+             (%check :whr-consistent (null bad)
+                     (format nil "every instance's key holder must hash back to its own handle; ~d mismatched: ~s"
+                             (length bad) (subseq bad 0 (min 3 (length bad)))))))
+      (dds.dcps:delete-participant pw))
+    t))
+
 (defun* run-writer-handle-intern-test ()
     (function () t)
   "Test: ADR 0106 — a DataWriter INTERNS its instance handles. Writing the same instance twice must hand

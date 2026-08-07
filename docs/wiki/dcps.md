@@ -268,13 +268,14 @@ paths:
 
 | access path | B/sample |
 |---|---|
-| `take-samples`, samples dropped (same type) | ~463 |
-| `take-into` | **~224** |
+| `take-samples`, samples dropped (same type) | ~431 |
+| `take-into` | **~192** |
 
-So the access path itself is worth about **239 B/sample**. ⚠️ **And ~224 B/sample remains — `take-into` is
+So the access path itself is worth about **239 B/sample**. ⚠️ **And ~192 B/sample remains — `take-into` is
 not zero-allocation today.** That residue is *not* the access path (an identical measurement on the same
-type isolates it) and is not yet attributed; it lives in the write path or the engine. The gate ratchets the
-number so it can only go down, and the honest claim is the one on this line rather than "zero-copy".
+type isolates it); it is the **write** path, and it is attributed — a payload cursor whose reuse cache
+misses 100 % of the time, plus one cons per write in the HistoryCache per-instance index. The gate ratchets
+the number so it can only go down, and the honest claim is the one on this line rather than "zero-copy".
 
 Slice 1 refuses a **loan-capable** reader (Zero-Copy / FlatData / secured) with
 `+retcode-precondition-not-met+` — a FlatData sample *is* a buffer, and copying a `flatdata-view` into the

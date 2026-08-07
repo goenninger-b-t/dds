@@ -55,10 +55,11 @@
 #            own column. The type had to change: a sequence member gives the arm a floor belonging to the
 #            TYPE, and a key over 16 octets (or any string key) takes the MD5 keyhash branch at a measured
 #            255.6 B/call in files gate-hotpath does not scan — either would make a zero unreachable with
-#            nothing saying why. ⛔ BANKED AT 237 AND THAT IS NOT A TARGET MET: slice 1's owner-stated exit
-#            criterion was a genuinely 0 B/sample arm and the arm reads ~224. See the report for the split
-#            (~239 B/sample of the old 463 WAS the access path; the remaining ~224 is NOT and is
-#            unattributed).
+#            nothing saying why. ⛔ NOT A TARGET MET: slice 1's owner-stated exit criterion was a genuinely
+#            0 B/sample arm. ⚠️ THE FIGURES IN THIS PARAGRAPH WERE SUPERSEDED WITHIN THE DAY — it was first
+#            banked at 237 for an arm reading ~224, and ADR 0106 then lowered it to 203 for ~192 (see that
+#            block below; the row is the authority, not this prose). The split: ~239 B/sample of the old
+#            463 WAS the access path, and the remainder is the WRITE path, now attributed.
 #
 #   COPY   — the legacy workload: the application takes samples and DROPS them. Unchanged, and every
 #            historical row above refers to this column, so it stays comparable across the whole campaign.

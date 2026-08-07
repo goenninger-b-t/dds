@@ -1877,19 +1877,42 @@
    Concurrency: guarded by a CAS try-lock, NOT a lock. A DataWriter may be written concurrently, and a
    shared serialization buffer would interleave into a WRONG instance handle — a silent mis-attribution,
    not a crash. The thread that wins KEYHASH-BUSY uses the scratch AND the out array; a concurrent writer
-   takes the allocating path, which is exactly today's behaviour and byte-identical — and then interns
-   through the same choke, so both threads still end up handing out the one stable handle."
+   takes the allocating path, which is exactly the pre-ADR-0106 behaviour and byte-identical.
+
+   ⛔ THE INTERN MUST HAPPEN WHILE THE CAS IS STILL HELD, and the first cut of ADR 0106 got this wrong.
+   %INSTANCE-HANDLE with an OUT-SCRATCH returns THAT ARRAY, not a copy (see %KEY-HASH-DEFUN), so the
+   winner's return value IS DW-KEYHASH-OUT. Interning after the guard — which is what an UNWIND-PROTECT
+   whose value feeds an enclosing call does, because the cleanup runs BEFORE the value reaches that call —
+   left a window in which a second writer could refill the array with ANOTHER instance's hash before this
+   thread looked it up. The loser then threaded a DIFFERENT instance's stable handle onto its CacheChange
+   (the KEEP_LAST eviction key), its offered-DEADLINE timer key and its key holder: a silent
+   mis-attribution, and a torn read would invent an instance matching no key at all. Exactly the defect
+   this CAS exists to prevent, reintroduced by moving where the array is consumed. It was found by review,
+   not by a test — the suite has no concurrent-writer arm.
+
+   ⚠️ SAMPLE IS PASSED AT INTERN TIME so the key holder is never NIL. %WRITE-KEY-HASH runs BEFORE the
+   publish, so a write that later returns :timeout (bounded cache + max_blocking_time) or unwinds to
+   BAD_PARAMETER would otherwise leave the instance REGISTERED with a NIL holder — LOOKUP-INSTANCE would
+   report it known while GET-KEY-VALUE returned NIL for that very handle. Residue, recorded: such a write
+   still registers the instance where pre-0106 it registered nothing. Registration is idempotent and
+   §2.2.2.4.2.2 makes write auto-register, so an eagerly-registered instance is benign; an inconsistent
+   pair of accessors would not have been."
   (when (%writer-keeplast-p dw)
     (let ((ts (topic-type-support (dw-topic dw)))
           (busy (dw-keyhash-busy dw)))
       (writer-instance-handle
-       (%writer-instance-record
-        dw
-        (if (zerop (dds.pal:cas busy 0 1))
-            (unwind-protect (%instance-handle ts sample (%writer-keyhash-scratch dw)
-                                              (%writer-keyhash-out dw))
-              (dds.pal:cas busy 1 0))
-            (%instance-handle ts sample)))))))
+       (if (zerop (dds.pal:cas busy 0 1))
+           ;; ⚠️ THE INTERN IS INSIDE THE GUARD, NOT AFTER IT. %INSTANCE-HANDLE RETURNS THE OUT ARRAY
+           ;; ITSELF, so the CAS must still be held while %WRITER-INSTANCE-RECORD reads it — see the
+           ;; docstring. Releasing first (an UNWIND-PROTECT cleanup runs BEFORE the value reaches the
+           ;; caller) let a second writer overwrite the array between the two, which is the very
+           ;; mis-attribution this CAS exists to stop.
+           (unwind-protect
+                (%writer-instance-record
+                 dw (%instance-handle ts sample (%writer-keyhash-scratch dw) (%writer-keyhash-out dw))
+                 sample)
+             (dds.pal:cas busy 1 0))
+           (%writer-instance-record dw (%instance-handle ts sample) sample))))))
 
 (defun* write-sample (dw sample &optional source-timestamp)
     (function (data-writer t &optional (or null integer))

@@ -173,11 +173,12 @@ owns == TRUE` variant, where the application owns the collections, allocates the
 to give back, so the middleware recycles its own struct inside the call.
 
 Current position on the measured DCPS path (arm64, `make gate-mem`, which ratchets **all three** workloads
-so none can regress unnoticed): **464 B/sample** dropping the samples, **257** returning the loans, and
-**225** through `take-into`. From 1738 / 1535 when the campaign's ratchet was set up. ⚠️ **`take-into` is
-not zero-allocation**: measured against the *same type* through `take-samples` (~463), the access path is
-worth ~239 B/sample and the remaining ~224 is something else — write path or engine — and is not yet
-attributed. The gate states that number rather than rounding it away.
+so none can regress unnoticed): **431 B/sample** dropping the samples, **222** returning the loans, and
+**192** through `take-into`. From 1738 / 1535 when the campaign's ratchet was set up. ⚠️ **`take-into` is
+not zero-allocation**, and the gate states that number rather than rounding it away. The residue is
+attributed: the access path itself was worth ~239 B/sample, and what remains is the WRITE path — a payload
+cursor whose reuse cache misses 100 % of the time and one cons per write in the HistoryCache index (see
+`bench/report/2026-08-06-the-tx-payload-cursor-misses-100-percent.md`).
 
 ### ASDF systems
 

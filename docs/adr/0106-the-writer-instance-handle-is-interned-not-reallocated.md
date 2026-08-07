@@ -133,3 +133,56 @@ API at all.
 `stable`, i.e. exactly the pre-ADR cost, `:whi-interned` goes RED while every value assertion stays green.
 That is the whole reason the arm asserts **EQ** and not `equalp`. It configures a **finite offered
 DEADLINE**, per §4, so all three retainers are exercised rather than two.
+
+---
+
+## 8. ⛔ A RACE THIS ADR SHIPPED, FOUND BY REVIEW — fixed, and now tested
+
+The first cut of §3 interned **after** releasing the CAS try-lock:
+
+```lisp
+(%writer-instance-record
+ dw
+ (if (zerop (dds.pal:cas busy 0 1))
+     (unwind-protect (%instance-handle ts sample (scratch) (out))
+       (dds.pal:cas busy 1 0))          ; <- released HERE …
+     (%instance-handle ts sample)))     ; <- … before the value reaches the intern
+```
+
+An `unwind-protect`'s cleanup runs **before** its value reaches the enclosing call, so the CAS was already
+free while `%WRITER-INSTANCE-RECORD` did its `gethash` and `copy-seq`. And the value being passed **is**
+`DW-KEYHASH-OUT` itself: `%KEY-HASH-DEFUN` returns the out-scratch, not a copy.
+
+**The window:** thread A fills the array with H(X) and releases; thread B wins the CAS and overwrites it
+with H(Y); thread A then interns **H(Y)** and receives instance **Y's** stable handle — which it threads
+onto **X's** CacheChange as the KEEP_LAST eviction key, uses as X's offered-DEADLINE timer key, and stores
+as X's key holder. A torn read invents a handle matching no key at all.
+
+**This is precisely the mis-attribution the CAS exists to prevent** (§2.2.2.4.2.11 permits concurrent
+`write`), and pre-0106 it could not happen because the winner returned a *freshly allocated* array — there
+was nothing shared to race on. Introducing the shared out-scratch without moving the consumer inside the
+guard reintroduced it.
+
+**Fix:** the intern happens inside the protected form, so the CAS is held across the lookup and the copy.
+No lock-order inversion: nothing acquires `KEYHASH-BUSY` while holding `DW-STATUS-LOCK`.
+
+**Also fixed (same review):** `%WRITE-KEY-HASH` now passes `SAMPLE` at intern time. It runs *before* the
+publish, so a write that later returns `:timeout` or unwinds to `BAD_PARAMETER` would otherwise leave the
+instance registered with a **NIL key holder** — `LOOKUP-INSTANCE` reporting it known while `GET-KEY-VALUE`
+returned NIL for that handle. Residue, recorded: such a write still registers the instance where pre-0106
+it registered nothing; registration is idempotent and §2.2.2.4.2.2 makes write auto-register, so an eagerly
+registered instance is benign where an inconsistent accessor pair would not have been.
+
+### ⭐ The suite had NO concurrent-writer arm at all, which is how this shipped
+
+`RUN-WRITER-HANDLE-RACE-TEST` is new: four threads × sixty disjoint instances on one DataWriter, then the
+end-to-end invariant — **every registered instance's `GET-KEY-VALUE` holder must hash back to its own
+handle**, and the instance count must be exactly what was written. No internals, no timing.
+
+| | result |
+|---|---|
+| the shipped (racy) form | **RED 3/3** — `got 219`, `220`, `215` of 240 instances |
+| as fixed | PASS |
+
+A ~10 % instance loss on every run, reproducible on the first attempt — and invisible to every other test
+in the suite, all of which write from one thread.

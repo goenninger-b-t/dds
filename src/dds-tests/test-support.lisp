@@ -272,3 +272,8 @@
   "ADR 0106 isolation offset: the writer's interned instance handle. The arm asserts EQ identity of the
    handles a writer hands out across writes and a finite offered DEADLINE arming per instance, so a foreign
    participant's traffic on the domain would add instances the EQ and per-instance assertions do not expect.")
+
+(defconstant +td-writer-handle-race+ 64
+  "ADR 0106 review finding 1 isolation offset: CONCURRENT writes on one DataWriter. The arm asserts that
+   every instance's key holder matches its own key after N threads write M instances each, so a foreign
+   participant's traffic would add instances the per-instance assertions do not expect.")
