@@ -66,7 +66,59 @@ column was obtained):
 ;; settle, then: (dds.dcps:samples-available dr)  =>  < (* threads per-thread)
 ```
 
-**Next step is a TX/RX split**, not a guess: instrument whether the lost samples ever reach the wire
-(writer HistoryCache contents and datagrams sent vs the reader's received-marker set). The two candidate
-neighbourhoods are the per-writer send path under concurrency and the reliable repair loop — but this
-report does not pick one, because the campaign's own rule is that a ranking is not an attribution.
+## LOCATED: the DCPS drain uses a per-writer HIGH-WATER MARK, and drops anything that arrives below it
+
+The TX/RX split settles it. Every write is accepted, and the lost samples **do arrive** — they sit
+undrained in the reader's node store:
+
+```
+SPLIT want=120 write-ok=120 write-notok=0 reader-node-store=4 dcps-available=111
+SPLIT want=120 write-ok=120 write-notok=0 reader-node-store=8 dcps-available=96
+```
+
+`write-ok=120/120` — nothing is refused at the API. And the node store is **not empty at the end**: the
+drain consumes what it delivers, so a residue means samples the RTPS engine received and the DCPS drain
+never took.
+
+The mechanism is `%data-pending-p`:
+
+```lisp
+(> sn (max (gethash g (dr-drained dr) 0)
+           (dds.disc:node-reader-join-watermark-unlocked node rid g)))
+```
+
+**`dr-drained` is a per-writer HIGH-WATER MARK, not a delivered-set**, and `%reader-advance-drained`
+advances it with `(max sn prior)`. So a sample is delivered only if its SN is **strictly greater** than the
+highest SN drained so far for that writer. Once SN 50 has been drained, SN 45 arriving afterwards is not
+"pending" — it is silently skipped, forever. RELIABLE cannot rescue it: the sample is already in the
+reader's store; it is the DCPS drain that refuses it.
+
+⭐ **The code already knew a lower SN can arrive late.** `%reader-advance-drained`'s own docstring says:
+
+> *"Pure reordering (a lower SN arriving late) never jumps forward, so it is conservatively not counted (a
+> false SAMPLE_LOST is the worse error)."*
+
+That reasoning was applied to the **SAMPLE_LOST status** and never to **delivery**. Reordering was
+understood, and the watermark that decides whether a sample is delivered at all was left unable to tolerate
+it.
+
+## Why single-threaded writing hides it completely
+
+One thread completes each `write-sample` — serialize, add to the HistoryCache, send — before starting the
+next, so SNs arrive in order and the high-water never overtakes a sample still in flight. Concurrent
+writers interleave their sends, so a thread that took a **lower** SN can put it on the wire **after** a
+thread that took a higher one. The reader drains the higher SN, the watermark jumps, and the lower one is
+dead on arrival. That is why the loss scales with thread count and why 643 single-threaded tests never saw
+it.
+
+## The fix is a design decision, not a patch
+
+An exactly-once record that tolerates reordering is a **delivered-set**, or a high-water plus a bounded
+gap-set — which is exactly the shape the RTPS reliable *reader* state already keeps for its own
+acknowledgement bookkeeping. Making `dr-drained` such a structure changes a per-sample hot-path lookup and
+its memory profile, so it wants its own ADR and its own measurement rather than an improvised edit at the
+end of a long session.
+
+⚠️ **Do not "fix" it by simply lowering or removing the watermark test** — it is what makes the drain
+exactly-once. Weakening it re-delivers samples instead of losing them, which is the worse conformance
+error.
