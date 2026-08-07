@@ -1979,8 +1979,23 @@
 
 (defun* %push-data (node)
     (function (disc-node) t)
-  "Push unsent changes on the caller thread using tx-msg (the synchronous send path)."
-  (%push-data-buf node (disc-node-tx-msg node)))
+  "Push unsent changes on the caller thread using tx-msg (the synchronous send path), SERIALISED against
+   every other application thread doing the same (ADR 0112).
+
+   ⛔ TX-MSG IS ONE BUFFER AND THE CALLERS ARE MANY THREADS. %push-data-buf's own contract says 'each thread
+   owns its buffer' — true of the receiver threads and of the WP-ASYNC sender (which owns ASYNC-TX-MSG), and
+   FALSE of application threads, which DDS 1.4 §2.2.2.4.2.11 permits any number of. Two of them interleaving
+   their datagram assembly put one thread's message header inside another's payload, so a reader decoded the
+   RTPS magic 'RT' as a representation id, read a length out of interleaved bytes, and received one sample's
+   octets under another sample's sequence number — one instance delivered twice, another never.
+
+   The lock is taken HERE rather than at each call site so the batch-size trigger, the announce-cadence
+   flush-batch, stop-node and the lifecycle publish paths are all covered without any of them remembering.
+   Lock order: THIS lock OUTER, disc-node-lock INNER (%push-data-buf takes the node lock for the ZC armed
+   snapshot); no caller of %push-data holds the node lock. The ASYNC sender does NOT take this — it owns its
+   own buffer and there is exactly one of it, so making it contend here would serialise it for nothing."
+  (dds.pal:with-lock ((disc-node-tx-lock node))
+    (%push-data-buf node (disc-node-tx-msg node))))
 
 (defun* %node-datagram-plan (node writer buf)
     (function (disc-node dds.rtps.reliable:rtps-writer dds.core.buffer:octet-buffer) (values list list))

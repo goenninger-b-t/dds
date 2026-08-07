@@ -24,6 +24,30 @@ under [Discovery](discovery.md) because that is where they are consumed.
 
 ---
 
+## Concurrency contract of the send path (ADR 0112)
+
+**`DataWriter::write` may be called from any number of threads** — DDS 1.4 §2.2.2.4.2.11 places no
+single-thread restriction on it, and this stack supports that.
+
+With asynchronous publishing **off** (the default) the outgoing RTPS message is assembled **on the calling
+thread**, into the node's single `tx-msg` buffer through the single `tx-cursor` paired with it. That buffer
+is therefore **serialised by a per-node TX lock** held across the whole synchronous push. Without it, two
+application threads interleave their datagram assembly, and the result is not a lost sample but a
+*corrupted* one: a second thread's message header lands inside the first's payload (a reader then decodes
+the RTPS magic `RT` as a representation identifier), a length is read out of interleaved bytes, and one
+sample's octets go out under another sample's sequence number — one instance delivered twice while another
+never arrives.
+
+⚠️ **A mis-attributed sample is internally consistent**, so payload-integrity checking cannot detect this
+class; only a distinctness check over the whole delivered set can.
+
+The **asynchronous** sender is deliberately not covered by that lock: it owns its own `async-tx-msg` and
+exactly one such thread exists, so enabling async publishing also removes the contention. The receiver
+threads likewise each own a buffer in their RX context.
+
+Lock order is **TX lock outer, node lock inner** — the synchronous push takes the node lock internally for
+the Zero-Copy armed-change snapshot, and no caller of the push holds the node lock.
+
 ## API reference
 
 ### Message header & framing (`dds.rtps.message`)

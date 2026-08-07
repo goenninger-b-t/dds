@@ -214,6 +214,15 @@
   (lock (dds.pal:make-lock "disc-node") :type t)
   (tx-payload nil :type (or null dds.core.buffer:octet-buffer))
   (tx-msg nil :type (or null dds.core.buffer:octet-buffer))
+  ;; ADR 0112: TX-MSG AND TX-CURSOR BELOW ARE ONE BUFFER SHARED BY EVERY APPLICATION THREAD, because the
+  ;; synchronous push assembles its datagram on the CALLER's thread and DDS 1.4 §2.2.2.4.2.11 permits any
+  ;; number of concurrent writers. Unsynchronised, two threads interleave their RTPS message assembly: a
+  ;; second thread's message HEADER lands inside the first's payload (the reader then decodes the RTPS magic
+  ;; 'RT' as a representation id), a length field is read out of interleaved bytes, and one sample's octets
+  ;; go out under another sample's sequence number — one instance delivered twice while another never
+  ;; arrives. %PUSH-DATA holds this across the whole push. The ASYNC sender is NOT covered and must not be:
+  ;; it owns ASYNC-TX-MSG and there is exactly one of it.
+  (tx-lock (dds.pal:make-lock "disc-node-tx") :type t)   ; HOTPATH-ALLOC(COLD): defstruct initform — one lock per node, not per datagram
   (rx-tx-msg nil :type (or null dds.core.buffer:octet-buffer))
   ;; NFR-MEM: the build cursor for the TX send path, paired with the scratch buffer above rather than consed
   ;; per datagram (48 B, once per sample on the single-datagram fast path). It is NO MORE SHARED THAN THE

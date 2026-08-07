@@ -14416,24 +14416,38 @@
            ;; self-describing — k = v+1 by construction — so a serializer whose cursor was shared or
            ;; freed under it interleaves two writers' bytes and the pairing breaks. A cursor-lifetime
            ;; bug corrupts PAYLOADS, not handles, and would otherwise be quieter than the ADR 0106 race.
-           (let ((want (* threads per-thread)) (got 0) (torn '()))
-             (loop repeat 400 until (>= (dds.dcps:samples-available dr) want)
+           (let ((want (* threads per-thread)) (got 0) (torn '())
+                 (seen (make-hash-table :test 'eql)))
+             (loop repeat 1000 until (>= (dds.dcps:samples-available dr) want)
                    do (dds.dcps:spin pw) (dds.dcps:spin pr) (sleep 0.01))
              (dolist (cs (dds.dcps:take-samples dr))
                (let ((d (dds.dcps:cached-sample-data cs)))
                  (when d
                    (incf got)
+                   (setf (gethash (tinto-k d) seen) t)
                    (unless (= (tinto-k d) (1+ (tinto-v d)))
                      (push (list :k (tinto-k d) :v (tinto-v d) :tag (tinto-tag d)) torn)))))
              (%check :whr-payload-intact (null torn)
                      (format nil "every delivered sample must satisfy k = v+1; ~d torn of ~d delivered: ~s"
                              (length torn) got (subseq torn 0 (min 3 (length torn)))))
-             ;; DELIVERY COMPLETENESS IS ASSERTED BY RUN-CONCURRENT-WRITE-DELIVERY-TEST, NOT HERE. That arm
-             ;; pins ADR 0108 over UDP, where the property is deterministic; this arm runs on the default
-             ;; transport, whose remaining intermittent loss is a separate OPEN defect (see that arm's
-             ;; docstring). Splitting them keeps each assertion falsifiable instead of flaky.
-             (%check :whr-delivered-some (plusp got)
-                     "no sample arrived at all — the arm cannot judge payload integrity"))
+             ;; ⭐ EXACTLY-ONCE, ASSERTED HERE BECAUSE ADR 0112 MADE IT ASSERTABLE. Until the TX datagram
+             ;; buffer was serialised, this workload delivered one instance TWICE under two sequence
+             ;; numbers while another never arrived — and the k = v+1 check above is STRUCTURALLY BLIND to
+             ;; that, because a mis-attributed sample is a complete, self-consistent sample carried under
+             ;; the wrong SN. Only counting DISTINCT instances over the whole delivered set sees it.
+             ;; Narrow the ADR 0112 lock (or delete it) and this goes red.
+             ;; NB this compares distinct to GOT, not to WANT: it must accuse DUPLICATION and nothing else.
+             ;; Comparing to WANT makes it fire on a pure loss too and blame the wrong mechanism — the
+             ;; sabotage run that proved this check works also produced "19 distinct of 19" under a message
+             ;; claiming a duplicate. WHR-COMPLETE below owns the loss half.
+             (%check :whr-distinct (= (hash-table-count seen) got)
+                     (format nil "no delivered sample may be a DUPLICATE: ~d distinct of ~d delivered — a ~
+                                  repeat means one sample's octets went out under another's sequence number"
+                             (hash-table-count seen) got))
+             (%check :whr-complete (= got want)
+                     (format nil "~d threads x ~d writes to ONE DataWriter, RELIABLE + KEEP_ALL: all ~d ~
+                                  samples must be delivered; got ~d (~d short)"
+                             threads per-thread want got (- want got))))
            ;; EVERY registered instance must hold the key sample its own handle stands for
            (let ((bad '()) (n 0))
              (maphash (lambda (h rec)
