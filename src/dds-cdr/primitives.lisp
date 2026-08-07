@@ -7,7 +7,6 @@
 ;;;; reference corpus (FR-CDR-3/8) — NOT encoded from memory. Modes are :xcdr1
 ;;;; (classic, align up to 8) and :xcdr2 (align capped at 4).
 
-(deftype cdr-mode () '(member :xcdr1 :xcdr2))
 
 
 (declaim (inline %max-align cdr-align))

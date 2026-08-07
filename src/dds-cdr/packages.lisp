@@ -35,3 +35,17 @@
            #:+pid-extended+ #:+pid-extended-mu+ #:+pid-list-end+ #:+pid-list-end-mu+ #:+pid-ignore+
            #:+pid-sentinel-rtps+ #:+emheader-mu-flag+
            #:pl-pid-encode #:pl-pid-decode #:pl-end-of-list-p))
+
+(in-package #:dds.cdr)
+
+;;; ADR 0114: CDR-MODE is defined HERE, in the first-loaded file, and not beside its users in
+;;; primitives.lisp — because cdr.lisp is compiled BEFORE primitives.lisp and declaims an ftype that
+;;; mentions it. A type referenced before its DEFTYPE is a deferred style-warning on SBCL and Clasp and a
+;;; HARD ERROR on AllegroCL, which reported it as "(FUNCTION ((UNSIGNED-BYTE 16)) (:DEFAULT)) is not a
+;;; valid type specifier" and blocked 12 of the 18 systems from loading. The forward reference was always
+;;; a latent defect; only a third implementation made it fatal.
+(deftype cdr-mode ()
+  "The XCDR encoding version an operation is running under: :XCDR1 (PLAIN_CDR) or :XCDR2 (PLAIN_CDR2).
+   Threaded explicitly through every codec entry point rather than held in a special, so a serializer and
+   its deserializer cannot disagree about the encoding at a distance."
+  '(member :xcdr1 :xcdr2))
