@@ -353,3 +353,19 @@
            (return-from fsync-directory (values nil :fsync-failed)))
       (cffi:foreign-funcall "close" :int fd :int))
     (values t nil)))
+
+(defun* lisp-eval-command (forms)
+    (function (list) (or null list))
+  "The command list for LAUNCH-PROGRAM that starts a CHILD of this same Lisp and evaluates each string in
+   FORMS, in order (ADR 0116). The binary is this image's own (UIOP:ARGV0), so a child is always the same
+   implementation as its parent.
+
+   SBCL takes --dynamic-space-size in megabytes and evaluates with --eval. The 512 MB cap is the pre-existing value from the durability runner, preserved so this refactor changes no behaviour on the implementation that already worked.
+
+   ⛔ THE FLAGS ARE NOT COSMETIC. A child handed another implementation's flags does not report an error —
+   it treats them as garbage and the parent waits forever for a service that never started, which is how
+   the durability runner's SBCL-only argv stalled the whole suite on AllegroCL."
+  (let ((bin (uiop:argv0)))
+    (when (and bin (plusp (length bin)))          ; no argv0 => the caller cannot launch a child at all
+      (append (list bin) (list "--dynamic-space-size" "512")
+              (loop for f in forms append (list "--eval" f))))))

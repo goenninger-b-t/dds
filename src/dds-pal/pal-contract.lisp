@@ -32,6 +32,10 @@
    ;; Here because no portable ANSI CL spelling is both correct across denormals/NaN/Inf and fast — which
    ;; is precisely what the PAL exists for, and the only place a reader conditional may live.
    #:f32-bits #:f32-from-bits #:f64-bits #:f64-from-bits
+   ;; ADR 0116: the command line that launches a CHILD of THIS Lisp evaluating a list of forms. Per-impl
+   ;; because the eval flag and the memory flags differ (SBCL/Clasp --eval, AllegroCL -e; only SBCL takes
+   ;; --dynamic-space-size), and a wrong flag is not an error the child reports — it hangs.
+   #:lisp-eval-command
    #:load-sap-u8 #:load-sap-u16 #:load-sap-u32
    ;; foreign-SAP 8-bit write — backs the FlatData loan-write SAP-mode Offset setters
    ;; (WP-FLATDATA-LOAN-WRITE; R6, NOT cleared for ship — see ADR 0042). Both impls.

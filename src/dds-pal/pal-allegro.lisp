@@ -363,4 +363,20 @@
   (excl::shorts-to-double-float (ldb (byte 16 48) v) (ldb (byte 16 32) v)
                                 (ldb (byte 16 16) v) (ldb (byte 16 0) v)))
 
+(defun* lisp-eval-command (forms)
+    (function (list) (or null list))
+  "The command list for LAUNCH-PROGRAM that starts a CHILD of this same Lisp and evaluates each string in
+   FORMS, in order (ADR 0116). The binary is this image's own (UIOP:ARGV0), so a child is always the same
+   implementation as its parent.
+
+   AllegroCL evaluates with -e (NOT --eval) and has no --dynamic-space-size; -batch is what makes it non-interactive. ⚠️ -q is deliberately NOT passed: it suppresses the init file, which is where a site puts its ASDF/Quicklisp bootstrap — and a child that cannot find ASDF is exactly the failure this function exists to avoid.
+
+   ⛔ THE FLAGS ARE NOT COSMETIC. A child handed another implementation's flags does not report an error —
+   it treats them as garbage and the parent waits forever for a service that never started, which is how
+   the durability runner's SBCL-only argv stalled the whole suite on AllegroCL."
+  (let ((bin (uiop:argv0)))
+    (when (and bin (plusp (length bin)))          ; no argv0 => the caller cannot launch a child at all
+      (append (list bin) (list "-batch")
+              (loop for f in forms append (list "-e" f))))))
+
 ) ; #+allegro

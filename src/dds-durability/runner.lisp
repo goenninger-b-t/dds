@@ -58,16 +58,17 @@
                 ;; service that looks durable but is not; the runner sheds the spec.
                 (bail :process-mode-non-memory-store)))
              (argv (dds.durability::%spec->argv spec))
-             (lisp-bin (uiop:argv0))
-             (_ (unless (and lisp-bin (plusp (length lisp-bin)))
-                  (bail :no-argv0)))   ; ADR 0064: cannot launch subprocess — runner sheds the spec
-             (cmd  (list* lisp-bin
-                          "--dynamic-space-size" "512"
-                          "--eval" "(require :asdf)"
-                          "--eval" (format nil "(asdf:load-system :dds-durability)")
-                          "--eval" (format nil "(dds.durability:durability-service-main :argv ~s)"
-                                           argv)
-                          '()))
+             ;; ADR 0116: the flags are PER IMPLEMENTATION and the PAL owns them. This list used to be
+             ;; written with SBCL's CLI inline — "--dynamic-space-size" and "--eval" — which AllegroCL
+             ;; does not accept (it evaluates with -e and has no dynamic-space flag). A child handed
+             ;; another implementation's flags does not report an error: it never starts, and the parent
+             ;; waits for a service that will never come up, which STALLED THE WHOLE TEST SUITE there.
+             (cmd  (dds.pal:lisp-eval-command
+                    (list "(require :asdf)"
+                          "(asdf:load-system :dds-durability)"
+                          (format nil "(dds.durability:durability-service-main :argv ~s)" argv))))
+             (_ (unless cmd (bail :no-argv0)))   ; ADR 0064: cannot launch a subprocess — the runner sheds the spec
+
              (proc  (uiop:launch-program cmd
                                          :output :interactive
                                          :error-output :interactive))
