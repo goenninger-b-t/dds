@@ -111,6 +111,11 @@
   (type-support nil :type (or null dds.types:type-support))
   (changes (make-hash-table :test 'eql) :type hash-table)   ; HOTPATH-ALLOC(COLD): defstruct initform — one table per HistoryCache, not per sample
   (instances (make-hash-table :test 'equalp) :type hash-table)                   ; keyhash -> SNs oldest-first (per-instance KEEP_LAST, §2.2.3.18)   ; HOTPATH-ALLOC(COLD): defstruct initform — one table per HistoryCache, not per sample
+  ;; ADR 0110: the parked cons cells of the per-instance index. KEEP_LAST evicts exactly as often as it
+  ;; appends, so the index consed one cell per write and dropped one per write — steady-state garbage at a
+  ;; fixed rate (NFR-MEM). The dropped cell is parked here and the next append reuses it; the free list is
+  ;; guarded by the SAME writer lock that already guards INSTANCES, so it adds no new race class.
+  (free-cells nil :type list)
   (count 0 :type (integer 0))
   ;; WP-PERF: the stored SN extent, maintained INCREMENTALLY at the two chokepoints (%hc-store / %hc-remove-change)
   ;; so hc-min-seq / hc-max-seq are O(1) reads instead of a full maphash SCAN of the change table. They are read on
@@ -184,6 +189,29 @@
    case, DDS 1.4 §2.2.3.18); any other 16-octet handle is its own bucket (EQUALP-compared)."
   (if (or (null key-hash) (every #'zerop key-hash)) :unkeyed key-hash))
 
+(defun* %hc-cell-take (hc sn)
+    (function (history-cache integer) cons)
+  "A one-element list holding SN, drawn from HC's parked-cell free list when one is available and freshly
+   consed only when it is empty (ADR 0110). The single place the per-instance index obtains a cell."
+  (let ((cell (history-cache-free-cells hc)))
+    (cond (cell (setf (history-cache-free-cells hc) (cdr cell)
+                      (car cell) sn
+                      (cdr cell) nil)
+                cell)
+          (t (list sn)))))   ; HOTPATH-ALLOC(TRACKED): first write per instance-depth; steady state reuses a parked cell (ADR 0110)
+
+(defun* %hc-cell-park (hc cell)
+    (function (history-cache cons) t)
+  "Park CELL — already unlinked from its bucket — on HC's free list for the next append to reuse.
+
+   ⛔ THE CALLER MUST HAVE UNLINKED IT FIRST. A cell parked while still reachable from a bucket would be
+   handed to a later append and appear in TWO buckets at once, which is a wrong KEEP_LAST eviction (one
+   instance's depth accounting silently driving another's), not merely a leak."
+  (setf (car cell) 0
+        (cdr cell) (history-cache-free-cells hc)
+        (history-cache-free-cells hc) cell)
+  t)
+
 (defun* %hc-index-append (hc sn change)
     (function (history-cache integer cache-change) t)
   "Append SN to its instance bucket tail (SNs arrive monotonically per writer, so the bucket
@@ -195,7 +223,7 @@
   (when (eq (history-cache-kind hc) :keep-last)
     (let ((key (%hc-bucket-key (cache-change-instance-key-hash change))))
       (setf (gethash key (history-cache-instances hc))
-            (nconc (gethash key (history-cache-instances hc)) (list sn)))))
+            (nconc (gethash key (history-cache-instances hc)) (%hc-cell-take hc sn)))))
   t)
 
 (defun* %hc-index-drop (hc sn change)
@@ -205,11 +233,22 @@
    (mirrors %hc-index-append): a KEEP_ALL cache keeps no index, so its purge/dispose removals never
    touch it (an O(1) change-table-only removal, unchanged from pre-WP)."
   (when (eq (history-cache-kind hc) :keep-last)
-    (let* ((key (%hc-bucket-key (cache-change-instance-key-hash change)))
-           (rest (delete sn (gethash key (history-cache-instances hc)))))
-      (if rest
-          (setf (gethash key (history-cache-instances hc)) rest)
-          (remhash key (history-cache-instances hc)))))
+    (let ((key (%hc-bucket-key (cache-change-instance-key-hash change))))
+      ;; ADR 0110: unlink IN PLACE rather than DELETE, so the removed cell can be captured and parked for
+      ;; reuse — DELETE discards it and the next append had to cons a replacement. Every occurrence of SN is
+      ;; removed, which is what DELETE did.
+      (let ((head (gethash key (history-cache-instances hc)))
+            (prev nil))
+        (loop for cell = (if prev (cdr prev) head)
+              while cell
+              do (let ((next (cdr cell)))
+                   (cond ((eql (car cell) sn)
+                          (if prev (setf (cdr prev) next) (setf head next))
+                          (%hc-cell-park hc cell))
+                         (t (setf prev cell)))))
+        (if head
+            (setf (gethash key (history-cache-instances hc)) head)
+            (remhash key (history-cache-instances hc))))))
   t)
 
 (defun* hc-try-release-pooled (hc change)

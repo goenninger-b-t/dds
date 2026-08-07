@@ -401,5 +401,17 @@
 # (retransmission, an empty-poll storm, a pool that never fills), not for a bigger object. Chase it with a
 # run that PRINTS the empty-poll count and the pool hit/miss counts; it can now be chased ON THE BOX, which
 # is the part that changed.
-arm64  453 236 203
-x86_64 490 - 258
+arm64  436 216 186
+x86_64 473 - 239
+
+# 2026-08-07 (ADR 0110, the KEEP_LAST index cell). arm64 453/236/203 -> 436/216/186; x86_64 490/-/258 ->
+# 473/-/239. Measured -17 to -18 B/sample on EVERY arm and BOTH arches, which is the shape a per-write cons
+# must have. x86_64 RETURN stays a DASH deliberately (it reads 259.6/259.7, stable, but ratcheting it is its
+# own decision, not part of this slice).
+#
+# ⚠️ ONE x86_64 INTO RUN READ 74126.2 B/sample (x380) AND THE IMMEDIATE RE-RUN READ 227.0. No wedged
+# process, no port holder, and the box's tree was verified byte-identical to the source tree (all 134 files)
+# before either run. This reproduces the previously-recorded x86_64 INTO blowup signature (x2.4-x435) whose
+# cause was once a wedged gate-mem holding the domain — but there was no such process this time, so that
+# explanation does NOT cover this one and the arm has an uncharacterised failure mode. A single INTO reading
+# on x86_64 is NOT trustworthy on its own: re-run before believing one.
