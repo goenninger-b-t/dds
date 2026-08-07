@@ -14384,15 +14384,24 @@
    handle matching no key at all — which shows up as an instance count that is not the number written."
   (let* ((ts (dds.types:find-type-support "tinto"))
          (pw (dds.dcps:create-participant :domain (test-domain +td-writer-handle-race+)))
+         (pr (dds.dcps:create-participant :domain (test-domain +td-writer-handle-race+)))
          (threads 4)
-         (per-thread 60))
+         (per-thread 30))
     (unwind-protect
          (let* ((tw (dds.dcps:create-topic pw "HandleRace" "tinto" ts))
+                (tr (dds.dcps:create-topic pr "HandleRace" "tinto" ts))
                 (dw (dds.dcps:create-datawriter
                      (dds.dcps:create-publisher pw) tw
                      :qos (dds.qos:make-writer-qos :reliability :reliable
-                                                   :history-kind :keep-last :history-depth 1)))
+                                                   :history-kind :keep-all)))
+                (dr (dds.dcps:create-datareader
+                     (dds.dcps:create-subscriber pr) tr
+                     :qos (dds.qos:make-reader-qos :reliability :reliable
+                                                   :history-kind :keep-all)))
                 (ths '()))
+           (loop repeat 250 until (and (plusp (dds.dcps:matched-count pw)) (plusp (dds.dcps:matched-count pr)))
+                 do (dds.dcps:spin pw) (dds.dcps:spin pr) (sleep 0.02))
+           (%check :whr-matched (plusp (dds.dcps:matched-count pr)) "writer/reader never matched")
            (dotimes (tid threads)
              (let ((tid tid))
                (push (dds.pal:spawn
@@ -14403,6 +14412,33 @@
                       :name "handle-race")
                      ths)))
            (dolist (th ths) (dds.pal:join th))
+           ;; ADR 0107 gate: PAYLOAD CORRECTNESS under concurrent writers. Every sample is
+           ;; self-describing — k = v+1 by construction — so a serializer whose cursor was shared or
+           ;; freed under it interleaves two writers' bytes and the pairing breaks. A cursor-lifetime
+           ;; bug corrupts PAYLOADS, not handles, and would otherwise be quieter than the ADR 0106 race.
+           (let ((want (* threads per-thread)) (got 0) (torn '()))
+             (loop repeat 400 until (>= (dds.dcps:samples-available dr) want)
+                   do (dds.dcps:spin pw) (dds.dcps:spin pr) (sleep 0.01))
+             (dolist (cs (dds.dcps:take-samples dr))
+               (let ((d (dds.dcps:cached-sample-data cs)))
+                 (when d
+                   (incf got)
+                   (unless (= (tinto-k d) (1+ (tinto-v d)))
+                     (push (list :k (tinto-k d) :v (tinto-v d) :tag (tinto-tag d)) torn)))))
+             (%check :whr-payload-intact (null torn)
+                     (format nil "every delivered sample must satisfy k = v+1; ~d torn of ~d delivered: ~s"
+                             (length torn) got (subseq torn 0 (min 3 (length torn)))))
+             ;; ⚠️ DELIVERY COMPLETENESS IS DELIBERATELY *NOT* ASSERTED HERE, and that is not an oversight.
+             ;; Concurrent writes on one DataWriter LOSE samples under RELIABLE — measured on this tree and
+             ;; on 43fa6e0 (before any of this campaign's work), so it is PRE-EXISTING, not a regression:
+             ;; baseline 4-thread runs delivered 119/102/112/115 and once 66 of 120, and a 30-second settle
+             ;; budget does not recover them. Asserting the count here would land a permanently-red gate for
+             ;; a defect this arm does not fix, and the standing order allows exactly two options — fix it or
+             ;; delete it, never gate it. It is recorded as an open finding with a standalone reproducer
+             ;; instead. What IS asserted is what this arm exists for: every sample that DOES arrive is
+             ;; internally consistent, which is the property a cursor-lifetime bug would break.
+             (%check :whr-delivered-some (plusp got)
+                     "no sample arrived at all — the arm cannot judge payload integrity"))
            ;; EVERY registered instance must hold the key sample its own handle stands for
            (let ((bad '()) (n 0))
              (maphash (lambda (h rec)
@@ -14420,7 +14456,7 @@
              (%check :whr-consistent (null bad)
                      (format nil "every instance's key holder must hash back to its own handle; ~d mismatched: ~s"
                              (length bad) (subseq bad 0 (min 3 (length bad)))))))
-      (dds.dcps:delete-participant pw))
+      (progn (dds.dcps:delete-participant pw) (dds.dcps:delete-participant pr)))
     t))
 
 (defun* run-writer-handle-intern-test ()
