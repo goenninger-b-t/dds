@@ -218,13 +218,65 @@
               "U+00E4 is TWO octets C3 A4 in UTF-8, not the single octet E4 Latin-1 wrote")
       (%check :utf8-3-octet (equal '(4 0 0 0 #xE2 #x82 #xAC 0) (octets-of (string (code-char #x20AC))))
               "U+20AC encodes as E2 82 AC")
-      (%check :utf8-4-octet (equal '(5 0 0 0 #xF0 #x9F #x98 #x80 0)
-                                   (octets-of (string (code-char #x1F600))))
-              "U+1F600 encodes as F0 9F 98 80")
+      ;; ⛔ SUPPLEMENTARY-PLANE ENCODE IS ASSERTED ONLY WHERE THE IMPLEMENTATION CAN HOLD THE CHARACTER.
+      ;; AllegroCL has 16-bit characters (CHAR-CODE-LIMIT 65536), so (code-char #x1F600) is NIL and
+      ;; (string NIL) is the three-character string "NIL" — a fixture written without this guard PASSES on
+      ;; SBCL and silently asserts the encoding of "NIL" on Allegro, i.e. stops covering the case exactly
+      ;; where coverage was the point. Same family as the -0.0 literal trap in RUN-FLOAT-PRIMITIVES-TEST.
+      ;; The DECODE direction is covered unconditionally in RUN-UTF8-DECODE-TEST, from OCTETS, which needs
+      ;; no representable character and therefore runs everywhere.
+      (let ((astral (code-char #x1F600)))
+        (if astral
+            (%check :utf8-4-octet (equal '(5 0 0 0 #xF0 #x9F #x98 #x80 0) (octets-of (string astral)))
+                    "U+1F600 encodes as F0 9F 98 80")
+            (%check :utf8-4-octet-unrepresentable (< char-code-limit #x1F600)
+                    (format nil "(code-char #x1F600) answered NIL, so this implementation must genuinely ~
+                                 lack supplementary-plane characters; char-code-limit is ~d"
+                            char-code-limit))))
       (%check :utf8-length-multibyte (= 3 (dds.cdr:utf8-octet-length (string (code-char #x20AC))))
               "utf8-octet-length counts OCTETS, not characters")
       (%check :utf8-length-ascii (= 2 (dds.cdr:utf8-octet-length "AB"))
               "utf8-octet-length of ASCII equals its character count")))
+  t)
+
+(defun* run-utf8-supplementary-decode-test ()
+    (function () t)
+  "Test: ADR 0115 — a VALID 4-octet UTF-8 sequence must never crash the decoder, on any implementation.
+
+   ⛔ THIS IS A SECURITY PROPERTY, NOT A UNICODE NICETY. CDR-GET-STRING built its result with
+   (setf (char s k) (code-char cp)). CODE-CHAR answers NIL for any scalar value the implementation cannot
+   represent, and AllegroCL has 16-bit characters (CHAR-CODE-LIMIT 65536) — so every supplementary-plane
+   code point, which is every emoji and all of CJK Extension B, made that SETF a type error thrown out of
+   the RECEIVE path. The input is not malformed: it is exactly what a conformant peer sends. That is a
+   remotely-triggerable crash (NFR-SEC-POSTURE), and the operating contract forbids our code signalling at
+   all.
+
+   Driven from OCTETS rather than from a character, deliberately: constructing the character is precisely
+   what the affected implementation cannot do, so a character-driven fixture could not run where the bug
+   lived. The decode must yield ONE character — U+1F600 where representable, U+FFFD where not — and must
+   not signal either way."
+  (let* ((arena (dds.core.arena:init-arena :bytes (* 16 1024)))
+         (pool (dds.core.arena:make-buffer-pool arena 64 2))
+         (b (dds.core.arena:pool-acquire pool)))
+    ;; length 5 (4 octets + NUL) then F0 9F 98 80 00 — U+1F600, well-formed per RFC 3629 §3
+    (let ((c (dds.core.buffer:cursor b :endianness :little)))
+      (dolist (o '(5 0 0 0 #xF0 #x9F #x98 #x80 0)) (dds.core.buffer:put-u8 c o)))
+    (multiple-value-bind (str status)
+        (dds.cdr:cdr-get-string (dds.core.buffer:cursor b :endianness :little) :xcdr2)
+      (%check :utf8-supp-no-signal (stringp str)
+              "a valid 4-octet UTF-8 sequence must DECODE, never signal, on every implementation")
+      (%check :utf8-supp-not-malformed (null status)
+              (format nil "a well-formed supplementary sequence is not malformed input; status was ~s" status))
+      (%check :utf8-supp-one-char (= 1 (length str))
+              (format nil "one scalar value must decode to exactly one character; got ~d" (length str)))
+      (%check :utf8-supp-value
+              (let ((code (char-code (char str 0))))
+                (if (code-char #x1F600) (= code #x1F600) (= code #xFFFD)))
+              (format nil "must be U+1F600 where representable and U+FFFD where not; got U+~4,'0X on an ~
+                           implementation whose char-code-limit is ~d"
+                      (char-code (char str 0)) char-code-limit)))
+    (dds.core.arena:pool-release pool b)
+    (dds.core.arena:teardown-arena arena))
   t)
 
 (defun* run-utf8-decode-test ()
@@ -276,7 +328,13 @@
         (ok-case :utf8-dec-ascii '(65 66) "AB")
         (ok-case :utf8-dec-2-octet '(#xC3 #xA4) (string (code-char #xE4)))
         (ok-case :utf8-dec-3-octet '(#xE2 #x82 #xAC) (string (code-char #x20AC)))
-        (ok-case :utf8-dec-4-octet '(#xF0 #x9F #x98 #x80) (string (code-char #x1F600)))
+        ;; ADR 0115: expect the SCALAR VALUE where the implementation can hold it and U+FFFD where it
+        ;; cannot. AllegroCL has 16-bit characters, so every supplementary code point decodes to the
+        ;; replacement character — a substitution, NOT a malformed-input rejection, which is why this stays
+        ;; an OK-CASE. Writing (string (code-char #x1F600)) unguarded made this assert against the string
+        ;; "NIL" on that implementation.
+        (ok-case :utf8-dec-4-octet '(#xF0 #x9F #x98 #x80)
+                 (string (or (code-char #x1F600) (code-char #xFFFD))))
         (bad-case :utf8-bare-continuation '(#x80))              ; 10xxxxxx cannot lead
         (bad-case :utf8-overlong '(#xC0 #xAF))                  ; '/' in two octets — the filter bypass
         (bad-case :utf8-truncated '(#xE2 #x82))                 ; 3-octet sequence cut short
@@ -3946,6 +4004,7 @@
                  ("xcdr-byte-exact-seed"     . run-byte-exact-test)
                  ("cdr-utf8-encode"          . run-utf8-encode-test)
                  ("cdr-utf8-decode"          . run-utf8-decode-test)
+                 ("cdr-utf8-supplementary"   . run-utf8-supplementary-decode-test) ; ADR 0115: a valid 4-octet sequence must never crash the decoder
                  ("cdr-utf8-size-estimate"   . run-utf8-size-estimate-test)
                  ("gen-bounded-string"       . run-bounded-string-test)
                  ("gen-enum"                 . run-gen-enum-test)

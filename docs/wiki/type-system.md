@@ -66,6 +66,24 @@ The DSL recognizes these member-type keywords (from `*dds-type-map*`): `:bool`, 
 - **`dds.types:default-assignability-options`** — a fresh options struct carrying the XTypes §7.6.3.4.1 defaults.
 - **`dds.types:ti-assignable-from`** — `T1` is-assignable-from `T2` at the TypeIdentifier level (primitives by same kind; narrow strings under the bound rule; plain sequences when the element is strongly-assignable and the bound rule holds; nested structs by recursion). Unmodeled or mismatched kinds are not assignable.
 - **`dds.types:strongly-assignable-from`** — assignable-from **and** `T2` is a delimited type (required for collection elements and aggregated key members).
+### String decoding and unrepresentable characters (ADR 0115)
+
+`String<Char8>` is UTF-8 (XTypes 1.3 §7.4.1.1.2), so a conformant peer may send any Unicode scalar value —
+including supplementary-plane ones such as emoji and CJK Extension B.
+
+⚠️ **Not every implementation can represent them.** `CHAR-CODE-LIMIT` is 1 114 112 on SBCL but **65 536 on
+AllegroCL**, where `(code-char #x1F600)` answers `NIL`. `cdr-get-string` therefore substitutes **U+FFFD
+REPLACEMENT CHARACTER** for any scalar value the running implementation cannot hold, rather than signalling.
+
+This is a **substitution, not a rejection**: the sequence is well-formed, so it is *not* reported as
+`:malformed-utf8` — that status stays reserved for genuinely ill-formed input (overlong forms, bare
+continuations, surrogates, values beyond U+10FFFF). The substitution is visible to the application, which
+receives `�`; dropping the sample or returning a status the generated codecs ignore would both hide it.
+
+On implementations with full Unicode characters the substitution arm is unreachable and decoding is exact.
+A round trip through a 16-bit-character implementation is lossy for supplementary code points — an
+NFR-PORT limitation of that implementation, not of the codec.
+
 ### Floating point (`:f32` / `:f64`) — ADR 0111 slice 1
 
 `:f32` and `:f64` are IEEE 754 binary32 and binary64 — IDL `float` and `double`, XTypes Float32 and Float64

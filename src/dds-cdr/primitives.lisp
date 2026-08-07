@@ -9,6 +9,13 @@
 
 
 
+(defconstant +replacement-character+
+  #.(code-char #xFFFD)
+  "U+FFFD REPLACEMENT CHARACTER, substituted by CDR-GET-STRING for a UTF-8 scalar value this
+   implementation cannot represent as a CL character (ADR 0115). Read at COMPILE time so the decoder does
+   not call CODE-CHAR per substitution. Always representable: #xFFFD is below AllegroCL's 16-bit
+   CHAR-CODE-LIMIT, and below every other supported implementation's.")
+
 (declaim (inline %max-align cdr-align))
 (defun* %max-align (mode)
     (function (cdr-mode) (integer 4 8))
@@ -296,7 +303,20 @@
         (declare (type (integer 0) k))
         (loop while (< i limit)
               do (multiple-value-bind (cp seq) (%utf8-decode-at vec i limit)
-                   (setf (char s k) (code-char cp))
+                   ;; ⛔ CODE-CHAR CAN ANSWER NIL, AND A BARE (SETF (CHAR S K) NIL) IS A TYPE ERROR THROWN
+                   ;; OUT OF A NETWORK-FACING DECODER (ADR 0115). AllegroCL has 16-bit characters —
+                   ;; CHAR-CODE-LIMIT 65536, (code-char #x1F600) => NIL — so every SUPPLEMENTARY-plane code
+                   ;; point (emoji, CJK Extension B, …) is unrepresentable there. That input is not
+                   ;; malformed: it is perfectly valid UTF-8 that any conformant peer may send, which made
+                   ;; this a remotely-triggerable crash of the receive path on one implementation
+                   ;; (NFR-SEC-POSTURE; and the operating contract forbids signalling from our code at all).
+                   ;; U+FFFD REPLACEMENT CHARACTER is the Unicode-standard substitution and is itself always
+                   ;; representable (below the 16-bit limit). It is deliberately NOT silent: the application
+                   ;; receives the replacement character and can see it, where dropping the sample or
+                   ;; returning a status the generated codecs ignore would both hide the loss.
+                   ;; On SBCL and Clasp CODE-CHAR never fails for a valid scalar value, so this is
+                   ;; byte-identical there — the OR arm is unreachable.
+                   (setf (char s k) (or (code-char cp) +replacement-character+))
                    (incf k)
                    (incf i seq)))
         (dds.core.buffer:cursor-set-position c (+ start len))
