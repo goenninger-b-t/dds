@@ -79,7 +79,8 @@ if [ -n "$CACHE_VOLUME" ]; then
 fi
 
 # The default payload: load, run every test, and exit non-zero if any failed (run-all-tests signals).
-# Trap 2 — the ql:quickload and the forms are ONE --eval chain in ONE process.
+# Trap 2 — the loads and the forms are ONE --eval chain in ONE process. Each container is fresh, so a
+# SEPARATE preload step dies with `Component "static-vectors" not found`.
 if [ "$#" -eq 0 ]; then
   set -- --eval '(handler-case (progn (dds.tests:run-all-tests) (uiop:quit 0)) (error (e) (format t "~&SUITE FAILED: ~a~%" e) (uiop:quit 1)))'
 fi
@@ -90,6 +91,23 @@ if [ "${1:-}" = "--shell" ]; then
     "$IMAGE" bash
 fi
 
+# QUICKLOAD THE DEPENDENCIES, asdf:load-system OUR CODE — the split is the whole point.
+#
+# It used to be one `ql:quickload :dds-tests`, which loads our code too, and quickload wraps the whole
+# load in call-with-quiet-compilation — so compile-file's failure-p never reached ASDF and THIS HARNESS,
+# the fallback for when the CI box is unreachable, could not fail on a compile error. gate-quickload now
+# forbids that shape.
+#
+# But quickload cannot simply be dropped: it is what INSTALLS a missing dist system, and asdf:load-system
+# only finds ones already installed. The container is fresh and its ~/quicklisp does not persist, so
+# asdf:load-system alone dies with `Component "static-vectors" not found` (observed, 2026-08-14 — the
+# obvious one-line substitution was wrong and only running it in Docker showed that).
+#
+# So: quickload installs+loads the THIRD-PARTY systems (what Quicklisp is for, and what the lint allows),
+# then asdf:load-system builds OURS with warnings still fatal. The list mirrors the auto-discovered
+# top-level :depends-on set that scripts/generate-sbom.py pins; keep the two in step.
 exec docker run --rm --platform "$PLATFORM" --shm-size="$SHM_SIZE" \
   -v "${REPO}:/src" "${CACHE_ARGS[@]}" -w /src -e XDG_CACHE_HOME=/lispcache \
-  "$IMAGE" ./scripts/with-sbcl.sh --eval '(ql:quickload :dds-tests :silent t)' "$@"
+  "$IMAGE" ./scripts/with-sbcl.sh \
+    --eval "(ql:quickload '(:static-vectors :cffi :bordeaux-threads :chipz :xmls :sqlite) :silent t)" \
+    --eval '(asdf:load-system :dds-tests)' "$@"

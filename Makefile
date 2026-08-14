@@ -14,7 +14,7 @@ SBCL  := ./scripts/with-sbcl.sh
 ALLEGRO := ./scripts/with-allegro.sh
 LISP  ?= $(CLASP)
 
-.PHONY: all build test build-clasp build-sbcl build-allegro test-clasp test-sbcl test-allegro gate-build gate-mem gate-pal gate-nocond gate-drivers \
+.PHONY: all build test build-clasp build-sbcl build-allegro test-clasp test-sbcl test-allegro gate-build gate-mem gate-pal gate-nocond gate-quickload gate-drivers \
         build-all test-all gate-hotpath gate-types corpus fuzz wire interop \
         square-pub square-sub square-spy large-pub large-sub gated-sub corpus-capture \
         nokey-pub nokey-sub keyed-flat-pub keyed-flat-sub \
@@ -119,6 +119,11 @@ gate-types: ; ./scripts/gate-types.sh
 # No reader conditionals outside dds-pal/ (contract §10, NFR-PORT). The contract claimed "CI lint enforces
 # this" — no such lint existed, and there was no CI to run it in. This is that lint; it falsifies itself.
 gate-pal: ; ./scripts/gate-pal.sh
+
+# Quicklisp may PROVIDE our dependencies; it must never GATE our own code. ql:quickload muffles every
+# compile warning, so a system loaded through it cannot fail on one. The Makefile was swept long ago;
+# two scripts were missed and kept the Linux fallback harness structurally unable to go red.
+gate-quickload: ; ./scripts/gate-quickload.sh
 
 # Owner directive 2026-07-14 (NON-NEGOTIABLE): no Lisp conditions in the hot path; every condition handled
 # at latest at the toplevel DDS API. Annotation lint + asserts the receiver boundary handlers still exist.

@@ -27,8 +27,13 @@ cd "$REPO"
 mkdir -p corpus/xcdr2
 
 # Our capture subscriber writes one .bin per distinct (id, seq-len) it sees from Connext.
-sbcl --non-interactive \
-     --eval '(ql:quickload :dds-bench :silent t)' \
+#
+# THROUGH THE LAUNCHER, AND asdf:load-system — NOT bare sbcl + ql:quickload. Two reasons, both bitten
+# before: quickload muffles every compile warning so this capture could be built from code that does not
+# compile cleanly (gate-quickload), and a bare `sbcl` does not source scripts/lisp-cache-env.sh, so it
+# writes into the SHARED ~/.cache/common-lisp that gate-build's `rm -rf` is entitled to wipe.
+./scripts/with-sbcl.sh \
+     --eval '(asdf:load-system :dds-bench)' \
      --eval "(dds.bench:corpus-capture :domain $DOMAIN :advertise-address \"$ADVERTISE\" :seconds 200)" \
      > /tmp/corpus-capture.log 2>&1 &
 CAP=$!
