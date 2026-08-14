@@ -287,6 +287,52 @@
   #+allegro (socket:socket-os-fd socket)
   #-allegro (sb-bsd-sockets:socket-file-descriptor socket))
 
+(declaim (inline %ssize))
+(defun* %ssize (n)
+    (function (integer) integer)
+  "N reinterpreted as a SIGNED 64-bit ssize_t.
+
+   ⛔ A FAILING send/recv RETURNS -1, AND CFFI DOES NOT ALWAYS HAND IT BACK THAT WAY. On AllegroCL a
+   :LONG return arrives as the UNSIGNED pattern — recv(2) answering -1 read as 18446744073709551615 — so
+   (MINUSP n) was false, the byte count jumped past the frame length, and EVERY FAILED READ REPORTED
+   SUCCESS with uninitialised buffer contents. A timeout became a full frame of garbage, which is worse
+   than an error: the caller cannot tell. Sibling of the mask LOAD-SAP-U64 already carries for the
+   opposite skew."
+  (if (>= n #x8000000000000000) (- n #x10000000000000000) n))
+
+(declaim (inline %sint32))
+(defun* %sint32 (n)
+    (function (integer) integer)
+  "N reinterpreted as a SIGNED 32-bit int — the :INT-width sibling of %SSIZE.
+
+   The same AllegroCL skew applies to a :INT return: fcntl(2) answering -1 arrives as 4294967295
+   (measured on the CI host), so a bare (>= n 0) guard is DEAD — it is true for every value the call can
+   return, including every failure."
+  (if (>= n #x80000000) (- n #x100000000) n))
+
+#+allegro
+(defun* %socket-make-blocking (socket)
+    (function (t) t)
+  "Clear O_NONBLOCK on SOCKET's descriptor (AllegroCL only).
+
+   ⛔ EVERY AllegroCL SOCKET IS NON-BLOCKING — verified on listener, accepted and client alike
+   (F_GETFL answers O_NONBLOCK set). Its scheduler needs that so a blocked socket cannot stall the whole
+   image. But the raw recv(2)/send(2) path this PAL uses then gets EAGAIN *immediately*, and EAGAIN is the
+   SAME errno SO_RCVTIMEO reports on expiry — so a 30-second timeout appeared to expire instantly and
+   every exchange failed with :TIMEOUT before the peer had even read the request.
+
+   Clearing it makes SO_RCVTIMEO govern, which is what the sb-bsd-sockets path relies on. Only the raw fd
+   path is affected: nothing here reads or writes these sockets as Lisp STREAMS."
+  ;; F_GETFL 3 / F_SETFL 4 / O_NONBLOCK #o4000 are the Linux x86-64 ABI values (asm-generic/fcntl.h); this
+  ;; whole function is #+allegro and AllegroCL runs on Linux here. %SINT32 is not decoration — without it
+  ;; the guard below is dead, because a failing fcntl returns 4294967295 on this implementation.
+  (let ((fd (%socket-fd socket)))
+    (let ((fl (%sint32 (cffi:foreign-funcall "fcntl" :int fd :int 3 :int 0 :int))))   ; F_GETFL
+      (when (>= fl 0)
+        (cffi:foreign-funcall "fcntl" :int fd :int 4                                  ; F_SETFL
+                              :int (logandc2 fl #o4000) :int))))                      ; ~O_NONBLOCK
+  t)
+
 (defun* %socket-close (socket)
     (function (t) t)
   "Release SOCKET's descriptor. An AllegroCL SOCKET: object IS a stream, so CLOSE is the operation; the
@@ -783,6 +829,7 @@
       (declare (ignore ok))
       (when status (%socket-close s) (bail status)))
     #-allegro (sb-bsd-sockets:socket-connect s (%parse-ipv4 host) port)   ; Allegro connects at creation
+    #+allegro (%socket-make-blocking s)   ; see %SOCKET-MAKE-BLOCKING: raw recv/send vs EAGAIN
     (values s nil)))
 
 (defun* tcp-listen (host port &key (backlog 8))
@@ -811,6 +858,7 @@
     (multiple-value-bind (ok status) (%tcp-suppress-sigpipe s)
       (declare (ignore ok))
       (when status (%socket-close s) (bail status)))
+    #+allegro (%socket-make-blocking s)   ; the raw recv/send path needs SO_RCVTIMEO to govern, not EAGAIN
     (values s nil)))
 
 (defun* tcp-local-port (listener)
@@ -853,13 +901,23 @@
    never allowed to unwind a caller's stack). Callers distinguish a torn connection from a short send by
    the status, not by a handler."
   #+allegro
-  ;; An AllegroCL SOCKET: stream socket IS a Lisp stream, so the short-write loop is WRITE-SEQUENCE's
-  ;; job — it writes the whole extent or signals. FORCE-OUTPUT is not optional: without it the bytes sit
-  ;; in the stream buffer and a request/reply peer waits forever for a message that was never flushed.
-  (handler-case (progn (write-sequence buffer socket :end len)
-                       (force-output socket)
-                       (values len nil))
-    (error () (bail :send-failed)))
+  ;; Raw send(2), paired with TCP-RECV's raw recv(2). A stream write would sit in AllegroCL's buffer until
+  ;; flushed, and mixing buffered writes with unbuffered reads on one descriptor is how a request/reply
+  ;; peer ends up waiting for bytes that were never put on the wire.
+  (let ((sent 0))
+    (declare (type (integer 0) sent))
+    (cffi:with-foreign-object (p :uint8 len)
+      (dotimes (i len) (setf (cffi:mem-ref p :uint8 i) (aref buffer i)))
+      (loop while (< sent len)
+            do (let ((n (%ssize (cffi:foreign-funcall "send" :int (%socket-fd socket)
+                                                     :pointer (cffi:inc-pointer p sent)
+                                                     :unsigned-long (- len sent) :int 0 :long))))
+                 ;; ⚠️ EINTR CANNOT BE DISTINGUISHED HERE — see TCP-RECV's note: errno is unreadable on
+                 ;; this implementation, so an interrupted send is reported as a torn one. The caller
+                 ;; reconnects, so the outcome is correct but coarser than the #-allegro arm.
+                 (unless (plusp n) (bail :send-failed))   ; no progress: the peer is gone
+                 (incf sent n))))
+    (values len nil))
   #-allegro
   (let ((sent 0))
     (declare (type (integer 0) sent))
@@ -900,17 +958,35 @@
   (when (zerop len) (return-from tcp-recv (values 0 nil)))
   (let ((got 0) (scratch nil))
     (declare (type (integer 0) got))
+    (declare (ignorable scratch))       ; the split-read scratch belongs to the #-allegro arm only
     #+allegro
-    ;; READ-SEQUENCE on the stream socket fills the extent or stops SHORT at end-of-file, returning the
-    ;; index it reached — so a short read is the peer closing, which is :EOF. ⚠️ This does NOT reproduce
-    ;; the sb-bsd-sockets path's :TIMEOUT outcome: there, SO_RCVTIMEO surfaces as n=NIL and is
-    ;; distinguishable from a clean close, whereas here a timeout signals and is folded into :EOF. The
-    ;; consumer (the durability microservice) retries either way, so the behaviour is safe but COARSER,
-    ;; and that is a documented NFR-PORT gap rather than an equivalence.
-    (handler-case
-        (let ((n (read-sequence buffer socket :end len)))
-          (if (< n len) (bail :eof) (values len nil)))
-      (error () (bail :eof)))
+    ;; ⛔ RAW recv(2) ON THE FD, NOT THE STREAM. The first cut used READ-SEQUENCE on the socket stream and
+    ;; it HUNG: TCP-SET-RECV-TIMEOUT arms SO_RCVTIMEO on the file DESCRIPTOR, and AllegroCL's stream layer
+    ;; does its own buffering that never consults it — so a serve thread waiting on a client that sent
+    ;; nothing blocked forever instead of returning :TIMEOUT, and one test stalled the entire suite.
+    ;; Reading the fd directly matches the sb-bsd-sockets outcomes (n>0 data, n=0 clean close, n<0 the
+    ;; timeout expiring) and removes the :TIMEOUT/:EOF conflation that cut also introduced.
+    ;;
+    ;; ⚠️ MEASURED NFR-PORT GAP, NOT AN EQUIVALENCE — and errno cannot close it on this implementation.
+    ;; recv(2) answers -1 for BOTH a retryable outcome (SO_RCVTIMEO expiry, EINTR) and a TORN connection
+    ;; (ECONNRESET, ETIMEDOUT, ENOTCONN), so classifying on the value alone reports :TIMEOUT where the
+    ;; #-allegro arm reports :EOF for a peer that sent RST. The obvious fix — consult errno — was
+    ;; implemented and MEASURED NOT TO WORK HERE: after a recv(2) returning -1, AllegroCL 11.0 reads errno
+    ;; as 0 through both a cached __errno_location pointer and a direct call, and it exposes no errno
+    ;; accessor of its own (EXCL:GET-ERRNO, EXCL.OSI:ERRNO, SOCKET:ERRNO are all absent or unbound). The
+    ;; runtime clobbers errno before any subsequent call can read it, so the discrimination is not
+    ;; available and a guess would be worse than the coarser status. Every consumer folds :EOF and
+    ;; :TIMEOUT to one disposition (drop / reconnect), so the behaviour is correct but COARSER.
+    (let ((fd (%socket-fd socket)) (n 0))
+      (declare (type integer n))
+      (cffi:with-foreign-object (p :uint8 len)        ; control plane, not the per-sample path
+        (loop while (< got len)
+              do (setf n (%ssize (cffi:foreign-funcall "recv" :int fd :pointer (cffi:inc-pointer p got)
+                                                      :unsigned-long (- len got) :int 0 :long)))
+                 (cond ((zerop n) (bail :eof))        ; peer closed cleanly
+                       ((minusp n) (bail :timeout))   ; SO_RCVTIMEO expired, EINTR, or a torn peer
+                       (t (incf got n))))
+        (dotimes (i len) (setf (aref buffer i) (cffi:mem-ref p :uint8 i)))))
     #-allegro
     (flet ((step-outcome (n)          ; n>0 = data; n=0 = clean EOF; n=NIL = SO_RCVTIMEO/EINTR
              (cond ((null n) (bail :timeout))

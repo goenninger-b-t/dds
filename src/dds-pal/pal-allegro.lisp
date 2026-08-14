@@ -290,9 +290,16 @@
   "Install CALLBACK for each of SIGNALS (keywords, e.g. :INT :TERM). EXCL::SET-SIGNAL-HANDLER takes the
    signal NUMBER, so the keywords are mapped from the POSIX numbers on Linux/x86-64: SIGINT 2, SIGTERM 15,
    SIGHUP 1. An unrecognised keyword is skipped rather than guessed at."
+  ;; ⛔ ALLEGRO CALLS THE HANDLER WITH ARGUMENTS; the PAL contract is a 0-ARG callback (as SBCL and Clasp
+  ;; deliver it). Passing CALLBACK straight to SET-SIGNAL-HANDLER made the signal invoke it with two, and
+  ;; the handler died with "got 2 args, wanted an unknown number of args" — inside a signal handler, where
+  ;; nothing reports it. The trampoline discards them.
   (dolist (s signals t)
     (let ((n (case s (:int 2) (:term 15) (:hup 1) (t nil))))
-      (when n (excl::set-signal-handler n callback)))))
+      (when n
+        (excl::set-signal-handler n (lambda (&rest ignored)
+                                      (declare (ignore ignored))
+                                      (funcall callback)))))))
 
 (defun* register-image-restart-hook (hook)
     (function ((or symbol function)) (eql t))
@@ -369,14 +376,29 @@
    FORMS, in order (ADR 0116). The binary is this image's own (UIOP:ARGV0), so a child is always the same
    implementation as its parent.
 
-   AllegroCL evaluates with -e (NOT --eval) and has no --dynamic-space-size; -batch is what makes it non-interactive. ⚠️ -q is deliberately NOT passed: it suppresses the init file, which is where a site puts its ASDF/Quicklisp bootstrap — and a child that cannot find ASDF is exactly the failure this function exists to avoid.
+   AllegroCL evaluates with -e (NOT --eval) and has no --dynamic-space-size; -batch is what makes it
+   non-interactive.
 
    ⛔ THE FLAGS ARE NOT COSMETIC. A child handed another implementation's flags does not report an error —
-   it treats them as garbage and the parent waits forever for a service that never started, which is how
-   the durability runner's SBCL-only argv stalled the whole suite on AllegroCL."
-  (let ((bin (uiop:argv0)))
+   it treats them as garbage and the parent waits forever for a service that never started.
+
+   ⚠️ NO LIVE CONSUMER TODAY. dds-durability/runner.lisp gates :process mode on
+   (eq (pal-impl-name) :sbcl), and both the LISP-EVAL-COMMAND call and the :NO-ARGV0 bail sit inside that
+   branch — on AllegroCL control reaches the fallback that prints \":process mode not available\" and starts
+   in-thread. This arm is preventive PAL-contract completion, NOT the fix for any observed stall."
+  ;; UIOP:ARGV0 is NIL on AllegroCL (measured), so this falls back to SYS:COMMAND-LINE-ARGUMENT 0, which
+  ;; answers "alisp" — LAUNCH-PROGRAM resolves that through the inherited PATH.
+  (let ((bin (or (uiop:argv0)
+                 (ignore-errors (funcall (find-symbol "COMMAND-LINE-ARGUMENT" "SYS") 0)))))
     (when (and bin (plusp (length bin)))          ; no argv0 => the caller cannot launch a child at all
       (append (list bin) (list "-batch")
+              ;; ⛔ AN ALLEGRO CHILD INHERITS NEITHER ASDF NOR QUICKLISP. Measured on the CI host: a -batch
+              ;; child reaches its -e forms with (find-package :ql) and (find-package :asdf) both NIL, WITH
+              ;; AND WITHOUT -q — the init file's own bootstrap does not survive -batch. So the child must
+              ;; load Quicklisp itself. CL_SOURCE_REGISTRY is inherited and needs no help.
+              ;; PROBE, never a bare LOAD: ~/quicklisp is not universal (192.168.2.113 has only the site
+              ;; path), and a missing file would signal FILE-ERROR out of a PAL contract function.
+              (list "-e" "(let ((p (or (probe-file (merge-pathnames \"quicklisp/setup.lisp\" (user-homedir-pathname))) (probe-file \"/opt/common-lisp/quicklisp/setup.lisp\")))) (when p (load p)))")
               (loop for f in forms append (list "-e" f))))))
 
 ) ; #+allegro

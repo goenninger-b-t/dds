@@ -89,7 +89,36 @@ Result: **GREEN, 0 failures**, and `:dds-pal` loads.
 
 Plus the full suites on SBCL and Clasp, and `gate-build`, to prove the shared arms are unchanged.
 
-## 7. What is still not parity
+## 7. ⛔ Addendum 2026-08-14 — errno is not readable, so the raw path cannot classify a failure
+
+The stream-based `TCP-SEND`/`TCP-RECV` this ADR shipped were replaced by raw `send(2)`/`recv(2)` on the
+descriptor, because `TCP-SET-RECV-TIMEOUT` arms `SO_RCVTIMEO` on the **fd** and AllegroCL's stream layer
+never consults it — a serve thread waiting on a silent client blocked forever instead of returning
+`:TIMEOUT`. Two consequences of dropping below the abstraction had to be handled: a `:LONG` return arrives
+**unsigned** (`-1` reads as 18446744073709551615, so `MINUSP` was false and every failed read reported
+success with uninitialised buffer contents — `%SSIZE`), and every AllegroCL socket is **`O_NONBLOCK`**, so
+raw `recv` got `EAGAIN` immediately and a 30-second timeout appeared to expire instantly
+(`%SOCKET-MAKE-BLOCKING`). A `:INT` return carries the same unsigned skew (`fcntl` −1 reads as 4294967295,
+which made that function's own guard dead until `%SINT32`).
+
+**What could not be handled: `recv(2)` answering −1 for both a retryable outcome (`SO_RCVTIMEO` expiry,
+`EINTR`) and a torn connection (`ECONNRESET`, `ETIMEDOUT`, `ENOTCONN`).** The `#-allegro` arm separates
+these; this one cannot, so it reports `:TIMEOUT` where SBCL reports `:EOF`.
+
+The obvious fix — consult `errno` — was implemented and **measured not to work on this implementation**:
+after a `recv(2)` returning −1, AllegroCL 11.0 reads errno as **0** through both a cached
+`__errno_location` pointer and a direct call, and it exposes no accessor of its own (`EXCL:GET-ERRNO`,
+`EXCL.OSI:ERRNO`, `SOCKET:ERRNO` are absent or unbound). The runtime clobbers errno before any subsequent
+call can read it. Shipping it regressed `MS-HUGE-TIMES-OUT` — a test that asserts a read *times out* —
+from pass to fail, because every failure fell through to `:EOF`. **Reverted.**
+
+This is therefore a **measured NFR-PORT gap, not an equivalence**, and the comment in `TCP-RECV` says so
+rather than claiming parity. It is tolerable only because every consumer folds `:EOF` and `:TIMEOUT` to one
+disposition (drop / reconnect); it would stop being tolerable the moment a caller needs to distinguish a
+stalled peer from a closed one. Note the standing lesson runs the other way — *match the abstraction you
+replaced rather than document the divergence* — and this is a case where the platform does not permit it.
+
+## 8. What is still not parity
 
 `:dds-pal` is one system. The layers above it — `dds-core`, `dds-cdr`, `dds-types`, `dds-rtps`, `dds-disc`,
 `dds-dcps`, the tests — have not been loaded on AllegroCL yet, and each may surface its own portability

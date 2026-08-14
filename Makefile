@@ -1,14 +1,20 @@
-# M0 quality gates (the operating contract §6). Landed targets: Clasp + SBCL. Allegro later.
+# M0 quality gates (the operating contract §6). Landed targets: Clasp + SBCL + AllegroCL.
 # Live gates this milestone: build, test, gate-hotpath. The rest are M1+ stubs.
 #
 # Bare `build`/`test` use $(LISP) (default Clasp); override with LISP=... or use
-# the per-impl / -all variants. `make all` runs both landed impls.
+# the per-impl / -all variants. `make all` runs all three landed impls, and each launcher exits 127 when
+# its binary is absent — deliberately, so a run cannot report success without validating that impl. The
+# per-impl targets (`make test-sbcl`) are the escape hatch on a machine lacking one (AllegroCL is
+# commercially licensed; the Mac has no alisp and 192.168.2.180 has no Clasp).
 
 CLASP := ./scripts/with-clasp.sh
 SBCL  := ./scripts/with-sbcl.sh
+# ADR 0004's tracked follow-up, closed 2026-08-07. The launcher translates --eval to AllegroCL's -e, so
+# every target below keeps ONE spelling (ADR 0116 does the same for CHILD processes).
+ALLEGRO := ./scripts/with-allegro.sh
 LISP  ?= $(CLASP)
 
-.PHONY: all build test build-clasp build-sbcl test-clasp test-sbcl gate-build gate-mem gate-pal gate-nocond gate-drivers \
+.PHONY: all build test build-clasp build-sbcl build-allegro test-clasp test-sbcl test-allegro gate-build gate-mem gate-pal gate-nocond gate-drivers \
         build-all test-all gate-hotpath gate-types corpus fuzz wire interop \
         square-pub square-sub square-spy large-pub large-sub gated-sub corpus-capture \
         nokey-pub nokey-sub keyed-flat-pub keyed-flat-sub \
@@ -96,12 +102,14 @@ test:
 	$(LISP) --eval '(asdf:load-system :dds-tests)' \
 	        --eval '(handler-case (progn (asdf:test-system :dds-tests) (uiop:quit 0)) (error (e) (format t "~&~a~%" e) (uiop:quit 1)))'
 
-build-clasp: ; $(MAKE) build LISP=$(CLASP)
-build-sbcl:  ; $(MAKE) build LISP=$(SBCL)
-test-clasp:  ; $(MAKE) test  LISP=$(CLASP)
-test-sbcl:   ; $(MAKE) test  LISP=$(SBCL)
-build-all: build-clasp build-sbcl
-test-all:  test-clasp test-sbcl
+build-clasp:   ; $(MAKE) build LISP=$(CLASP)
+build-sbcl:    ; $(MAKE) build LISP=$(SBCL)
+build-allegro: ; $(MAKE) build LISP=$(ALLEGRO)
+test-clasp:    ; $(MAKE) test  LISP=$(CLASP)
+test-sbcl:     ; $(MAKE) test  LISP=$(SBCL)
+test-allegro:  ; $(MAKE) test  LISP=$(ALLEGRO)
+build-all: build-clasp build-sbcl build-allegro
+test-all:  test-clasp test-sbcl test-allegro
 
 gate-hotpath:
 	./scripts/gate-hotpath.sh

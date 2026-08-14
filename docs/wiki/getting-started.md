@@ -22,8 +22,10 @@
 ```sh
 make build         # load all systems (default LISP = Clasp; override LISP=./scripts/with-sbcl.sh)
 make test          # run the unit/integration suite once
-make build-all     # build on both landed impls (Clasp + SBCL)
-make test-all      # test on both
+make build-allegro # build on AllegroCL (ALISP_BIN / ALLEGRO_BIN override the binary)
+make test-allegro  # test on AllegroCL
+make build-all     # build on all three landed impls (Clasp + SBCL + AllegroCL); each launcher exits 127
+make test-all      # test on all three — where an impl is absent, use the per-impl targets above
 make gate-build    # THE build gate: clean-cache rebuild + a falsification self-test (see below)
 make gate-types    # every defun has a single-line ftype declaim (FR-LANG-8)
 make gate-pal      # no reader conditionals outside dds-pal/ (contract §10, NFR-PORT)

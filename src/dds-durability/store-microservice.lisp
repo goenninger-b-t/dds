@@ -343,6 +343,26 @@
     (incf (ms-reader-pos r) n)
     (values v nil)))
 
+(declaim (inline %ms-char))
+(defun* %ms-char (c)
+    (function (t) character)
+  "C, or U+FFFD when C is NIL.
+
+   ⛔ VALIDITY IS NOT REPRESENTABILITY (ADR 0117). %MS-UTF8->STRING rejects every ill-formed sequence
+   before calling CODE-CHAR, and its docstring concluded from that it could never see a TYPE-ERROR. But
+   CODE-CHAR also answers NIL for a PERFECTLY VALID scalar the implementation cannot hold: AllegroCL has
+   16-bit characters (CHAR-CODE-LIMIT 65536), so the entire 4-byte branch produced NIL and
+   VECTOR-PUSH-EXTEND signalled — killing the serve thread and HANGING the caller, which is how one test
+   stalled the whole suite. Substitutes U+FFFD exactly as CDR-GET-STRING does (ADR 0115). Unreachable
+   where characters are full Unicode.
+
+   ⛔ THE SUBSTITUTION IS NOT INJECTIVE. Two distinct supplementary scalars both become U+FFFD, so on an
+   AllegroCL SERVER two distinct wire topics alias onto ONE store key — get-range then returns another
+   client's records and purge/replace-topic destroys them, silently (ADR 0117 §2). No decoder on a 16-bit
+   character implementation can avoid this; the fix for it is a policy change to BOTH decoders, not a
+   change here. Do not 'repair' it by reverting to a signal or by rejecting valid input."
+  (or c #.(code-char #xFFFD)))
+
 (defun* %ms-utf8->string (buf start end)
     (function ((simple-array (unsigned-byte 8) (*)) (integer 0) (integer 0))
               (values (or null string) (or null keyword)))
@@ -355,8 +375,14 @@
    (#xD800-#xDFFF), and scalars > #x10FFFF, so CODE-CHAR is only ever called on a valid Unicode scalar —
    ANY ill-formed sequence returns (values NIL :BAD-UTF8) BEFORE code-char (ADR 0064 — a status, not a
    signal), never a TYPE-ERROR / out-of-range crash (operating contract §4, the fuzz posture). A
-   well-formed topic (a Unicode scalar string, the only thing %string->utf8 emits) round-trips exactly,
-   returning (values string NIL)."
+   well-formed topic (a Unicode scalar string, the only thing %string->utf8 emits) returns
+   (values string NIL).
+
+   ⚠️ VALIDITY IS NOT REPRESENTABILITY (ADR 0117). Everything above is a property of the OCTETS and does
+   NOT make CODE-CHAR total, which is the inference this docstring used to invite. Every scalar therefore
+   goes through %MS-CHAR. The round trip is EXACT only where CHAR-CODE-LIMIT exceeds the scalar: on
+   AllegroCL (limit 65536) a supplementary code point comes back U+FFFD — a visible substitution, never a
+   signal, and an NFR-PORT gap rather than a rejection."
   (let ((out (make-array 0 :element-type 'character :adjustable t :fill-pointer 0))
         (i start))
     (declare (type (integer 0) i))
@@ -368,10 +394,10 @@
         (let ((b0 (aref buf i)))
           (cond
             ((<= b0 #x7F)                                   ; 1-byte  00..7F
-             (vector-push-extend (code-char b0) out) (incf i))
+             (vector-push-extend (%ms-char (code-char b0)) out) (incf i))
             ((<= #xC2 b0 #xDF)                              ; 2-byte  C2..DF 80..BF
              (when (> (+ i 2) end) (bail :bad-utf8))        ; truncated 2-byte
-             (vector-push-extend (code-char (logior (ash (logand b0 #x1F) 6) (tail (+ i 1)))) out)
+             (vector-push-extend (%ms-char (code-char (logior (ash (logand b0 #x1F) 6) (tail (+ i 1))))) out)
              (incf i 2))
             ((<= #xE0 b0 #xEF)                              ; 3-byte, second-byte range per lead
              (when (> (+ i 3) end) (bail :bad-utf8))        ; truncated 3-byte
@@ -380,8 +406,8 @@
                    (hi (if (= b0 #xED) #x9F #xBF)))
                (unless (<= lo b1 hi)
                  (bail :bad-utf8))                          ; invalid 3-byte sequence
-               (vector-push-extend (code-char (logior (ash (logand b0 #x0F) 12)
-                                                      (ash (logand b1 #x3F) 6) (tail (+ i 2)))) out))
+               (vector-push-extend (%ms-char (code-char (logior (ash (logand b0 #x0F) 12)
+                                                      (ash (logand b1 #x3F) 6) (tail (+ i 2))))) out))
              (incf i 3))
             ((<= #xF0 b0 #xF4)                              ; 4-byte, second-byte range per lead
              (when (> (+ i 4) end) (bail :bad-utf8))        ; truncated 4-byte
@@ -390,8 +416,8 @@
                    (hi (if (= b0 #xF4) #x8F #xBF)))
                (unless (<= lo b1 hi)
                  (bail :bad-utf8))                          ; invalid 4-byte sequence
-               (vector-push-extend (code-char (logior (ash (logand b0 #x07) 18) (ash (logand b1 #x3F) 12)
-                                                      (ash (tail (+ i 2)) 6) (tail (+ i 3)))) out))
+               (vector-push-extend (%ms-char (code-char (logior (ash (logand b0 #x07) 18) (ash (logand b1 #x3F) 12)
+                                                      (ash (tail (+ i 2)) 6) (tail (+ i 3))))) out))
              (incf i 4))
             (t (bail :bad-utf8))))))                        ; invalid lead: 80..BF, C0/C1, F5..FF
     (values (coerce out 'string) nil)))

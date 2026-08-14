@@ -7169,11 +7169,31 @@
     (%check :ms-fuzz-utf8-reject
             (eq :bad-utf8 (nth-value 1 (dds.durability::%ms-utf8->string bad 0 (length bad))))
             "malformed UTF-8 topic returns a clean :BAD-UTF8 status (no TYPE-ERROR / crash)"))
-  (let ((valid "AZ¿ࠀ\U0001F600"))   ; ASCII + 2/3/4-byte scalars
+  (let ((valid "AZ¿ࠀ"))   ; ASCII + 2- and 3-byte scalars; the 4-byte case is octet-driven below
     (%check :ms-fuzz-utf8-roundtrip
             (string= valid (let ((u (dds.durability::%string->utf8 valid)))
                              (dds.durability::%ms-utf8->string u 0 (length u))))
             "a well-formed multibyte topic round-trips exactly through the validating decoder"))
+  ;; ⛔ ADR 0117 — THE 4-BYTE BRANCH, DRIVEN FROM OCTETS. The literal above read "AZ¿ࠀ\U0001F600" and was
+  ;; commented "2/3/4-byte scalars", but a backslash inside an ANSI CL string escapes the next character
+  ;; and nothing more — \U is the character U — so it measured 13 characters with a maximum code point of
+  ;; 2048 and the 4-byte branch was UNEXERCISED ON EVERY IMPLEMENTATION. Octets, not a character literal:
+  ;; constructing the character is exactly what the affected implementation cannot do (ADR 0115).
+  (let ((supp (octets #xF0 #x9F #x98 #x80)))          ; U+1F600, well-formed per RFC 3629 §3
+    (multiple-value-bind (str status) (dds.durability::%ms-utf8->string supp 0 (length supp))
+      (%check :ms-fuzz-utf8-supp-no-signal (stringp str)
+              "a valid 4-octet sequence must DECODE, never signal, on every implementation")
+      (%check :ms-fuzz-utf8-supp-not-malformed (null status)
+              (format nil "a well-formed supplementary sequence is not malformed input; status was ~s" status))
+      (%check :ms-fuzz-utf8-supp-one-char (and (stringp str) (= 1 (length str)))
+              (format nil "one scalar value must decode to exactly one character; got ~d"
+                      (if (stringp str) (length str) -1)))
+      (%check :ms-fuzz-utf8-supp-value
+              (and (stringp str) (= 1 (length str))
+                   (let ((code (char-code (char str 0))))
+                     (if (code-char #x1F600) (= code #x1F600) (= code #xFFFD))))
+              (format nil "must be U+1F600 where representable and U+FFFD where not, on an implementation ~
+                           whose char-code-limit is ~d" char-code-limit))))
   ;; (2) SERVER SURVIVAL: raw malformed-topic frames must not kill the listener
   (let* ((srv (dds.durability:make-microservice-server :port 0))
          (port (dds.durability:microservice-server-port srv)))

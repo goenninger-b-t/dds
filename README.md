@@ -202,14 +202,20 @@ cursor whose reuse cache misses 100 % of the time and one cons per write in the 
 
 ## Build & test
 
-Requires a Lisp (SBCL and/or Clasp) with Quicklisp. The `Makefile` wraps per-implementation
-invocation (`scripts/with-sbcl.sh`, `scripts/with-clasp.sh`).
+Requires a Lisp (SBCL, Clasp and/or AllegroCL) with Quicklisp. The `Makefile` wraps per-implementation
+invocation (`scripts/with-sbcl.sh`, `scripts/with-clasp.sh`, `scripts/with-allegro.sh`).
+
+The `-all` targets run every landed implementation and each launcher exits 127 when its binary is
+absent, so a run cannot report success without validating that implementation. AllegroCL is
+commercially licensed; where one implementation is unavailable, use the per-impl targets.
 
 ```sh
 make build         # load all systems (LISP=./scripts/with-clasp.sh by default; or with-sbcl.sh)
 make test          # run the unit/integration suite
-make build-all     # build on both landed impls (Clasp + SBCL)
-make test-all      # test on both
+make build-allegro # build on AllegroCL (ALISP_BIN / ALLEGRO_BIN override the binary)
+make test-allegro  # test on AllegroCL
+make build-all     # build on all three landed impls (Clasp + SBCL + AllegroCL)
+make test-all      # test on all three
 make gate-types    # every defun has a single-line ftype declaim (FR-LANG-8)
 make gate-hotpath  # no CLOS dispatch / per-sample alloc in hot-path files (NFR-CLOS)
 make gate-nocond   # NO Lisp conditions in our code — failures are returned, never signalled (ADR 0064)

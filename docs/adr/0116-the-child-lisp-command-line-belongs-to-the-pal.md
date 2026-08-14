@@ -50,6 +50,13 @@ which is what makes a single per-implementation mapping sufficient.
   a site puts its ASDF/Quicklisp bootstrap — and a child that cannot find ASDF is the very failure this
   function exists to prevent.
 
+  > ⛔ **CORRECTED 2026-08-14 (ADR 0117 review). The rationale above is FALSE and was never measured.**
+  > On the CI host, `(find-package :ql)` and `(find-package :asdf)` are **both NIL after startup with AND
+  > without `-q`** — the init file's bootstrap does not survive `-batch`, so omitting `-q` buys the child
+  > nothing. What running the init file *does* do is start a swank listener on a fixed port 4008, so a
+  > second concurrent run aborts with `"Local socket address already in use (errno 98)"`. `scripts/with-allegro.sh`
+  > now passes `-q`. The child bootstraps Quicklisp explicitly instead (§5).
+
 ### Returning NIL rather than a broken command
 
 `LISP-EVAL-COMMAND` answers **NIL** when `ARGV0` is unusable, and the runner bails `:no-argv0` on that.
@@ -81,6 +88,26 @@ paren in **all three** PAL files — found by `READ error during COMPILE-FILE`, 
 Probed on the CI host: an AllegroCL child has **neither ASDF nor Quicklisp**. There is no Allegro init file
 there, where SBCL's child inherits both from `~/.sbclrc`. So after this ADR an Allegro child starts with
 *correct* flags and then fails at `(asdf:load-system :dds-durability)`.
+
+> ⛔ **CORRECTED 2026-08-14 (ADR 0117 review).** The **conclusion** holds — the child does have neither —
+> but the premise is wrong: `/home/frgo/.clinit.cl` **does** exist on the CI host and **is** loaded
+> (`alisp` reports `during loading init file`), and it even bootstraps Quicklisp from
+> `/opt/common-lisp/quicklisp/setup.lisp`. The reason the child has nothing is that the init file's
+> bootstrap does not survive `-batch` (measured, see the §2 correction), not that no init file exists.
+>
+> ⛔ **The stall attributed to this path never ran through it.** `src/dds-durability/runner.lisp:52` gates
+> `:process` mode on `(eq (dds.pal:pal-impl-name) :sbcl)`, and both the `LISP-EVAL-COMMAND` call (`:66`)
+> and the `:no-argv0` bail (`:70`) sit **inside** that branch — that gate has been present since the file
+> was created (`c212408`), so an AllegroCL child was never handed SBCL's flags and the `:no-argv0` guard
+> cannot fire there. On AllegroCL control reaches `:97`, which prints *":process mode not available on
+> ALLEGRO — starting in-thread"*. The AllegroCL suite stall at `durability-microservice-fuzz` had a
+> different, already-located cause with no subprocess in it: `CODE-CHAR` → NIL in the microservice's UTF-8
+> decoder, fixed by `%MS-CHAR` in **ADR 0117**. `LISP-EVAL-COMMAND`'s AllegroCL arm is preventive
+> PAL-contract completion, **not** the fix for any observed stall.
+>
+> The bootstrap gap itself is now closed: the PAL and the launcher both `PROBE-FILE` `~/quicklisp/setup.lisp`
+> and then `/opt/common-lisp/quicklisp/setup.lisp`, loading whichever exists (192.168.2.113 has only the
+> site path, and a bare `LOAD` would signal `FILE-ERROR` out of a PAL contract function).
 
 That is a **deployment** question, not a flags question — most likely passing `CL_SOURCE_REGISTRY` and a
 Quicklisp setup path through `UIOP:LAUNCH-PROGRAM`'s `:environment`, which is a decision about how a child
