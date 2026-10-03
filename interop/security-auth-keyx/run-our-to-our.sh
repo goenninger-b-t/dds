@@ -19,7 +19,7 @@
 #   - RTI Security Plugins: NOT INSTALLED (libnddssecurity.dylib absent)
 #   - Fast DDS 3.6.1: NOT AVAILABLE in this environment
 #   - tshark: AVAILABLE at /Applications/Wireshark.app/Contents/MacOS/tshark
-#   - Our Lisp build: both Clasp and SBCL validated (337 tests each, all gates green)
+#   - Our Lisp build at that date: Clasp and SBCL validated (337 tests each, all gates green); Clasp withdrawn since (ADR 0118)
 #
 # LIVE CONNEXT-SECURITY EXECUTION OUTCOME
 #   A live Connext-Security key-exchange run CANNOT be completed in this environment:
@@ -29,7 +29,8 @@
 #     derive KxKey / exchange KeyMaterial, so no encrypted DATA exchange is possible.
 #
 # PORTABLE GUARD (in-process, always runs in CI)
-#   All three in-process tests above run as part of the full dds-tests suite (Clasp first).
+#   All three in-process tests above run as part of the full dds-tests suite, and this script runs
+#   them once on SBCL and once on AllegroCL.
 #   They exercise every layer of the slice without a foreign peer:
 #   - The HMAC-SHA256 KxKey KDF is verified by RFC 4231 TC1 + TC4 published vectors.
 #   - The AES256-GCM seal/open is verified by NIST SP 800-38D published vectors.
@@ -43,7 +44,7 @@
 #      using the same CA as our test PKI (interop/security-auth/pki/ca/ca-cert.pem).
 #   3. Start the Connext security participant on domain 0 (subscriber, EC identity).
 #   4. Start our security participant:
-#        cd <repo-root> && scripts/with-clasp.sh --eval '
+#        cd <repo-root> && scripts/with-sbcl.sh --eval '
 #          (asdf:load-system :dds)
 #          (let* ((ca   (uiop:read-file-string "interop/security-auth/pki/ca/ca-cert.pem"))
 #                 (cert (uiop:read-file-string "interop/security-auth/pki/participant_ec/identity_cert.pem"))
@@ -121,37 +122,28 @@ fi
 
 echo ""
 echo "=== Portable guard: run-auth-encrypted-pubsub-keyx-test + don't-break-plain ==="
-echo "Running three in-process checks (Clasp first, then SBCL):"
+echo "Running three in-process checks (SBCL leg, then AllegroCL leg):"
 echo "  (a) run-auth-encrypted-pubsub-keyx-test  — full e2e encrypted with exchanged keys"
 echo "  (b) run-auth-plain-byte-identical-test    — don't-break-plain byte-identity"
 echo "  (c) run-auth-secured-refuses-plain-test   — strict-refuse non-vacuous"
 echo ""
 
-CLASP="${REPO_ROOT}/projects/clasp/build/boehmprecise/clasp"
-if [ -f "${CLASP}" ]; then
-    echo "--- Clasp ---"
-    "${CLASP}" --non-interactive \
-        --eval "(asdf:test-system :dds-tests)" \
-        --eval "(format t \"~&keyx-e2e: ~a~%\" (dds.tests:run-auth-encrypted-pubsub-keyx-test))" \
-        --eval "(format t \"~&plain-byte-id: ~a~%\" (dds.tests:run-auth-plain-byte-identical-test))" \
-        --eval "(format t \"~&strict-refuse: ~a~%\" (dds.tests:run-auth-secured-refuses-plain-test))" \
-        --eval "(uiop:quit 0)" 2>&1 || true
-else
-    echo "[SKIP] Clasp binary not found at ${CLASP}"
-fi
-
-echo ""
-echo "--- SBCL ---"
-if command -v sbcl >/dev/null 2>&1; then
-    sbcl --non-interactive \
-        --eval "(asdf:test-system :dds-tests)" \
-        --eval "(format t \"~&keyx-e2e: ~a~%\" (dds.tests:run-auth-encrypted-pubsub-keyx-test))" \
-        --eval "(format t \"~&plain-byte-id: ~a~%\" (dds.tests:run-auth-plain-byte-identical-test))" \
-        --eval "(format t \"~&strict-refuse: ~a~%\" (dds.tests:run-auth-secured-refuses-plain-test))" \
-        --eval "(uiop:quit 0)" 2>&1 || true
-else
-    echo "[SKIP] sbcl not found on PATH"
-fi
+# One leg per supported Lisp (ADR 0118). A missing Lisp, a failing test, or a skipped test (no OpenSSL
+# >= 3.5) FAILS its leg, and either leg failing fails the run.
+# shellcheck source=../lisp-legs.sh
+. "${REPO_ROOT}/interop/lisp-legs.sh"
+legs_failed=0
+for leg in "sbcl:${SBCL_LAUNCHER}:900" "allegro:${ALLEGRO_LAUNCHER}:2400"; do
+  IFS=: read -r label launcher secs <<<"$leg"
+  echo "--- ${label} ---"
+  if ! run_inprocess_leg "$label" "$launcher" "/tmp/auth-keyx-${label}.log" "$secs" \
+       dds.tests::run-auth-encrypted-pubsub-keyx-test \
+       dds.tests::run-auth-plain-byte-identical-test \
+       dds.tests::run-auth-secured-refuses-plain-test; then
+    legs_failed=1
+  fi
+  echo ""
+done
 
 echo ""
 echo "=== Outcome ==="
@@ -160,3 +152,9 @@ echo "  Security Plugins add-on (libnddssecurity.dylib absent in this environmen
 echo "Portable guard (all three in-process tests) + published KAT vectors (RFC 4231,"
 echo "  NIST SP 800-38D) + DDS-Security 1.1 §9.5.3 spec conformance provide structural"
 echo "  confidence. See interop/security-auth-keyx/README.md and ADR 0034."
+
+if [ "$legs_failed" -ne 0 ]; then
+  echo "RESULT: FAIL — the portable guard failed (or did not run) on at least one Lisp"
+  exit 1
+fi
+echo "RESULT: PASS — the portable guard passed on SBCL and AllegroCL"

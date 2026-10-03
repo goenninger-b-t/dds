@@ -26,7 +26,7 @@
 #   - RTI Security Plugins: NOT INSTALLED (libnddssecurity.dylib absent)
 #   - Fast DDS 3.6.1: NOT AVAILABLE in this environment
 #   - tshark: AVAILABLE at /Applications/Wireshark.app/Contents/MacOS/tshark
-#   - Our Lisp build: both Clasp and SBCL validated (349 tests each, all gates green)
+#   - Our Lisp build at that date: Clasp and SBCL validated (349 tests each, all gates green); Clasp withdrawn since (ADR 0118)
 #
 # LIVE CONNEXT-SECURITY ACCESSCONTROL EXECUTION OUTCOME
 #   A live Connext-Security AccessControl run CANNOT be completed in this environment:
@@ -36,7 +36,8 @@
 #     the signed Governance/Permissions documents, or enforce topic-level access control.
 #
 # PORTABLE GUARD (in-process, always runs in CI)
-#   All three in-process tests above run as part of the full dds-tests suite (Clasp first).
+#   All three in-process tests above run as part of the full dds-tests suite, and this script runs
+#   them once on SBCL and once on AllegroCL.
 #   They exercise every layer of the AccessControl slice without a foreign peer:
 #   - CMS signature verification proven by run-access-cms-verify-test (signed fixture
 #     verifies; tampered doc -> NIL; wrong CA -> NIL; non-vacuous).
@@ -117,37 +118,28 @@ fi
 
 echo ""
 echo "=== Portable guard: allow/deny e2e + local-deny + default-off ==="
-echo "Running three in-process checks (Clasp first, then SBCL):"
+echo "Running three in-process checks (SBCL leg, then AllegroCL leg):"
 echo "  (a) run-access-control-allow-deny-test  — full e2e allow/deny (real signed docs + wire)"
 echo "  (b) run-access-control-local-deny-test  — check_create_datawriter enforcement"
 echo "  (c) run-access-control-default-off-test — default-OFF byte-identical"
 echo ""
 
-CLASP="${REPO_ROOT}/projects/clasp/build/boehmprecise/clasp"
-if [ -f "${CLASP}" ]; then
-    echo "--- Clasp ---"
-    "${CLASP}" --non-interactive \
-        --eval "(asdf:test-system :dds-tests)" \
-        --eval "(format t \"~&allow-deny-e2e: ~a~%\" (dds.tests:run-access-control-allow-deny-test))" \
-        --eval "(format t \"~&local-deny: ~a~%\" (dds.tests:run-access-control-local-deny-test))" \
-        --eval "(format t \"~&default-off: ~a~%\" (dds.tests:run-access-control-default-off-test))" \
-        --eval "(uiop:quit 0)" 2>&1 || true
-else
-    echo "[SKIP] Clasp binary not found at ${CLASP}"
-fi
-
-echo ""
-echo "--- SBCL ---"
-if command -v sbcl >/dev/null 2>&1; then
-    sbcl --non-interactive \
-        --eval "(asdf:test-system :dds-tests)" \
-        --eval "(format t \"~&allow-deny-e2e: ~a~%\" (dds.tests:run-access-control-allow-deny-test))" \
-        --eval "(format t \"~&local-deny: ~a~%\" (dds.tests:run-access-control-local-deny-test))" \
-        --eval "(format t \"~&default-off: ~a~%\" (dds.tests:run-access-control-default-off-test))" \
-        --eval "(uiop:quit 0)" 2>&1 || true
-else
-    echo "[SKIP] sbcl not found on PATH"
-fi
+# One leg per supported Lisp (ADR 0118). A missing Lisp, a failing test, or a skipped test (no OpenSSL
+# >= 3.5) FAILS its leg, and either leg failing fails the run.
+# shellcheck source=../lisp-legs.sh
+. "${REPO_ROOT}/interop/lisp-legs.sh"
+legs_failed=0
+for leg in "sbcl:${SBCL_LAUNCHER}:900" "allegro:${ALLEGRO_LAUNCHER}:2400"; do
+  IFS=: read -r label launcher secs <<<"$leg"
+  echo "--- ${label} ---"
+  if ! run_inprocess_leg "$label" "$launcher" "/tmp/access-control-${label}.log" "$secs" \
+       dds.tests::run-access-control-allow-deny-test \
+       dds.tests::run-access-control-local-deny-test \
+       dds.tests::run-access-control-default-off-test; then
+    legs_failed=1
+  fi
+  echo ""
+done
 
 echo ""
 echo "=== Outcome ==="
@@ -156,3 +148,9 @@ echo "  Security Plugins add-on (libnddssecurity.dylib absent in this environmen
 echo "Portable guard (all three in-process tests) + DDS-Security 1.1 §8.4 / §9.4 spec"
 echo "  evidence provide structural confidence. See interop/security-access-control/README.md"
 echo "  and ADR 0035. Live Connext-Security ACCESSCONTROL interop is the P6 exit gate (Slice 5)."
+
+if [ "$legs_failed" -ne 0 ]; then
+  echo "RESULT: FAIL — the portable guard failed (or did not run) on at least one Lisp"
+  exit 1
+fi
+echo "RESULT: PASS — the portable guard passed on SBCL and AllegroCL"

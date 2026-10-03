@@ -48,7 +48,8 @@ without a live Connext-Security peer.
 | SUB | `shared-km` (decode) | byte-exact plaintext |
 | PLAIN | NIL (no crypto) | first 4 bytes = `#(0 0 0 4)` (SecuredPayload ciphertext on wire) |
 
-Both SBCL and Clasp pass identically, Clasp first.
+`run-our2our.sh` runs it on SBCL and on AllegroCL (ADR 0118); a leg fails if its Lisp is missing, the
+test fails, or the test skips (OpenSSL < 3.5). (Before ADR 0118 the second leg was Clasp.)
 
 ### Level 4 — Live cross-vendor Connext-Security byte-compare (DEFERRED)
 

@@ -14,15 +14,18 @@ name: Gates
 #
 # WHAT THIS RUNS: every gate that needs nothing but SBCL.
 # WHAT IT DOES NOT RUN, AND WHY — stated LOUDLY, never silently skipped (a gate that cannot run must not
-# report success):
-#   * CLASP   — not installable in a hosted runner in reasonable time (it is a source build). The standing
-#               rule is that Clasp AND SBCL must BOTH validate; CI covers SBCL only, so the CLASP LEG
-#               REMAINS A HUMAN STEP: `make test-clasp` + `make gate-build LISP=./scripts/with-clasp.sh`.
-#   * INTEROP — needs licensed RTI Connext + a Fast DDS build. Human step: `make interop`.
-#   * WIRE    — needs tshark; installed below, so it DOES run.
+# report success). The targets are SBCL and AllegroCL (ADR 0118 withdrew Clasp):
+#   * ALLEGROCL — commercially licensed; it cannot be installed in a hosted runner until the CI licence
+#                 question is settled. Every AllegroCL leg is therefore a HUMAN STEP, run locally:
+#                 `make gate-build LISP=./scripts/with-allegro.sh` + `make test LISP=./scripts/with-allegro.sh`.
+#   * INTEROP   — needs licensed RTI Connext + a Fast DDS build. Human step: `make interop`.
+#   * WIRE      — needs tshark; installed below, so it DOES run.
+# The last step COMPUTES what was not covered rather than reciting a fixed list: every step that passes
+# records what it covered, and the required set is derived from the Makefile's gate-* targets plus the
+# per-Lisp build/test/corpus/fuzz legs. Anything required and not recorded is printed as NOT COVERED.
 #
 # 2026-07-29 — WHY THIS FILE WAS REBUILT. CI was red on ONE test and, because the runner stopped at the
-# first failure, that made it blind to everything after it. MD-E2E-P2-VIEW is 135th of 553, so 418 TESTS
+# first failure, that made it blind to everything after it. MD-E2E-P2-VIEW (fixed since, 4e642de) was 135th of 553, so 418 TESTS
 # HAD NEVER RUN IN CI AT ALL — the whole loan-write, keyed-FlatData, durability, XTypes-lookup and
 # DDS-Security suites among them. The run reported nothing about them, and the local run reported "623
 # passed" from a DIFFERENT platform, so the gap was invisible from both ends.
@@ -32,12 +35,6 @@ name: Gates
 # failure injected into the FIRST test, 590 tests still ran, the summary read "622 passed, 1 FAILED,
 # 623 total", and make exited 2.
 #
-# ⚠️ EXPECT MD-E2E-P2-VIEW TO STILL FAIL HERE, and that is the point of this rebuild rather than a defect
-# in it. It has NEVER passed on Linux: it landed 2026-07-05 and this CI was created 2026-07-14, nine days
-# later, so Linux first ran it after it was merged. It is NOT skipped — skipping would hide a real
-# platform defect — so the job stays red until it is fixed, but the run now reports the status of the
-# other 552 tests instead of stopping.
-
 on:
   push:
     branches: [main]
@@ -81,50 +78,92 @@ jobs:
       # THE build gate: clears the fasl cache, rebuilds from scratch, and falsifies itself.
       # `make build` is incremental and can pass on a tree that does not compile — that is the whole point.
       - name: gate-build (clean-cache rebuild + self-falsification)
-        run: make gate-build LISP=./scripts/with-sbcl.sh
+        run: |
+          make gate-build LISP=./scripts/with-sbcl.sh
+          echo "gate-build" >> "$RUNNER_TEMP/ci-covered"
+          echo "build@sbcl" >> "$RUNNER_TEMP/ci-covered"
 
       # Bounded so a hang gives a FAST RED instead of burning the 60-minute job timeout.
       - name: test (SBCL)
         timeout-minutes: 12
-        run: make test LISP=./scripts/with-sbcl.sh
+        run: |
+          make test LISP=./scripts/with-sbcl.sh
+          echo "test@sbcl" >> "$RUNNER_TEMP/ci-covered"
 
       - name: corpus (XCDR byte-exact vs Connext's WIRE bytes)
-        run: make corpus LISP=./scripts/with-sbcl.sh
+        run: |
+          make corpus LISP=./scripts/with-sbcl.sh
+          echo "corpus@sbcl" >> "$RUNNER_TEMP/ci-covered"
 
       - name: gate-hotpath (CLOS purity + allocation purity; prints the NFR-MEM debt)
-        run: make gate-hotpath
+        run: |
+          make gate-hotpath
+          echo "gate-hotpath" >> "$RUNNER_TEMP/ci-covered"
 
       - name: gate-types (every defun ftype-declared)
-        run: make gate-types
+        run: |
+          make gate-types
+          echo "gate-types" >> "$RUNNER_TEMP/ci-covered"
 
       - name: gate-pal (no reader conditionals outside dds-pal/)
-        run: make gate-pal
+        run: |
+          make gate-pal
+          echo "gate-pal" >> "$RUNNER_TEMP/ci-covered"
 
       # gate-mem creates two DDS participants on loopback — same container-networking exposure as `test`.
       - name: gate-nocond (no conditions in the hot path; boundary handlers intact)
-        run: make gate-nocond
+        run: |
+          make gate-nocond
+          echo "gate-nocond" >> "$RUNNER_TEMP/ci-covered"
 
       - name: gate-mem (NFR-MEM allocation ratchet)
         timeout-minutes: 10
-        run: make gate-mem
+        run: |
+          make gate-mem
+          echo "gate-mem" >> "$RUNNER_TEMP/ci-covered"
 
       # ADR 0095. Asserts what `make mem` was long credited with and never checked: that ONE process arena
       # sized by *static-arena-bytes* bounds hot-path static memory, that a live participant charges it,
       # that a create/delete cycle RETURNS the charge, and that high-water < budget. Falsifies itself first.
       - name: gate-arena (FR-PF-7 static-memory budget)
         timeout-minutes: 10
-        run: make gate-arena
+        run: |
+          make gate-arena
+          echo "gate-arena" >> "$RUNNER_TEMP/ci-covered"
 
       - name: fuzz (CDR/RTPS parser fuzzers, prod + safety-0)
-        run: make fuzz LISP=./scripts/with-sbcl.sh
+        run: |
+          make fuzz LISP=./scripts/with-sbcl.sh
+          echo "fuzz@sbcl" >> "$RUNNER_TEMP/ci-covered"
 
       - name: wire (validate emitted RTPS against the tshark RTPS dissector)
-        run: make wire
+        run: |
+          make wire
+          echo "wire" >> "$RUNNER_TEMP/ci-covered"
 
-      - name: Declare what CI did NOT cover
+      - name: Declare what CI did NOT cover (computed)
         if: always()
         run: |
-          echo "::warning::CLASP NOT RUN — CI covers SBCL only. The standing rule is that BOTH must validate."
-          echo "::warning::  Human step: make test-clasp && make gate-build LISP=./scripts/with-clasp.sh"
-          echo "::warning::INTEROP NOT RUN — needs licensed RTI Connext + Fast DDS. Human step: make interop"
-
+          set -uo pipefail
+          touch "$RUNNER_TEMP/ci-covered"
+          # REQUIRED is derived, not hand-listed: every gate-* target in the Makefile, the per-Lisp legs for
+          # both supported Lisps (ADR 0118), wire, and interop.
+          mapfile -t gates < <(grep -oE '^gate-[a-z0-9-]+:' Makefile | tr -d ':' | sort -u)
+          required=("${gates[@]}")
+          for lisp in sbcl allegro; do
+            for leg in build test corpus fuzz; do required+=("${leg}@${lisp}"); done
+          done
+          required+=(wire interop)
+          missing=()
+          for r in "${required[@]}"; do
+            grep -qxF "$r" "$RUNNER_TEMP/ci-covered" || missing+=("$r")
+          done
+          echo "Covered:     $(sort -u "$RUNNER_TEMP/ci-covered" | tr '\n' ' ')"
+          echo "Not covered: ${missing[*]:-(none)}"
+          for m in "${missing[@]}"; do echo "::warning::NOT COVERED: $m"; done
+          if printf '%s\n' "${missing[@]}" | grep -q '@allegro$'; then
+            echo "::warning::ALLEGROCL NOT RUN — CI cannot run AllegroCL yet (licensed). Human step: make gate-build LISP=./scripts/with-allegro.sh && make test LISP=./scripts/with-allegro.sh"
+          fi
+          if printf '%s\n' "${missing[@]}" | grep -qx 'interop'; then
+            echo "::warning::INTEROP NOT RUN — needs licensed RTI Connext + Fast DDS. Human step: make interop"
+          fi

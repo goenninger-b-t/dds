@@ -120,7 +120,7 @@ authenticated remotes for the same writer GUID) is proven by the `kpub-single-wr
 3. Start the Connext security participant on domain 0 (subscriber with an EC identity).
 4. Start our security participant:
    ```bash
-   scripts/with-clasp.sh --eval '
+   scripts/with-sbcl.sh --eval '
      (asdf:load-system :dds)
      (let* ((ca   (uiop:read-file-string "interop/security-auth/pki/ca/ca-cert.pem"))
             (cert (uiop:read-file-string "interop/security-auth/pki/participant_ec/identity_cert.pem"))

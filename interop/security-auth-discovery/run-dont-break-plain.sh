@@ -13,7 +13,7 @@
 #   - RTI Security Plugins: NOT INSTALLED (libnddssecurity.dylib absent)
 #   - Fast DDS 3.6.1: NOT AVAILABLE in this environment
 #   - tshark: AVAILABLE at /Applications/Wireshark.app/Contents/MacOS/tshark
-#   - Our Lisp build: both SBCL and Clasp validated (329 tests each, all gates green)
+#   - Our Lisp build at that date: SBCL and Clasp validated (329 tests each, all gates green); Clasp withdrawn since (ADR 0118)
 #
 # LIVE EXECUTION OUTCOME
 #   A fully automated live cross-peer run CANNOT be completed in this environment:
@@ -43,7 +43,7 @@
 #   1. Build the Lisp driver:
 #        cd <repo-root> && make build
 #   2. Start our participant (WITH IdentityToken) on domain 0 in one terminal:
-#        scripts/with-clasp.sh --eval '
+#        scripts/with-sbcl.sh --eval '
 #          (asdf:load-system :dds)
 #          ;; Load test PKI fixtures
 #          (let* ((ca   (uiop:read-file-string "interop/security-auth/pki/ca/ca-cert.pem"))
@@ -158,30 +158,23 @@ echo "This test validates the don't-break property without a live foreign peer:"
 echo "  - arm (b): DEFAULT-OFF -> byte-identical SPDP (no PID_IDENTITY_TOKEN, no PSM bits)"
 echo "  - arm (a): WITH-token -> PID_IDENTITY_TOKEN round-trips + PSM bits 22/23 set"
 echo ""
-echo "Running the portable guard (Clasp first, then SBCL)..."
+echo "Running the portable guard (SBCL leg, then AllegroCL leg)..."
 echo ""
 
-CLASP="${REPO_ROOT}/projects/clasp/build/boehmprecise/clasp"
-if [ -f "${CLASP}" ]; then
-    echo "--- Clasp ---"
-    "${CLASP}" --non-interactive \
-        --eval "(asdf:test-system :dds-tests)" \
-        --eval "(let ((results (dds.tests:run-auth-spdp-identity-token-test))) (format t \"~&auth-spdp-identity-token: ~a~%\" results))" \
-        --eval "(uiop:quit 0)" 2>&1 || true
-else
-    echo "[SKIP] Clasp binary not found at ${CLASP}"
-fi
-
-echo ""
-echo "--- SBCL ---"
-if command -v sbcl >/dev/null 2>&1; then
-    sbcl --non-interactive \
-        --eval "(asdf:test-system :dds-tests)" \
-        --eval "(let ((results (dds.tests:run-auth-spdp-identity-token-test))) (format t \"~&auth-spdp-identity-token: ~a~%\" results))" \
-        --eval "(uiop:quit 0)" 2>&1 || true
-else
-    echo "[SKIP] sbcl not found on PATH"
-fi
+# One leg per supported Lisp (ADR 0118). A missing Lisp, a failing test, or a skipped test (no OpenSSL
+# >= 3.5) FAILS its leg, and either leg failing fails the run.
+# shellcheck source=../lisp-legs.sh
+. "${REPO_ROOT}/interop/lisp-legs.sh"
+legs_failed=0
+for leg in "sbcl:${SBCL_LAUNCHER}:900" "allegro:${ALLEGRO_LAUNCHER}:2400"; do
+  IFS=: read -r label launcher secs <<<"$leg"
+  echo "--- ${label} ---"
+  if ! run_inprocess_leg "$label" "$launcher" "/tmp/auth-discovery-${label}.log" "$secs" \
+       dds.tests::run-auth-spdp-identity-token-test; then
+    legs_failed=1
+  fi
+  echo ""
+done
 
 echo ""
 echo "=== Outcome ==="
@@ -189,3 +182,9 @@ echo "ENVIRONMENT-LIMITED: live cross-peer don't-break check requires a display 
 echo "  (GUI Shapes Demo) or headless Fast DDS tools not available here."
 echo "Portable guard (run-auth-spdp-identity-token-test) + RTPS spec evidence (§9.6.2.2.2)"
 echo "  provide structural confidence. See interop/security-auth-discovery/README.md."
+
+if [ "$legs_failed" -ne 0 ]; then
+  echo "RESULT: FAIL — the portable guard failed (or did not run) on at least one Lisp"
+  exit 1
+fi
+echo "RESULT: PASS — the portable guard passed on SBCL and AllegroCL"

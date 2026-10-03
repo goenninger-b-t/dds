@@ -90,9 +90,10 @@ The aspects that are our-to-our self-consistent but unverified against a live Co
 
 ---
 
-## Portable guard (in CI; always green)
+## Portable guard (in the dds-tests suite; runner legs SBCL + AllegroCL)
 
-The three in-process tests above run as part of the full `dds-tests` suite (Clasp first).
+The three in-process tests above run as part of the full `dds-tests` suite; `run-our-to-our.sh` also runs
+them once on SBCL and once on AllegroCL (ADR 0118) and fails if either Lisp is missing, fails, or skips.
 They exercise every layer of the slice without a foreign peer:
 
 - The CMS signature verification is exercised by `run-access-cms-verify-test` (signed fixture
@@ -153,7 +154,7 @@ for both allow and deny rules.
 3. Start the Connext security participant on domain 0 (subscriber with an EC identity).
 4. Start our security participant:
    ```bash
-   scripts/with-clasp.sh --eval '
+   scripts/with-sbcl.sh --eval '
      (asdf:load-system :dds)
      (let* ((to-oct (lambda (s) (map (quote (simple-array (unsigned-byte 8) (*)))
                                      (function char-code) s)))

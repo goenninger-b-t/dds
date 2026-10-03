@@ -24,64 +24,39 @@
 #   loopback capture requires elevated privileges, arm B is skipped and documented here.
 #
 # USAGE:  Run from repo root:  bash interop/security-crypto/run-our2our.sh
-# EXIT:   0 = arm A passed (arm B may be skipped); 1 = arm A failed.
+# EXIT:   0 = arm A passed on BOTH SBCL and AllegroCL (arm B may be skipped); 1 = arm A failed, skipped, or
+#         a Lisp is missing on either leg.
 set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-CLASP_LAUNCHER="$REPO/scripts/with-clasp.sh"
-SBCL_LAUNCHER="$REPO/scripts/with-sbcl.sh"
+# shellcheck source=../lisp-legs.sh
+. "$REPO/interop/lisp-legs.sh"
 
 overall=0
 
-# ── Arm A: in-process ciphertext proof (portable, runs on both impls) ──────────────────────
+# ── Arm A: in-process ciphertext proof (portable; one leg per supported Lisp) ───────────────
 #
-# Invokes run-security-encrypted-pubsub-test directly via the test harness.
-# This test asserts (a) SUB receives plaintext, (b) PLAIN receives ciphertext,
-# (c) ciphertext begins with #(0 0 0 4) = AES256-GCM transformation_kind.
-
-run_in_process() {
-  local label="$1"
-  local launcher="$2"
-  local log="/tmp/sec-crypto-${label}.log"
-
-  echo "=== [${label}] arm A: in-process encrypted-pubsub ciphertext proof ==="
-  "$launcher" --eval '(asdf:test-system :dds-tests)' >"$log" 2>&1
-  local rc=$?
-
-  if grep -q "security-encrypted-pubsub" "$log" && ! grep -q "TEST FAILED" "$log"; then
-    echo "  [${label}] arm A: PASS"
-    tail -5 "$log"
-  else
-    echo "  [${label}] arm A: FAIL (rc=${rc})"
-    grep -E "TEST FAILED|security-encrypted-pubsub|error|Error" "$log" | head -20
-    echo "  --- full log: ${log} ---"
-    return 1
-  fi
-}
+# Runs run-security-encrypted-pubsub-test on SBCL and on AllegroCL (ADR 0118). This test asserts
+# (a) SUB receives plaintext, (b) PLAIN receives ciphertext, (c) ciphertext begins with #(0 0 0 4) =
+# AES256-GCM transformation_kind. A leg FAILS if its Lisp is missing, if the test fails, or if the test
+# skips (it needs OpenSSL >= 3.5; a skipped proof proves nothing).
 
 echo ""
 echo "=== WP-DDS-SECURITY-CRYPTO-MVP T3: our-to-our encrypted pub/sub wire proof ==="
 echo "=== ADR 0031, DDS-Security 1.1 §9.5.3.3 Slice-1 ==="
 echo ""
 
-# Clasp first (operating contract)
-if run_in_process "clasp" "$CLASP_LAUNCHER"; then
-  echo "Clasp arm A: PASS"
-else
-  echo "Clasp arm A: FAIL"
-  overall=1
-fi
-
-echo ""
-
-if run_in_process "sbcl" "$SBCL_LAUNCHER"; then
-  echo "SBCL arm A: PASS"
-else
-  echo "SBCL arm A: FAIL"
-  overall=1
-fi
-
-echo ""
+for leg in "sbcl:$SBCL_LAUNCHER:900" "allegro:$ALLEGRO_LAUNCHER:2400"; do
+  IFS=: read -r label launcher secs <<<"$leg"
+  if run_inprocess_leg "$label" "$launcher" "/tmp/sec-crypto-${label}.log" "$secs" \
+       dds.tests::run-security-encrypted-pubsub-test; then
+    echo "${label} arm A: PASS"
+  else
+    echo "${label} arm A: FAIL"
+    overall=1
+  fi
+  echo ""
+done
 
 # ── Arm B: tshark live capture (environment-dependent) ──────────────────────────────────────
 #
@@ -102,12 +77,12 @@ else
   echo "=== arm B: tshark live ciphertext capture on ${IFACE} ==="
   CAP_FILE="/tmp/sec-crypto-tshark.pcap"
 
-  # Capture 5 s of loopback traffic while running the Clasp in-process test in the background.
+  # Capture 5 s of loopback traffic while an SBCL publisher runs in the background.
   "$TSHARK" -i "$IFACE" -a duration:5 -w "$CAP_FILE" -q 2>/dev/null &
   TSHARK_PID=$!
 
-  # Run a single publish (Clasp, domain 83) concurrently with the capture.
-  "$CLASP_LAUNCHER" --eval '
+  # Run a single publish (SBCL, domain 83) concurrently with the capture.
+  timeout --kill-after=30 120 "$SBCL_LAUNCHER" --eval '
     (asdf:load-system :dds-disc)
     (let* ((km (dds.security:make-test-key-material))
            (node (dds.disc:make-disc-node :domain 83 :host "127.0.0.1" :port 0
@@ -121,7 +96,7 @@ else
         (make-array 8 :element-type (quote (unsigned-byte 8))
                       :initial-contents (quote (#x53 #x51 #x55 #x41 #x52 #x45 #x20 #x01))))
       (sleep 1)
-      (dds.disc:stop-node node))' >/dev/null 2>&1 || true
+      (dds.disc:stop-node node))' --eval '(uiop:quit 0)' >/dev/null 2>&1 || true
 
   wait "$TSHARK_PID" 2>/dev/null || true
 
@@ -149,7 +124,7 @@ fi
 
 echo ""
 if [ "$overall" -eq 0 ]; then
-  echo "=== RESULT: arm A PASSED on both Clasp and SBCL (wire carries SecuredPayload, not plaintext) ==="
+  echo "=== RESULT: arm A PASSED on both SBCL and AllegroCL (wire carries SecuredPayload, not plaintext) ==="
 else
   echo "=== RESULT: arm A FAILED on one or more impls ==="
 fi
