@@ -10,7 +10,8 @@ a unique identifier). SPDX 3.0's native serialization is JSON-LD, so this emits 
 Top-level dependencies are derived live from the ASDF *.asd `:depends-on` lists (so new
 direct deps appear automatically); version/licence/supplier come from the pinned table
 below (refresh from the Quicklisp dist when it changes). The runtime (SBCL) version is
-queried live when `sbcl` is on PATH. Dynamic fields (timestamp, git revision) are computed
+queried live when `sbcl` is on PATH; AllegroCL, the second required runtime (ADR 0118), is pinned in
+the table because querying it means starting a licensed image. Dynamic fields (timestamp, git revision) are computed
 each run. Run before every commit (scripts/git-hooks/pre-commit) or via `make sbom`.
 """
 import datetime
@@ -70,6 +71,14 @@ COMPONENTS = {
     "libsqlite3":       {"version": "3.51.0", "license": "NOASSERTION",
                          "download": "https://www.sqlite.org/download.html",
                          "supplier": "SQLite Consortium"},
+    # AllegroCL is the SECOND REQUIRED Common Lisp runtime (ADR 0118: SBCL and AllegroCL, co-equal; Clasp
+    # withdrawn). Pinned rather than queried: starting it here would need the licensed image on every
+    # committer's PATH. 11.0 is what `(lisp-implementation-version)` reports on the reference host
+    # ("11.0 [64-bit Linux (x86-64) *SMP*]", Enterprise Edition, checked 2026-10-04; docs/provenance.md).
+    # Commercial, closed-source: the licence is a LicenseRef (plan decision D6), not an SPDX list id.
+    "allegrocl":        {"version": "11.0", "license": "LicenseRef-Franz-proprietary",
+                         "download": "https://franz.com/products/allegro-common-lisp/",
+                         "supplier": "Franz Inc."},
 }
 
 
@@ -127,6 +136,8 @@ def main():
     doc_id = NS + "document"
     root_pkg = NS + "package/neodds"
     rt_pkg = NS + "package/sbcl"
+    acl_pkg = NS + "package/allegrocl"
+    lic_franz = NS + "license/LicenseRef-Franz-proprietary"
     openssl_pkg = NS + "package/openssl"
     iterate_pkg = NS + "package/iterate"
     libsqlite3_pkg = NS + "package/libsqlite3"
@@ -165,7 +176,12 @@ def main():
                   "creationInfo": ci, "simplelicensing_licenseExpression": "CC-BY-ND-4.0"})
     graph.append({"spdxId": lic_apache, "type": "simplelicensing_LicenseExpression",
                   "creationInfo": ci, "simplelicensing_licenseExpression": "Apache-2.0"})
-    elements += [lic_mit, lic_cc0, lic_proj, lic_apache]
+    graph.append({"spdxId": lic_franz, "type": "simplelicensing_LicenseExpression",
+                  "creationInfo": ci,
+                  "simplelicensing_licenseExpression": "LicenseRef-Franz-proprietary",
+                  "comment": "Franz Inc. commercial licence for Allegro Common Lisp (not an SPDX "
+                             "list licence; terms are the licensee's agreement with Franz Inc.)."})
+    elements += [lic_mit, lic_cc0, lic_proj, lic_apache, lic_franz]
 
     # Root product package.
     root = {"spdxId": root_pkg, "type": "software_Package", "creationInfo": ci,
@@ -203,13 +219,15 @@ def main():
         graph.append({"spdxId": rid, "type": "Relationship", "creationInfo": ci,
                       "from": root_pkg, "to": [pid], "relationshipType": "dependsOn"})
 
-    # Runtime: the Common Lisp implementation (SBCL queried live; Clasp is the alternative).
+    # Runtime: the Common Lisp implementations. Two are required (ADR 0118): SBCL (queried live) and
+    # AllegroCL (pinned, emitted after SBCL below).
     graph.append({"spdxId": rt_pkg, "type": "software_Package", "creationInfo": ci,
                   "name": "sbcl", "software_packageVersion": sbcl_version(),
                   "software_downloadLocation": "https://www.sbcl.org/",
                   "software_homePage": "https://www.sbcl.org/",
                   "software_primaryPurpose": "application",
-                  "comment": "Common Lisp runtime (alternative landed target: Clasp). "
+                  "comment": "Common Lisp runtime (one of the two required targets, with "
+                             "AllegroCL; ADR 0118). "
                              "SBCL is public-domain with BSD/MIT portions -> declared "
                              "licence omitted (NOASSERTION)."})
     elements.append(rt_pkg)
@@ -217,6 +235,33 @@ def main():
     relationships.append(rt_rel)
     graph.append({"spdxId": rt_rel, "type": "Relationship", "creationInfo": ci,
                   "from": root_pkg, "to": [rt_pkg], "relationshipType": "dependsOn",
+                  "comment": "runtime dependency"})
+
+    # Runtime: AllegroCL (pinned; commercial, Franz Inc.).
+    acl = COMPONENTS["allegrocl"]
+    acl_sup = acl["supplier"]
+    if acl_sup not in suppliers:
+        acl_sup_id = NS + "agent/" + slug(acl_sup)
+        suppliers[acl_sup] = acl_sup_id
+        graph.append({"spdxId": acl_sup_id, "type": "Organization", "creationInfo": ci,
+                      "name": acl_sup})
+        elements.append(acl_sup_id)
+    graph.append({"spdxId": acl_pkg, "type": "software_Package", "creationInfo": ci,
+                  "name": "allegrocl", "software_packageVersion": acl["version"],
+                  "software_downloadLocation": acl["download"],
+                  "software_homePage": acl["download"],
+                  "software_packageUrl": "pkg:generic/allegrocl@" + acl["version"],
+                  "software_primaryPurpose": "application",
+                  "software_declaredLicense": lic_franz,
+                  "suppliedBy": suppliers[acl_sup],
+                  "comment": "Common Lisp runtime (one of the two required targets, with SBCL; "
+                             "ADR 0118). Allegro CL 11.0 Enterprise, 64-bit Linux x86-64 SMP, the "
+                             "alisp image. Commercial licence from Franz Inc."})
+    elements.append(acl_pkg)
+    acl_rel = NS + "relationship/runtime-allegrocl"
+    relationships.append(acl_rel)
+    graph.append({"spdxId": acl_rel, "type": "Relationship", "creationInfo": ci,
+                  "from": root_pkg, "to": [acl_pkg], "relationshipType": "dependsOn",
                   "comment": "runtime dependency"})
 
     # Native runtime: OpenSSL >= 3.5 (the CNSA-2.0 DARE crypto backend for dds-dare; loaded via
@@ -301,7 +346,8 @@ def main():
     # The SBOM element (its rootElement is the product; contents are deps + relationships).
     graph.append({"spdxId": sbom_id, "type": "software_Sbom", "creationInfo": ci,
                   "software_sbomType": ["source"], "rootElement": [root_pkg],
-                  "element": dep_ids + [rt_pkg, openssl_pkg, iterate_pkg, libsqlite3_pkg] + relationships})
+                  "element": dep_ids + [rt_pkg, acl_pkg, openssl_pkg, iterate_pkg, libsqlite3_pkg]
+                             + relationships})
     elements.append(sbom_id)
 
     # The containing document.

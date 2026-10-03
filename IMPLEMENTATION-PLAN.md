@@ -1,7 +1,7 @@
 # IMPLEMENTATION PLAN — NeoDDS (Common Lisp DDS/RTPS Stack, XCDR-based)
 
 **Companion to:** `REQUIREMENTS.md` (read first). **Tone:** normative, sequencing-focused.
-**Method:** subagent-driven, contract-first. **Targets:** SBCL, AllegroCL, Clasp.
+**Method:** subagent-driven, contract-first. **Targets:** SBCL, AllegroCL (Clasp withdrawn 2026-10-03, ADR 0118).
 
 > This plan is written so that autonomous coding subagents can each own a work package with minimal coupling. The governing rule is **contract-first**: inter-layer interfaces are frozen by the Integrator before parallel work begins; changes flow through ADRs.
 
@@ -32,11 +32,10 @@ L0  PAL (per-impl)       Raw memory/SAP, atomics/CAS/fences, native threads, soc
 
 ```
 dds/                      (umbrella)
-  dds-pal/                L0 — files guarded by #+sbcl / #+allegro / #+clasp; ONE shared contract package
+  dds-pal/                L0 — files guarded by #+sbcl / #+allegro; ONE shared contract package
     src/pal-contract.lisp     (the frozen API: package DDS.PAL, all functions declared here)
     src/pal-sbcl.lisp
     src/pal-allegro.lisp
-    src/pal-clasp.lisp
   dds-core/               L1
   dds-cdr/                L2   (depends: dds-core)
   dds-types/              L3   (depends: dds-cdr)         — runtime type machinery
@@ -60,7 +59,7 @@ dds/                      (umbrella)
   dds-tests/  dds-bench/  dds-interop/   (cross-cutting test/bench/interop systems)
 ```
 
-**Conditional-compilation rule (MUST):** `#+sbcl|#+allegro|#+clasp` reader conditionals appear **only** inside `dds-pal/` and (rarely, with an ADR) inside `dds-bench/`. A CI lint fails the build on any reader conditional elsewhere.
+**Conditional-compilation rule (MUST):** `#+sbcl|#+allegro` reader conditionals appear **only** inside `dds-pal/` and (rarely, with an ADR) inside `dds-bench/`. A CI lint fails the build on any reader conditional elsewhere.
 
 ---
 
@@ -75,7 +74,7 @@ The work is decomposed so that, after an initial contract-freeze phase, **6–10
 | **A0 — Architect/Integrator** (lead) | All contracts, ADRs, integration, the verification matrix, release gates | Frozen interface packages; merges; gate sign-off |
 | **A1 — PAL/SBCL** | `pal-sbcl.lisp` | SAP buffers, atomics, sockets, GC hooks, vops for endian/memcpy |
 | **A2 — PAL/Allegro** | `pal-allegro.lisp` | `sys:memref` buffers, native atomics+`mp:`, sockets, `gsgc` hooks |
-| **A3 — PAL/Clasp** | `pal-clasp.lisp` | CFFI/clbind buffers, `mp:`/std::atomic, sockets, Boehm/MPS tuning; optional C++ hot-codec |
+| ~~**A3 — PAL/Clasp**~~ | — | **Withdrawn (ADR 0118).** Clasp is not a target; `pal-clasp.lisp` was deleted (recovery point: git tag `clasp-last`). |
 | **A4 — CDR codec** | `dds-cdr/` | XCDR1/2 encode/decode, encapsulation, conformance corpus |
 | **A5 — Type compiler** | `dds-types/`, `dds-gen/` | IDL/s-expr → defstruct+codecs+TypeObject+keyhash+type-support |
 | **A6 — RTPS engine** | `dds-rtps/` | submessage codec, writer/reader state machines, reliability, fragmentation, HistoryCache |
@@ -94,13 +93,13 @@ A single human (or a single orchestrating agent) MAY hold several roles in early
 1. **A0 freezes the L0–L4 interface packages in M0** (signatures + docstrings + invariants + a stub/mocked impl). These are: `DDS.PAL`, `DDS.CORE.BUFFER`, `DDS.CDR` (the codec protocol), the **`type-support` struct shape**, the **transport record shape**, and the **HistoryCache protocol**. See §7.
 2. Each agent codes against frozen contracts + the mocked deps, with its own unit tests, **before** the real dependency exists.
 3. Interface changes require an **ADR** (`/docs/adr/NNNN-*.md`) approved by A0; the ADR enumerates every consumer and the migration.
-4. **Definition of Done (per WP):** code + unit tests green on all three impls (or documented Clasp gap) + contract unchanged-or-ADR'd + docs updated + entry in verification matrix.
+4. **Definition of Done (per WP):** code + unit tests green on SBCL and AllegroCL (both required, ADR 0118) + contract unchanged-or-ADR'd + docs updated + entry in verification matrix.
 5. **Integration cadence:** weekly merge to `main`; a green `main` requires the full conformance suite for all *landed* profiles to pass.
 6. **No agent edits another agent's package** without a cross-cutting ADR; bugs in a dependency are filed, not patched in place.
 
 ### 3.3 Parallelism map (what can run concurrently)
 
-- After M0 freeze: **A1/A2/A3 (PALs), A4 (CDR), A5 (types/gen)** run fully in parallel against contracts.
+- After M0 freeze: **A1/A2 (PALs), A4 (CDR), A5 (types/gen)** run fully in parallel against contracts.
 - A6 (RTPS) starts against the **mock transport + mock type-support**, so it does not wait for A9 or A5.
 - A8 (DCPS) starts against a **mock RTPS engine** exposing the writer/reader/HistoryCache protocol.
 - A11 (interop/QA) builds the harness against mocks and the Shapes type early, so interop tests exist *before* the engine is real.
@@ -113,16 +112,16 @@ A single human (or a single orchestrating agent) MAY hold several roles in early
 Effort is expressed in **sequence and dependency**, not calendar dates (calendar depends on agent throughput, which is yours to set). Each milestone has a hard, demonstrable exit gate.
 
 ### M0 — Contracts, skeleton, CI (foundation)
-- A0 freezes interface packages (§7); CI matrix (SBCL/Allegro/Clasp) green on the skeleton; `noclos-gate` lint live; ADR process live.
+- A0 freezes interface packages (§7); CI matrix (SBCL/Allegro) green on the skeleton; `noclos-gate` lint live; ADR process live.
 - PAL **contract** defined; each PAL has a *compiling stub* (real impls follow in M1).
-- **Exit:** every ASDF system loads on all three impls; mocks let every upper layer compile; one trivial end-to-end "echo over a mock transport" test passes.
+- **Exit:** every ASDF system loads on SBCL and AllegroCL (ADR 0118: M0 must be re-passed on these two; the earlier Clasp+SBCL pass is not inherited); mocks let every upper layer compile; one trivial end-to-end "echo over a mock transport" test passes.
 
 ### M1 — P0 CDR + real PALs (the bedrock)
 - A4 delivers XCDR1+XCDR2 byte-exact against the conformance corpus (both endiannesses, all extensibility kinds, optionals, DHEADER/EMHEADER).
-- A1/A2/A3 deliver real buffers, atomics, sockets, GC hooks. PAL conformance tests pass on all three.
+- A1/A2 deliver real buffers, atomics, sockets, GC hooks. PAL conformance tests pass on both.
 - A5 delivers the **s-expr type DSL → defstruct + monomorphic codec + key-hash + type-support**; round-trips through A4's codec.
 - A11 stands up the fuzzer against the CDR parser and the (stub) submessage parser.
-- **Exit (P0):** XCDR byte-exact vs. RTI-generated vectors; CDR fuzzer runs clean for N hours; generated `defstruct` types serialize/deserialize losslessly on all three impls.
+- **Exit (P0):** XCDR byte-exact vs. RTI-generated vectors; CDR fuzzer runs clean for N hours; generated `defstruct` types serialize/deserialize losslessly on SBCL and AllegroCL.
 
 ### M2 — P1 Minimal RTPS interop (the credibility milestone)
 - A6 delivers submessage codec + stateful reliable writer/reader + best-effort path + HistoryCache (KEEP_LAST/KEEP_ALL) + HEARTBEAT/ACKNACK/GAP + SequenceNumberSet.
@@ -182,7 +181,7 @@ Each WP: **Owner · Inputs · Outputs · Depends · Acceptance.** (IDs map to mi
 
 ## 6. Per-implementation engineering notes (the L0 substance)
 
-The PAL contract is impl-agnostic; the implementations differ sharply. `(C: high on SBCL specifics; moderate on Allegro/Clasp exact symbol names — verify against current vendor docs; treat symbol names below as the capability required, not a guaranteed spelling.)`
+The PAL contract is impl-agnostic; the implementations differ sharply. `(C: high on SBCL specifics; moderate on Allegro exact symbol names — verify against current vendor docs; treat symbol names below as the capability required, not a guaranteed spelling.)`
 
 ### 6.1 SBCL (pacesetter)
 - **Buffers:** `static-vectors` (foreign-backed `(simple-array (unsigned-byte 8) (*))` with a stable SAP) for all wire I/O; `sb-sys:sap-ref-{8,16,32,64}` with explicit endianness; `sb-sys:with-pinned-objects` only where a Lisp object must survive a syscall. Avoid GC-moving buffers in I/O.
@@ -198,12 +197,17 @@ The PAL contract is impl-agnostic; the implementations differ sharply. `(C: high
 - **Codegen:** `(declaim (optimize (speed 3)(safety 0)))` scoped; use `(declare (:explain :boxing :calls))` to drive boxing out of hot loops; immediate-type-aware coding.
 - **GC/determinism:** Allegro's GC is highly tunable — `sys:gsgc-parameter` / `sys:gsgc-switch` to control tenuring and newspace; `excl:without-interrupts`/scheduling for short critical sections.
 
-### 6.3 Clasp (trailing target)
+### 6.3 Clasp — withdrawn (ADR 0118)
+
+> **Withdrawn 2026-10-03 (owner directive, ADR 0118).** Clasp is not a target: it is not built, tested,
+> benched or used as an interop leg, and no code path, launcher or reader conditional exists for it. The
+> notes below are kept as history only; they bind nothing. Recovery point: git tag `clasp-last`.
+
 - **Buffers:** CFFI (`cffi:foreign-alloc`, `cffi:mem-ref`) and/or `clbind` to C++; a `static-vectors` backend if available, else CFFI buffers. The hot CDR codec MAY be implemented in C++ and exposed via `clbind` — a legitimate, Clasp-specific optimization that sidesteps GC entirely for serialization. `(C: moderate.)`
 - **Atomics/concurrency:** `mp:` package; `std::atomic` via interop where needed; `atomics` library fallback.
 - **Sockets:** CFFI to POSIX directly (Clasp's strength is C interop).
 - **Codegen:** LLVM backend does the heavy lifting; `(declaim (optimize speed))`; push truly-hot kernels to C++.
-- **GC/determinism:** **the risk.** Boehm is conservative (imprecise, less predictable pauses); MPS-precise mode is preferable for determinism — evaluate. Document the NFR-PERF-3/8 gap rather than pretend parity. Clasp is allowed to trail one profile (NFR-PORT).
+- **GC/determinism:** **the risk.** Boehm is conservative (imprecise, less predictable pauses); MPS-precise mode is preferable for determinism — evaluate. Document the NFR-PERF-3/8 gap rather than pretend parity. (History: NFR-PORT once allowed Clasp to trail one profile; ADR 0118 withdrew that allowance.)
 
 ---
 
@@ -292,11 +296,11 @@ arena-report (arena) -> plist                             ; reserved sizes per p
 
 ## 8. Testing & verification strategy
 
-- **Unit:** per module, per impl. CI matrix = {SBCL, Allegro, Clasp} × {systems landed}.
+- **Unit:** per module, per impl. CI matrix = {SBCL, Allegro} × {systems landed}.
 - **CDR conformance corpus (gating P0):** golden byte vectors for every primitive, struct, union, sequence, array, optional, and extensibility kind, both endiannesses — generated from (a) RTI `rtiddsgen` reference programs and (b) [XTYPES] worked examples. Assert byte-exact. This is the single highest-leverage test asset; build it first.
 - **Property/fuzz (gating P1+):** the CDR decoder and RTPS submessage parser are fuzzed (AFL/libFuzzer-style via CFFI harness, plus replay of captured Connext traffic). A malformed packet MUST never corrupt memory (NFR-SEC-POSTURE) — fuzz proves it.
 - **RTPS reliability correctness:** a lossy/reordering/duplicating mock transport injects faults; assert eventual reliable delivery, correct NACK/GAP, no infinite retransmit, resource limits honored.
-- **Interop matrix (gating, FR-IO):** {SBCL, Allegro, Clasp} × {Connext 7.x, one of Fast DDS/Cyclone/OpenDDS} × {best-effort, reliable, content-filter, durability, XTypes-evolution, large-data/frag}. Wireshark/tshark validates wire conformance in CI. The **Shapes** demo is the smoke test; the matrix is the gate.
+- **Interop matrix (gating, FR-IO):** {SBCL, Allegro} × {Connext 7.x, one of Fast DDS/Cyclone/OpenDDS} × {best-effort, reliable, content-filter, durability, XTypes-evolution, large-data/frag}. Wireshark/tshark validates wire conformance in CI. The **Shapes** demo is the smoke test; the matrix is the gate.
 - **Performance harness (`dds-bench`, gating NFR-PERF):** mirror RTI Perftest scenarios (latency PING/PONG halved for one-way; max-throughput with batching; latency-vs-throughput) on **identical hardware** running both this stack and Connext; report p50/p99/p99.99/max + samples/s + Mbps + allocation counters + GC events. Parity is judged from this report.
 - **Determinism/soak:** 24h+ runs reporting latency-distribution drift, GC frequency/pause, and queue-depth stability; verify **0 bytes/sample** in pre-alloc mode via allocation counters.
 - **`hotpath-purity-gate` (gating, all):** static analysis fails the build if `defmethod`/`defgeneric`/`defclass` — or per-sample CLOS instantiation — appears in the designated hot-path packages (`dds.cdr`, generated-codec output, `dds.core.buffer`, the engine's per-sample dispatch module, `dds.rtps.history` change ops). CLOS is unrestricted everywhere else and is the preferred default there.
@@ -307,14 +311,14 @@ arena-report (arena) -> plist                             ; reserved sizes per p
 
 Priority order — fix these and dispatch overhead is noise; ignore them and zero-CLOS is cosmetic:
 
-1. **Allocation/GC (highest leverage).** A static, startup-allocated, **non-GC'd arena** (sized by the special variable `*static-arena-bytes*`, read once at factory init) backs all hot-path buffers and pools (`CacheChange`/`SampleInfo`/fragments/scratch/per-endpoint state); steady-state acquire/release is pointer/index work with **0 allocation**. Raw-pointer/SAP buffers are always foreign/static (stable across SBCL's and Allegro's *moving* GCs; out of Clasp/Boehm's conservative scan). Arena exhaustion → RESOURCE_LIMITS (reject/backpressure), **never** a silent GC-heap fallback on the hot path. `dynamic-extent` for transients; per-impl GC tuning for the cold path. Verified by allocation counters **and per-pool high-water-mark**, not by eye.
+1. **Allocation/GC (highest leverage).** A static, startup-allocated, **non-GC'd arena** (sized by the special variable `*static-arena-bytes*`, read once at factory init) backs all hot-path buffers and pools (`CacheChange`/`SampleInfo`/fragments/scratch/per-endpoint state); steady-state acquire/release is pointer/index work with **0 allocation**. Raw-pointer/SAP buffers are always foreign/static (stable across SBCL's and Allegro's *moving* GCs). Arena exhaustion → RESOURCE_LIMITS (reject/backpressure), **never** a silent GC-heap fallback on the hot path. `dynamic-extent` for transients; per-impl GC tuning for the cold path. Verified by allocation counters **and per-pool high-water-mark**, not by eye.
 2. **Copies.** Target counts: UDP plain = 2 (ser into pooled buffer → socket; socket → pooled buffer + deser); FlatData = ser/deser elided (in-memory == wire); Zero-Copy/SHMEM = 0 intra-host (transmit 16-byte references). Every copy on the path is justified in code review or removed.
 3. **Syscalls.** `sendmmsg`/`recvmmsg` to batch; `sendmsg` iovec for scatter/gather (header + payload without a join copy); large socket buffers; multicast to fan out once.
 4. **Locks.** Lock-free SPSC (writer→sender) and MPSC (receiver→readers); per-endpoint state partitioned to avoid global locks; reader/writer matching done off the hot path.
 5. **Dispatch (lowest leverage, but free to get right).** On the per-sample path: monomorphic generated codecs; manual-vtable `funcall`; no GF type-cache probes; typed slot access with declarations. Off the per-sample path, generic functions are fine and preferred — a once-per-`write` GF on a monomorphic call site is single-digit-to-low-tens-of-ns on SBCL and is dominated by the serialization work it guards; verify with the bench harness rather than assuming.
 6. **Wire efficiency.** XCDR2 by default (more compact, 4-byte max alignment); batching for small samples; optional LZ4 at serialization.
 
-**Instrument first, optimize second.** Each impl gets a profiling recipe (SBCL `sb-sprof` + `statistical`/`:alloc`; Allegro profiler + `:explain` boxing notes; Clasp LLVM/perf). No optimization lands without a before/after number in the bench report.
+**Instrument first, optimize second.** Each impl gets a profiling recipe (SBCL `sb-sprof` + `statistical`/`:alloc`; Allegro profiler + `:explain` boxing notes). No optimization lands without a before/after number in the bench report.
 
 ---
 
@@ -326,9 +330,9 @@ Priority order — fix these and dispatch overhead is noise; ignore them and zer
 | R2 | Scope creep toward full "Professional" service suite | High | Very High | Hard scope line (REQUIREMENTS §1.2/§13); services only as separately-funded programs |
 | R3 | XCDR1↔XCDR2 alignment/extensibility interop bugs | High | High | Byte-exact corpus from RTI vectors *first*; tshark CI; fuzz; test 8-byte-member FINAL types specifically |
 | R4 | SequenceNumberSet / NACK bitmap off-by-one | Medium-High | High | Exhaustive bitmap tests; cross-check against Connext captures |
-| R5 | Clasp determinism/perf below target | Medium-High | Medium | NFR-PORT one-profile trailing allowance; MPS-precise GC eval; C++ hot-codec via clbind |
+| R5 | ~~Clasp determinism/perf below target~~ | — | — | **Withdrawn (ADR 0118):** Clasp is not a target, so the risk has no subject. |
 | R6 | FlatData/Zero-Copy **patent** exposure | Medium | **High (legal)** | Legal review before P4 ship; design around encumbered claims; document provenance (NFR-IP) |
-| R7 | Allegro/Clasp PAL primitive availability (exact atomic/socket APIs) differ from assumption | Medium | Medium | `atomics`+`bordeaux-threads`+`usocket` portable fallback; native fast paths as enhancement, not dependency |
+| R7 | Allegro PAL primitive availability (exact atomic/socket APIs) differ from assumption | Medium | Medium | `atomics`+`bordeaux-threads`+`usocket` portable fallback; native fast paths as enhancement, not dependency |
 | R8 | Type compiler complexity (IDL 4.2 full grammar) underestimated | Medium | Medium | s-expr DSL first (unblocks everyone); IDL parser as a second, parallel track |
 | R9 | Subagent integration drift / contract churn | Medium | High | Contract-first freeze; ADR gate; weekly green-`main` discipline; mocks for every dependency |
 | R10 | Discovery scalability / no-multicast deployment | Medium | Medium | Initial-peers + unicast-only mode in P1; defer Cloud-Discovery equivalent |
@@ -349,7 +353,7 @@ Priority order — fix these and dispatch overhead is noise; ignore them and zer
 ## 12. CI / tooling
 
 - ASDF + a lockfile (qlot or vendored) pinning every dependency.
-- GitHub-Actions-equivalent matrix: SBCL (latest + one prior), AllegroCL (the licensed version), Clasp (recent). Jobs: build, unit, CDR-corpus, fuzz (time-boxed), `hotpath-purity-gate`, tshark wire-conformance, interop (nightly, needs Connext + a peer in the runner), bench (nightly, dedicated HW), soak (weekly).
+- GitHub-Actions-equivalent matrix: SBCL (latest + one prior), AllegroCL (the licensed version). Jobs: build, unit, CDR-corpus, fuzz (time-boxed), `hotpath-purity-gate`, tshark wire-conformance, interop (nightly, needs Connext + a peer in the runner), bench (nightly, dedicated HW), soak (weekly).
 - ADR log, verification matrix CSV, and the interop matrix are CI-published artifacts.
 
 ---

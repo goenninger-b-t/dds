@@ -373,7 +373,7 @@ Still provisional: the unexercised serialization-VM edges (unions, MUTABLE struc
   the late reader's NACK, `CDR_LE 0x0001`); the reverse legs rest on the decoded application receipt + our
   outbound ACKNACKs on the wire, because the macOS lo0 BPF under-captures the foreign→us user-DATA
   direction (the same documented quirk, stated plainly). Our-to-our the feature is also covered by the
-  unit test `run-dcps-durability-latejoiner-test` (green SBCL + Clasp).
+  unit test `run-dcps-durability-latejoiner-test` (green on SBCL; SBCL-only evidence, ADR 0118 §3).
 
 Cross-links: [Type system](type-system.md) · [Discovery](discovery.md) · [DCPS](dcps.md) ·
 [CDR & memory](cdr-and-memory.md).

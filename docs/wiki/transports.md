@@ -1,13 +1,18 @@
 # Transports & the Platform Abstraction Layer
 
+> **Reading the evidence on this page (ADR 0118 §3).** Results recorded before 2026-10-03 as "both impls",
+> "SBCL + Clasp" or "Clasp first" are **SBCL-only evidence**: Clasp was withdrawn as a target, and AllegroCL
+> is unverified for such an item until an AllegroCL run says otherwise. Where this page says "both impls" about
+> a result dated 2026-10-03 or later, it means SBCL and AllegroCL.
+
 The transport layer (L7, `dds-xport`) decouples the RTPS engine from the wire: every transport is a single
 `transport` record — a `defstruct` whose per-packet `send` (and lifecycle) operations are *stored functions*,
 so the latency path is one slot read plus a `funcall`, never a CLOS dispatch. Adding a transport means
 constructing one record; the engine above is untouched (FR-XPORT-5). The Platform Abstraction Layer (L0,
 `dds-pal`) is the single frozen contract every layer depends on for off-heap static memory, atomics,
 threads/locks/condvars, UDPv4 sockets, the monotonic clock, GC control, and optimization hints — and it is the
-**only** place in the tree where `#+sbcl`/`#+clasp` reader conditionals are permitted (NFR-PORT). Landed today:
-UDPv4 unicast/multicast over each implementation's native `sb-bsd-sockets`, plus a synchronous loopback mock
+**only** place in the tree where `#+sbcl`/`#+allegro` reader conditionals are permitted (NFR-PORT). Landed today:
+UDPv4 unicast/multicast over each implementation's native sockets (SBCL `sb-bsd-sockets`, AllegroCL `socket:`, ADR 0114), plus a synchronous loopback mock
 for tests.
 
 Package nicknames used below: `dds.xport`, `dds.xport.udp`, `dds.pal` (and `dds.core.buffer`,
@@ -288,7 +293,7 @@ in-segment `PTHREAD_PROCESS_SHARED` mutex/condvar. All thin CFFI wrappers; no ex
 | `dds.pal:sysv-sem-open` / `-create` | function | Open an existing / create an exclusive System V semaphore set (`semget`). |
 | `dds.pal:sysv-sem-op` | function | `(set semnum delta undo-p)` — one `semop`: `delta<0` takes, `>0` posts, with `SEM_UNDO` iff `undo-p`. |
 | `dds.pal:sysv-sem-setval` / `-getval` | function | `semctl(SETVAL)` / `(GETVAL)` — set/read a semaphore value. `SETVAL` is the idempotent wake RTI's producer uses. |
-| `dds.pal:sysv-sem-setval-reliable-p` | function | `T` unless `semctl(SETVAL)` mispasses its variadic value (Clasp/macOS-arm64, ADR 0013). The RTI-SHMEM writer gates on it. |
+| `dds.pal:sysv-sem-setval-reliable-p` | function | `T` unless `semctl(SETVAL)` mispasses its variadic value (measured on the since-withdrawn Clasp/macOS-arm64 target, ADR 0013; the same would hold for any non-SBCL image on Darwin arm64). A runtime probe (SETVAL 42, read back), not a reader conditional. The RTI-SHMEM writer gates on it. |
 
 `least-bytes` on `sysv-shm-attach-readonly` **is the bounds check, and the kernel enforces it**: `shmget`
 returns `EINVAL` when a segment exists for `key` but is smaller than the requested size, so asking for the
@@ -342,13 +347,13 @@ unlike the `open(2)` flags these need no reader conditional.
 | Symbol | Kind | Description |
 |---|---|---|
 | `dds.xport.shmem:*shmem-rx-spin-iterations*` | special | **Latency vs CPU.** How many times the SHMEM receiver re-checks its lanes *before* it takes the mutex and parks on the pshared condvar. **Default 0** (park immediately). Parking costs a cross-process futex round trip — the sender's `pthread_cond_signal` plus the receiver having to be *scheduled* onto a core — measured at **~6–7 µs of the ~19 µs 256 B one-way**. A receiver still spinning when the datagram lands skips both halves, and costs the sender nothing (`%shmem-send` only signals when `parked=1`). Measured: **spin 0 → 19 125 ns; 500 → 12 270 ns; 5 000 → 11 791 ns; 50 000 → 11 750 ns** — it saturates by ~500. CPU cost is modest and bounded (responder CPU 0.76 s → 0.98 s over the same run), because the spin exits the instant data lands and a genuinely idle receiver still parks and *stays* parked. Set it (≈500–2 000) on a latency-critical node. **The spin runs OUTSIDE the pshared mutex** — putting it inside (where `%rx-wait-for-work` runs) starves `stop-shmem-receiver`, which needs that mutex to broadcast: latency went 7× *worse* and long spins hung on teardown. |
-| `dds.pal:monotonic-ns` | function | `()` — monotonic time in nanoseconds, via `clock_gettime` (CFFI, one shared implementation on both impls). The timebase for every latency measurement and RTPS timer deadline. **Resolution 41 ns**; cost 16 ns/call on SBCL, 633 ns/call on Clasp (see below). Superseded the M0 `get-internal-real-time` clock, which had **1 µs** resolution on SBCL — every latency figure published before this landed was quantised to 1 µs per timestamp. |
+| `dds.pal:monotonic-ns` | function | `()` — monotonic time in nanoseconds, via `clock_gettime` (CFFI, one shared implementation on both impls). The timebase for every latency measurement and RTPS timer deadline. **Resolution 41 ns**; cost 16 ns/call on SBCL; not yet measured on AllegroCL (the since-withdrawn Clasp measured 633 ns/call, see below). Superseded the M0 `get-internal-real-time` clock, which had **1 µs** resolution on SBCL — every latency figure published before this landed was quantised to 1 µs per timestamp. |
 | `dds.pal:*clock-monotonic-id*` | special | The `clock_gettime` clk_id, chosen by **measured resolution**, not by name: `4` = `CLOCK_MONOTONIC_RAW` on macOS (id `6`, `CLOCK_MONOTONIC`, is deliberately coarsened to a 1 µs tick there), `1` = `CLOCK_MONOTONIC` on Linux (ns, vDSO). Picking by name is silently wrong both ways — id `6` on Linux is `CLOCK_MONOTONIC_COARSE` (~ms) and the call still *succeeds*. |
-| `dds.pal:*clock-gettime-fp*` | special | The `clock_gettime` pointer, resolved **once** at load. Calling a foreign function *by name* on Clasp re-resolves the symbol on **every call** — measured 4230 ns/call (even bare `getpid()` costs 4824 ns) vs 379 ns through a cached pointer. Every hot foreign call must go through a cached pointer. |
-| `dds.pal:*thread-timespec*` | special | Per-thread pre-allocated foreign `struct timespec` for `monotonic-ns`, bound by `spawn`. `with-foreign-object` is a real `malloc` on Clasp (~3.3 µs/call); it must be reused — but per-thread, never global, because the receiver and user threads read the clock concurrently and would tear each other's timestamp. |
+| `dds.pal:*clock-gettime-fp*` | special | The `clock_gettime` pointer, resolved **once** at load. On some FFIs a call *by name* re-resolves the symbol on **every call** — measured on the since-withdrawn Clasp target (ADR 0118) at 4230 ns/call (even bare `getpid()` cost 4824 ns) vs 379 ns through a cached pointer. Caching costs nothing on SBCL or AllegroCL, so every hot foreign call goes through a cached pointer. |
+| `dds.pal:*thread-timespec*` | special | Per-thread pre-allocated foreign `struct timespec` for `monotonic-ns`, bound by `spawn`. `with-foreign-object` is not free on every FFI (a real `malloc` on the since-withdrawn Clasp target, ~3.3 µs/call), and a reused buffer is the zero-allocation path on SBCL and AllegroCL; it must be reused — but per-thread, never global, because the receiver and user threads read the clock concurrently and would tear each other's timestamp. |
 | `dds.pal:call-with-thread-clock` | function | `(fn)` — run FN with this thread's `monotonic-ns` scratch bound. `spawn` wraps every PAL thread in it; a thread the PAL did not create (e.g. a bench harness) may wrap itself to get the fast path instead of the `with-foreign-object` fallback. |
 
-> **Clasp clock cost — a known, root-caused platform limit.** Clasp is **633 ns/call** vs SBCL's **16 ns**, with the *same* clock and the *same* 41 ns resolution. The two avoidable costs are fixed above (per-call `dlsym`, per-call foreign `malloc`); the ~600 ns residual is Clasp's **libffi dynamic dispatch** — CFFI exposes no direct-call compiler macro on Clasp (`compiler-macro-function` is `NIL` for `foreign-funcall` and `foreign-funcall-pointer`), whereas SBCL emits a direct inline call. Closing it requires an upstream CFFI/Clasp contribution, not a change here. It is affordable because `monotonic-ns` is **not on the per-sample path** (it serves blocking-wait deadlines, the flow-controller token bucket on opt-in async writers, and shmem stress loops). **Consequence:** sub-µs *profiling* is done on SBCL; both impls remain fully validated for correctness.
+> **History (ADR 0118): the Clasp clock cost.** On the since-withdrawn Clasp target `monotonic-ns` cost **633 ns/call** vs SBCL's **16 ns**, with the *same* clock and the *same* 41 ns resolution. The two avoidable costs are fixed above (per-call `dlsym`, per-call foreign `malloc`); the ~600 ns residual is Clasp's **libffi dynamic dispatch** — CFFI exposes no direct-call compiler macro on Clasp (`compiler-macro-function` is `NIL` for `foreign-funcall` and `foreign-funcall-pointer`), whereas SBCL emits a direct inline call. Closing it requires an upstream CFFI/Clasp contribution, not a change here. It is affordable because `monotonic-ns` is **not on the per-sample path** (it serves blocking-wait deadlines, the flow-controller token bucket on opt-in async writers, and shmem stress loops). **Today:** sub-µs *profiling* is done on SBCL; AllegroCL's per-call clock cost has not been measured.
 
 **GC control / measurement**
 
@@ -612,8 +617,9 @@ default** — a writer with no controller is **byte-identical** to a sync (or `e
 publication async-and-paced; the writer is configured **HISTORY KEEP_ALL** with a finite `max_samples` and a
 `max_blocking_time` so a too-fast producer **blocks up to `max_blocking_time`** then gets `RETCODE_TIMEOUT`
 rather than growing the cache without bound (the backpressure half — see the [QoS wiki](qos.md#backpressure-block-up-to-max_blocking_time-reliability--resource_limits)).
-Adapted from `dds.tests::run-flow-pacing-test` (`src/dds-tests/integration-test.lisp`); SBCL (real threads +
-timing — the flow tests pass-skip on Clasp, NFR-PORT).
+Adapted from `dds.tests::run-flow-pacing-test` (`src/dds-tests/integration-test.lisp`); green on SBCL (real threads +
+timing). On AllegroCL the flow tests currently FAIL — `FLOW-PACE-DELIVERED`, `FLOW-RR-A-DELIVERED` and
+`FLOW-TD-NO-WEDGE` are among the 19 known failures of the 2026-10-03 baseline.
 
 ```lisp
 (let* ((payload (make-array 1400 :element-type '(unsigned-byte 8) :initial-element #x5a))
@@ -798,8 +804,9 @@ attach). The segment is laid out as a fixed-offset, little-endian region:
 - **Notify block** — a `PTHREAD_PROCESS_SHARED` mutex + condition variable + a `stop` flag + a `parked` flag,
   each at a fixed cache-aligned offset, the block sized to the per-platform max pthread struct sizes so one
   layout serves macOS and Linux. (Named POSIX semaphores were rejected: `sem_open` cannot be driven from the
-  Lisp runtime on macOS arm64 — its variadic args are mispassed. The non-variadic `pthread_*` calls work from
-  both SBCL and Clasp on macOS + Linux; libpthread is already linked.)
+  Lisp runtime on macOS arm64 — its variadic args are mispassed. The non-variadic `pthread_*` calls are plain
+  CFFI calls on every PAL; they were validated on SBCL (macOS + Linux) and on the since-withdrawn Clasp;
+  libpthread is already linked.)
 - **K per-sender SPSC lanes** — the path is multi-producer (several same-host participants may target one
   receiver) / single-consumer (one receive loop drains). v1 sidesteps a lock-free MPSC ring by giving **each
   sending participant its own SPSC lane**. A lane is a byte-ring of length-prefixed records `[len][payload]`; a
@@ -809,8 +816,8 @@ attach). The segment is laid out as a fixed-offset, little-endian region:
 
 **Lane claim is mutex-guarded** — at attach, a sender takes the segment's pshared mutex once, finds its
 existing lane (reuse) or the first free one, and claims it. One claim per (sender, receiver) pair for the life
-of the connection, off the hot path — so **no foreign-SAP compare-and-swap is needed**, which gives SBCL and
-Clasp full parity at that layer.
+of the connection, off the hot path — so **no foreign-SAP compare-and-swap is needed**, and the layer has no
+per-implementation atomics at all.
 
 **Steady-state enqueue/drain are lock-free** — the producer copies the record then publishes the advanced
 write-cursor with a *release* fence; the consumer does an *acquire* load of the write-cursor before reading up
@@ -946,11 +953,12 @@ byte-identical. See [security.md §3.8](security.md) and ADR 0051. Proof:
 | `dds.rtps.discovery:endpoint-data-zerocopy-capable` | accessor | T iff the endpoint advertised `PID_ZEROCOPY_CAPABLE` (fail-open: absent → NIL). |
 | `dds.cdr:+zc-encapsulation-id+` / `encode-zc-reference` / `parse-zc-reference` | constant / functions | The 20-octet reference codec (4-octet encapsulation header + `{slot-index, generation, slot-bytes, reserved}` LE). `parse-zc-reference` returns the `reserved` field as a 4th value. |
 | `dds.cdr:+zc-ref-overlay-secured+` | constant | The overlay sentinel (value 1) placed in the reference's `reserved` u32 when the slot holds a `data_protection` `SecuredPayload` overlay (ENCRYPT-tier ZC, ADR 0051); 0 = raw (byte-identical to a non-overlay reference). A LOCAL transport discriminator in our own ZC reference format, not an OMG wire constant; it rides inside the rtps/metadata wrap so a SHMEM attacker cannot flip it. |
-| `dds.xport.zerocopy` | package | The SHMEM sample-pool. The mutex'd copy-resolve (`%zc-resolve`/`%zc-resolve-fresh`) keeps full Clasp parity; the **loaned-RX path is lock-free** (WP-ZC-LOAN-LOCKFREE, ADR 0018, R6): `%zc-loan` writes payload → `fence :release` → generation-store-LAST (the generation is the release/acquire sync variable), `%zc-acquire-for-read` is a generation acquire-load + `fence :acquire` + clamped read (0-copy/0-alloc), and `%zc-release` is a direct `cas-sap-u32` refcount decrement (0-alloc at any generation; the freelist was dropped, so the writer's loan scans the lowest-pubseq `refcount==0` slot, O(slots)). The lock-free path is SBCL-only (foreign-SAP atomics, ADR 0013); Clasp pass-skips. |
+| `dds.xport.zerocopy` | package | The SHMEM sample-pool. The mutex'd copy-resolve (`%zc-resolve`/`%zc-resolve-fresh`) needs no foreign-SAP atomics, so it runs on every PAL; the **loaned-RX path is lock-free** (WP-ZC-LOAN-LOCKFREE, ADR 0018, R6): `%zc-loan` writes payload → `fence :release` → generation-store-LAST (the generation is the release/acquire sync variable), `%zc-acquire-for-read` is a generation acquire-load + `fence :acquire` + clamped read (0-copy/0-alloc), and `%zc-release` is a direct `cas-sap-u32` refcount decrement (0-alloc at any generation; the freelist was dropped, so the writer's loan scans the lowest-pubseq `refcount==0` slot, O(slots)). The lock-free path uses the foreign-SAP atomics (ADR 0013): SBCL `sb-ext:cas`, AllegroCL libatomic (ADR 0113). Its evidence is recorded on SBCL. |
 
 The pool segment name derives deterministically from the writer GUID and the domain (`seg-name-for-guid` + `"z"`, ADR 0099), so the
 reader maps it with no extra advertisement. The cross-vendor case is out of scope (the segment + encapsulation
-are ours — there is no standard RTPS zero-copy wire format). On the Clasp/macOS NFR-PORT gap (no by-name attach)
+are ours — there is no standard RTPS zero-copy wire format). On an image without reliable by-name attach
+(`dds.pal:shm-create-mode-reliable-p` NIL — a non-SBCL image on macOS, which is not an admitted platform)
 Zero-Copy is unavailable for the same reason as SHMEM; its end-to-end test pass-skips.
 
 ### Measured (Phase E) — bench + a real 2-process round-trip
@@ -977,7 +985,7 @@ generation / slot-index (`make fuzz`): the result is always NIL or clamped to sl
 publisher stores each in its pool and sends only a reference, and the subscriber resolves it from the writer's
 pool **cross-process** and verifies the payload byte-exact (PASS = sub received ≥ threshold byte-exact AND the
 pub's `zc-sends > 0`). This is the proof a within-image test cannot give: the reference resolves across the OS
-boundary. SBCL only (Clasp/macOS inherits the SHMEM by-name-attach gap). **FlatData-over-Zero-Copy literal-0-copy
+boundary. Recorded on SBCL only; the AllegroCL leg has not been run. **FlatData-over-Zero-Copy literal-0-copy
 RX landed (WP-FLATDATA-ZC-LOAN, FR-PF-3/4, ADR 0017): a loan-capable `:flatdata` reader's disc receiver thread
 stores the unresolved reference (no copy; slot held via the writer's refcount) and the DCPS `take-loaned` /
 `return-loan` loan API hands the app a `flatdata-view` it reads in place off the writer's slot — see the type
@@ -997,7 +1005,7 @@ view; and the WRITER KEEPS the HistoryCache full-payload copy (needed for retran
 so the writer-side is DOUBLE-STORAGE, NOT zero-copy, under reliability (the v1 cost — no writer-side-zero-copy
 claim for reliable). A saturated pool falls back to the full payload (copy-delivered, never a silent drop).
 Five SBCL scenarios green (`run-reliable-zc-{retransmit,poolfull-fallback,mixed,slot-outlives-purge,qos}-test`;
-Clasp pass-skip), 211 green both impls; the run also found + fixed a latent reliability/memory bug
+recorded alongside the since-withdrawn Clasp, which pass-skipped them), 211 green (SBCL-only evidence, ADR 0118 §3); the run also found + fixed a latent reliability/memory bug
 (`make-reader-qos`/`make-writer-qos` silently dropped a caller's `:reliability` override → a RELIABLE reader
 advertised BEST_EFFORT → was excluded from the writer's purge set → unbounded HC growth; fixed, commit
 `0a03bf5`). Scope-B follow-ups (not done): re-loan-on-retransmit (re-send a ZC ref on the ACKNACK path —
@@ -1028,10 +1036,10 @@ Clasp PAL were removed when Clasp was withdrawn (ADR 0118).
 
 ## Notes / status
 
-- **Landed:** UDPv4 unicast and multicast over each implementation's native `sb-bsd-sockets` (SBCL contrib;
-  Clasp bundled), the pluggable `transport` record, the synchronous mock transport, and the **shared-memory
-  intra-host transport** (FR-XPORT-2; auto-selected for same-host user DATA, UDP fallback; SBCL full, Clasp/macOS
-  NFR-PORT gap — see [SHMEM architecture](#shmem-architecture) above). The SHMEM send now **degrades a signalled
+- **Landed:** UDPv4 unicast and multicast over each implementation's native sockets (SBCL's `sb-bsd-sockets`
+  contrib; AllegroCL's `socket:` module behind the ADR 0114 seam), the pluggable `transport` record, the synchronous mock transport, and the **shared-memory
+  intra-host transport** (FR-XPORT-2; auto-selected for same-host user DATA, UDP fallback; SBCL everywhere, AllegroCL on
+  Linux — see [SHMEM architecture](#shmem-architecture) above). The SHMEM send now **degrades a signalled
   hard fault to the UDP fallback** (WP-SHMEM-SEND-SELF-GUARD, FR-XPORT-2): caught in `%send-raw-buf`, counted in
   `disc-node-shmem-send-faults`, observed via `*sender-emit-error-hook*` (context `:shmem-send-fault`), distinct
   from a benign lane-full return-0 — see
@@ -1071,13 +1079,14 @@ Clasp PAL were removed when Clasp was withdrawn (ADR 0118).
   when all readers are same-host ZC), a TCP transport, a Linux
   `futex` notification fast-path for SHMEM, a lock-free-MPSC ring, and a raw `recvmmsg`/`sendmmsg`/iovec batched
   send/recv fast path. The UDP send is one datagram per `socket-send` (small samples are coalesced first).
-- **Per-impl rule:** `#+sbcl`/`#+clasp` reader conditionals live **only** under `dds-pal/` (`pal-sbcl.lisp` and
+- **Per-impl rule:** `#+sbcl`/`#+allegro` reader conditionals live **only** under `dds-pal/` (`pal-sbcl.lisp` and
   the per-impl PALs). The shared `pal-net.lisp` and everything in `dds-xport` carry none. CI lint enforces this
   (NFR-PORT, the operating contract §10).
-- **PAL maturity:** the **SBCL** PAL is the reference; Clasp shares the native socket layer. The **AllegroCL**
-  PAL is a planned target and **not yet present**. The **M1 atomics fast path landed** with WP-SHMEM (ADR 0013):
+- **PAL maturity:** the **SBCL** PAL is the reference. The **AllegroCL** PAL exists and loads the whole stack
+  (ADR 0113 contract port, ADR 0114 socket seam); its suite runs 627/646 with 19 known failures and a hang at
+  exit (2026-10-03). Clasp was withdrawn (ADR 0118). The **M1 atomics fast path landed** with WP-SHMEM (ADR 0013):
   `fence` is now a real `:acquire`/`:release`/`:full` barrier, and the SAP-targeted 64-bit atomics + POSIX
-  shm/pshared primitives are implemented (SBCL full; Clasp has the SAP-CAS + `shm-create`/macOS gaps noted above).
+  shm/pshared primitives are implemented (SBCL natively; AllegroCL through libatomic and CFFI).
   The generic `cas`/`atomic-incf` place stubs remain (no callers; the SAP forms supersede them). `gc-suggest` and
   `with-gc-inhibited` are still no-ops. (`monotonic-ns` NO LONGER uses the portable scaled clock — the
   promised `clock_gettime` fast path has landed; see the clock entry above.)

@@ -32,7 +32,7 @@ Routing Service, Recording/Replay Service, Cloud Discovery Service, Admin Consol
 ### 1.3 The non-negotiable constraints (from the brief)
 
 1. **CLOS is permitted and preferred wherever it exhibits no performance degradation.** It is the default for the control plane, the public API, listeners, conditions, discovery, the type compiler, and tooling. `defstruct` + monomorphized code generation (and, where per-sample dispatch across many types is required, manual vtables) is mandatory only on the **measured hot path** (CDR primitives, generated per-type codecs, buffer/cursor, `CacheChange`/`SampleInfo`, the RTPS engine's per-sample type dispatch). The boundary is decided by **measurement, not dogma** (see FR-LANG / NFR-CLOS).
-2. **A per-implementation lower layer** (Platform Abstraction Layer, PAL) isolating implementation-specific optimizations for **SBCL, AllegroCL, and Clasp**.
+2. **A per-implementation lower layer** (Platform Abstraction Layer, PAL) isolating implementation-specific optimizations for **SBCL and AllegroCL** (Clasp was withdrawn as a target on 2026-10-03, ADR 0118).
 3. **Connext-class features and performance** as the north star, scoped per §1.1 and quantified in §6 and NFR-PERF.
 
 ---
@@ -75,7 +75,7 @@ Conformance is **profiled** so milestones are demonstrable and "parity" is decom
 - **P6 — Security (gated):** DDS-Security plugins.
 - **P7 — Tooling/Services (gated, mostly §13):** spy, gen, monitoring hooks; services only if separately funded.
 
-A build is "**Connext-class (core)**" when P0–P5 pass conformance + interop + the §6 performance gates on SBCL and AllegroCL; Clasp is allowed to trail by one profile (NFR-PORT).
+A build is "**Connext-class (core)**" when P0–P5 pass conformance + interop + the §6 performance gates on SBCL and AllegroCL; both are required and co-equal, with no profile allowance for either (NFR-PORT, ADR 0118).
 
 ---
 
@@ -228,7 +228,7 @@ Targets are **parity bands relative to RTI Connext on identical hardware/OS/tran
 | NFR-PERF-5 | Throughput, large samples (≥64 KB), UDP | within **1.2×**; ≥90% of line rate on GbE | moderate-high |
 | NFR-PERF-6 | Zero-Copy/SHMEM large-sample latency | within **1.5×** (dominated by SHMEM + mmap, not Lisp) | moderate-high |
 | NFR-PERF-7 | FlatData fixed-size sample: ser/deser cost | **zero** (read/write in place), matching RTI | high |
-| NFR-PERF-8 | Steady-state heap allocation in pre-alloc mode | **0 bytes/sample** (verified by allocation counters) | moderate-high on SBCL/Allegro; **low** on Clasp |
+| NFR-PERF-8 | Steady-state heap allocation in pre-alloc mode | **0 bytes/sample** (verified by allocation counters) | moderate-high on SBCL; **not yet measurable** on AllegroCL (its `dds.pal:bytes-consed` is the constant 0, ADR 0118 §6) |
 | NFR-PERF-9 | Discovery time, 100 participants | within **2×** of Connext | moderate |
 
 **Context anchors (verified):** RTI publishes sub-millisecond latency scaling ~linearly with payload, throughput >90% of line rate on GbE, and <100 µs at >200K samples/s; small-sample one-way latencies on fast x86 land in the tens-of-µs range; Zero-Copy reduces intra-host copies to zero; FlatData reduces copies from four to two. `(C: high — from RTI's own benchmark documentation.)`
@@ -242,34 +242,34 @@ Targets are **parity bands relative to RTI Connext on identical hardware/OS/tran
 ### 7.1 NFR-CLOS — CLOS policy & hot-path purity
 **(MUST)** CLOS is **permitted and preferred** wherever it exhibits no performance degradation against NFR-PERF. **(MUST)** The **hot path** is CLOS-free: no `defgeneric`/`defmethod` dispatch and no per-sample CLOS instantiation in the CDR primitives, generated per-type codecs, buffer/cursor, `CacheChange`/`SampleInfo`, or the RTPS engine's per-sample type dispatch — these use `defstruct` + monomorphic functions + manual vtables. **(MUST)** `print-object` and other GFs MUST NOT appear on hot-path data structs in a way that introduces dispatch on the sample path; provide explicit printer functions for those. **(MUST)** CI enforces a **hot-path-purity gate**: the build fails if `defmethod`/`defgeneric`/`defclass` (or per-sample CLOS allocation) appears in the designated hot-path packages (`dds.cdr`, generated-codec output, `dds.core.buffer`, the engine's per-sample dispatch module, `dds.rtps.history` change ops). Outside those packages, CLOS is unrestricted and is the preferred default. **(MUST)** Any change moving the CLOS/defstruct boundary is backed by a bench measurement (FR-LANG-7).
 
-### 7.2 NFR-PORT — Portability across SBCL / AllegroCL / Clasp
-**(MUST)** All layers above L0 are implementation-agnostic and depend **only** on the PAL contract. **(MUST)** SBCL and AllegroCL are co-equal first-class targets and the performance pacesetters. **(MAY-trail-by-one-profile)** Clasp is supported but permitted to lag by one conformance profile and to relax NFR-PERF-3/8 with a documented gap, given its conservative-GC determinism limits. **(MUST)** No feature is gated behind a single implementation except where it is intrinsically impossible elsewhere (documented per case).
+### 7.2 NFR-PORT — Portability across SBCL / AllegroCL
+**(MUST)** All layers above L0 are implementation-agnostic and depend **only** on the PAL contract. **(MUST)** SBCL and AllegroCL are co-equal first-class targets and the performance pacesetters. **(WITHDRAWN, ADR 0118)** The former one-profile trailing allowance for Clasp has no subject: Clasp is not a target from 2026-10-03 (owner directive), and no Clasp result counts toward any gate. A gap on either remaining target is a gap, recorded and owned, never a profile allowance. **(MUST)** No feature is gated behind a single implementation except where it is intrinsically impossible elsewhere (documented per case).
 
 ### 7.3 NFR-DET — Determinism & GC posture
-**(MUST)** Provide a **pre-allocation mode** (FR-PF-7): pools, history caches, buffers, fragment buffers, and per-reader/per-writer state are carved at init from the static, non-GC'd arena sized by `*static-arena-bytes*` (NFR-MEM); steady state allocates nothing. **(MUST)** No data-path consing (FR-LANG-5). **(SHOULD)** Tune per-impl GC (SBCL `bytes-consed-between-gcs`, generational sizing; Allegro `gsgc` parameters; Clasp Boehm/MPS tuning) and expose hooks. **(MAY, dangerous)** Short, bounded GC-inhibition windows around the tightest critical section, behind an explicit unsafe flag, only where measurement proves benefit and correctness is preserved. **(MUST)** Document the determinism gap vs. Connext honestly per impl.
+**(MUST)** Provide a **pre-allocation mode** (FR-PF-7): pools, history caches, buffers, fragment buffers, and per-reader/per-writer state are carved at init from the static, non-GC'd arena sized by `*static-arena-bytes*` (NFR-MEM); steady state allocates nothing. **(MUST)** No data-path consing (FR-LANG-5). **(SHOULD)** Tune per-impl GC (SBCL `bytes-consed-between-gcs`, generational sizing; Allegro `gsgc` parameters) and expose hooks. **(MAY, dangerous)** Short, bounded GC-inhibition windows around the tightest critical section, behind an explicit unsafe flag, only where measurement proves benefit and correctness is preserved. **(MUST)** Document the determinism gap vs. Connext honestly per impl.
 
 ### 7.4 NFR-MEM — Memory model (static, startup-allocated, non-GC'd memory on hot paths)
 **(MUST)** All hot code paths use **static memory allocated once at startup that is not garbage-collected**, wherever meaningful (i.e., wherever the alternative is per-sample/per-packet allocation, or wherever a raw pointer/SAP into the memory is taken). "Not garbage-collected" means **off-heap / foreign memory** (e.g., `static-vectors`-style foreign-backed octet arrays, FFI-allocated regions, SHMEM segments) that the GC neither scans, moves, nor reclaims — **not** merely "pooled heap objects that happen to stay live."
 **(MUST)** The **total amount of this static memory is configurable by a special (dynamic) variable** — the authoritative knob is **`*static-arena-bytes*`** (an integer byte budget), read **once at initialization** (DomainParticipantFactory init / first participant creation). Optional finer-grained special variables MAY refine the partition (`*wire-buffer-pool-bytes*`, `*max-cache-changes*`, `*max-fragment-reassembly-bytes*`, `*sample-info-pool-size*`, …), each defaulting to a documented partition of, or value subordinate to, the master budget. **Rebinding any of these variables after initialization has no effect** until the arena is torn down and reinitialized; this is documented behaviour, not a silent no-op.
-**(MUST)** **Any buffer addressed by a raw pointer/SAP MUST be foreign/static, never a plain heap array.** Rationale: SBCL's and AllegroCL's GCs *move* objects, invalidating SAPs across a GC; foreign/static memory is the only representation stable across all three target GCs (Clasp/Boehm is non-moving but conservative — still use foreign memory for uniformity and to keep it out of the conservative scan). Transient pins (`with-pinned-objects` / equivalent) are for **bounded** critical sections only, never for persistent buffers.
+**(MUST)** **Any buffer addressed by a raw pointer/SAP MUST be foreign/static, never a plain heap array.** Rationale: SBCL's and AllegroCL's GCs *move* objects, invalidating SAPs across a GC; foreign/static memory is the only representation stable across both target GCs. Transient pins (`with-pinned-objects` / equivalent) are for **bounded** critical sections only, never for persistent buffers.
 **(MUST)** **Static-arena exhaustion is a hard, observable event, never a silent fallback to the GC heap on the hot path.** When provisioned static memory is exhausted at runtime, the stack applies DDS **RESOURCE_LIMITS** semantics — reject (`SAMPLE_REJECTED`) or block per RELIABILITY/HISTORY — and surfaces the condition plus a metric, rather than allocating from the GC heap. Static pool sizes SHOULD be derived from / kept consistent with the relevant **RESOURCE_LIMITS** QoS so the DDS-level limit and the memory-level limit agree. An explicit, **off-by-default** "elastic" mode MAY permit heap fallback for non-real-time users; enabling it forfeits the determinism guarantees and is logged.
 **(MUST)** Object pools (for `CacheChange`, `SampleInfo`, fragment/reassembly buffers, submessage scratch, per-endpoint state) are **carved from the static arena at startup**; steady-state acquire/release is pointer/index manipulation with **zero allocation**. **(MUST)** `dynamic-extent` for transient stack data where the impl honors it.
 **(SHOULD)** Expose, at init, a **report** of the static arena sizes actually reserved, and at runtime a **high-water-mark** metric per pool, so provisioning can be tuned against real workloads (NFR-OBS).
 
 ### 7.5 NFR-CONC — Concurrency
-**(MUST)** Lock-free or low-contention queues on the data path (SPSC writer→sender, MPSC receiver→readers). **(MUST)** A portable atomics/threads substrate (e.g., `bordeaux-threads` + a portable `atomics` CAS layer) with **per-impl fast paths** in the PAL (SBCL `sb-concurrency`/`sb-ext` atomics; Allegro native atomics+`mp:`; Clasp `mp:`/C++-`std::atomic` via interop). **(SHOULD)** Thread-affinity / priority controls where the impl/OS expose them. **(MUST)** A documented memory-ordering model; fences inserted explicitly, not assumed.
+**(MUST)** Lock-free or low-contention queues on the data path (SPSC writer→sender, MPSC receiver→readers). **(MUST)** A portable atomics/threads substrate (e.g., `bordeaux-threads` + a portable `atomics` CAS layer) with **per-impl fast paths** in the PAL (SBCL `sb-concurrency`/`sb-ext` atomics; Allegro native atomics+`mp:`). **(SHOULD)** Thread-affinity / priority controls where the impl/OS expose them. **(MUST)** A documented memory-ordering model; fences inserted explicitly, not assumed.
 
 ### 7.6 NFR-OBS — Observability
 **(MUST)** Structured, low-overhead logging with compile-time-elidable levels; **zero logging cost** on the hot path when disabled. **(SHOULD)** Counters/metrics (samples in/out, naks, retransmits, drops, queue depths, GC events) exportable. **(SHOULD)** A distributed-logger-equivalent topic. GUIs out of scope.
 
 ### 7.7 NFR-TEST — Testability & verification
-**(MUST)** Unit tests per module; **property-based + fuzz** tests for the CDR codec and the RTPS submessage parser (parsers facing the network are the attack surface — fuzz them). **(MUST)** A byte-exact **CDR conformance corpus**. **(MUST)** An **interop matrix** (FR-IO-3) and a **`perftest`-equivalent** harness (NFR-PERF). **(MUST)** Per-impl CI on SBCL/Allegro/Clasp. **(SHOULD)** Soak/jitter tests (24h+) reporting latency-distribution drift and GC behavior.
+**(MUST)** Unit tests per module; **property-based + fuzz** tests for the CDR codec and the RTPS submessage parser (parsers facing the network are the attack surface — fuzz them). **(MUST)** A byte-exact **CDR conformance corpus**. **(MUST)** An **interop matrix** (FR-IO-3) and a **`perftest`-equivalent** harness (NFR-PERF). **(MUST)** Per-impl CI on SBCL/Allegro. **(SHOULD)** Soak/jitter tests (24h+) reporting latency-distribution drift and GC behavior.
 
 ### 7.8 NFR-SEC-POSTURE — Security hygiene (independent of the optional DDS-Security profile)
 **(MUST)** All network-facing parsers are bounds-checked **even in `(safety 0)` hot paths** — i.e., validate lengths/offsets against buffer extents before trusting wire data; a malformed RTPS submessage MUST NOT cause out-of-bounds access. This is the single most important safety requirement given `(safety 0)` codegen. **(MUST)** Resource-exhaustion guards (max fragments, max reassembly memory, max instances) to resist amplification/DoS.
 
 ### 7.9 NFR-BUILD — Build & packaging
-**(MUST)** ASDF systems with conditional compilation (`#+sbcl`/`#+allegro`/`#+clasp`) confined to the PAL. **(MUST)** Reproducible builds; pinned dependency versions. **(SHOULD)** A minimal external-dependency footprint; vendor or pin anything on the hot path.
+**(MUST)** ASDF systems with conditional compilation (`#+sbcl`/`#+allegro`) confined to the PAL. **(MUST)** Reproducible builds; pinned dependency versions. **(SHOULD)** A minimal external-dependency footprint; vendor or pin anything on the hot path.
 
 ### 7.10 NFR-IP — Intellectual-property / clean-room discipline
 **(MUST)** Implement **clean-room from the OMG specifications**. **(MUST NOT)** copy, decompile, or paste RTI Connext source, headers, or `rtiddsgen` output. **(MAY)** read Apache-2.0 (Fast DDS) / EPL-EDL (Cyclone) / open (OpenDDS) sources *for understanding*, but copying their code imports their license obligations — track provenance. **(MUST)** Review OMG IPR terms: RTPS is published under **RF-Limited** mode — confirm there are no patent encumbrances on the specific mechanisms used, especially Zero-Copy/FlatData-style techniques (RTI holds patents in adjacent areas — **legal review required before shipping a FlatData/Zero-Copy equivalent**). `(C: moderate; this is a genuine legal risk, not boilerplate — get counsel.)`
@@ -291,7 +291,7 @@ A release is **accepted as "Connext-class (core)"** iff, on **SBCL and AllegroCL
 2. FR-IO-1 (Connext interop) and FR-IO-2 (one open peer) pass across the interop matrix.
 3. NFR-PERF-1,4,5,6,7,8 met; NFR-PERF-2 met; NFR-PERF-3 **measured and its gap documented** (not necessarily met); hot-path workloads run to completion **entirely from the static arena** (no GC-heap fallback) at the documented provisioning, with high-water-mark within `*static-arena-bytes*`.
 4. NFR-CLOS hot-path-purity gate green; NFR-SEC-POSTURE fuzz suite green.
-5. Clasp passes through at least P4 with documented perf/determinism gaps.
+5. ~~Clasp passes through at least P4 with documented perf/determinism gaps.~~ **Withdrawn (ADR 0118, 2026-10-03):** Clasp is not a target; criteria 1–4 apply to SBCL and AllegroCL alike.
 
 ## 10. Verification matrix (skeleton — maintained in `/docs/verification.csv`)
 
@@ -315,7 +315,8 @@ A release is **accepted as "Connext-class (core)"** iff, on **SBCL and AllegroCL
 4. **VendorId** acquisition path with OMG. `(action)`
 5. **FlatData/Zero-Copy patent clearance** — legal review owner + deadline. `(action, gating P4 ship)`
 6. **IDL vs s-expr DSL priority** for the type compiler (recommend s-expr first for velocity, IDL parser second for interop with existing `.idl`). `(decision)`
-7. **Clasp determinism stance:** accept documented gap, or invest in MPS-precise-GC tuning? `(decision)`
+7. ~~**Clasp determinism stance:** accept documented gap, or invest in MPS-precise-GC tuning?~~ **RESOLVED 2026-10-03 (ADR 0118):** Clasp is withdrawn as a target; the question has no subject. `(resolved)`
+8. **NFR-MEM / FR-PF-7 versus ADR 0102 (plan decision D29).** FR-PF-7 and NFR-MEM say the hot-path arena is "allocated once at startup"; ADR 0102 (accepted, implemented) lets the arena *budget* grow in `*static-arena-growth-bytes*` chunks up to `*static-arena-max-bytes*`. Either the code reverts or the text changes. **Proposed amendment (draft, not in force):** *"All hot-path memory comes from the static, non-GC'd arena. Every hot-path pool is carved before the first sample at the documented provisioning; the arena's budget MAY grow in configured chunks up to a configured maximum (`*static-arena-max-bytes*`, ADR 0102), and steady state performs no growth and no allocation outside the arena. Reaching the maximum is RESOURCE_LIMITS, never a GC-heap fallback."* Gated by WP-2.11 (gate-arena at workload level). `(decision)`
 
 ---
 

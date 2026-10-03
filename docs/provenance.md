@@ -159,6 +159,8 @@ behavioural-reference-via-interop use, not a clean-room breach:
 | OpenSSL (`libcrypto`) ≥ 3.5 | vetted native CNSA-2.0 crypto for `dds-dare` Data-At-Rest Encryption (AES-256-GCM + ML-KEM-1024 + SHA-384/HKDF) via CFFI; FR-SEC-2 (no hand-rolling); control plane, off the hot path (ADR 0025) | Apache-2.0 |
 | Quicklisp | dependency loading (dev) | — |
 | Clasp `boehmprecise` | the M0 target implementation | LGPL-2.1 (runtime) |
+| Allegro CL 11.0 Enterprise (Franz Inc.) | second required runtime from 2026-10-03 (ADR 0118); its `socket:` module backs the PAL socket seam (ADR 0114) | LicenseRef-Franz-proprietary (commercial) |
+| *Clasp — retired 2026-10-03* | withdrawn as a target (ADR 0118): no longer built, tested, linked or shipped; recovery point git tag `clasp-last` (`9ed69bc`). The row above is history. | — |
 
 Pinning/vendoring of hot-path dependencies (NFR-BUILD) is a tracked M1 follow-up.
 
@@ -3417,3 +3419,15 @@ or adapted; the octets are the interoperability contract, not RTI's expression o
 only**, reading 1 whenever `acknowledgment_kind` was an APPLICATION kind and 0 under PROTOCOL. Being
 reader-only it cannot be the RxO-paired policy, and no published explanation of it was found, so it is
 neither emitted nor interpreted. Naming a field we have not identified is what ADR 0089 §5 forbids.
+
+## 2026-10-04 — WP-0.13: documents and SBOM rebased to SBCL + AllegroCL (ADR 0118)
+
+- **Clasp retired as a runtime dependency.** It is removed from `scripts/generate-sbom.py` and therefore from
+  `sbom.spdx.json`; every earlier line in this log that names Clasp is history and is left as written
+  (ADR 0118 §3 reads its results as SBCL-only evidence).
+- **AllegroCL added to the SBOM** as the second required runtime: supplier Franz Inc., version **11.0**,
+  licence `LicenseRef-Franz-proprietary` (plan decision D6). The version is not recalled: it was read on the
+  reference host on 2026-10-04 from `(lisp-implementation-version)` = `11.0 [64-bit Linux (x86-64) *SMP*]`
+  and `(lisp-implementation-type)` = `International Allegro CL Enterprise Edition`, run through
+  `scripts/with-allegro.sh`.
+- No external source was consulted for this change beyond that query; no third-party text was copied.

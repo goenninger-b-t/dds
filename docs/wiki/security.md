@@ -1,5 +1,10 @@
 # Security — DDS-Security Cryptographic plugin (serialized-payload protection)
 
+> **Reading the evidence on this page (ADR 0118 §3).** Results recorded before 2026-10-03 as "both impls",
+> "SBCL + Clasp" or "Clasp first" are **SBCL-only evidence**: Clasp was withdrawn as a target, and AllegroCL
+> is unverified for such an item until an AllegroCL run says otherwise. Where this page says "both impls" about
+> a result dated 2026-10-03 or later, it means SBCL and AllegroCL.
+
 This page covers the `dds-security` system: the DDS-Security 1.1 **Cryptographic plugin**,
 Slice 1 (serialized-payload protection, §9.5.3.3).  Slice 1 (landed 2026-06-22, ADR 0031)
 provides the on-the-wire **SecuredPayload** (de)serializer, the **session-key KDF**, the
@@ -217,11 +222,12 @@ signals rather than returning NIL, since a NIL descriptor would be a fail-OPEN o
 This is a **storage-representation** change only — every byte-exact corpus, the NIST AES-GCM KAT, and
 the KDF round-trips are unchanged, and `make mem` stays `0.0000` (the static allocation is at keying,
 the derived-cache miss is a GC-heap alloc off the steady-state hot path, and the session-key HIT path
-is a plain slot load).  Proven by `run-security-keymaterial-harden-test` (green on SBCL + Clasp),
+is a plain slot load).  Proven by `run-security-keymaterial-harden-test` (green on SBCL and AllegroCL, 2026-10-04, WP-0.6),
 which sweeps many distinct `session_id`s to prove no per-`session_id` foreign leak.  Off-heap
-discrimination is SBCL-precise (`sb-ext:heap-allocated-p`); Clasp/Boehm is non-moving, so on Clasp
-`dds.pal:static-vector-p` is by-design permissive and the zeroize **wipe** is the master-slot
-hardening evidence (see the per-impl `static-vector-p` docstrings; NFR-PORT).
+discrimination is SBCL-precise (`sb-ext:heap-allocated-p`); on AllegroCL `dds.pal:static-vector-p`
+answers the type question only and cannot tell an off-heap vector from a heap one, so there the zeroize
+**wipe**, proven by the wipe → read-back → release hook (`dds.dare:*secret-wipe-readback-hook*`), is the
+master-slot hardening evidence (see the per-impl `static-vector-p` docstrings; NFR-PORT).
 
 ### 2.3 Encode / decode
 
@@ -575,8 +581,8 @@ fails-closed to a drop).
 - **Proof (live-path)** — the `make mem` `oauth-send` / `oauth-recv` arms now **drive the real memoized resolver**
   (`dds.security:km-receiver-descriptor{-list}`, the exact call the installed `cm-rtps-*-receiver{s}` make) INSIDE the
   measured window — not a pre-built stub list — so they measure the **live origin-auth datagram path (resolver +
-  transform)** and still report **`delta 0.0000 B/sample`** over the common empty-receivers baseline on SBCL (Clasp
-  smokes, `bytes-consed` 0). The first cold-cache fill amortizes off the window; the reported 0.0000 is warmed
+  transform)** and still report **`delta 0.0000 B/sample`** over the common empty-receivers baseline on SBCL (on
+  AllegroCL `bytes-consed` is the constant 0, so the number is not measurable there). The first cold-cache fill amortizes off the window; the reported 0.0000 is warmed
   steady-state (the `%km-session-key-at` convention). `run-security-origin-auth-test` block (4) round-trips the
   `-into` verify entries (right key recovers byte-exact; wrong/absent key → NIL; no key → common_mac alone) and
   `run-security-crypto-manager-test` drives the T10 `cm-rtps-*` resolvers through the memoized path, so the mem arms
@@ -1105,7 +1111,7 @@ See `run-auth-handshake-over-wire-test` in
 
 **Level 1 — Our-to-our handshake over the real UDP wire (ACHIEVED)**
 Both nodes reach `:authenticated` with byte-equal `SharedSecret`.  Proven by
-`run-auth-handshake-over-wire-test` (Clasp 329 + SBCL 329, Clasp first).
+`run-auth-handshake-over-wire-test` (SBCL 329, recorded alongside the since-withdrawn Clasp; SBCL-only evidence, ADR 0118 §3).
 
 **Level 2 — Don't-break-plain (ENVIRONMENT-LIMITED)**
 The in-process portable guard (`run-auth-spdp-identity-token-test` arm b) proves the
@@ -1257,7 +1263,7 @@ KeyMaterial installed.  A security-enabled participant strictly refuses an unaut
 (`run-auth-secured-refuses-plain-test`, non-vacuous via plain↔plain control).  Encrypted pub/sub
 round-trip with the exchanged keys proven by `run-auth-encrypted-pubsub-keyx-test` (ciphertext on
 wire: plaintext absent + header `#(0 0 0 4)` per §9.5.3.3.1; plaintext delivered to subscriber).
-337 tests Clasp + SBCL (Clasp first; non-vacuous — NOT `:keyed` before the exchange completes).
+337 tests SBCL (SBCL-only evidence, ADR 0118 §3; non-vacuous — NOT `:keyed` before the exchange completes).
 
 **Level 2 — Don't-break-plain (ACHIEVED)** A participant with no `:identity` is byte-identical to
 the pre-security plain path; `run-auth-plain-byte-identical-test` confirms 8-byte `"PLAINDAT"` is
@@ -1438,7 +1444,7 @@ header bytes `#(0 0 0 4)` = AES256-GCM `transformation_kind` per §9.5.3.3.1 Tab
 
 | Item | Status |
 |---|---|
-| Our-to-our: auth → key exchange → strict gate → encrypted DATA | **ACHIEVED** (337 tests Clasp + SBCL) |
+| Our-to-our: auth → key exchange → strict gate → encrypted DATA | **ACHIEVED** (337 tests, SBCL-only evidence per ADR 0118 §3) |
 | Don't-break-plain (byte-identical plain path) | **ACHIEVED** (`run-auth-plain-byte-identical-test`) |
 | Strict refusal of unauthenticated peers | **ACHIEVED** (`run-auth-secured-refuses-plain-test`) |
 | KxKey-AEAD wrap nonce/AAD vs Connext | **NEEDS-VERIFICATION** (Slice 5) |
@@ -1599,7 +1605,7 @@ Two security-enabled participants with signed Governance + Permissions authentic
 auth path → both reach `:keyed`), then the permissions-gate enforces the topic-level policy:
 an allowed topic matches and communicates; a denied topic is refused (`:incompatible`).
 `run-access-control-local-deny-test` proves `check_create_datawriter` enforcement.
-349 tests Clasp + SBCL (Clasp first; non-vacuous — both reach `:keyed` before the deny fires;
+349 tests SBCL (SBCL-only evidence, ADR 0118 §3; non-vacuous — both reach `:keyed` before the deny fires;
 the ONLY variable is the topic name).
 
 **Level 2 — Default-OFF (ACHIEVED)** A participant with no Governance/Permissions has
@@ -1754,8 +1760,8 @@ Worked example (datawriter, ENCRYPT, two receivers; decode as receiver #2):
   (dds.security:decode-datawriter-submessage km blob))
 ```
 
-**Honest interop posture (T3).** Self-consistent (our encode ↔ our decode) and byte-reproducible across
-SBCL + Clasp; corpus + property-fuzz (hostile/oversized `receiver_specific_macs_count` is capped by T1
+**Honest interop posture (T3).** Self-consistent (our encode ↔ our decode) and byte-reproducible (recorded
+on SBCL and the since-withdrawn Clasp; SBCL-only evidence, ADR 0118 §3); corpus + property-fuzz (hostile/oversized `receiver_specific_macs_count` is capped by T1
 before any allocation, fail-closed). The two foundational cross-vendor divergences are now **RESOLVED**
 (T-RECONCILE, 2026-06-27): the session-key KDF drops the `"0001"` counter Fast DDS omits, and the footer
 `receiver_specific_macs_count` (plus the `crypto_content` length sibling found in the audit) is BIG-ENDIAN —
@@ -1808,8 +1814,8 @@ Worked example (whole-RTPS, SIGN, our-to-our round-trip):
   (dds.security:decode-rtps-message km srtps))                      ; => subs (byte-exact), or NIL
 ```
 
-**Honest interop posture (T4).** Self-consistent (our encode ↔ our decode) and byte-reproducible across
-SBCL + Clasp; corpus (byte-exact 100-octet ENCRYPT + 92-octet SIGN vectors), round-trip, negatives, and
+**Honest interop posture (T4).** Self-consistent (our encode ↔ our decode) and byte-reproducible (recorded
+on SBCL and the since-withdrawn Clasp; SBCL-only evidence, ADR 0118 §3); corpus (byte-exact 100-octet ENCRYPT + 92-octet SIGN vectors), round-trip, negatives, and
 property-fuzz (adversarial SRTPS brackets + hostile `rsm_count` hitting the T1 cap, prod + `(safety 0)`,
 fail-closed). The shared-foundation divergences (the KDF `"0001"` counter and the footer-count /
 `crypto_content`-length endianness) are now **RESOLVED** (T-RECONCILE, see §6sexto.1) —
@@ -1878,7 +1884,7 @@ out of the receiver thread, never plaintext on a failure.
 **Tests.** `run-volatile-secure-reliable-test` (drop every PVMS DATA while a flag is set → B stays empty;
 clear it → the HEARTBEAT/ACKNACK loop repairs the gap → B delivers EXACTLY once, bytes equal) and
 `run-volatile-secure-fail-closed-test` (B installs a WRONG bootstrap KM → B never delivers; non-vacuous).
-Both green on SBCL + Clasp.
+Both green on SBCL (SBCL-only evidence, ADR 0118 §3).
 
 **Carry (T8) — bidirectional nonce uniqueness.** The bootstrap KM is symmetric across the pair; with the
 Slice-1 fixed (all-zeros) `session_id`, two sides encoding under the shared key from `iv-counter` 0 would
@@ -1938,7 +1944,7 @@ protected writer with a verified per-receiver MAC — `'Square'` never in cleart
 **non-vacuous** `run-secure-sedp-origin-auth-tamper-test` (the WRONG receiver key, same key_id → B NEVER matches
 **even though the common_mac is valid** — the receiver-MAC gates beyond the common_mac, fail-closed);
 `run-auth-keymaterial-origin-auth-cdr` (the 120-byte CDR round-trip + the byte-identical 88-byte carry). All
-green SBCL + Clasp. SIGN/ENCRYPT (non-origin-auth) + security-OFF remain byte-identical.
+green on SBCL (SBCL-only evidence, ADR 0118 §3). SIGN/ENCRYPT (non-origin-auth) + security-OFF remain byte-identical.
 
 ### 6sexto.5 `rtps_protection` engagement on the live data path (T10, §8.5.1.10-.12)
 
@@ -2020,7 +2026,7 @@ a **no-false-REJECT** check that a plain builtin SEDP HEARTBEAT from the keyed p
 `%on-builtin-heartbeat`, advancing the ack counter, never reaching the user gate). The participant-tier
 origin-auth resolvers (`cm-rtps-encode-receivers` /
 `cm-rtps-decode-receiver`) are driven directly in `run-security-crypto-manager-test` (a wrong participant
-receiver key fails the receiver-MAC though the common_mac is valid). All green SBCL + Clasp.
+receiver key fails the receiver-MAC though the common_mac is valid). All green on SBCL (SBCL-only evidence, ADR 0118 §3).
 
 ### 6sexto.6 Secure participant-message (liveliness) + secure SPDP re-announce (T11, §7.4.5 / §8.4.1.6)
 
@@ -2069,7 +2075,7 @@ one-octet-flipped copy fails the MAC and is dropped), `run-secure-pm-origin-auth
 `-tamper-test` (correct receiver key detects; the WRONG key, same id, never detects though the common_mac is
 valid), and `run-secure-spdp-reannounce-test` (a plain node advertises no bits 26/27 but an armed node does;
 plain SPDP still bootstraps; a SEC_PREFIX re-announce is emitted; a FRESH peer that saw no plain SPDP registers
-the participant from the protected re-announce alone). All green SBCL + Clasp.
+the participant from the protected re-announce alone). All green on SBCL (SBCL-only evidence, ADR 0118 §3).
 
 ### 6sexto.7 Governance protection-kind model — the knobs (T5, DDS-Security 1.1 §9.4.1.2)
 
@@ -2400,8 +2406,8 @@ implemented conformantly:
 - **forward (ours→Connext):** still 8/8 — `rtiddsspy` logs 8× `New data … topic="HelloWorldTopic"`; the residual
   `DecryptFinal` errors are the benign participant-metatraffic (`0x000001C1`), not the user-data topic.
 
-**Regression:** ours↔ours (auth/handshake/keyx + secure-SEDP + PVMS + access-manager) green on **both** SBCL and
-Clasp; the byte-exact token/handshake/crypto corpora + KATs are UNCHANGED (this is a protocol-flow addition, no
+**Regression:** ours↔ours (auth/handshake/keyx + secure-SEDP + PVMS + access-manager) green on SBCL (recorded
+alongside the since-withdrawn Clasp; SBCL-only evidence, ADR 0118 §3); the byte-exact token/handshake/crypto corpora + KATs are UNCHANGED (this is a protocol-flow addition, no
 emitted codec changed). ours↔Fast-DDS: GOV=secure protected user DATA still flows BOTH directions; the
 handshake still reaches `:keyed` (Fast DDS silently discards our unknown `dds.sec.auth_request`, verified
 against `SecurityManager.cpp`), byte-identical to the pre-WP baseline. The live decode is the oracle (tshark
@@ -2463,7 +2469,7 @@ aligned to 4 bytes … SECURE_RTPS_POSTFIX not found`).  This was an **encode bu
 `data=NONE` tiers masked** — the Slice-5c I1 error-guard (which merely *refused* a non-4-aligned payload) is replaced
 by the pad.  Decode was already alignment-agnostic (`N=len−40`), which is exactly why it was encode-only and only a
 real non-4-aligned payload flowing to Connext surfaced it.  Byte-exact corpus golden UNCHANGED (pad=0 for a 4-aligned
-`N`); regression **430 passed** both impls (Clasp first).
+`N`); regression **430 passed** on SBCL (SBCL-only evidence, ADR 0118 §3).
 
 **Harness note:** `rtiddsspy -qosProfile` rejects a **hyphenated** profile name (`OursConnextInterop::data-sign` →
 `Error in parameter`), while the identical governance loads under a non-hyphen name; the C++ `QosProvider`

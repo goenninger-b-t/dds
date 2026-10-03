@@ -1,5 +1,10 @@
 # Durability — TRANSIENT_LOCAL, the TRANSIENT/PERSISTENT Durability Service, and DARE
 
+> **Reading the evidence on this page (ADR 0118 §3).** Results recorded before 2026-10-03 as "both impls",
+> "SBCL + Clasp" or "Clasp first" are **SBCL-only evidence**: Clasp was withdrawn as a target, and AllegroCL
+> is unverified for such an item until an AllegroCL run says otherwise. Where this page says "both impls" about
+> a result dated 2026-10-03 or later, it means SBCL and AllegroCL.
+
 This page covers the DDS DURABILITY QoS implementation in this stack: TRANSIENT_LOCAL writer-side
 retention + late-joiner replay (fully conformant, P5/M6, §2); the embedded durability service with
 its in-memory TRANSIENT tier (§3–§6) and dedup/no-double-delivery (§6); always-on CNSA-2.0
@@ -143,8 +148,13 @@ still fails CLOSED at store-open (a `SECURITY-FAILCLOSED` unwind, ADR 0045), nev
 never be reported as durable (NFR-SEC-POSTURE) — is now a `:FSYNC-FAILED` STATUS rather than a signal. It rides
 `store-put`/`store-delete`/`store-purge`'s PRIMARY value and a 2nd status value on `store-sync`/`store-close`/
 `store-replace-topic`/`store-open`; the collect-loop group-commit tick routes it to `*durability-error-hook*`.
-`dds.pal:fsync-stream`/`fsync-directory` return `(values t status)` (`:FSYNC-FAILED` on failure); the Clasp
-`fsync-stream` cannot observe a failure so it always returns `NIL` status.
+On **SBCL**, `dds.pal:fsync-stream`/`fsync-directory` return `(values t status)` and report `:FSYNC-FAILED` when
+fdatasync / open / fsync fails (the declared ftype of SBCL `fsync-directory` still says `(eql t)` and disagrees with
+that two-value return). On **AllegroCL there is no parity yet**: `fsync-stream` is a Lisp-level flush only and
+always returns a `NIL` status, and `fsync-directory` returns a single `T` in every case — it treats a failed
+`open` as "nothing to sync" and ignores the result of `fsync(2)` (`src/dds-pal/pal-allegro.lisp`). A failed
+directory fsync on AllegroCL is therefore reported as durable. This is an open PAL gap, recorded in
+`docs/verification.csv` and owned by WP-1.19 (Allegro PAL documented gaps).
 
 `store-open` accepts optional `history-kind` (`:keep-all` | `:keep-last`) and `history-depth`
 (positive integer) arguments. When supplied they override the store's factory-time defaults
@@ -395,8 +405,8 @@ Lisp thread, never in the signal context.
 
 Implementations:
 - **SBCL** — `sb-sys:enable-interrupt` for `sb-unix:sigterm` / `sb-unix:sigint`.
-- **Clasp** — `mp:service-interrupt :around` methods on `core:sigterm` / `core:sigint`;
-  dispatched via an alist guarded by `*signal-handler-lock*`.
+- **AllegroCL** — `excl::set-signal-handler` on the POSIX signal numbers (SIGINT 2, SIGTERM 15, SIGHUP 1),
+  through a 0-argument trampoline, because AllegroCL calls a handler with arguments.
 
 No reader conditional escapes `dds-pal/`.
 
@@ -404,8 +414,9 @@ No reader conditional escapes `dds-pal/`.
 service on SBCL and on AllegroCL (ADR 0118), waits for the driver's "signal handler installed" marker,
 sends `kill -15`, and asserts: the service really started (no `RUNNER-START-FAILED`; a PERSISTENT store
 needs OpenSSL ≥ 3.5), the process exits within 30 s, the driver printed "teardown complete", and no SIGBUS. A Lisp that is not installed FAILS its leg; it is never skipped.
-Result (2026-06-22, recorded on the then-supported Clasp and SBCL): **both impls clean exit, no
-SIGBUS** (ADR 0026 §10 item 3 RESOLVED).
+Result (2026-06-22, recorded on SBCL and the since-withdrawn Clasp): **clean exit, no SIGBUS** (ADR 0026
+§10 item 3 RESOLVED) — SBCL-only evidence under ADR 0118 §3; the AllegroCL leg was added to the runner by
+WP-0.14 and is not yet recorded here.
 
 ### 5.2 Microservice SERVER mode (`--backend server`, ADR 0050 §4.8)
 
@@ -712,7 +723,8 @@ load and would go **stale across a dumped image** — on restart the shared libr
 address, so a naively cached pointer would dangle and the first AEAD/X.509 call would crash. DARE closes
 this by resolving through **re-resolvable boxes** and registering an **image-restart hook**
 (`%dare-reresolve-foreign-pointers`) via the portable PAL seam `dds.pal:register-image-restart-hook`
-(SBCL `sb-ext:*init-hooks*`, Clasp `core:*initialize-hooks*`), which re-opens `libcrypto` and
+(SBCL `sb-ext:*init-hooks*`; AllegroCL `excl::*restart-init-function*`, which holds one function, so the
+PAL chains the previous value rather than overwriting it), which re-opens `libcrypto` and
 re-resolves every cached pointer on startup. So a **delivered durability-service executable** built with
 `save-lisp-and-die` re-resolves crypto automatically on launch — no action required by the operator.
 
@@ -904,8 +916,8 @@ records from a prior run could not be reopened. 3b adds a persisted **key-epoch*
   `epochs.dat` creation, the compaction rename, a recovery truncate rename, and the `topics.map`
   write — the containing directory is fsync'd via `dds.pal:fsync-directory` (`open(dir,O_RDONLY) +
   fsync + close`), so the dirent survives a power loss (POSIX requires fsyncing the directory, not
-  just the file contents). The PAL seam is impl-agnostic (identical CFFI body on SBCL and Clasp; on
-  macOS `fsync` on a directory fd is valid).
+  just the file contents). The PAL seam is impl-agnostic (the same CFFI `open`/`fsync`/`close` route on SBCL
+  and AllegroCL; on macOS `fsync` on a directory fd is valid).
 
 ### 8.5 Keyed MAC'd log chain — whole-record tamper-evidence (ADR 0045)
 
@@ -1081,8 +1093,8 @@ The PERSISTENT tier is **always DARE-wrapped**, so the §7.3 deployment requirem
 checked at startup (`dds.dare:dare-available-p`); if it is absent/below 3.5/ML-KEM-less, the service
 signals `dds.dare:dare-unavailable` — a **hard error, never a silent plaintext-on-disk path**. The
 file store itself adds no new dependency (plain-file IO). `dds.pal:fsync-stream` is an **NFR-PORT
-split**: SBCL issues a true `fdatasync(2)`; **Clasp falls back to `finish-output`** (no stream-fd
-`fdatasync` exposed here), so the SBCL path carries the production OS-level durability guarantee.
+split**: SBCL issues a true `fdatasync(2)`; **AllegroCL falls back to `finish-output`** (a Lisp-level
+flush; no stream-fd `fdatasync` is exposed there), so the SBCL path carries the production OS-level durability guarantee.
 
 ### 8.6 Cross-DDS transparency-after-restart + cross-vendor dual-relay exactly-once
 
@@ -1237,7 +1249,7 @@ off the per-sample hot path, so maximum safety over throughput). `set-chain-mac-
 per-row keyed MAC chain is at parity with the file store (§8.8.1).
 
 **Dependency.** `cl-sqlite` (ASDF `sqlite`, CFFI over `libsqlite3`) — impl-agnostic, loads +
-round-trips identically on Clasp and SBCL (no reader conditionals). Transitive: `iterate`; native:
+round-trips on SBCL (recorded together with the since-withdrawn Clasp) with no reader conditionals. Transitive: `iterate`; native:
 `libsqlite3` (SBOM + provenance recorded).
 
 **Follow-ons:** encrypted-tier physical reclaim — **RESOLVED, both backends, continuously-open + cross-restart
@@ -1647,7 +1659,8 @@ records in a **separate process** reached over TCP. It is the same `durable-stor
 
 **PAL TCP primitives (the enabler).** `dds.pal:tcp-connect / tcp-listen / tcp-accept / tcp-local-port /
 tcp-send / tcp-recv / tcp-close` — native `sb-bsd-sockets` **stream** sockets, the same substrate as the
-UDP primitives (SBCL contrib + Clasp bundled, **no new dependency, no usocket**). A TCP stream is a byte
+UDP primitives (SBCL contrib; AllegroCL's `socket:` module behind the PAL seam of ADR 0114 — **no new dependency, no
+usocket**). A TCP stream is a byte
 pipe, not message-framed, so two loops are load-bearing: `tcp-send` loops over short writes; `tcp-recv`
 loops over partial reads until the full frame is assembled (a large payload splits across TCP segments —
 a partial read is normal, not EOF), returning `NIL` only on genuine peer-close. On Darwin each socket
@@ -1817,7 +1830,7 @@ file inner + **idempotent-retry** chain-verify-on-reopen — RED without the fix
 OpenSSL < 3.5) and `run-durability-microservice-reconnect-bare-test` (**bare reconnect-after-restart** +
 **send-side-error-clean** + **no-infinite-loop** [down server fails bounded] + **bare-delete-tolerates-rejected**;
 always runs) + `run-durability-microservice-reconnect-exhausted-test` + `run-durability-microservice-reconnect-
-seal-test` (§8.10.4 Fix 1/A/B). Both impls, Clasp first; suite 489 → 493 → 494 → 498 → **503**.
+seal-test` (§8.10.4 Fix 1/A/B). Recorded on SBCL and the since-withdrawn Clasp (SBCL-only evidence, ADR 0118 §3); suite 489 → 493 → 494 → 498 → **503**.
 
 ### 8.10.2 Client-side remote-tier chain-MAC — detecting a malicious server (Slice 3b, built)
 
@@ -1992,7 +2005,7 @@ holes are closed — **no wire-protocol change, no new crypto, no new dependency
   block indefinitely, so a client that sent the 4-byte length header then STALLED parked the single serve
   thread **forever** and **denied every other client**. A new PAL primitive
   **`dds.pal:tcp-set-recv-timeout (sock seconds)`** (`setsockopt(SO_RCVTIMEO)`, a 16-byte `struct timeval`,
-  portable across SBCL + Clasp — the `SO_RCVTIMEO` optname is OS-specific, an `#+darwin`/`#-darwin` constant
+  portable across the PAL's targets — the `SO_RCVTIMEO` optname is OS-specific, an `#+darwin`/`#-darwin` constant
   inside `dds-pal` like the existing socket-option constants, never an impl conditional) arms an idle
   deadline; `tcp-recv` returns a distinct **status `:timeout`** as its second value when the deadline fires
   (`socket-receive` returns `n=NIL` on a timeout vs `n=0` on a clean close — identical on both impls — so a
@@ -2035,11 +2048,12 @@ timeout, so this test now proves the timeout's remaining role — RED with the t
 slow-loris's cap slot is NOT reclaimed; GREEN with a 1 s timeout it is DROPPED + its slot RECLAIMED, and a
 subsequent client is served), `run-durability-microservice-huge-declared-test` (over-cap rejected before alloc; a huge at-cap
 declare with no body times out via the incremental reader and allocates **<< the declared length** — a
-numeric bound on SBCL, a behavioral no-hang/no-OOM proof on Clasp), `run-durability-microservice-client-
+numeric bound on SBCL; it was a behavioral no-hang/no-OOM proof on the since-withdrawn Clasp, and on AllegroCL
+`bytes-consed` is the constant 0, so there the numeric bound is vacuous and only the no-hang half means anything), `run-durability-microservice-client-
 timeout-test` (a stalling server → the client recv-timeout → clean `:UNAVAILABLE` op-failure status, bounded), and
 `run-durability-microservice-accept-backoff-test` (the `%ms-accept-backoff` decision + a fault-injected
 backoff-then-recover); the fuzz gate (`run-durability-microservice-fuzz-test`) is extended with slow-loris +
-over-cap arms. Both impls green identically, Clasp first (Suite 503 → 507). The timeouts default to 30 s and
+over-cap arms. Green on SBCL and the since-withdrawn Clasp (SBCL-only evidence, ADR 0118 §3) (Suite 503 → 507). The timeouts default to 30 s and
 are configurable; `NIL` disables (the pre-hardening blocking behavior).
 
 ### 8.10.6 Server multi-client concurrency (Slice 3c-3, built — ADR 0050 §4.7)
@@ -2085,7 +2099,7 @@ rounds → byte-exact, no loss / dup / cross-client corruption), `run-durability
 (N live connections drained + joined, no leak/hang), `run-durability-microservice-max-connections-test` (cap
 reject → existing-connection-works → close → recover), and `run-durability-microservice-slow-drip-concurrent-test`
 (a stalled client parks its own thread while a concurrent client is served — the §8.10.5 slow-drip residual
-**structurally fixed**). Both impls green identically, Clasp first (Suite **507 → 512**; SBCL is the
+**structurally fixed**). Green on SBCL and the since-withdrawn Clasp (SBCL-only evidence, ADR 0118 §3) (Suite **507 → 512**; SBCL is the
 race-correctness oracle).
 
 ### 8.10.7 Live 2-process interop + a server entrypoint + `tcp-shutdown` clean stop-wake (Slice 3c-4, the CAPSTONE — ADR 0050 §4.8)
@@ -2123,8 +2137,8 @@ interop/durability-persistent/run-microservice.sh    # LEG 1 PUT->GET + LEG 2 re
 
 The server is **DARE-BLIND** (it stores only opaque sealed frames; the client holds the DARE key + the
 log-MAC chain in its LOCAL epoch-dir/key-dir). An operator-runnable `main.lisp --backend server` CLI mode was
-a clean **follow-on** this slice — now **built** (§8.10.8). Both impls green identically, Clasp first
-(Suite **513 → 514**).
+a clean **follow-on** this slice — now **built** (§8.10.8). Green on SBCL and the since-withdrawn Clasp
+(SBCL-only evidence, ADR 0118 §3) (Suite **513 → 514**).
 
 ### 8.10.8 The operator server CLI entrypoint — `durability-service-main --backend server` (WP-DURABILITY-MS-SERVER-CLI, ADR 0050 §4.9)
 
@@ -2152,7 +2166,7 @@ durability-service-main --backend server --port 8080 --inner-backend file --inne
   block → `microservice-server-stop` (the §8.10.7 clean `tcp-shutdown` wake) → log `MS-SERVER-STOPPED` →
   `uiop:quit 0` — and is called by BOTH the CLI mode AND `interop/durability-persistent/driver-ms-server.lisp`
   (updated to call it: no duplicated body). `:block nil` returns the running server (in-process/testing).
-- **Gates (both impls, Clasp first, Suite 519 → 522).** `durability-server-mode-cli` (STARTS + client
+- **Gates (SBCL and the since-withdrawn Clasp (SBCL-only evidence, ADR 0118 §3), Suite 519 → 522).** `durability-server-mode-cli` (STARTS + client
   round-trip byte-exact + CLEAN stop), `durability-server-mode-restart` (PERSISTENT + clean-stop + RESTART
   on the same port + inner dir via the CLI → byte-exact recovery), `durability-server-mode-config` (the full
   CLI parse + defaults + env + CLI>env + the bad-args battery + the SERVICE-mode-unchanged discriminator +
@@ -2191,6 +2205,6 @@ durability-service-main --backend server --port 8080 --inner-backend file --inne
 - `src/dds-disc/disc.lisp` — `sample-origins` struct slot; `capture-data-key-hash` slot (KEEP_LAST, ADR 0029); `sample-key-hashes` table; `src/dds-disc/dataplane.lisp` — `node-sample-origin-guid` / `node-sample-origin-sn` (logical-origin accessors) + `%record-sample-origin` setter; `node-sample-key-hash (node key)` → captured `PID_KEY_HASH (0x0070)` per `(writer-guid . sn)` (ADR 0029)
 - `src/dds-durability/` — service implementation (store / store-file / store-sqlite / store-microservice / spec / service / runner / supervisor / main / store-encrypted)
 - `src/dds-dare/` — DARE crypto (openssl-ffi / primitives / envelope / key-provider)
-- `src/dds-pal/pal-{sbcl,clasp}.lisp` — `fsync-stream` (group-commit; NFR-PORT split: SBCL `fdatasync(2)` / Clasp `finish-output`)
+- `src/dds-pal/pal-{sbcl,allegro}.lisp` — `fsync-stream` (group-commit; NFR-PORT split: SBCL `fdatasync(2)` / AllegroCL `finish-output`)
 - `src/dds-tests/durability-test.lisp` — unit + integration tests (incl. `run-durability-no-double-delivery-test`, `run-durability-multitopic-test`, `run-durability-dispose-replay-test`, `run-durability-file-recovery-test`, `run-dare-*`, `run-durability-collect-origin-convergence-test`, `run-durability-keeplast-compaction-test`, `run-durability-keeplast-cross-restart-test`, `run-durability-keeplast-service-spec-policy-test`, `run-durability-keeplast-memory-test`)
 - `src/dds-tests/pbt-test.lisp` — PID-parse fuzz arm (`fuzz-original-writer-info-parse`) + DARE open-path fuzz arm (`fuzz-dare-open-payload`) + the PERSISTENT crash-injection arm, NFR-SEC-POSTURE

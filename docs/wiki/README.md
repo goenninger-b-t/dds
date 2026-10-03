@@ -39,7 +39,9 @@ and worked examples (grounded in the verified test suite under `src/dds-tests/`)
   (`:dds-cdr`, `:dds-types`, …) for a narrower surface.
 - Examples that talk over the network use UDP loopback on a domain id; two participants in
   one image is the normal test/demo pattern.
-- Every example here is adapted from a test in `src/dds-tests/` that passes on SBCL + Clasp.
+- Every example here is adapted from a test in `src/dds-tests/` that passes on SBCL. AllegroCL runs the same
+  suite with 19 known failures, listed in the repository README's status section; check that list before
+  relying on an example on AllegroCL. Clasp is no longer a target (ADR 0118).
 
 ---
 

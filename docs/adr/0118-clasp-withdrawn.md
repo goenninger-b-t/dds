@@ -71,6 +71,7 @@ So the rebaseline is visible in the matrix rather than only stated here:
 | Where | Retired value | Replacement |
 |---|---|---|
 | `docs/verification.csv` Status | `done-clasp+sbcl` (8 rows) | `done-sbcl` — done, SBCL evidence only, AllegroCL not yet run (WP-0.13) |
+| `docs/verification.csv` Status | any value on a row whose evidence and subject are Clasp-only (3 NFR-PORT rows) | `withdrawn` — Clasp-only evidence, kept as history, counts toward no gate (WP-0.13) |
 | `docs/verification.csv` Notes | "Clasp+SBCL …", "both impls" | left as written (historical); the Status column carries the truth |
 | ADR Status line of a superseded ADR | — | `Superseded by ADR 0118` or `Partly superseded by ADR 0118 (§N)` |
 
