@@ -3,7 +3,7 @@
   "@graph": [
     {
       "@id": "_:creationinfo",
-      "created": "2026-10-03T23:24:01Z",
+      "created": "2026-10-03T23:44:08Z",
       "createdBy": [
         "https://github.com/goenninger-b-t/dds/sbom#agent/goenninger-b-t"
       ],
@@ -93,6 +93,13 @@
       "type": "simplelicensing_LicenseExpression"
     },
     {
+      "comment": "Franz Inc. commercial licence for Allegro Common Lisp (not an SPDX list licence; terms are the licensee's agreement with Franz Inc.).",
+      "creationInfo": "_:creationinfo",
+      "simplelicensing_licenseExpression": "LicenseRef-Franz-proprietary",
+      "spdxId": "https://github.com/goenninger-b-t/dds/sbom#license/LicenseRef-Franz-proprietary",
+      "type": "simplelicensing_LicenseExpression"
+    },
+    {
       "comment": "OMG DDS 1.4 / DDSI-RTPS 2.5 / XCDR middleware in Common Lisp. Project code + documentation licensed CC-BY-ND-4.0 (see LICENSE.md / COPYRIGHT.md). Third-party dependencies retain their own licences.",
       "creationInfo": "_:creationinfo",
       "name": "neodds",
@@ -102,8 +109,8 @@
       "software_declaredLicense": "https://github.com/goenninger-b-t/dds/sbom#license/CC-BY-ND-4.0",
       "software_downloadLocation": "https://github.com/goenninger-b-t/dds",
       "software_homePage": "https://github.com/goenninger-b-t/dds",
-      "software_packageUrl": "pkg:github/goenninger-b-t/dds@abd8eef",
-      "software_packageVersion": "0.0.0-dev+git.abd8eef",
+      "software_packageUrl": "pkg:github/goenninger-b-t/dds@857df71",
+      "software_packageVersion": "0.0.0-dev+git.857df71",
       "software_primaryPurpose": "library",
       "spdxId": "https://github.com/goenninger-b-t/dds/sbom#package/neodds",
       "suppliedBy": "https://github.com/goenninger-b-t/dds/sbom#agent/goenninger-b-t",
@@ -240,7 +247,7 @@
       "type": "Relationship"
     },
     {
-      "comment": "Common Lisp runtime (alternative landed target: Clasp). SBCL is public-domain with BSD/MIT portions -> declared licence omitted (NOASSERTION).",
+      "comment": "Common Lisp runtime (one of the two required targets, with AllegroCL; ADR 0118). SBCL is public-domain with BSD/MIT portions -> declared licence omitted (NOASSERTION).",
       "creationInfo": "_:creationinfo",
       "name": "sbcl",
       "software_downloadLocation": "https://www.sbcl.org/",
@@ -258,6 +265,37 @@
       "spdxId": "https://github.com/goenninger-b-t/dds/sbom#relationship/runtime-sbcl",
       "to": [
         "https://github.com/goenninger-b-t/dds/sbom#package/sbcl"
+      ],
+      "type": "Relationship"
+    },
+    {
+      "creationInfo": "_:creationinfo",
+      "name": "Franz Inc.",
+      "spdxId": "https://github.com/goenninger-b-t/dds/sbom#agent/Franz-Inc.",
+      "type": "Organization"
+    },
+    {
+      "comment": "Common Lisp runtime (one of the two required targets, with SBCL; ADR 0118). Allegro CL 11.0 Enterprise, 64-bit Linux x86-64 SMP, the alisp image. Commercial licence from Franz Inc.",
+      "creationInfo": "_:creationinfo",
+      "name": "allegrocl",
+      "software_declaredLicense": "https://github.com/goenninger-b-t/dds/sbom#license/LicenseRef-Franz-proprietary",
+      "software_downloadLocation": "https://franz.com/products/allegro-common-lisp/",
+      "software_homePage": "https://franz.com/products/allegro-common-lisp/",
+      "software_packageUrl": "pkg:generic/allegrocl@11.0",
+      "software_packageVersion": "11.0",
+      "software_primaryPurpose": "application",
+      "spdxId": "https://github.com/goenninger-b-t/dds/sbom#package/allegrocl",
+      "suppliedBy": "https://github.com/goenninger-b-t/dds/sbom#agent/Franz-Inc.",
+      "type": "software_Package"
+    },
+    {
+      "comment": "runtime dependency",
+      "creationInfo": "_:creationinfo",
+      "from": "https://github.com/goenninger-b-t/dds/sbom#package/neodds",
+      "relationshipType": "dependsOn",
+      "spdxId": "https://github.com/goenninger-b-t/dds/sbom#relationship/runtime-allegrocl",
+      "to": [
+        "https://github.com/goenninger-b-t/dds/sbom#package/allegrocl"
       ],
       "type": "Relationship"
     },
@@ -362,6 +400,7 @@
         "https://github.com/goenninger-b-t/dds/sbom#package/static-vectors",
         "https://github.com/goenninger-b-t/dds/sbom#package/xmls",
         "https://github.com/goenninger-b-t/dds/sbom#package/sbcl",
+        "https://github.com/goenninger-b-t/dds/sbom#package/allegrocl",
         "https://github.com/goenninger-b-t/dds/sbom#package/openssl",
         "https://github.com/goenninger-b-t/dds/sbom#package/iterate",
         "https://github.com/goenninger-b-t/dds/sbom#package/libsqlite3",
@@ -372,6 +411,7 @@
         "https://github.com/goenninger-b-t/dds/sbom#relationship/dependsOn-static-vectors",
         "https://github.com/goenninger-b-t/dds/sbom#relationship/dependsOn-xmls",
         "https://github.com/goenninger-b-t/dds/sbom#relationship/runtime-sbcl",
+        "https://github.com/goenninger-b-t/dds/sbom#relationship/runtime-allegrocl",
         "https://github.com/goenninger-b-t/dds/sbom#relationship/runtime-openssl",
         "https://github.com/goenninger-b-t/dds/sbom#relationship/depends-iterate",
         "https://github.com/goenninger-b-t/dds/sbom#relationship/runtime-libsqlite3"
@@ -402,6 +442,7 @@
         "https://github.com/goenninger-b-t/dds/sbom#license/CC0-1.0",
         "https://github.com/goenninger-b-t/dds/sbom#license/CC-BY-ND-4.0",
         "https://github.com/goenninger-b-t/dds/sbom#license/Apache-2.0",
+        "https://github.com/goenninger-b-t/dds/sbom#license/LicenseRef-Franz-proprietary",
         "https://github.com/goenninger-b-t/dds/sbom#package/neodds",
         "https://github.com/goenninger-b-t/dds/sbom#package/bordeaux-threads",
         "https://github.com/goenninger-b-t/dds/sbom#package/cffi",
@@ -410,6 +451,8 @@
         "https://github.com/goenninger-b-t/dds/sbom#package/static-vectors",
         "https://github.com/goenninger-b-t/dds/sbom#package/xmls",
         "https://github.com/goenninger-b-t/dds/sbom#package/sbcl",
+        "https://github.com/goenninger-b-t/dds/sbom#agent/Franz-Inc.",
+        "https://github.com/goenninger-b-t/dds/sbom#package/allegrocl",
         "https://github.com/goenninger-b-t/dds/sbom#agent/The-OpenSSL-Project",
         "https://github.com/goenninger-b-t/dds/sbom#package/openssl",
         "https://github.com/goenninger-b-t/dds/sbom#agent/The-iterate-authors",

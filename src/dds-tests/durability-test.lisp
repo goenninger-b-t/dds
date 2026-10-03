@@ -2829,7 +2829,7 @@
    (passing its filter) via the idempotent service-add-topic, with no explicit add-topic and no restart.
    Structural (both impls): the filter + selection core, the %service-topics :auto-discover relaxation,
    DEFAULT-OFF byte-identical (no discovery node/thread when off), and the start->stop->start lifecycle.
-   SBCL-live: a publisher on the new topic DynC is discovered -> auto-added (nodes grow, topic-names gains DynC)
+   Live (SBCL; AllegroCL is a known failure at :dd-auto-serve-dync): a publisher on the new topic DynC is discovered -> auto-added (nodes grow, topic-names gains DynC)
    -> collected (store-count = N) -> a TL late-joiner gets the N-sample replay; a non-matching 'Other' is NOT
    served (filter gate). RED contrast: a :auto-discover NIL service never serves DynC (pre-3c behavior)."
   ;; ============================================================================================

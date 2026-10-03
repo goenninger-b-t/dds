@@ -3305,7 +3305,8 @@
 ;;; WP-DCPS-API-COMPLETION S4 — deadline monitoring + SAMPLE_LOST (DDS 1.4 §2.2.3.7 /
 ;;; §2.2.4.1): the three previously-dead statuses (OFFERED/REQUESTED_DEADLINE_MISSED,
 ;;; SAMPLE_LOST) fire via a background deadline monitor thread + a reader-side lost-sample
-;;; detection site. Timing-based; generous margins keep them deterministic on both impls.
+;;; detection site. Timing-based; generous margins keep them deterministic on SBCL. On AllegroCL
+;;; RUN-DCPS-DEADLINE-MONITOR-TEST is a known failure (:off-deadline-fires, 2026-10-03 baseline).
 
 (defun* run-dcps-deadline-monitor-test ()
     (function () t)

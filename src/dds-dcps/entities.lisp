@@ -2068,8 +2068,9 @@
    Return a writer-side loaned FlatData sample the app fills via the existing <name>-<field>-fd setters, then
    publishes with write-loaned (or abandons with discard-loan). When the FULL ZC-TX eligibility holds — the topic
    type is FlatData, its +<name>-flatdata-size+ clears *zerocopy-min-payload-bytes*, the node has a writer pool,
-   the writer is NOT wire-protected (secured) NOR data_protection-transformed (ADR 0042 §6), and the impl
-   supports foreign-SAP writes (SBCL; ZC is SBCL-only, ADR 0013) — the loan is SLOT-BACKED: a pool slot is
+   the writer is NOT wire-protected (secured) NOR data_protection-transformed (ADR 0042 §6), and the node can
+   attach the SHMEM pool by name (dds.disc:node-loan-write-eligible-p; every PAL implements store-sap-u8, so
+   the gate is that capability, not the implementation name) — the loan is SLOT-BACKED: a pool slot is
    acquired (dds.disc:node-loan-write-acquire), the type's 4-octet encap header + OPTIONS are written into the
    slot head (%loan-encap-header — the slot IS a self-describing SerializedPayload, byte-identical to the
    classic path's), and the sample is a flatdata-view over the slot's XCDR2 body, so the app's setters write
