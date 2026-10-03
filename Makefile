@@ -14,7 +14,7 @@ SBCL  := ./scripts/with-sbcl.sh
 ALLEGRO := ./scripts/with-allegro.sh
 LISP  ?= $(CLASP)
 
-.PHONY: all build test build-clasp build-sbcl build-allegro test-clasp test-sbcl test-allegro gate-build gate-mem gate-pal gate-nocond gate-quickload gate-drivers \
+.PHONY: all build test build-clasp build-sbcl build-allegro test-clasp test-sbcl test-allegro gate-build gate-mem gate-pal gate-nocond gate-quickload gate-verification gate-drivers \
         build-all test-all gate-hotpath gate-types corpus fuzz wire interop \
         square-pub square-sub square-spy large-pub large-sub gated-sub corpus-capture \
         nokey-pub nokey-sub keyed-flat-pub keyed-flat-sub \
@@ -124,6 +124,11 @@ gate-pal: ; ./scripts/gate-pal.sh
 # compile warning, so a system loaded through it cannot fail on one. The Makefile was swept long ago;
 # two scripts were missed and kept the Linux fallback harness structurally unable to go red.
 gate-quickload: ; ./scripts/gate-quickload.sh
+
+# The verification matrix is a Definition-of-Done artifact (§5) and prose-heavy, so nothing parsed it for a
+# long time: 36 of 201 records had drifted into unparseable CSV (Notes written unquoted, so its commas
+# became field separators — one record split into 79 fields) plus 2 empty records from stray bare LFs.
+gate-verification: ; ./scripts/gate-verification.sh
 
 # Owner directive 2026-07-14 (NON-NEGOTIABLE): no Lisp conditions in the hot path; every condition handled
 # at latest at the toplevel DDS API. Annotation lint + asserts the receiver boundary handlers still exist.
