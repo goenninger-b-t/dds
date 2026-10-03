@@ -401,8 +401,11 @@ Implementations:
 No reader conditional escapes `dds-pal/`.
 
 **Live proof:** `interop/graceful-shutdown/run-kill15.sh` — launches a PERSISTENT (DARE/file)
-service on both Clasp and SBCL, sends `kill -15`, and asserts: status 0, no SIGBUS.
-Result (2026-06-22): **both impls clean exit, no SIGBUS** (ADR 0026 §10 item 3 RESOLVED).
+service on SBCL and on AllegroCL (ADR 0118), waits for the driver's "signal handler installed" marker,
+sends `kill -15`, and asserts: the service really started (no `RUNNER-START-FAILED`; a PERSISTENT store
+needs OpenSSL ≥ 3.5), the process exits within 30 s, the driver printed "teardown complete", and no SIGBUS. A Lisp that is not installed FAILS its leg; it is never skipped.
+Result (2026-06-22, recorded on the then-supported Clasp and SBCL): **both impls clean exit, no
+SIGBUS** (ADR 0026 §10 item 3 RESOLVED).
 
 ### 5.2 Microservice SERVER mode (`--backend server`, ADR 0050 §4.8)
 
@@ -679,6 +682,13 @@ wrap the inner store in the decorator backed by a file key-provider:
   construction it opens the provider, ML-KEM-1024-encapsulates, derives the DEK, and frees the
   transient shared secret. The DEK is a foreign-backed secret (a `static-vector`, zeroized+freed on
   `store-close`).
+- `dds.dare:free-secret-octets v` — the single wipe-then-release point for every foreign-backed secret
+  (ML-KEM private key, shared secret, DEK, DDS-Security master keys). It runs in three phases: fill `v`
+  with zeros; if `dds.dare:*secret-wipe-readback-hook*` is non-NIL, call it with the wiped, still-live
+  `v`; release `v` (under `unwind-protect`, so a hook that exits non-locally cannot leak it). The hook
+  is a verification seam, NIL in production: it is the only point at which a test can read the wipe
+  back on both SBCL and AllegroCL, because after the release the storage is gone. See
+  [Security §2.4](security.md) for a worked example.
 - `dds.dare:make-file-key-provider :dir DIR` — an ML-KEM-1024 keypair in `DIR/ml-kem-1024.{pub,key}`,
   generated on first open (perms enforced **0600 file / 0700 dir** and checked at open — a
   group/other-readable or unverifiable key **refuses to load**, fail-closed) and loaded thereafter.
@@ -2177,7 +2187,7 @@ durability-service-main --backend server --port 8080 --inner-backend file --inne
 - `interop/durability-persistent/` — PERSISTENT transparency-after-restart (Connext 458 / Fast DDS 186) + the RTI-PS coexistence finding
 - `interop/durability-coexist-dedup/` — live dual-relay coexistence harness; captures dir-a (N=545) + dir-b (N=550); `analyze-capture.py --assert-converged`
 - `interop/durability-keeplast/` — KEEP_LAST restart-seed cross-DDS harness (Leg 1 Connext M=302→D=2, Leg 2 Fast DDS M=134→D=2); `spike/` — `PID_KEY_HASH` presence confirmations (767 Connext + 362 Fast DDS)
-- `interop/graceful-shutdown/` — `kill -15` clean-exit harness (`driver.lisp` + `run-kill15.sh`); both Clasp and SBCL: status 0, no SIGBUS (ADR 0030)
+- `interop/graceful-shutdown/` — `kill -15` clean-exit harness (`driver.lisp` + `run-kill15.sh`); legs: SBCL and AllegroCL, a missing Lisp FAILS (ADR 0030, ADR 0118)
 - `src/dds-disc/disc.lisp` — `sample-origins` struct slot; `capture-data-key-hash` slot (KEEP_LAST, ADR 0029); `sample-key-hashes` table; `src/dds-disc/dataplane.lisp` — `node-sample-origin-guid` / `node-sample-origin-sn` (logical-origin accessors) + `%record-sample-origin` setter; `node-sample-key-hash (node key)` → captured `PID_KEY_HASH (0x0070)` per `(writer-guid . sn)` (ADR 0029)
 - `src/dds-durability/` — service implementation (store / store-file / store-sqlite / store-microservice / spec / service / runner / supervisor / main / store-encrypted)
 - `src/dds-dare/` — DARE crypto (openssl-ffi / primitives / envelope / key-provider)

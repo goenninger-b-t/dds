@@ -53,7 +53,7 @@
    (b) identity-token equals the locked 224-byte regression vector (byte-exact; §9.3.4 no propagate).
    (c) wrong-CA cert with the test CA -> (values nil reason) (chain-verify fail-closed).
    (d) validate-remote-identity between two distinct-GUID handles -> :ok + :requester/:replier.
-   Requires OpenSSL >= 3.5; skips gracefully if absent. Both SBCL and Clasp must pass."
+   Requires OpenSSL >= 3.5; skips gracefully if absent. Must pass on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
       (format t "~&  [auth-identity] SKIP — OpenSSL >= 3.5 not available: ~a~%"
@@ -157,7 +157,7 @@
      Vectors: Ux, Uy (public key); message = ASCII 'sample'; r, s (DER-encoded ECDSA-Sig-Value).
      Source: https://www.rfc-editor.org/rfc/rfc6979.txt §A.2.5
      ecdsa-verify takes the raw message and hashes SHA-256 internally (EVP_DigestVerify).
-   Both SBCL and Clasp must pass."
+   Must pass on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
       (format t "~&  [ecdsa-kat] SKIP: ~a~%" %dare-reason)
@@ -311,7 +311,7 @@
    tcId=1: msg='' (empty), valid signature.
    tcId=62: msg=313233343030, invalid signature (wrong salt / tampered).
    Key: RSA-2048 public key (n, e=010001) from Wycheproof test group 1.
-   Both SBCL and Clasp must pass."
+   Must pass on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
       (format t "~&  [rsa-pss-kat] SKIP: ~a~%" %dare-reason)
@@ -432,7 +432,7 @@
    KAT method: generate two ephemeral key pairs (A, B); assert
      ffdh-compute(A-priv, B-pub) == ffdh-compute(B-priv, A-pub) (DH commutativity property).
    Also asserts the shared secret length = 256 bytes (MODP-2048 group order, RFC 3526 §3)
-   and that SHA-256 of the shared secret is 32 bytes (DDS-Security §9.3.3). Both SBCL/Clasp."
+   and that SHA-256 of the shared secret is 32 bytes (DDS-Security §9.3.3). Must pass on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
       (format t "~&  [ffdh-kat] SKIP: ~a~%" %dare-reason)
@@ -464,7 +464,7 @@
    (:ec  :rsa) -> NIL  (mismatched -> no common suite -> handshake must reject).
    (:rsa :ec)  -> NIL  (same, reversed direction).
    %cert-algo->kind: \"EC-prime256v1\"->:ec, \"RSA-2048\"->:rsa, unknown->NIL (§8.7.2.2 / §9.3.1).
-   Both SBCL and Clasp must pass."
+   Must pass on SBCL and AllegroCL."
   (%check :sel-ec-ec
           (eq (dds.security:select-auth-suite :ec :ec) dds.security:+suite-ecdh+)
           "select-auth-suite(:ec :ec) must return +suite-ecdh+")
@@ -507,7 +507,7 @@
   "DDS-Security 1.1 §8.7.2.4 three-message PKI-DH handshake via +suite-ffdh+ (RSA-2048 certs).
    Happy-path: participant_rsa (GUID-A < GUID-B) is requester; participant_rsa_b is replier.
    Full Request->Reply->Final: both handles -> :authenticated; SharedSecrets byte-equal (32 bytes).
-   Negative: tampered reply -> requester :rejected. Both SBCL and Clasp must pass."
+   Negative: tampered reply -> requester :rejected. Must pass on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
       (format t "~&  [auth-handshake-rsa] SKIP: ~a~%" %dare-reason)
@@ -640,7 +640,7 @@
    Each negative asserts :rejected / (values nil reason) with NO SharedSecret and NO throw.
    Each is paired with a matching positive-control so the test cannot pass by always-rejecting.
    Internal token format is the in-process tagged binary (not CDR DataHolder wire — Slice 5).
-   Requires OpenSSL >= 3.5; skips gracefully if absent. Both SBCL and Clasp must pass."
+   Requires OpenSSL >= 3.5; skips gracefully if absent. Must pass on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
       (format t "~&  [auth-negatives] SKIP — OpenSSL >= 3.5 not available: ~a~%"
@@ -1008,7 +1008,7 @@
      (d) NEG-REQUESTER: requester REJECTS (:rejected) when EXPECTED-CHALLENGE2 != the reply's challenge2.
      (e) ABSENCE-TOLERANCE: replier with EXPECTED-CHALLENGE1=NIL (no auth_request seen) still ACCEPTS the
          bound request — §8.7.2.3-optional, absence must NOT false-reject a conformant peer.
-   Requires OpenSSL >= 3.5; skips gracefully if absent. Both SBCL and Clasp must pass."
+   Requires OpenSSL >= 3.5; skips gracefully if absent. Must pass on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
       (format t "~&  [auth-challenge-binding] SKIP — OpenSSL >= 3.5 not available: ~a~%"
@@ -1149,7 +1149,7 @@
           retransmit of N1 is a no-op (stays N1).
    No trust gate is weakened: A2/A5 show the binding still fires on a match and the strict API still rejects a
    supplied mismatch; the downgrade only ever falls back to the cert-chain+Sign path a Fast DDS peer already
-   takes. Requires OpenSSL >= 3.5; skips gracefully if absent. Both SBCL and Clasp must pass."
+   takes. Requires OpenSSL >= 3.5; skips gracefully if absent. Must pass on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
       (format t "~&  [auth-forged-request-hardening] SKIP — OpenSSL >= 3.5 not available: ~a~%"
@@ -1271,7 +1271,7 @@
    and structural invariants (class_id presence, prop set, field ordering) for regression.
    Nonces and ephemeral DH keys are non-deterministic; we assert structural invariants +
    round-trip identity rather than full byte-exact vectors.
-   Both SBCL and Clasp must pass."
+   Must pass on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
       (format t "~&  [auth-token-corpus] SKIP — OpenSSL >= 3.5 not available: ~a~%"
@@ -1451,7 +1451,7 @@
    Tests BOTH a normal-optimization path AND a (safety 0) compiled inner loop (NFR-SEC-POSTURE).
    Invariant: every input returns (:rejected NIL) or equivalent — never OOB, never crash, never throw.
    Uses a deterministic seed (make-random-state nil, xorshift-like index-based fill, no Date.now).
-   Requires OpenSSL >= 3.5; skips gracefully if absent. Both SBCL and Clasp must pass."
+   Requires OpenSSL >= 3.5; skips gracefully if absent. Must pass on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
       (format t "~&  [auth-token-fuzz] SKIP — OpenSSL >= 3.5 not available: ~a~%"
@@ -1563,7 +1563,7 @@
    Happy-path: participant_ec (GUID-A < GUID-B) is requester; participant_ec_b is replier.
    Full Request->Reply->Final: both handles -> :authenticated; SharedSecrets byte-equal.
    Negative (a): tampered reply signature -> requester returns :rejected.
-   Negative (b): tampered Final -> replier returns :rejected. Both SBCL and Clasp must pass."
+   Negative (b): tampered Final -> replier returns :rejected. Must pass on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
       (format t "~&  [auth-handshake-ecdh] SKIP: ~a~%" %dare-reason)
@@ -1807,7 +1807,7 @@
        message-class-id + GUIDs + DataHolder list round-trip byte-identically.
    (c) Self-consistency prefix: DataHolder leading bytes match the T0-pinned CDR-LE layout
        (the locked +dataholder-req-prefix-vector+ above).
-   Requires OpenSSL >= 3.5; skips gracefully if absent. Both SBCL and Clasp must pass."
+   Requires OpenSSL >= 3.5; skips gracefully if absent. Must pass on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
       (format t "~&  [auth-wire-codec] SKIP — OpenSSL >= 3.5 not available: ~a~%"
@@ -1985,7 +1985,7 @@
   "WP-DDS-SECURITY-AUTH-2BI T2: parser fuzz — N=2000 malformed/short/oversized/random blobs.
    Drives dataholder->handshake-token AND parse-generic-message; asserts fail-closed (-> NIL).
    Tests BOTH a normal-optimization path AND a (safety 0) compiled inner loop (NFR-SEC-POSTURE).
-   Deterministic blob generation (index-based fill, no random-state). Both SBCL and Clasp must pass."
+   Deterministic blob generation (index-based fill, no random-state). Must pass on SBCL and AllegroCL."
   (let* ((fuzz-blobs '())
          (fuzz-count 0))
 
@@ -2203,7 +2203,7 @@
    (d) Node-A receives the Reply -> process-handshake -> sends Final.
    (e) Node-B receives the Final -> process-handshake -> :authenticated.
    (f) Both reach :authenticated with byte-equal SharedSecrets (bounded 4 s poll).
-   Requires OpenSSL >= 3.5; skips gracefully if absent. Both SBCL and Clasp must pass."
+   Requires OpenSSL >= 3.5; skips gracefully if absent. Must pass on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
       (format t "~&  [auth-handshake-over-wire] SKIP — OpenSSL >= 3.5 not available: ~a~%"
@@ -2420,7 +2420,7 @@
        §9.5.3.1 PVMS bootstrap KM, exchanges crypto tokens over reliable PVMS, and reaches :keyed BOTH ways.
    (d) T8 (migrated off auth-remote-remote-km): each crypto-manager installed the OTHER's ParticipantCrypto
        (§8.5.2) — the per-writer/entity KeyMaterial now lives in the crypto-manager registries.
-   Requires OpenSSL >= 3.5; skips gracefully if absent. Both SBCL and Clasp must pass."
+   Requires OpenSSL >= 3.5; skips gracefully if absent. Must pass on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
       (format t "~&  [auth-manager-handshake] SKIP — OpenSSL >= 3.5 not available: ~a~%"
@@ -2513,7 +2513,7 @@
      (d)  B's decode resolver returns a non-nil KEY-MATERIAL for A's wire writer GUID.
      (e)  B receives EXACTLY the original plaintext PT (encode+decode round-trip byte-exact).
    No make-test-key-material is used anywhere in this test.
-   Requires OpenSSL >= 3.5; skips gracefully if absent. Both SBCL and Clasp must pass."
+   Requires OpenSSL >= 3.5; skips gracefully if absent. Must pass on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
       (format t "~&  [auth-encrypted-pubsub-keyx] SKIP — OpenSSL >= 3.5 not available: ~a~%"
@@ -2691,7 +2691,7 @@
      (d) each installed the remote's secure-SEDP publications-secure-writer (DW) EntityCrypto (a builtin token).
      (e) NONCE-DISJOINTNESS (safety-critical, HARD CONSTRAINT #1): %pvms-role-session-id is DIFFERENT for the
          two directions (A->B vs B->A), so the symmetric bootstrap KM never reuses a (key, nonce) pair.
-   Requires OpenSSL >= 3.5; skips gracefully if absent. Both SBCL and Clasp must pass."
+   Requires OpenSSL >= 3.5; skips gracefully if absent. Must pass on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
       (format t "~&  [secure-discovery-keyed] SKIP — OpenSSL >= 3.5 not available: ~a~%"
@@ -2783,7 +2783,9 @@
 ;;;   SHA-256 inner step is already covered by run-auth-sha256-kat (spike §5.5, §B.2 KAT passes).
 ;;;   (b) Structural/determinism checks on derive-kx-key — no fabricated composed KAT exists.
 ;;; Explicit statement: No published end-to-end DDS-Security KxKey test vector exists (spike §5.5).
-;;; The two-impl (Clasp + SBCL) cross-check is the composition conformance method.
+;;; The composition conformance method is a cross-check: the KxKey/KxSalt for fixed inputs are pinned to values
+;;; computed OUTSIDE Lisp (Python 3 hashlib/hmac, from the §9.5.3 construction as documented in
+;;; keyexchange.lisp), and SBCL and AllegroCL must each reproduce them byte-exactly.
 
 (defun* run-auth-kxkey-kat ()
     (function () t)
@@ -2792,9 +2794,12 @@
        SHA-256 inner step is already covered by run-auth-sha256-kat (spike §5.5).
    (b) Structural checks on derive-kx-key: 32-byte output; deterministic; KxKey != KxSalt
        (swapped challenges take effect); KxKey != raw shared_secret; free-kx-key returns nil.
-   No fabricated composed KxKey expected-value is asserted (spike §5.5 — none published).
-   Clasp and SBCL cross-check on identical fixed inputs is the composition conformance method.
-   Requires OpenSSL >= 3.5; skips gracefully if absent. Both impls must pass."
+   (c) Cross-check: KxKey and KxSalt for the fixed inputs must equal reference values computed outside
+       Lisp with Python 3 hashlib/hmac from the same §9.5.3 construction (HMAC-SHA256 keyed by
+       SHA-256(first || 16-octet label || second), data = shared_secret). No published composed vector
+       exists (spike §5.5), so this is not a spec KAT: it proves the composition and that SBCL and AllegroCL
+       produce the identical bytes, not the reading of the labels and challenge order (keyexchange.lisp).
+   Requires OpenSSL >= 3.5; skips if absent. Must pass on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
       (format t "~&  [kxkey-kat] SKIP — OpenSSL >= 3.5 not available: ~a~%"
@@ -2841,7 +2846,7 @@
             (format nil "RFC 4231 TC4: HMAC-SHA256 mismatch; got ~{~2,'0x~}" (coerce tc4-got 'list))))
 
   ;;; --- (b) derive-kx-key structural / determinism / asymmetry checks ---
-  ;; Fixed inputs (no published composed vector exists; Clasp+SBCL cross-check is the method).
+  ;; Fixed inputs (no published composed vector exists; the pinned cross-check values below are the method).
   (let* ((shared-secret
           (make-array 32 :element-type '(unsigned-byte 8)
                          :initial-contents '(#x01 #x02 #x03 #x04 #x05 #x06 #x07 #x08
@@ -2880,7 +2885,23 @@
            ;; KxKey != raw shared_secret (output is derived, not copied)
            (%check :kxkey-ne-secret
                    (not (equalp (dds.security:kx-key-bytes kx1) shared-secret))
-                   "KxKey == raw shared_secret (KDF produced identity output)"))
+                   "KxKey == raw shared_secret (KDF produced identity output)")
+           ;; (c) cross-check against values computed outside Lisp (Python 3, 2026-10-04):
+           ;;   hmac.new(sha256(c2 + b"key exchange key" + c1).digest(), ss, sha256)  -> KxKey
+           ;;   hmac.new(sha256(c1 + b"keyexchange salt" + c2).digest(), ss, sha256)  -> KxSalt
+           ;; with ss = 01..20, c1 = a1..c0, c2 = c1..e0 (the fixtures above). Both Lisps must match.
+           (let ((want-kxkey  #(#xe6 #x59 #xb2 #xae #xbc #x96 #x71 #x09 #xcf #xdb #xa8 #xfc #xd7 #xec #x7e #x60
+                                #xfe #xa8 #xeb #x3f #x92 #xd5 #x12 #x75 #x8d #x4d #x59 #xb0 #x82 #x77 #x47 #xfc))
+                 (want-kxsalt #(#xba #xe2 #x6f #x87 #x96 #x57 #xb6 #x38 #xb3 #x47 #x76 #x41 #x70 #x94 #xa2 #x4b
+                                #x0f #xd1 #xba #xba #x6a #x4e #xd6 #x8e #x0a #x77 #xc1 #x76 #x91 #x0d #x61 #x04)))
+             (%check :kxkey-crosscheck
+                     (equalp (dds.security:kx-key-bytes kx1) want-kxkey)
+                     (format nil "KxKey differs from the out-of-Lisp reference on ~a; got ~{~2,'0x~}"
+                             (lisp-implementation-type) (coerce (dds.security:kx-key-bytes kx1) 'list)))
+             (%check :kxsalt-crosscheck
+                     (equalp (dds.security:kx-key-bytes kxs) want-kxsalt)
+                     (format nil "KxSalt differs from the out-of-Lisp reference on ~a; got ~{~2,'0x~}"
+                             (lisp-implementation-type) (coerce (dds.security:kx-key-bytes kxs) 'list)))))
       (dds.security:free-kx-key kx1)
       (dds.security:free-kx-key kx2)
       (dds.security:free-kx-key kxs)))
@@ -2944,7 +2965,7 @@
    (c) flipped ciphertext byte -> NIL; (d) flipped tag byte -> NIL.
    (e) make-crypto-token-message / parse-crypto-token-message envelope round-trip.
    (f) 2-DataHolder message -> NIL (cap enforced, spike §6.3).
-   Requires OpenSSL >= 3.5; skips gracefully if absent. Both SBCL and Clasp must pass."
+   Requires OpenSSL >= 3.5; skips gracefully if absent. Must pass on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
       (format t "~&  [auth-keymaterial-roundtrip] SKIP — OpenSSL >= 3.5 not available: ~a~%"
@@ -3129,7 +3150,7 @@
    and parse-crypto-token-message, under BOTH normal and (safety 0) compiled paths (NFR-SEC-POSTURE).
    Every result must be NIL and nothing must crash or signal (fail-closed).
    Blob sizes: 0..299 bytes (covers truncations and near-valid lengths).
-   Requires OpenSSL >= 3.5; skips gracefully if absent. Both SBCL and Clasp must pass."
+   Requires OpenSSL >= 3.5; skips gracefully if absent. Must pass on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
       (format t "~&  [auth-cryptotoken-fuzz] SKIP — OpenSSL >= 3.5 not available: ~a~%"
@@ -3212,7 +3233,7 @@
    returns :incompatible (plain peer has no IdentityToken -> no AUTH-REMOTE -> strict refuse).
    NON-VACUOUS: plain participants C and D on the SAME topic/type/QoS DO match (matched-count >=1),
    proving the SEC<->PLAIN non-match is the auth-gate, not a topic/type/QoS mismatch.
-   Requires OpenSSL >= 3.5 (identity load); skips gracefully if absent. Both SBCL and Clasp must pass."
+   Requires OpenSSL >= 3.5 (identity load); skips gracefully if absent. Must pass on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
       (format t "~&  [auth-secured-refuses-plain] SKIP — OpenSSL >= 3.5 not available: ~a~%"
@@ -3310,7 +3331,7 @@
    byte-exact — exactly as the non-security baseline does. Confirms: no IdentityToken in SPDP,
    no PSM bits, normal SEDP match, and DATA delivery with exact payload recovery.
    Proves the security build does not regress the unauthenticated default path.
-   No OpenSSL dependency; must pass on BOTH SBCL and Clasp unconditionally."
+   No OpenSSL dependency; must pass on BOTH SBCL and AllegroCL unconditionally."
   (let ((p-w nil)
         (p-r nil))
     (unwind-protect
@@ -3434,7 +3455,7 @@
          sets my-receiver-key-id, so decode REQUIRES a valid receiver-specific MAC — hence B's match (c) PROVES the
          per-receiver MAC was emitted by A and verified by B (decode fails closed without it, even on a valid
          common_mac). The wrong-receiver-key fail-closed control is run-secure-sedp-origin-auth-tamper-test.
-   Requires OpenSSL >= 3.5; skips gracefully if absent. Both SBCL and Clasp must pass."
+   Requires OpenSSL >= 3.5; skips gracefully if absent. Must pass on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
       (format t "~&  [secure-discovery-e2e ~a] SKIP — OpenSSL >= 3.5 not available: ~a~%"
@@ -3636,7 +3657,7 @@
    base). The (g) assertions prove BOTH peers minted the secure-SEDP readers WITH a receiver-specific key, so
    the match is gated on a verified receiver-specific MAC (decode fails closed without it). The non-vacuous
    wrong-receiver-key control is run-secure-sedp-origin-auth-tamper-test. Delegates to %run-secure-discovery-e2e
-   with ORIGIN-AUTH-P. Requires OpenSSL >= 3.5; skips gracefully if absent. Both SBCL and Clasp must pass."
+   with ORIGIN-AUTH-P. Requires OpenSSL >= 3.5; skips gracefully if absent. Must pass on SBCL and AllegroCL."
   (%run-secure-discovery-e2e "governance-origin-auth.p7s" nil t))
 
 (defun* run-protection-kind-base-test ()
@@ -3661,7 +3682,7 @@
    (a) Good: governance.p7s + perm-ca-cert.pem -> verified bytes containing domain_access_rules.
    (b) Tampered: 1-byte-flipped governance.p7s -> NIL (CMS signature invalid, fail-closed).
    (c) Wrong CA: governance.p7s + identity CA -> NIL (chain verify fails, fail-closed).
-   Both SBCL and Clasp must pass."
+   Must pass on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
       (format t "~&  [cms-verify-kat] SKIP: ~a~%" %dare-reason)
@@ -3843,7 +3864,7 @@
    ONE crypto-manager. After join, every thread's KMs resolved by transformation_key_id and the index
    holds exactly N*M entries — the single manager lock keeps the registries uncorrupted under concurrent
    read+write (a lost update would drop the count or fail a resolve). Threads do only register/resolve
-   (no CLOS error-signaling inside threads, per the Clasp threading note)."
+   (no CLOS error-signaling inside worker threads)."
   (let* ((cm (dds.dcps::make-crypto-manager))
          (n-threads 8)
          (per 50)
@@ -3976,7 +3997,7 @@
    resolvers the §9.5.3.3 data path consumes (by GUID-prefix for participant, by transformation_key_id
    / inner GUID for entity), each fail-closed on a miss, with a light concurrency smoke over the
    single manager lock. Requires OpenSSL >= 3.5 (random KeyMaterial); skips only if truly absent.
-   Both SBCL and Clasp must pass identically."
+   Must pass identically on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
       (format t "~&  [security-crypto-manager] SKIP — OpenSSL >= 3.5 not available: ~a~%"

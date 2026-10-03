@@ -92,8 +92,8 @@
 
    The BYTE-EXACT vectors are the point, not the round-trip: a round-trip passes even if both halves share
    a wrong bit order or a wrong sign convention, and the two implementations' native primitives disagree
-   about signedness (SBCL's single-float-bits returns a SIGNED pattern, Clasp's ext:single-float-to-bits an
-   UNSIGNED one). Only fixed octets pin that down."
+   about signedness (SBCL's single-float-bits returns a SIGNED pattern; AllegroCL's excl::single-float-to-shorts
+   returns two UNSIGNED 16-bit halves). Only fixed octets pin that down."
   ;; 1. BYTE-EXACT, both endiannesses. -1.0f0 is IEEE binary32 #xBF800000; -1.0d0 is #xBFF0000000000000.
   (let* ((arena (dds.core.arena:init-arena :bytes (* 64 1024)))
          (pool (dds.core.arena:make-buffer-pool arena 512 2))
@@ -533,7 +533,7 @@
        ((setf (slot dst) (copy-mpoint (slot src))), or a %COPY-SEQ-INTO that always COPY-SEQs): the
        values stay right and every other check stays green, but :copy-into-in-place-* goes red.
    (3) ZERO ALLOCATION on that reuse path, measured with the NFR-PERF-8 oracle (dds.pal:bytes-consed;
-       constant on Clasp by the documented NFR-PORT gap, so this arm is SBCL-effective).
+       constant on AllegroCL by the documented NFR-PORT gap, so this arm is SBCL-effective).
    (4) NO CONDITION ESCAPES for a destination whose sequence slot holds a different representation —
        legal, because the slot type is the unspecialised VECTOR. Falsify by REPLACEing without the
        element-type guard: an (unsigned-byte 8) destination raises a TYPE-ERROR out of src/."
@@ -759,7 +759,7 @@
    both blocks, so it CANCELS in secured-minus-plain — leaving only the data_protection encode contribution (the
    T5a pool acquire + encode-into, which is alloc-free). KEEP_LAST depth-1 supersession releases the pooled buffer
    each publish (steady state ~1 in use); no matched readers/sockets (no start-node) isolates the publish cost.
-   SBCL-exact (dds.pal:bytes-consed); Clasp returns 0.0/0.0 by the NFR-PORT gap."
+   SBCL-exact (dds.pal:bytes-consed); AllegroCL returns 0.0/0.0 by the NFR-PORT gap."
   (let ((node (let ((dds.disc:*shmem-enabled* nil))
                 (dds.disc:make-disc-node
                  :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element #xC1)
@@ -807,7 +807,7 @@
    plaintext for the plain baseline. Used for the plain baseline and the allocating-decode comparison (LOAN NIL,
    whose per-sample plaintext copy is a big signal that SCALES with payload); the loan-vs-plain delta over two
    fresh nodes (identical 0->N proxy/store growth) corroborates the EXACT 0.0000 that %secured-wrapper-cycle-bps
-   proves deterministically. SBCL-exact; Clasp 0.0."
+   proves deterministically. SBCL-exact; AllegroCL 0.0."
   (let ((node (let ((dds.disc:*shmem-enabled* nil))
                 (dds.disc:make-disc-node
                  :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element #xC2)
@@ -833,7 +833,7 @@
    fixed-vector registry, then deregister + release the buffer + recycle the handle: exactly the per-sample wrapper
    work %deliver-user-sample and node-return-loan do AROUND the (separately-proven-0.0000) payload decode. No decode
    / store / reader-proxy, so there is NO framing or GC-boundary noise — the result is an EXACT 0.0000 on SBCL
-   (Clasp 0.0, NFR-PORT). This is the rock-solid proof that T5d de-consed the loan delivery wrapper (handle struct
+   (AllegroCL 0.0, NFR-PORT). This is the rock-solid proof that T5d de-consed the loan delivery wrapper (handle struct
    + registry cons + take list cons); the live-loop delta corroborates it end-to-end within the cross-node GC
    quantum. Returns 0.0 if the decode pool could not be carved (arena unavailable)."
   (let ((node (let ((dds.disc:*shmem-enabled* nil))
@@ -867,7 +867,7 @@
 (defun* run-mem-test ()
     (function () t)
   "Measured zero-alloc serialize + deserialize (NFR-PERF-8). Asserted on SBCL
-   (exact bytes-consed); on Clasp bytes-consed is 0 (gap) so it only smokes."
+   (exact bytes-consed); on AllegroCL bytes-consed is 0 (gap) so it only smokes."
   (let* ((arena (dds.core.arena:init-arena :bytes (* 64 1024)))
          (pool (dds.core.arena:make-buffer-pool arena 512 1))
          (ts (dds.types:find-type-support "mline"))
@@ -907,7 +907,7 @@
 (defun* run-mem-test-secure ()
     (function () t)
   "Measured zero-alloc data_protection AEAD encode + decode (NFR-MEM, security-ON). SBCL asserts
-   bytes-consed/iter < 1.0; Clasp smokes (bytes-consed is 0). Closes the gap that make mem never
+   bytes-consed/iter < 1.0; AllegroCL smokes (bytes-consed is 0). Closes the gap that make mem never
    covered the security path (ADR-0036 Carry-3)."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
@@ -981,7 +981,7 @@
             (%check :zero-alloc-secure-live-rx (< rx-wrap 1.0)
                     (format nil "live secured RECEIVE loan wrapper must be zero-alloc; measured ~,4f B/sample" rx-wrap))))))
     ;; WP-DDS-SECURITY-ZEROALLOC-AEAD T5 (ZA-2): the LIVE submessage (metadata_protection) + whole-RTPS (rtps_protection)
-    ;; dataplane — SEND + RECEIVE each add 0 B/sample over the non-secured baseline (SBCL-asserted; Clasp smokes) +
+    ;; dataplane — SEND + RECEIVE each add 0 B/sample over the non-secured baseline (SBCL-asserted; AllegroCL smokes) +
     ;; pool-exhaustion fail-closes rather than GC-falling-back. Runs on both impls (self-guards AES-GCM availability).
     (dds.disc:run-secured-dataplane-mem-test)
     (dds.pal:free-static (dds.core.buffer:octet-buffer-vec out))

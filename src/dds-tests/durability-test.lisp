@@ -621,12 +621,11 @@
 
 ;;; --- supervisor: OTP-style one-for-one + restart-intensity (Task 7) ---
 ;;; Sub-test 1 (PURE, both impls): %restart-allowed-p restart-intensity math.
-;;; Sub-test 2 (SBCL; Clasp-skip): liveness restart — kill service, assert revived.
-;;; Sub-test 3 (SBCL; Clasp-skip): crash-loop shed — *durability-debug-start-fault*
+;;; Sub-test 2 (live threads): liveness restart — kill service, assert revived.
+;;; Sub-test 3 (live threads): crash-loop shed — *durability-debug-start-fault*
 ;;;            makes a fresh service die immediately; after max-restarts the service
 ;;;            must be shed and the hook must have fired with :supervisor-shed.
-;;; NFR-PORT: sub-tests 2+3 may be skipped on Clasp due to intermittent Clasp CLOS
-;;; error-signaling SIGSEGV on multithreaded teardown (memory: clasp-threading-gap).
+;;; All three sub-tests run on SBCL and AllegroCL (AllegroCL currently fails :sup-revived, a known failure).
 ;;; Domain 37 avoids collision with domains 7/17/27.
 
 (defun* run-durability-supervisor-test ()
@@ -666,115 +665,108 @@
               "timestamps outside window must not count toward cap: restart must be ALLOWED")))
 
   ;; --- Sub-tests 2+3 (live threads) ---
-  (cond
-    ((eq (dds.pal:pal-impl-name) :clasp)
-     ;; NFR-PORT: Clasp intermittently SIGSEGVs in its own CLOS error-signaling on
-     ;; multithreaded condvar teardown (memory: clasp-threading-gap). Skip the thread
-     ;; sub-tests; the pure restart-intensity math above ran on both impls.
-     (format t "~&    [supervisor] Clasp: skipping live-thread sub-tests (NFR-PORT gap)~%"))
-    (t
-     ;; Sub-test 2: liveness restart.
-     ;; Start a runner+supervisor; forcibly stop the service; assert supervisor revives it.
-     (let* ((spec (dds.durability:make-service-spec
-                   :domain (test-domain +td-supervisor+)
-                   :topics '(("SupSquare" . "ShapeType"))
-                   :name "sup-liveness-test"))
-            (runner (dds.durability:make-service-runner (list spec))))
-       (unwind-protect
-            (progn
-              (dds.durability:runner-start runner)
-              (let* ((svc (first (dds.durability:service-runner-services runner)))
-                     (sup (dds.durability:make-supervisor runner
-                                                         :max-restarts 3
-                                                         :window-seconds 5
-                                                         :poll-ms 50)))
-                (dds.durability:supervisor-start sup)
-                (%check :sup-start-alive
-                        (dds.durability:service-alive-p svc)
-                        "service must be alive after runner-start")
-                ;; kill the service to simulate collect-loop death
-                (dds.durability:service-stop svc)
-                (%check :sup-killed
-                        (not (dds.durability:service-alive-p svc))
-                        "service must report dead after service-stop")
-                ;; wait up to 2 s for the supervisor to restart it
-                (loop repeat 400
-                      until (let ((svcs2 (dds.durability:service-runner-services runner)))
-                              (and svcs2 (dds.durability:service-alive-p (first svcs2))))
-                      do (sleep 0.005))
-                (let* ((svcs3 (dds.durability:service-runner-services runner))
-                       (svc3  (first svcs3)))
-                  (%check :sup-revived
-                          (and svc3 (dds.durability:service-alive-p svc3))
-                          "supervisor must revive the dead service within 2 s"))
-                (dds.durability:supervisor-stop sup)
-                ;; Orphan guard: the runner must still have exactly 1 service after supervisor-stop.
-                ;; A stop-during-restart bug would cause the runner to have 0 (if the orphan was
-                ;; never installed) or would leave a live orphan outside the runner (undetectable
-                ;; from here). The count-1 assertion proves no spurious extra install occurred.
-                (sleep 0.1)
-                (let ((svcs4 (dds.durability:service-runner-services runner)))
-                  (%check :sup-stop-services-count
-                          (= 1 (length svcs4))
-                          (format nil "after supervisor-stop, runner must have exactly 1 service, got ~d"
-                                  (length svcs4))))))
-         (ignore-errors (dds.durability:runner-stop runner))))
+  ;; Sub-test 2: liveness restart.
+  ;; Start a runner+supervisor; forcibly stop the service; assert supervisor revives it.
+  (let* ((spec (dds.durability:make-service-spec
+                :domain (test-domain +td-supervisor+)
+                :topics '(("SupSquare" . "ShapeType"))
+                :name "sup-liveness-test"))
+         (runner (dds.durability:make-service-runner (list spec))))
+    (unwind-protect
+         (progn
+           (dds.durability:runner-start runner)
+           (let* ((svc (first (dds.durability:service-runner-services runner)))
+                  (sup (dds.durability:make-supervisor runner
+                                                      :max-restarts 3
+                                                      :window-seconds 5
+                                                      :poll-ms 50)))
+             (dds.durability:supervisor-start sup)
+             (%check :sup-start-alive
+                     (dds.durability:service-alive-p svc)
+                     "service must be alive after runner-start")
+             ;; kill the service to simulate collect-loop death
+             (dds.durability:service-stop svc)
+             (%check :sup-killed
+                     (not (dds.durability:service-alive-p svc))
+                     "service must report dead after service-stop")
+             ;; wait up to 2 s for the supervisor to restart it
+             (loop repeat 400
+                   until (let ((svcs2 (dds.durability:service-runner-services runner)))
+                           (and svcs2 (dds.durability:service-alive-p (first svcs2))))
+                   do (sleep 0.005))
+             (let* ((svcs3 (dds.durability:service-runner-services runner))
+                    (svc3  (first svcs3)))
+               (%check :sup-revived
+                       (and svc3 (dds.durability:service-alive-p svc3))
+                       "supervisor must revive the dead service within 2 s"))
+             (dds.durability:supervisor-stop sup)
+             ;; Orphan guard: the runner must still have exactly 1 service after supervisor-stop.
+             ;; A stop-during-restart bug would cause the runner to have 0 (if the orphan was
+             ;; never installed) or would leave a live orphan outside the runner (undetectable
+             ;; from here). The count-1 assertion proves no spurious extra install occurred.
+             (sleep 0.1)
+             (let ((svcs4 (dds.durability:service-runner-services runner)))
+               (%check :sup-stop-services-count
+                       (= 1 (length svcs4))
+                       (format nil "after supervisor-stop, runner must have exactly 1 service, got ~d"
+                               (length svcs4))))))
+      (ignore-errors (dds.durability:runner-stop runner))))
 
-     ;; Sub-test 3: crash-loop shed via *durability-debug-start-fault*.
-     ;; Sequence: runner-start (no fault) -> kill service -> supervisor-start WITH fault
-     ;; so every restart attempt fails immediately -> supervisor sheds after max-restarts.
-     (let* ((spec (dds.durability:make-service-spec
-                   :domain (test-domain +td-supervisor+)
-                   :topics '(("SupSquare2" . "ShapeType"))
-                   :name "sup-crash-test"))
-            (runner (dds.durability:make-service-runner (list spec)))
-            (shed-context nil)
-            (hook-fired nil))
-       (let ((saved-hook dds.durability:*durability-error-hook*))
-         (setf dds.durability:*durability-error-hook*
-               (lambda (c ctx n)
-                 (declare (ignore c n))
-                 (setf hook-fired t)
-                 (setf shed-context ctx)
-                 t))
-         (unwind-protect
-              (progn
-                (dds.durability:runner-start runner)
-                ;; kill the initial service so the supervisor sees a dead service to restart
-                (let ((svc0 (first (dds.durability:service-runner-services runner))))
-                  (ignore-errors (dds.durability:service-stop svc0)))
-                (let ((sup (dds.durability:make-supervisor runner
-                                                           :max-restarts 2
-                                                           :window-seconds 10
-                                                           :poll-ms 30)))
-                  ;; fault: set global so watcher thread (different thread) also sees it
-                  (setf dds.durability:*durability-debug-start-fault* t)
-                  (unwind-protect
-                       (progn
-                         (dds.durability:supervisor-start sup)
-                         ;; wait up to 5 s for the SHED HOOK to fire (not just the shed flag): the flag is
-                         ;; set UNDER the supervisor lock, but the :supervisor-shed hook fires AFTER the lock
-                         ;; releases, so waiting on the flag races the hook's shed-context setf (SUP-HOOK-
-                         ;; CONTEXT flake). Waiting until shed-context is :supervisor-shed guarantees the hook
-                         ;; has fired with the terminal context (the flag was necessarily set earlier); a
-                         ;; transient :supervisor-restart-failed hook call is overwritten, so this can't
-                         ;; false-exit. Test-only wait condition — the supervisor is untouched. Bounded.
-                         (loop repeat 1000
-                               until (eq :supervisor-shed shed-context)
-                               do (sleep 0.005)))
-                    (setf dds.durability:*durability-debug-start-fault* nil))
-                  (%check :sup-shed
-                          (dds.durability:supervisor-shed-p sup "sup-crash-test")
-                          "supervisor must shed service after max-restarts crash-loop")
-                  (%check :sup-hook-fired
-                          hook-fired
-                          "supervisor must fire *durability-error-hook* with :supervisor-shed context")
-                  (%check :sup-hook-context
-                          (eq :supervisor-shed shed-context)
-                          (format nil "hook context must be :supervisor-shed, got ~s" shed-context))
-                  (dds.durability:supervisor-stop sup)))
-           (ignore-errors (dds.durability:runner-stop runner))
-           (setf dds.durability:*durability-error-hook* saved-hook))))))
+  ;; Sub-test 3: crash-loop shed via *durability-debug-start-fault*.
+  ;; Sequence: runner-start (no fault) -> kill service -> supervisor-start WITH fault
+  ;; so every restart attempt fails immediately -> supervisor sheds after max-restarts.
+  (let* ((spec (dds.durability:make-service-spec
+                :domain (test-domain +td-supervisor+)
+                :topics '(("SupSquare2" . "ShapeType"))
+                :name "sup-crash-test"))
+         (runner (dds.durability:make-service-runner (list spec)))
+         (shed-context nil)
+         (hook-fired nil))
+    (let ((saved-hook dds.durability:*durability-error-hook*))
+      (setf dds.durability:*durability-error-hook*
+            (lambda (c ctx n)
+              (declare (ignore c n))
+              (setf hook-fired t)
+              (setf shed-context ctx)
+              t))
+      (unwind-protect
+           (progn
+             (dds.durability:runner-start runner)
+             ;; kill the initial service so the supervisor sees a dead service to restart
+             (let ((svc0 (first (dds.durability:service-runner-services runner))))
+               (ignore-errors (dds.durability:service-stop svc0)))
+             (let ((sup (dds.durability:make-supervisor runner
+                                                        :max-restarts 2
+                                                        :window-seconds 10
+                                                        :poll-ms 30)))
+               ;; fault: set global so watcher thread (different thread) also sees it
+               (setf dds.durability:*durability-debug-start-fault* t)
+               (unwind-protect
+                    (progn
+                      (dds.durability:supervisor-start sup)
+                      ;; wait up to 5 s for the SHED HOOK to fire (not just the shed flag): the flag is
+                      ;; set UNDER the supervisor lock, but the :supervisor-shed hook fires AFTER the lock
+                      ;; releases, so waiting on the flag races the hook's shed-context setf (SUP-HOOK-
+                      ;; CONTEXT flake). Waiting until shed-context is :supervisor-shed guarantees the hook
+                      ;; has fired with the terminal context (the flag was necessarily set earlier); a
+                      ;; transient :supervisor-restart-failed hook call is overwritten, so this can't
+                      ;; false-exit. Test-only wait condition — the supervisor is untouched. Bounded.
+                      (loop repeat 1000
+                            until (eq :supervisor-shed shed-context)
+                            do (sleep 0.005)))
+                 (setf dds.durability:*durability-debug-start-fault* nil))
+               (%check :sup-shed
+                       (dds.durability:supervisor-shed-p sup "sup-crash-test")
+                       "supervisor must shed service after max-restarts crash-loop")
+               (%check :sup-hook-fired
+                       hook-fired
+                       "supervisor must fire *durability-error-hook* with :supervisor-shed context")
+               (%check :sup-hook-context
+                       (eq :supervisor-shed shed-context)
+                       (format nil "hook context must be :supervisor-shed, got ~s" shed-context))
+               (dds.durability:supervisor-stop sup)))
+        (ignore-errors (dds.durability:runner-stop runner))
+        (setf dds.durability:*durability-error-hook* saved-hook))))
   t)
 
 ;;; --- config parser + process-mode smoke (Task 8) ---
@@ -869,9 +861,11 @@
     (function () t)
   "Process-mode smoke: %spec->argv round-trip proof (deterministic; see task-8-report.md).
    Verifies domain, topics, mode AND name survive %spec->argv → parse-durability-config.
-   On Clasp this test is skipped (Clasp threading gap; subprocess mode is SBCL-oriented)."
+   Runs on SBCL only: process mode launches a child Lisp only on SBCL (other implementations fall back to
+   in-thread mode, runner.lisp), so on AllegroCL this test pass-skips."
   (unless (eq (dds.pal:pal-impl-name) :sbcl)
-    (format t "~&    [process-smoke] Clasp: skipping (NFR-PORT gap — subprocess mode is SBCL-oriented)~%")
+    (format t "~&    [process-smoke] ~a: skipping (NFR-PORT gap — subprocess mode is SBCL-only)~%"
+            (dds.pal:pal-impl-name))
     (return-from run-durability-process-smoke-test t))
   (let* ((spec (dds.durability:make-service-spec
                 :domain (test-domain +td-writer-rep+)
@@ -2698,10 +2692,8 @@
 ;;; Assert "DynA"'s node is still present (node-count=2 after add).
 ;;; Idempotency: a second service-add-topic "DynB" returns T and does NOT double-add
 ;;; (node count stays at 2).
-;;; NFR-PORT: the live-thread sub-tests (late-joiner delivery) are skipped on Clasp due to the
-;;; Clasp threading gap (intermittent SIGSEGV in CLOS error-signaling on multithreaded condvar
-;;; teardown — memory: clasp-threading-gap).  The idempotency + node-count structural assertions
-;;; run on BOTH impls.  Domain 127 avoids collision with all prior tests.
+;;; The live-thread sub-test (late-joiner delivery) and the idempotency + node-count structural
+;;; assertions all run on SBCL and AllegroCL.  Domain 127 avoids collision with all prior tests.
 
 (defun* run-durability-dynamic-topic-test ()
     (function () t)
@@ -2755,77 +2747,71 @@
                                (length (dds.durability:durability-service-nodes svc)))))
 
              ;; --- live-thread sub-test: publisher on DynB → TL late-joiner on DynB ---
-             ;; NFR-PORT: skipped on Clasp (clasp-threading-gap: intermittent SIGSEGV in CLOS
-             ;; error-signaling on multithreaded condvar teardown; pure structural tests above ran both impls)
-             (cond
-               ((eq (dds.pal:pal-impl-name) :clasp)
-                (format t "~&    [dynamic-topic] Clasp: skipping live-thread sub-test (NFR-PORT gap)~%"))
-               (t
-                ;; svc-b-node is the node returned directly by service-add-topic (no prefix re-derivation)
-                (let* ((pub-prefix (%make-test-prefix #xC7))
-                       (pub-node (dds.disc:make-disc-node :guid-prefix pub-prefix :domain (test-domain +td-dynamic-topic+)
-                                                          :host "127.0.0.1" :port 0 :multicast nil)))
-                  (when svc-b-node
-                    (unwind-protect
-                         (progn
-                           ;; set up publisher on DynB
-                           (dds.disc:add-local-writer pub-node :topic "DynB" :type "ShapeType"
-                                                      :qos (dds.qos:make-writer-qos
-                                                            :reliability :reliable
-                                                            :durability :transient-local))
-                           (dds.disc:enable-publisher pub-node :history-kind :keep-all)
-                           (dds.disc:start-node pub-node)
-                           ;; wire pub <-> svc-b-node
-                           (setf (dds.disc:disc-node-peers pub-node)
-                                 (list (cons "127.0.0.1" (dds.disc:disc-node-port svc-b-node))))
-                           (setf (dds.disc:disc-node-peers svc-b-node)
-                                 (list (cons "127.0.0.1" (dds.disc:disc-node-port pub-node))))
-                           ;; discovery + publish N samples
-                           (%await-match pub-node svc-b-node :retries 300 :sleep-s 0.02)
-                           (dotimes (i n) (dds.disc:publish-sample pub-node (%make-small-payload (1+ i))))
-                           (loop repeat 80
-                                 do (%announce-both pub-node svc-b-node) (sleep 0.05))
-                           (%await-store-count svc-store "DynB" n)
-                           (%check :dyn-b-store-count
-                                   (= n (dds.durability:store-count svc-store "DynB"))
-                                   (format nil "DynB store expected ~d, got ~d"
-                                           n (dds.durability:store-count svc-store "DynB")))
-                           ;; stop publisher — writer gone
-                           (ignore-errors (dds.disc:stop-node pub-node))
-                           (sleep 0.1)
-                           ;; TL late-joiner on DynB: must receive N from the service
-                           (let* ((lj-prefix (%make-test-prefix #xE8))
-                                  (lj-node (dds.disc:make-disc-node :guid-prefix lj-prefix :domain (test-domain +td-dynamic-topic+)
-                                                                     :host "127.0.0.1" :port 0
-                                                                     :multicast nil)))
-                             (unwind-protect
-                                  (progn
-                                    (dds.disc:add-local-reader lj-node :topic "DynB" :type "ShapeType"
-                                                               :qos (dds.qos:make-reader-qos
-                                                                     :reliability :reliable
-                                                                     :durability :transient-local))
-                                    (dds.disc:enable-subscriber lj-node)
-                                    (setf (dds.disc:disc-node-on-match lj-node)
-                                          (lambda (kind remote &optional local-eid) (declare (ignore local-eid))
-                                            (when (eq kind :remote-writer)
-                                              (dds.disc:%reader-durability-init
-                                               lj-node
-                                               (copy-seq (dds.rtps.discovery:endpoint-data-guid remote))
-                                               (dds.qos:qos-durability
-                                                (dds.rtps.discovery:endpoint-data-qos remote))))))
-                                    (dds.disc:start-node lj-node)
-                                    (setf (dds.disc:disc-node-peers lj-node)
-                                          (list (cons "127.0.0.1" (dds.disc:disc-node-port svc-b-node))))
-                                    (setf (dds.disc:disc-node-peers svc-b-node)
-                                          (list (cons "127.0.0.1" (dds.disc:disc-node-port lj-node))))
-                                    (%await-match lj-node svc-b-node :retries 300 :sleep-s 0.02)
-                                    (%await-sample-count lj-node n :retries 1200 :sleep-s 0.005)
-                                    (%check :dyn-b-latejoiner-count
-                                            (= n (dds.disc:node-sample-count lj-node))
-                                            (format nil "DynB TL late-joiner expected ~d samples, got ~d"
-                                                    n (dds.disc:node-sample-count lj-node))))
-                               (ignore-errors (dds.disc:stop-node lj-node)))))
-                      (ignore-errors (dds.disc:stop-node pub-node)))))))))
+             ;; svc-b-node is the node returned directly by service-add-topic (no prefix re-derivation)
+             (let* ((pub-prefix (%make-test-prefix #xC7))
+                    (pub-node (dds.disc:make-disc-node :guid-prefix pub-prefix :domain (test-domain +td-dynamic-topic+)
+                                                       :host "127.0.0.1" :port 0 :multicast nil)))
+               (when svc-b-node
+                 (unwind-protect
+                      (progn
+                        ;; set up publisher on DynB
+                        (dds.disc:add-local-writer pub-node :topic "DynB" :type "ShapeType"
+                                                   :qos (dds.qos:make-writer-qos
+                                                         :reliability :reliable
+                                                         :durability :transient-local))
+                        (dds.disc:enable-publisher pub-node :history-kind :keep-all)
+                        (dds.disc:start-node pub-node)
+                        ;; wire pub <-> svc-b-node
+                        (setf (dds.disc:disc-node-peers pub-node)
+                              (list (cons "127.0.0.1" (dds.disc:disc-node-port svc-b-node))))
+                        (setf (dds.disc:disc-node-peers svc-b-node)
+                              (list (cons "127.0.0.1" (dds.disc:disc-node-port pub-node))))
+                        ;; discovery + publish N samples
+                        (%await-match pub-node svc-b-node :retries 300 :sleep-s 0.02)
+                        (dotimes (i n) (dds.disc:publish-sample pub-node (%make-small-payload (1+ i))))
+                        (loop repeat 80
+                              do (%announce-both pub-node svc-b-node) (sleep 0.05))
+                        (%await-store-count svc-store "DynB" n)
+                        (%check :dyn-b-store-count
+                                (= n (dds.durability:store-count svc-store "DynB"))
+                                (format nil "DynB store expected ~d, got ~d"
+                                        n (dds.durability:store-count svc-store "DynB")))
+                        ;; stop publisher — writer gone
+                        (ignore-errors (dds.disc:stop-node pub-node))
+                        (sleep 0.1)
+                        ;; TL late-joiner on DynB: must receive N from the service
+                        (let* ((lj-prefix (%make-test-prefix #xE8))
+                               (lj-node (dds.disc:make-disc-node :guid-prefix lj-prefix :domain (test-domain +td-dynamic-topic+)
+                                                                  :host "127.0.0.1" :port 0
+                                                                  :multicast nil)))
+                          (unwind-protect
+                               (progn
+                                 (dds.disc:add-local-reader lj-node :topic "DynB" :type "ShapeType"
+                                                            :qos (dds.qos:make-reader-qos
+                                                                  :reliability :reliable
+                                                                  :durability :transient-local))
+                                 (dds.disc:enable-subscriber lj-node)
+                                 (setf (dds.disc:disc-node-on-match lj-node)
+                                       (lambda (kind remote &optional local-eid) (declare (ignore local-eid))
+                                         (when (eq kind :remote-writer)
+                                           (dds.disc:%reader-durability-init
+                                            lj-node
+                                            (copy-seq (dds.rtps.discovery:endpoint-data-guid remote))
+                                            (dds.qos:qos-durability
+                                             (dds.rtps.discovery:endpoint-data-qos remote))))))
+                                 (dds.disc:start-node lj-node)
+                                 (setf (dds.disc:disc-node-peers lj-node)
+                                       (list (cons "127.0.0.1" (dds.disc:disc-node-port svc-b-node))))
+                                 (setf (dds.disc:disc-node-peers svc-b-node)
+                                       (list (cons "127.0.0.1" (dds.disc:disc-node-port lj-node))))
+                                 (%await-match lj-node svc-b-node :retries 300 :sleep-s 0.02)
+                                 (%await-sample-count lj-node n :retries 1200 :sleep-s 0.005)
+                                 (%check :dyn-b-latejoiner-count
+                                         (= n (dds.disc:node-sample-count lj-node))
+                                         (format nil "DynB TL late-joiner expected ~d samples, got ~d"
+                                                 n (dds.disc:node-sample-count lj-node))))
+                            (ignore-errors (dds.disc:stop-node lj-node)))))
+                   (ignore-errors (dds.disc:stop-node pub-node)))))))
       (ignore-errors (dds.durability:service-stop svc))))
   t)
 
@@ -2834,8 +2820,8 @@
 ;;; UNCONFIGURED topic at RUNTIME and auto-spins a node to collect + serve it — no explicit service-add-topic call,
 ;;; no restart. Structural asserts (the pure filter/select core, the %service-topics relaxation, DEFAULT-OFF
 ;;; byte-identical, the start->stop->start lifecycle) run on BOTH impls. The live end-to-end arm (a real publisher
-;;; discovered -> auto-added -> collected -> TL late-joiner replay) is SBCL-only per NFR-PORT (the clasp-threading
-;;; gap), pass-skipped on Clasp exactly like run-durability-dynamic-topic-test. Domain +td-dynamic-topic-discovery+.
+;;; discovered -> auto-added -> collected -> TL late-joiner replay) runs on SBCL and AllegroCL too (AllegroCL
+;;; currently fails :dd-auto-serve-dync, a known failure). Domain +td-dynamic-topic-discovery+.
 
 (defun* run-durability-dynamic-topic-discovery-test ()
     (function () t)
@@ -3015,8 +3001,8 @@
   ;; PART D — auto-add fires DETERMINISTICALLY on BOTH impls (synthetic discovered writer, no live
   ;; publisher / timing): inject writers into the discovery node, drive one poll cycle, assert
   ;; auto-add fires + nodes grow + topic-names gains the topic + the filter gates + idempotent.
-  ;; This exercises exactly the service-add-topic node/thread build the API-driven test already runs
-  ;; on Clasp (durability-dynamic-topic), so it is Clasp-safe.
+  ;; This exercises exactly the service-add-topic node/thread build the API-driven test
+  ;; (durability-dynamic-topic) already runs.
   ;; ============================================================================================
   (let* ((inj-store (dds.durability:make-memory-store))
          (inj-spec  (dds.durability:make-service-spec
@@ -3054,143 +3040,139 @@
                      "repeated poll must not double-add (idempotent-by-name)")))
       (ignore-errors (dds.durability:service-stop inj-svc))))
   ;; ============================================================================================
-  ;; PART E — SBCL-live end-to-end (Clasp-skipped per NFR-PORT clasp-threading-gap)
+  ;; PART E — live end-to-end (SBCL and AllegroCL)
   ;; ============================================================================================
-  (cond
-    ((eq (dds.pal:pal-impl-name) :clasp)
-     (format t "~&    [dynamic-topic-discovery] Clasp: skipping live-thread arm (NFR-PORT gap)~%"))
-    (t
-     (let* ((n 3)
-            (dom (test-domain +td-dynamic-topic-discovery+))
-            (pub-prefix (%make-test-prefix #xD9))
-            (pub-node (dds.disc:make-disc-node :guid-prefix pub-prefix :domain dom
-                                               :host "127.0.0.1" :port 0 :multicast nil)))
-       (unwind-protect
-            (progn
-              ;; publisher with TWO writers: DynC (matches "Dyn*") + Other (non-matching); arbitrary type-names
-              ;; (DynCType/OtherType, NOT ShapeType) prove opaque-bytes / no-type-registration end-to-end
-              (dds.disc:add-local-writer pub-node :topic "DynC" :type "DynCType"
-                                         :qos (dds.qos:make-writer-qos :reliability :reliable
-                                                                        :durability :transient-local))
-              (dds.disc:add-local-writer pub-node :topic "Other" :type "OtherType"
-                                         :qos (dds.qos:make-writer-qos :reliability :reliable
-                                                                        :durability :transient-local))
-              (dds.disc:enable-publisher pub-node :history-kind :keep-all)
-              (dds.disc:start-node pub-node)
-              (let ((pub-port (dds.disc:disc-node-port pub-node)))
-                ;; --- RED contrast: a :auto-discover NIL service, same domain + pub, never serves DynC ---
-                (let* ((red-store (dds.durability:make-memory-store))
-                       (red-spec  (dds.durability:make-service-spec
-                                   :domain dom :topics '(("CtrlA" . "ShapeType"))
-                                   :qos-overrides (list :peers (list (cons "127.0.0.1" pub-port)))
-                                   :store (lambda () red-store) :name "auto-discover-red-control"))
-                       (red-svc   (dds.durability:make-durability-service red-spec :store red-store)))
-                  (unwind-protect
-                       (progn
-                         (dds.durability:service-start red-svc)
-                         (loop repeat 60 do (dds.disc:announce-participant pub-node)
-                                            (dds.disc:announce-endpoints pub-node) (sleep 0.02))
-                         (%check :dd-red-dync-not-served
-                                 (not (dds.durability:service-serves-topic-p red-svc "DynC"))
-                                 "RED (pre-3c): a :auto-discover NIL service must NEVER auto-serve DynC"))
-                    (ignore-errors (dds.durability:service-stop red-svc))))
-                ;; --- GREEN: :auto-discover service, filter "Dyn*", empty start-list, pub in :peers ---
-                (let* ((svc-store (dds.durability:make-memory-store))
-                       (spec (dds.durability:make-service-spec
-                              :domain dom
-                              :topics '()
-                              :auto-discover t
-                              :auto-discover-filter "Dyn*"
-                              :qos-overrides (list :peers (list (cons "127.0.0.1" pub-port)))
-                              :store (lambda () svc-store)
-                              :name "auto-discover-green"))
-                       (svc (dds.durability:make-durability-service spec :store svc-store)))
-                  (unwind-protect
-                       (progn
-                         (dds.durability:service-start svc)
-                         (%check :dd-green-starts-empty
-                                 (null (dds.durability:durability-service-nodes svc))
-                                 "GREEN service starts with zero collect nodes (empty start-list)")
-                         ;; drive discovery: pub announces until the service AUTO-ADDS DynC
-                         (loop repeat 500
-                               until (dds.durability:service-serves-topic-p svc "DynC")
-                               do (dds.disc:announce-participant pub-node)
-                                  (dds.disc:announce-endpoints pub-node)
-                                  (sleep 0.02))
-                         ;; --- the point: DynC auto-served (nodes grew, topic-names gained DynC) ---
-                         (%check :dd-auto-serve-dync
-                                 (dds.durability:service-serves-topic-p svc "DynC")
-                                 "GREEN: DynC must be AUTO-SERVED from discovery (no explicit add, no restart)")
-                         (%check :dd-nodes-grew
-                                 (>= (length (dds.durability:durability-service-nodes svc)) 1)
-                                 "auto-add must grow durability-service-nodes")
-                         ;; a few more cycles so any Other SEDP + several poll ticks have surely elapsed
-                         (loop repeat 40 do (dds.disc:announce-participant pub-node)
-                                            (dds.disc:announce-endpoints pub-node) (sleep 0.02))
-                         ;; --- FILTER gate (live): the non-matching Other is NOT served ---
-                         (%check :dd-filter-blocks-other
-                                 (not (dds.durability:service-serves-topic-p svc "Other"))
-                                 "FILTER: the non-matching topic Other must NOT be auto-served")
-                         (%check :dd-dync-still-served
-                                 (dds.durability:service-serves-topic-p svc "DynC")
-                                 "DynC must remain served after further poll cycles (idempotent, no drop)")
-                         ;; --- collect: locate the auto-added DynC collect node (by its relay writer's topic),
-                         ;; wire it bidirectionally to the pub, then publish N and drain (fast announce loop) ---
-                         (let ((dync-node
-                                (let ((pair (find "DynC" (dds.durability:durability-service-nodes svc)
-                                                  :key (lambda (p)
-                                                         (let ((w (dds.disc::disc-node-local-writers (car p))))
-                                                           (and w (dds.rtps.discovery:endpoint-data-topic-name
-                                                                   (first w)))))
-                                                  :test #'equal)))
-                                  (and pair (car pair)))))
-                           (%check :dd-dync-node-found
-                                   (not (null dync-node))
-                                   "the auto-added DynC collect node must be locatable by its relay writer's topic")
-                           (when dync-node
-                             (%wire-unicast dync-node pub-node)
-                             (%await-match dync-node pub-node :retries 300 :sleep-s 0.02)
-                             (dotimes (i n) (dds.disc:publish-sample pub-node (%make-small-payload (1+ i))))
-                             (loop repeat 120
-                                   until (>= (dds.durability:store-count svc-store "DynC") n)
-                                   do (%announce-both pub-node dync-node) (sleep 0.02))
-                             (%check :dd-dync-collected
-                                     (= n (dds.durability:store-count svc-store "DynC"))
-                                     (format nil "DynC store expected ~d, got ~d"
-                                             n (dds.durability:store-count svc-store "DynC")))
-                             ;; --- TL late-joiner replay: stop pub, then a fresh TL reader on DynC gets all N ---
-                             (ignore-errors (dds.disc:stop-node pub-node))
-                             (sleep 0.1)
-                             (let* ((lj-prefix (%make-test-prefix #xE9))
-                                    (lj-node (dds.disc:make-disc-node :guid-prefix lj-prefix :domain dom
-                                                                       :host "127.0.0.1" :port 0 :multicast nil)))
-                               (unwind-protect
-                                    (progn
-                                      (dds.disc:add-local-reader lj-node :topic "DynC" :type "DynCType"
-                                                                 :qos (dds.qos:make-reader-qos
-                                                                       :reliability :reliable
-                                                                       :durability :transient-local))
-                                      (dds.disc:enable-subscriber lj-node)
-                                      (setf (dds.disc:disc-node-on-match lj-node)
-                                            (lambda (kind remote &optional local-eid)
-                                              (declare (ignore local-eid))
-                                              (when (eq kind :remote-writer)
-                                                (dds.disc:%reader-durability-init
-                                                 lj-node
-                                                 (copy-seq (dds.rtps.discovery:endpoint-data-guid remote))
-                                                 (dds.qos:qos-durability
-                                                  (dds.rtps.discovery:endpoint-data-qos remote))))))
-                                      (dds.disc:start-node lj-node)
-                                      (%wire-unicast lj-node dync-node)
-                                      (%await-match lj-node dync-node :retries 300 :sleep-s 0.02)
-                                      (%await-sample-count lj-node n :retries 1200 :sleep-s 0.005)
-                                      (%check :dd-latejoiner-replay
-                                              (= n (dds.disc:node-sample-count lj-node))
-                                              (format nil "DynC TL late-joiner expected ~d samples, got ~d"
-                                                      n (dds.disc:node-sample-count lj-node))))
-                                 (ignore-errors (dds.disc:stop-node lj-node)))))))
-                    (ignore-errors (dds.durability:service-stop svc))))))
-         (ignore-errors (dds.disc:stop-node pub-node))))))
+  (let* ((n 3)
+         (dom (test-domain +td-dynamic-topic-discovery+))
+         (pub-prefix (%make-test-prefix #xD9))
+         (pub-node (dds.disc:make-disc-node :guid-prefix pub-prefix :domain dom
+                                            :host "127.0.0.1" :port 0 :multicast nil)))
+    (unwind-protect
+         (progn
+           ;; publisher with TWO writers: DynC (matches "Dyn*") + Other (non-matching); arbitrary type-names
+           ;; (DynCType/OtherType, NOT ShapeType) prove opaque-bytes / no-type-registration end-to-end
+           (dds.disc:add-local-writer pub-node :topic "DynC" :type "DynCType"
+                                      :qos (dds.qos:make-writer-qos :reliability :reliable
+                                                                     :durability :transient-local))
+           (dds.disc:add-local-writer pub-node :topic "Other" :type "OtherType"
+                                      :qos (dds.qos:make-writer-qos :reliability :reliable
+                                                                     :durability :transient-local))
+           (dds.disc:enable-publisher pub-node :history-kind :keep-all)
+           (dds.disc:start-node pub-node)
+           (let ((pub-port (dds.disc:disc-node-port pub-node)))
+             ;; --- RED contrast: a :auto-discover NIL service, same domain + pub, never serves DynC ---
+             (let* ((red-store (dds.durability:make-memory-store))
+                    (red-spec  (dds.durability:make-service-spec
+                                :domain dom :topics '(("CtrlA" . "ShapeType"))
+                                :qos-overrides (list :peers (list (cons "127.0.0.1" pub-port)))
+                                :store (lambda () red-store) :name "auto-discover-red-control"))
+                    (red-svc   (dds.durability:make-durability-service red-spec :store red-store)))
+               (unwind-protect
+                    (progn
+                      (dds.durability:service-start red-svc)
+                      (loop repeat 60 do (dds.disc:announce-participant pub-node)
+                                         (dds.disc:announce-endpoints pub-node) (sleep 0.02))
+                      (%check :dd-red-dync-not-served
+                              (not (dds.durability:service-serves-topic-p red-svc "DynC"))
+                              "RED (pre-3c): a :auto-discover NIL service must NEVER auto-serve DynC"))
+                 (ignore-errors (dds.durability:service-stop red-svc))))
+             ;; --- GREEN: :auto-discover service, filter "Dyn*", empty start-list, pub in :peers ---
+             (let* ((svc-store (dds.durability:make-memory-store))
+                    (spec (dds.durability:make-service-spec
+                           :domain dom
+                           :topics '()
+                           :auto-discover t
+                           :auto-discover-filter "Dyn*"
+                           :qos-overrides (list :peers (list (cons "127.0.0.1" pub-port)))
+                           :store (lambda () svc-store)
+                           :name "auto-discover-green"))
+                    (svc (dds.durability:make-durability-service spec :store svc-store)))
+               (unwind-protect
+                    (progn
+                      (dds.durability:service-start svc)
+                      (%check :dd-green-starts-empty
+                              (null (dds.durability:durability-service-nodes svc))
+                              "GREEN service starts with zero collect nodes (empty start-list)")
+                      ;; drive discovery: pub announces until the service AUTO-ADDS DynC
+                      (loop repeat 500
+                            until (dds.durability:service-serves-topic-p svc "DynC")
+                            do (dds.disc:announce-participant pub-node)
+                               (dds.disc:announce-endpoints pub-node)
+                               (sleep 0.02))
+                      ;; --- the point: DynC auto-served (nodes grew, topic-names gained DynC) ---
+                      (%check :dd-auto-serve-dync
+                              (dds.durability:service-serves-topic-p svc "DynC")
+                              "GREEN: DynC must be AUTO-SERVED from discovery (no explicit add, no restart)")
+                      (%check :dd-nodes-grew
+                              (>= (length (dds.durability:durability-service-nodes svc)) 1)
+                              "auto-add must grow durability-service-nodes")
+                      ;; a few more cycles so any Other SEDP + several poll ticks have surely elapsed
+                      (loop repeat 40 do (dds.disc:announce-participant pub-node)
+                                         (dds.disc:announce-endpoints pub-node) (sleep 0.02))
+                      ;; --- FILTER gate (live): the non-matching Other is NOT served ---
+                      (%check :dd-filter-blocks-other
+                              (not (dds.durability:service-serves-topic-p svc "Other"))
+                              "FILTER: the non-matching topic Other must NOT be auto-served")
+                      (%check :dd-dync-still-served
+                              (dds.durability:service-serves-topic-p svc "DynC")
+                              "DynC must remain served after further poll cycles (idempotent, no drop)")
+                      ;; --- collect: locate the auto-added DynC collect node (by its relay writer's topic),
+                      ;; wire it bidirectionally to the pub, then publish N and drain (fast announce loop) ---
+                      (let ((dync-node
+                             (let ((pair (find "DynC" (dds.durability:durability-service-nodes svc)
+                                               :key (lambda (p)
+                                                      (let ((w (dds.disc::disc-node-local-writers (car p))))
+                                                        (and w (dds.rtps.discovery:endpoint-data-topic-name
+                                                                (first w)))))
+                                               :test #'equal)))
+                               (and pair (car pair)))))
+                        (%check :dd-dync-node-found
+                                (not (null dync-node))
+                                "the auto-added DynC collect node must be locatable by its relay writer's topic")
+                        (when dync-node
+                          (%wire-unicast dync-node pub-node)
+                          (%await-match dync-node pub-node :retries 300 :sleep-s 0.02)
+                          (dotimes (i n) (dds.disc:publish-sample pub-node (%make-small-payload (1+ i))))
+                          (loop repeat 120
+                                until (>= (dds.durability:store-count svc-store "DynC") n)
+                                do (%announce-both pub-node dync-node) (sleep 0.02))
+                          (%check :dd-dync-collected
+                                  (= n (dds.durability:store-count svc-store "DynC"))
+                                  (format nil "DynC store expected ~d, got ~d"
+                                          n (dds.durability:store-count svc-store "DynC")))
+                          ;; --- TL late-joiner replay: stop pub, then a fresh TL reader on DynC gets all N ---
+                          (ignore-errors (dds.disc:stop-node pub-node))
+                          (sleep 0.1)
+                          (let* ((lj-prefix (%make-test-prefix #xE9))
+                                 (lj-node (dds.disc:make-disc-node :guid-prefix lj-prefix :domain dom
+                                                                    :host "127.0.0.1" :port 0 :multicast nil)))
+                            (unwind-protect
+                                 (progn
+                                   (dds.disc:add-local-reader lj-node :topic "DynC" :type "DynCType"
+                                                              :qos (dds.qos:make-reader-qos
+                                                                    :reliability :reliable
+                                                                    :durability :transient-local))
+                                   (dds.disc:enable-subscriber lj-node)
+                                   (setf (dds.disc:disc-node-on-match lj-node)
+                                         (lambda (kind remote &optional local-eid)
+                                           (declare (ignore local-eid))
+                                           (when (eq kind :remote-writer)
+                                             (dds.disc:%reader-durability-init
+                                              lj-node
+                                              (copy-seq (dds.rtps.discovery:endpoint-data-guid remote))
+                                              (dds.qos:qos-durability
+                                               (dds.rtps.discovery:endpoint-data-qos remote))))))
+                                   (dds.disc:start-node lj-node)
+                                   (%wire-unicast lj-node dync-node)
+                                   (%await-match lj-node dync-node :retries 300 :sleep-s 0.02)
+                                   (%await-sample-count lj-node n :retries 1200 :sleep-s 0.005)
+                                   (%check :dd-latejoiner-replay
+                                           (= n (dds.disc:node-sample-count lj-node))
+                                           (format nil "DynC TL late-joiner expected ~d samples, got ~d"
+                                                   n (dds.disc:node-sample-count lj-node))))
+                              (ignore-errors (dds.disc:stop-node lj-node)))))))
+                 (ignore-errors (dds.durability:service-stop svc))))))
+      (ignore-errors (dds.disc:stop-node pub-node))))
   t)
 
 ;;; --- logical-origin accessor test (Task 1: WP-DURABILITY-COEXIST-LIVE) ---
@@ -6905,7 +6887,7 @@
     (%check :b1-persistent-not-conveyable
             (not (dds.durability::%process-mode-store-conveyable-p persist-spec))
             "persistent :process store must NOT be conveyable (NIL) — the fail-fast target")
-    ;; SBCL: the subprocess path returns a reject STATUS before launch; Clasp falls to in-thread mode
+    ;; SBCL: the subprocess path returns a reject STATUS before launch; AllegroCL falls to in-thread mode
     ;; (honors the real store), so the refuse assertion is SBCL-only (NFR-PORT).
     (when (eq (dds.pal:pal-impl-name) :sbcl)
       (%check :b1-persistent-process-rejects
@@ -9239,7 +9221,7 @@
    error BEFORE any body buffer is allocated. (ii) A huge AT-CAP declared length with NO body TIMES OUT via
    the incremental reader (a bounded chunk, not the full 256 MiB) — proven BEHAVIORALLY (it RETURNS, with
    status :TIMEOUT — no infinite block / OOM) on both impls, and NUMERICALLY (allocated << the declared length)
-   where the impl exposes a consing counter (SBCL; Clasp reports 0, a documented NFR-PORT gap). Read INLINE
+   where the impl exposes a consing counter (SBCL; AllegroCL reports 0, a documented NFR-PORT gap). Read INLINE
    on a raw socketpair (the test thread) so the allocation is measurable. Bounded (1 s reader timeout)."
   ;; (i) OVER-CAP declared length -> protocol error, no allocation
   (let* ((ln (dds.pal:tcp-listen "127.0.0.1" 0)) (port (dds.pal:tcp-local-port ln))
@@ -9266,7 +9248,7 @@
                     "a huge (at-cap) declared body with NO data TIMES OUT via the incremental reader (no infinite block, no OOM)")
             (let ((delta (- (dds.pal:bytes-consed) consed0)))
               (%check :ms-huge-bounded-alloc
-                      (or (zerop (dds.pal:bytes-consed))          ; Clasp: no consing counter -> behavioral proof only
+                      (or (zerop (dds.pal:bytes-consed))          ; AllegroCL: no consing counter -> behavioral proof only
                           (< delta (floor dds.durability::+ms-max-message+ 4)))
                       (format nil "the huge declared length did NOT force a full up-front allocation (incremental read; delta=~d << cap ~d)"
                               delta dds.durability::+ms-max-message+)))))
@@ -9436,8 +9418,8 @@
    over multiple rounds; the accumulated state is then verified byte-exact with NO loss / dup / cross-client
    corruption. Proves the per-connection-thread server + the internally-locked inner serve concurrent
    clients CORRECTLY (the serial server could not run them in parallel at all). Bounded (every client thread
-   is self-limited — finite ops + a client recv-timeout so no op can hang; all joined). Both impls (SBCL is
-   the race-correctness oracle; a Clasp-internal threading SIGSEGV is the documented NFR-PORT gap)."
+   is self-limited — finite ops + a client recv-timeout so no op can hang; all joined). Runs on SBCL and
+   AllegroCL."
   (let* ((nclients 6) (nputs 8) (nrounds 2)
          (srv  (dds.durability:make-microservice-server :port 0 :recv-timeout 5))
          (port (dds.durability:microservice-server-port srv))
@@ -9573,8 +9555,8 @@
    already-owner-closed socket' (those slots have left the registry, so stop never shuts them down; with
    NIT-1's reg-lock serialization stop never shuts down an already-closed slot at all). tcp-shutdown's
    already-closed safety is BY CONSTRUCTION (a shutdown of an owner-closed socket reads fd=-1 → harmless
-   EBADF), not proven by this arm. Plus IDEMPOTENCE (a second stop is a no-op). Bounded throughout. Both
-   impls, Clasp first (the RED — a cross-thread close not waking a foreign recv — manifests as a stop stall
+   EBADF), not proven by this arm. Plus IDEMPOTENCE (a second stop is a no-op). Bounded throughout. Runs on
+   SBCL and AllegroCL (the RED — a cross-thread close not waking a foreign recv — manifests as a stop stall
    on Linux; on Darwin the gate proves the GREEN wake + the single-close/no-double-close + drained
    invariants hold; a regression fails via the watchdog on either)."
   (let* ((n 5)

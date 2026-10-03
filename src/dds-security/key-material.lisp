@@ -159,7 +159,8 @@
     (function ((or null key-material)) null)
   "Wipe-then-free the three MASTER secret slots of KM — the single teardown choke for §9.5.2 KeyMaterial secret
    hygiene (ADR-0034; operating contract NFR-MEM / CNSA-2.0 data-at-rest). Wipes then releases the foreign-static
-   master_salt, master_sender_key, master_receiver_specific_key via dds.dare:free-secret-octets (fill-0 then
+   master_salt, master_sender_key, master_receiver_specific_key via dds.dare:free-secret-octets (fill-0, then
+   the dds.dare:*secret-wipe-readback-hook* read-back point while the buffer is still live, then
    free-static), then DROPS the derived §9.5.3.3.4.2/.4.3 session-key caches
    (the two session-cache objects) and the memoized origin-auth
    receiver-descriptor cons. The derived caches are EPHEMERAL plain GC-HEAP vectors (re-derivable, not

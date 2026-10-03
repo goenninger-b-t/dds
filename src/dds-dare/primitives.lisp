@@ -826,16 +826,40 @@
     (dotimes (i n v)
       (setf (aref v i) (cffi:mem-aref ptr :uint8 i)))))
 
+(defvar *secret-wipe-readback-hook* nil
+  "Verification seam for the secret wipe, NIL in production. When non-NIL it is a function of one argument
+   that FREE-SECRET-OCTETS calls with the secret buffer AFTER the buffer has been filled with zeros and
+   BEFORE it is released, so the buffer is still live and reading it is not a use-after-free. This is the
+   only point at which the wipe can be read back on every implementation: once FREE-STATIC has run, the
+   storage is gone (SBCL and AllegroCL both free the whole static vector), so a post-release read proves
+   nothing and is undefined. Contract for the hook: read only; never retain the buffer past the call
+   (it is released immediately afterwards); do not write it. A non-local exit from the hook does not skip
+   the release (FREE-SECRET-OCTETS releases under UNWIND-PROTECT). A LET binding is seen only by the
+   binding thread, so a test that wipes on another thread (a service shutdown, for instance) must SETF
+   the global value and restore it. Not on any hot path: the wipe runs at key teardown only.")
+
+(defun* %wipe-secret-octets (v)
+    (function ((simple-array (unsigned-byte 8) (*))) (simple-array (unsigned-byte 8) (*)))
+  "WIPE phase of FREE-SECRET-OCTETS: overwrite every octet of the foreign-backed secret buffer V with zero
+   and return V, still allocated. The fill reliably wipes because the storage is pinned/foreign (design
+   spec §6). Never releases; release is the separate, final phase."
+  (fill v 0))
+
 (defun* free-secret-octets (v)
     (function ((or null (simple-array (unsigned-byte 8) (*)))) null)
-  "Zeroize then release a foreign-backed secret buffer returned by %MAKE-SECRET-OCTETS /
-   %FOREIGN->SECRET (the ML-KEM private key, shared secret, or DEK; design spec §6).
-   The (fill V 0) reliably wipes because the storage is pinned/foreign. Release is via the PAL
-   FREE-STATIC (static-vectors on SBCL and AllegroCL). Returns NIL so callers can
-   write (setf slot (free-secret-octets slot)). Idempotent: a NIL argument is a no-op."
+  "Wipe, then release, a foreign-backed secret buffer returned by %MAKE-SECRET-OCTETS / %FOREIGN->SECRET /
+   OCTETS->SECRET (the ML-KEM private key, shared secret, DEK or a DDS-Security master key; design spec §6).
+   Two phases with a read-back point between them: (1) %WIPE-SECRET-OCTETS fills V with zeros; (2) if
+   *SECRET-WIPE-READBACK-HOOK* is non-NIL it is called with the wiped, still-live V; (3) the PAL
+   FREE-STATIC releases V (static-vectors on SBCL and AllegroCL), under UNWIND-PROTECT so a hook that exits
+   non-locally cannot leak the buffer. Returns NIL so callers can write (setf slot (free-secret-octets
+   slot)). Idempotent: a NIL argument is a no-op."
   (when v
-    (fill v 0)
-    (dds.pal:free-static v))
+    (unwind-protect
+         (let ((hook *secret-wipe-readback-hook*))
+           (%wipe-secret-octets v)
+           (when hook (funcall hook v)))
+      (dds.pal:free-static v)))
   nil)
 
 (defun* octets->secret (vec)

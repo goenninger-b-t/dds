@@ -43,8 +43,8 @@
    consed (dds.pal:bytes-consed) across 100000 disabled log-debug calls; the per-call allocation must
    round to 0. The disabled path is one (aref *log-thresholds* <compile-time-const>) + a compare + a
    short-circuited WHEN, so the message-building format never runs and the logger (here NIL — never
-   dereferenced when disabled) is never touched. SBCL is the oracle: dds.pal:bytes-consed is 0 on Clasp,
-   so the Clasp run is vacuously consistent while the real measurement is SBCL (the gate-mem oracle)."
+   dereferenced when disabled) is never touched. SBCL is the oracle: dds.pal:bytes-consed is 0 on AllegroCL,
+   so the AllegroCL run is vacuously consistent while the real measurement is SBCL (the gate-mem oracle)."
   (dds.log:set-log-threshold :net dds.log:+severity-info+)   ; ensure :net DEBUG is DISABLED (default)
   ;; a BARE logger struct: no participant, hence no background receiver thread, so dds.pal:bytes-consed
   ;; (a process-wide counter) measures ONLY the disabled-call path. NIL cannot be used — logger-emit's

@@ -49,6 +49,8 @@
    ;; Task 6b: foreign-backed secret-material lifetime (design spec §6)
    #:free-secret-octets
    #:octets->secret
+   ;; WP-0.6: read-back point between the wipe and the release of a secret buffer (verification seam)
+   #:*secret-wipe-readback-hook*
    ;; X.509 / EVP_PKEY primitives (WP-DDS-SECURITY-AUTH-2A T1)
    #:x509-load-cert
    #:x509-free

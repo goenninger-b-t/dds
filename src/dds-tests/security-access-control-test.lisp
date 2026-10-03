@@ -250,7 +250,7 @@
   "T3: validate-local-permissions + check predicates (DDS-Security 1.1 §8.4.2).
    (a) Good: non-nil handle; check-create-participant T; Square allowed; Circle denied.
    (b) validate-remote-permissions: non-nil; check-remote-datawriter/datareader Square/Circle.
-   (c) Fail-closed: wrong local-subject → NIL; tampered governance.p7s → NIL. Both SBCL+Clasp."
+   (c) Fail-closed: wrong local-subject → NIL; tampered governance.p7s → NIL. Must pass on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
       (format t "~&  [access-plugin-validate] SKIP: ~a~%" %dare-reason)
@@ -524,7 +524,7 @@
    (permissions-gate :incompatible — EC + ECB grants both deny Circle pub/sub).
    NON-VACUOUS: sq-b matched-count >= 1 (Square allowed) AND ci-b matched-count = 0 (Circle denied);
    the ONLY difference is the topic name — same identities, same auth :keyed, same QoS/type.
-   Requires OpenSSL >= 3.5; skips gracefully if absent. Both SBCL and Clasp must pass."
+   Requires OpenSSL >= 3.5; skips gracefully if absent. Must pass on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
       (format t "~&  [ac-allow-deny] SKIP — OpenSSL >= 3.5 not available: ~a~%"
@@ -716,7 +716,7 @@
    (b) create-datawriter on a 'Square' topic SUCCEEDS — EC grant allows Square publish.
    (c) create-datareader on a 'Circle' topic SIGNALS access-denied (EC grant denies Circle subscribe).
    (d) create-datareader on a 'Square' topic SUCCEEDS (EC grant allows Square subscribe).
-   Both SBCL and Clasp must pass."
+   Must pass on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
       (format t "~&  [ac-local-deny] SKIP — OpenSSL >= 3.5 not available: ~a~%"
@@ -788,7 +788,7 @@
    round-trips byte-exact — confirming the security build does not regress the default unauthenticated
    path (AccessControl off behaves byte-identically to the non-security baseline).
    Also confirms neither participant has DP-AUTH-STATE or DP-ACCESS-STATE (AC truly off).
-   No OpenSSL dependency; passes unconditionally on both SBCL and Clasp."
+   No OpenSSL dependency; passes unconditionally on both SBCL and AllegroCL."
   (let ((p-off-w nil)
         (p-off-r nil))
     (unwind-protect
@@ -1308,7 +1308,7 @@
    send/decode assertions need OpenSSL (dare); the control-plane assertions (a,b,c,d) run unconditionally.
    WP-N-ENDPOINT-2C2 (ADR 0048): (g) a 2nd SECURED writer on an ALREADY-HELD topic (Circle) now REGISTERS (fence B
    lifted) with a DISTINCT EntityId and its OWN EntityCrypto km (distinct sender_key_id) — same-topic secured
-   multi-writer supported. Clasp FIRST."
+   multi-writer supported."
   (let ((gov (dds.security:make-governance
               :discovery-protection-kind :none :liveliness-protection-kind :none :rtps-protection-kind :none
               :topic-rules

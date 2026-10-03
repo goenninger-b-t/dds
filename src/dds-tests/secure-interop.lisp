@@ -296,7 +296,7 @@
    load-bearing proof that each writer is keyed under its OWN km (not the primary), so a live secured observer
    decodes both writers' DATA each under its own key; (c) %key-id-hex renders a resolved sender_key_id. Full
    send/decode crypto correctness (cross-key fails closed) is run-security-n-secured-writer-test; this proves the
-   new harness MODE runs. Control-plane only (no OpenSSL/dare needed). Clasp FIRST."
+   new harness MODE runs. Control-plane only (no OpenSSL/dare needed)."
   (let ((gov (dds.security:make-governance
               :discovery-protection-kind :none :liveliness-protection-kind :none :rtps-protection-kind :none
               :topic-rules

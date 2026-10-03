@@ -8,7 +8,7 @@
     (function () t)
   "SHA-384 (NIST FIPS 180-4 §B.2) + HKDF-SHA384 (Google Wycheproof) known-answer tests.
    Requires OpenSSL >= 3.5 on the host; skips only if truly absent (host without OpenSSL 3.x).
-   Both SBCL and Clasp must pass identically when OpenSSL 3.x is installed."
+   Must pass identically on SBCL and AllegroCL when OpenSSL 3.x is installed."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
       (format t "~&  [dare-sha384-hkdf-kat] SKIP — OpenSSL >= 3.5 not available on this host: ~a~%"

@@ -547,15 +547,12 @@
   "cas-sap-u64 / cas-sap-u32 / atomic-incf-sap-u64 over a RAW FOREIGN CELL — the atomics that back the SHMEM
    ring's lane claim and the zero-copy refcount.
 
-   RUNS ON BOTH IMPLS. It was gated SBCL-only, because the Clasp PAL stubbed these out as an unclosable
-   NFR-PORT gap (ADR 0013: \"Clasp has no hardware atomic over a raw foreign cell\"). That was asserted, not
-   measured — true of the Lisp-side operators tried (mp:cas rejects a cffi:mem-ref place; core:acas drops a
-   store whose compare operand exceeds most-positive-fixnum), but the C atomic runtime is linked into the
-   Clasp image and __atomic_compare_exchange_8/_4 + __atomic_fetch_add_8 are real hardware atomics over a
-   plain pointer. So this asserts PARITY, and it asserts the two things the gap hid:
+   RUNS ON SBCL AND ALLEGROCL, with no branch. SBCL uses sb-ext:cas over sb-sys:sap-ref-N; the AllegroCL PAL calls the
+   C atomic builtins __atomic_compare_exchange_8/_4 and __atomic_fetch_add_8 over the raw pointer
+   (pal-allegro.lisp). This asserts PARITY, and it asserts the two properties a wrong primitive would break:
 
-     (a) a FULL-WIDTH 2^64-1 compare operand round-trips — the exact case core:acas silently dropped, and
-         the one that would have corrupted a ring cursor rather than failing loudly;
+     (a) a FULL-WIDTH 2^64-1 compare operand round-trips — a primitive limited to fixnum operands drops
+         it, which would corrupt a ring cursor rather than fail loudly;
      (b) CONTENTION loses nothing — 8 threads x 2000 CAS-increments and fetch-adds must total exactly
          16000 each. A CAS that is not really atomic passes every single-threaded check and fails here."
   (let ((m (dds.pal:alloc-static 64)))
@@ -567,7 +564,7 @@
            (%check :cas-fail  (= 42 (dds.pal:cas-sap-u64 sap 0 0 99)) "cas mismatch returns prev")
            (%check :cas-nochg (= 42 (dds.pal:load-sap-u64 sap 0)) "cas mismatch no write")
            (%check :incf      (= 47 (dds.pal:atomic-incf-sap-u64 sap 0 5)) "incf returns new")
-           ;; (a) FULL-WIDTH operand: the case the old Clasp primitive dropped silently
+           ;; (a) FULL-WIDTH operand: the case a fixnum-limited primitive drops silently
            (let ((big (1- (expt 2 64))))
              (dds.pal:store-sap-u64 sap 8 0)
              (%check :cas-u64-wide-set  (= 0 (dds.pal:cas-sap-u64 sap 8 0 big)) "cas stores a full-width 2^64-1")
@@ -607,9 +604,9 @@
    correctness of ATOMIC-INCF (returns the NEW value, signed delta) + CAS (returns the PREVIOUS
    value, succeeds on match / fails on mismatch), then a CONCURRENCY proof that ATOMIC-INCF loses
    no updates — N threads each ATOMIC-INCF a shared cell M times, asserting the final value is
-   exactly N*M. Runs on BOTH impls: sb-ext:cas/atomic-incf on SBCL, mp:cas/atomic-incf on Clasp, over the
-   shared (unsigned-byte 64) slot. (The SAP atomics in run-pal-sap-atomics-test are now equally
-   cross-impl — see there; they were the SBCL-only ones until the Clasp gap was closed.)"
+   exactly N*M. Runs on SBCL and AllegroCL: sb-ext:cas/atomic-incf on SBCL, excl::atomic-conditional-setf /
+   excl::incf-atomic on AllegroCL, over the shared (unsigned-byte 64) slot. (The SAP atomics in
+   run-pal-sap-atomics-test run on both as well — see there.)"
   ;; (a) atomic-incf: returns the NEW value; signed delta decrements
   (let ((c (dds.pal:make-atomic-cell)))
     (%check :ainc-5   (= 5 (dds.pal:atomic-incf c 5)) "atomic-incf returns new value (0+5=5)")
@@ -644,11 +641,9 @@
    assert load-sap-u8/u16/u32 at offsets 0/2/4 EQUAL the little-endian composition of the same
    underlying aref bytes (the byte-exact oracle), plus a store-sap-u8 read-back.
 
-   RUNS IDENTICALLY ON BOTH IMPLS — no branch, no gap. This test used to assert the OPPOSITE on Clasp
-   (\"must signal PAL-UNIMPLEMENTED\"), enshrining a supposed NFR-PORT gap that was asserted rather than
-   measured: cffi:mem-ref reads and writes a foreign cell on Clasp exactly as sb-sys:sap-ref-N does on SBCL.
-   Owner directive 2026-07-14: Clasp and SBCL MUST be equally fitted. A test that asserts a gap is a test
-   that PREVENTS the gap from being closed."
+   RUNS IDENTICALLY ON SBCL AND ALLEGROCL — no branch, no gap. Owner directive 2026-07-14: the supported
+   implementations MUST be equally fitted. A test that asserts a gap is a test that PREVENTS the gap from
+   being closed."
   (let* ((buf (dds.core.buffer:make-octet-buffer 16))
          (vec (dds.core.buffer:octet-buffer-vec buf))
          (bytes (octets #x11 #x22 #xAA #xBB #x01 #x02 #x03 #x04)))
@@ -677,16 +672,16 @@
 
 (defun* %shm-attach-by-name-reliable-p ()
     (function () t)
-  "True except on Clasp/macOS-arm64, whose plain cffi:foreign-funcall mispasses shm_open's variadic
-   mode_t -> the created object is unre-openable (documented NFR-PORT gap, ADR 0013). Delegates to the
-   single transport-layer definition to keep the platform fact in one place (DRY)."
+  "T iff a segment this process creates can be re-opened by name (ADR 0013). Delegates to the single
+   transport-layer definition, which asks the PAL, to keep the platform fact in one place (DRY)."
   (dds.xport.shmem:shm-attach-by-name-reliable-p))
 
 (defun* run-pal-shm-test ()
     (function () (eql t))
   "Create a segment, prove MAP_SHARED sharing via a second mapping (deterministic on every target),
-   and assert shm-attach by name sees the same memory (mandatory on SBCL all platforms + Clasp/non-macOS;
-   the Clasp/macOS-arm64 variadic-mode_t ABI gap is tolerated at runtime, NFR-PORT)."
+   and assert shm-attach by name sees the same memory. The by-name attach is mandatory wherever
+   %shm-attach-by-name-reliable-p is T, and tolerated (skipped) only where the PAL reports it unreliable
+   (ADR 0013)."
   (let* ((name (format nil "/dds-test-shm-b1-~a" (random 1000000))) (size 4096))
     (ignore-errors (dds.pal:shm-destroy name))
     (let ((seg (dds.pal:shm-create name size)))
@@ -701,7 +696,7 @@
                             "second mapping sees the first's write")
                  (cffi:foreign-funcall "munmap" :pointer sap2 :unsigned-long size :int)))
              ;; by-name attach: cross-process path. Deterministic with the SBCL varargs create
-             ;; (verified macOS arm64); Clasp/macOS-arm64 mispasses the variadic mode -> tolerated.
+             ;; (verified macOS arm64); where the PAL reports by-name attach unreliable -> tolerated.
              ;; shm-attach RETURNS a status now (it does not signal), so the NFR-PORT gap is an explicit
              ;; branch: where the attach MUST work, a failed attach FAILS the test; where the ABI gap is
              ;; tolerated, it is skipped. (Previously a handler-case swallowed it — which would also have
@@ -865,8 +860,9 @@
    NIL — force-reclaim NEVER overwrites a held slot (the binary safety gate); after releasing the oldest
    (slot 0), a fresh loan force-reclaims that now-UNLOANED slot (lowest pubseq) with a bumped generation;
    releasing a valid (slot,generation) succeeds; a stale generation or a double-release is a no-op. SBCL only
-   since WP-ZC-LOAN-LOCKFREE Phase B (R6, ADR 0018): %zc-release is now a lock-free cas-sap-u32 refcount decrement, an
-   SBCL-only PAL primitive (ZC is an NFR-PORT gap on Clasp, ADR 0013); Clasp pass-skips."
+   since WP-ZC-LOAN-LOCKFREE Phase B (R6, ADR 0018): %zc-release is now a lock-free cas-sap-u32 refcount decrement (a
+   PAL primitive). Runs on SBCL only (ADR 0013); on AllegroCL it pass-skips: the gate is on pal-impl-name :sbcl, and it has not
+   been re-evaluated against the AllegroCL PAL, which does define cas-sap-u32."
   (if (not (eq (dds.pal:pal-impl-name) :sbcl))
       (progn
         (format t "~&  [skip] zc-pool-loan: %zc-release uses cas-sap-u32 (SBCL-only since WP-ZC-LOAN-LOCKFREE, ADR 0018) — NFR-PORT gap~%")
@@ -960,10 +956,10 @@
    misaligned without the fix), resolves each back into a sink, asserts byte-exact match. Without
    %zc-slot-stride rounding, slot 1+ would be misaligned and the u64 pubseq store/load
    (dds.pal:store/load-sap-u64, documented aligned) would be UB on strict-align targets. Runs on BOTH
-   impls: the alignment is proven via %zc-resolve (mutex'd, Clasp-portable); the loaned slots need no
+   impls: the alignment is proven via %zc-resolve (mutex'd, portable); the loaned slots need no
    explicit %zc-release here (%zc-destroy + free-static tear the region down regardless of refcount), so
-   the test does NOT invoke the SBCL-only lock-free release (WP-ZC-LOAN-LOCKFREE, ADR 0018) and keeps its
-   Clasp alignment coverage."
+   the test does NOT invoke the lock-free release (WP-ZC-LOAN-LOCKFREE, ADR 0018) and keeps its AllegroCL
+   alignment coverage."
   (let ((m (dds.pal:alloc-static (dds.xport.zerocopy::%zc-bytes 3 13))))
     (unwind-protect
          (let ((sap (dds.pal:static-pointer m))
@@ -1004,7 +1000,8 @@
    octets — read via dds.pal:load-sap-u8 over the returned POOL-SAP at PAYLOAD-BASE — EQUAL the loaned
    payload, WITHOUT a copy and WITHOUT bumping the refcount (the slot is held by the loan's existing count);
    a forged/stale generation ⇒ NIL; a forged over-long recorded LEN is CLAMPED to slot-bytes (no OOB read).
-   SBCL only (load-sap-u8 is SBCL-only, ZC ADR 0013); Clasp pass-skips."
+   SBCL only (ZC, ADR 0013); on AllegroCL it pass-skips: the gate is on pal-impl-name :sbcl, and it has not
+   been re-evaluated against the AllegroCL PAL, which does define load-sap-u8."
   (if (eq (dds.pal:pal-impl-name) :sbcl)
       (let ((m (dds.pal:alloc-static (dds.xport.zerocopy::%zc-bytes 2 32)))
             (payload (octets 11 22 33 44 55)))
@@ -1061,8 +1058,9 @@
    loan: the pool is full and every slot is loaned (refcount>0) ⇒ %zc-loan returns NIL (the writer's non-ZC
    fallback) and A is NOT reclaimed (its generation + payload stay intact while held). Then %zc-release A ⇒
    exactly one slot frees and the next loan reuses it (A is reclaimable only once unloaned). SBCL only since
-   WP-ZC-LOAN-LOCKFREE Phase B (R6, ADR 0018): %zc-release is now a lock-free cas-sap-u32 refcount decrement, an
-   SBCL-only PAL primitive (ZC is an NFR-PORT gap on Clasp, ADR 0013); Clasp pass-skips."
+   WP-ZC-LOAN-LOCKFREE Phase B (R6, ADR 0018): %zc-release is now a lock-free cas-sap-u32 refcount decrement (a
+   PAL primitive). Runs on SBCL only (ADR 0013); on AllegroCL it pass-skips: the gate is on pal-impl-name :sbcl, and it has not
+   been re-evaluated against the AllegroCL PAL, which does define cas-sap-u32."
   (if (not (eq (dds.pal:pal-impl-name) :sbcl))
       (progn
         (format t "~&  [skip] zc-reclaim-skips-loaned: %zc-release uses cas-sap-u32 (SBCL-only since WP-ZC-LOAN-LOCKFREE, ADR 0018) — NFR-PORT gap~%")
@@ -1114,8 +1112,9 @@
    (slot,generation) is a validated NO-OP — the refcount stays 0 (never negative) and the reclaimable count is
    unchanged; a release with a stale generation is also a no-op. Guards a double return_loan of one view and a
    reader-close returning an already-returned loan. SBCL only since WP-ZC-LOAN-LOCKFREE Phase B (R6, ADR 0018):
-   %zc-release is now a lock-free cas-sap-u32 refcount decrement, an SBCL-only PAL primitive (ZC is an NFR-PORT gap on
-   Clasp, ADR 0013); Clasp pass-skips (the lock-free double-return-safety also has run-zc-lockfree-release-test)."
+   %zc-release is now a lock-free cas-sap-u32 refcount decrement. Runs on SBCL only (ADR 0013); on AllegroCL it
+   pass-skips (gated on pal-impl-name :sbcl, not yet re-evaluated against the AllegroCL PAL's cas-sap-u32). The
+   lock-free double-return-safety also has run-zc-lockfree-release-test."
   (if (not (eq (dds.pal:pal-impl-name) :sbcl))
       (progn
         (format t "~&  [skip] zc-release-idempotent: %zc-release uses cas-sap-u32 (SBCL-only since WP-ZC-LOAN-LOCKFREE, ADR 0018) — NFR-PORT gap~%")
@@ -1160,8 +1159,8 @@
    (oldest) such slot. Proves slot reuse WITHOUT any freelist: (1) loan/release/loan cycles correctly reuse a
    slot (the scan finds the released slot, with a bumped generation); (2) reclaim is OLDEST-FIRST — with two
    slots free, the next loan reuses the lower-pubseq one; (3) a fully-loaned pool (every slot refcount>0) ⇒
-   %zc-loan returns NIL (the writer's non-ZC fallback, never reclaiming a held slot). SBCL only (ZC is SBCL,
-   ADR 0013); Clasp pass-skips."
+   %zc-loan returns NIL (the writer's non-ZC fallback, never reclaiming a held slot). SBCL only (ZC,
+   ADR 0013); on AllegroCL it pass-skips (gated on pal-impl-name :sbcl)."
   (if (eq (dds.pal:pal-impl-name) :sbcl)
       (let ((m1 (dds.pal:alloc-static (dds.xport.zerocopy::%zc-bytes 1 32)))
             (m3 (dds.pal:alloc-static (dds.xport.zerocopy::%zc-bytes 3 32)))
@@ -1239,8 +1238,8 @@
    with the writer's release-store-LAST generation ⇒ the payload is visible); (2) a STALE/FORGED generation ⇒
    NIL (single value) before any payload read; an OOB slot ⇒ NIL; (3) a FORGED over-long recorded LEN ⇒ CLAMPED
    to slot-bytes (no OOB read at (safety 0)); (4) THE HEADLINE — the lock-free acquire CONSES 0 BYTES per call
-   (the ~31 B CFFI pthread-mutex residue is gone). SBCL only (load-sap-u8 + bytes-consed are SBCL-exact, ZC
-   ADR 0013); Clasp pass-skips."
+   (the ~31 B CFFI pthread-mutex residue is gone). SBCL only (bytes-consed is exact only on SBCL; ZC
+   ADR 0013); on AllegroCL it pass-skips (gated on pal-impl-name :sbcl)."
   (if (eq (dds.pal:pal-impl-name) :sbcl)
       (let ((m (dds.pal:alloc-static (dds.xport.zerocopy::%zc-bytes 2 32)))
             (payload (octets 11 22 33 44 55)))
@@ -1305,7 +1304,8 @@
    direct u32-refcount CAS touches ONLY the refcount cell @+0 — the generation @+4 is PRESERVED (read generation
    after a release, assert unchanged); (5) THE HEADLINE — the lock-free release CONSES 0 BYTES per call (the
    mutex residue is gone; see run-zc-lockfree-release-biggen-test for 0-alloc AT ANY generation).
-   SBCL only (cas-sap-u32 + bytes-consed are SBCL-exact, ZC ADR 0013); Clasp pass-skips."
+   SBCL only (bytes-consed is exact only on SBCL; ZC ADR 0013); on AllegroCL it pass-skips (gated on
+   pal-impl-name :sbcl)."
   (if (eq (dds.pal:pal-impl-name) :sbcl)
       (let ((m (dds.pal:alloc-static (dds.xport.zerocopy::%zc-bytes 2 32)))
             (payload (octets 7 8 9)))
@@ -1378,8 +1378,8 @@
    (2) the release CONSES 0 BYTES/sample (this MUST have measured ~32 B against the pre-fix overlay); (3)
    double-return is still a safe no-op (refcount stays 0, no underflow); (4) a stale-generation release is a
    no-op; (5) the generation high-half @+4 is PRESERVED across the u32-refcount CAS (the CAS touches ONLY @+0).
-   Re-asserts the small-generation 0-alloc too (the fix is generation-independent). SBCL only (cas-sap-u32 +
-   bytes-consed are SBCL-exact, ZC ADR 0013); Clasp pass-skips."
+   Re-asserts the small-generation 0-alloc too (the fix is generation-independent). SBCL only (bytes-consed is
+   exact only on SBCL; ZC ADR 0013); on AllegroCL it pass-skips (gated on pal-impl-name :sbcl)."
   (if (eq (dds.pal:pal-impl-name) :sbcl)
       (let ((m (dds.pal:alloc-static (dds.xport.zerocopy::%zc-bytes 2 32)))
             (payload (octets 4 5 6))
@@ -1456,7 +1456,8 @@
    overwritten mid-read); (2) NO refcount UNDERFLOW/LEAK — after every thread joins and all loans drain, the
    pool FULLY reclaims (free-count == K) and no slot's refcount wrapped; (3) NO slot overwritten under a reader;
    (4) the writer made progress (the lock-free readers never block it). Bounded behind a deadline so a
-   regression FAILS rather than wedges. SBCL only (ZC pool + foreign SAP reads, ADR 0013); Clasp pass-skips."
+   regression FAILS rather than wedges. SBCL only (ZC pool + foreign SAP reads, ADR 0013);
+   on AllegroCL it pass-skips (gated on pal-impl-name :sbcl)."
   (if (not (eq (dds.pal:pal-impl-name) :sbcl))
       (progn
         (format t "~&  [skip] zc-lockfree-stress: ZC pool + load-sap-u8 are SBCL-only (ADR 0013) — NFR-PORT gap~%")
@@ -1723,7 +1724,7 @@
          is NOT released (refcount still 1, the slot still loaned) — the slot lifetime is handed to DCPS.
      (2) NON-LOAN-CAPABLE: the stored sample is a normal resolved octet-vector EQUAL to the published payload AND
          the slot WAS released (refcount 0, freed) — the shipped resolve-copy-release path, byte-unchanged.
-   Skips where SHMEM (hence a ZC pool) is unavailable (Clasp/macOS by-name-attach gap, ADR 0013)."
+   Skips where SHMEM (hence a ZC pool) is unavailable (shm-attach-by-name-reliable-p is NIL, ADR 0013)."
   (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
     (dds.pal:note-test-skip "run-zc-defer-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
     (return-from run-zc-defer-test t))
@@ -1796,7 +1797,7 @@
          drainer owes that one release, so releasing here would free the slot under the app's in-place read
          (a cross-process use-after-free, strictly worse than the leak). An unconditional release passes
          arm (1) and FAILS arm (2).
-   Skips where SHMEM (hence a ZC pool) is unavailable (Clasp/macOS by-name-attach gap, ADR 0013)."
+   Skips where SHMEM (hence a ZC pool) is unavailable (shm-attach-by-name-reliable-p is NIL, ADR 0013)."
   (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
     (dds.pal:note-test-skip "run-zc-unrouted-release-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
     (return-from run-zc-unrouted-release-test t))
@@ -2053,7 +2054,7 @@
 (defun* %fd-measure-bytes (label iters thunk)
     (function (string (integer 1) function) single-float)
   "Run THUNK ITERS times, print + return its mean dds.pal:bytes-consed per call (NFR-PERF-7 honest-measurement
-   harness, mirrors run-mem-test). On Clasp bytes-consed is 0 (NFR-PORT gap) so it reports 0."
+   harness, mirrors run-mem-test). On AllegroCL bytes-consed is 0 (NFR-PORT gap) so it reports 0."
   (declare (type function thunk))
   (let ((before (dds.pal:bytes-consed)))
     (dotimes (i iters) (funcall thunk))
@@ -2067,7 +2068,7 @@
     (function () (eql t))
   "WP-FLATDATA honest GC-bytes/sample measurement (NFR-PERF-7, FR-LANG-7), separating the TX win, the deferred
    ZC RX path, and the engine's ACTUAL non-ZC RX path. Mirrors run-mem-test's dds.pal:bytes-consed harness:
-   reusable write+RX buffers reset per iteration; on SBCL it asserts, on Clasp bytes-consed is 0 (NFR-PORT gap)
+   reusable write+RX buffers reset per iteration; on SBCL it asserts, on AllegroCL bytes-consed is 0 (NFR-PORT gap)
    so it only smokes. Four numbers, each on the FUNCTION the engine actually funcalls:
      serialize-id     = vtable :serialize (FlatData identity, into the engine's reused cursor)  -> assert ~0 (real TX win).
      deser-into-loan  = deserialize-into-<name>-fd, the inner copy into a PRE-LOANED target — the 0-alloc path
@@ -2201,8 +2202,8 @@
   "Measure the WP-FLATDATA-over-ZC RX GC bytes/sample on a standalone in-process ZC pool (the same pool ABI the
    data plane uses): loan ONE slot with an fd-abc-sized payload, then resolve it ITERS times each way — the NEW
    safe single-copy (%zc-resolve-fresh) vs the WP-ZEROCOPY-v1 sink+re-copy (%fd-zc-rx-bytes-v1, DRY) — and
-   return (values new-bytes v1-bytes). Pass-returns (0 0) where SHMEM by-name attach is unreliable (Clasp/macOS
-   gap, ADR 0013), since the pool's PTHREAD_PROCESS_SHARED mutex needs a usable SHMEM segment."
+   return (values new-bytes v1-bytes). Pass-returns (0 0) where SHMEM by-name attach is unreliable
+   (ADR 0013), since the pool's PTHREAD_PROCESS_SHARED mutex needs a usable SHMEM segment."
   (if (not (dds.xport.shmem:shm-attach-by-name-reliable-p))
       (values 0 0)
       (let* ((slots 8)
@@ -2246,7 +2247,7 @@
 
 (defun* %bench-ratio (a b)
     (function (real real) double-float)
-  "A/B as a double-float for a bench report, or 0.0d0 when B is 0 (div-by-zero-safe; Clasp bytes-consed=0 gap)."
+  "A/B as a double-float for a bench report, or 0.0d0 when B is 0 (div-by-zero-safe; AllegroCL bytes-consed=0 gap)."
   (if (zerop b) 0.0d0 (/ (coerce a 'double-float) b)))
 
 (defun* %set-view-from-acquire (view psap idx gen len base)
@@ -2271,7 +2272,7 @@
    vs the classic per-field codec for the SAME type, over the EXACT functions the engine funcalls. Prints a
    markdown report to *standard-output*; when FILE is given, ALSO writes it there (broadcast — captured by
    make bench-flatdata). Each row is GC bytes/op (dds.pal:bytes-consed delta, NFR-PERF-8 oracle; SBCL-exact,
-   Clasp=0 by NFR-PORT gap) + ns/op (amortised over ITERS; the PAL clock is ~us so a single op reads 0). The
+   AllegroCL=0 by NFR-PORT gap) + ns/op (amortised over ITERS; the PAL clock is ~us so a single op reads 0). The
    measured paths (DRY — reuses %fd-measure-bytes + the ZC measurement helpers): TX serialize (FlatData
    identity vs classic per-field); RX deserialize (the engine-visible vtable deserialize-<name>-fd vs classic
    deserialize-<name>, AND the loaned-target 0-alloc inner path deserialize-into-<name>-fd); the Offset
@@ -2311,7 +2312,7 @@
                (format stream "| iters (ser/deser/accessor) | ~d |~%" iters)
                (format stream "| iters (ZC-RX) | ~d |~%" zc-iters)
                (format stream "~%## Method~%~%")
-               (format stream "Each path is measured over the FUNCTION the engine actually funcalls (the type-support vtable slot), not a hand-rolled stand-in. GC bytes/op is the `dds.pal:bytes-consed` delta over the loop (NFR-PERF-8 oracle; SBCL-exact, Clasp reports 0 — a documented NFR-PORT gap). ns/op is total elapsed (`dds.pal:monotonic-ns`, ~~microsecond resolution) divided by the iteration count: a single op reads 0 on this clock, so the per-op figure is the amortised loop time (the same method `perftest.lisp` uses) and is a coarse RELATIVE indicator, not an absolute single-op latency. The TX serialize loop resets the write cursor + re-writes the encap header each iteration (as `%serialize-sample` does); the RX loops re-parse the encap header each iteration (as `%deserialize-sample` does). Reusable write/RX buffers are PAL-static and freed at the end.~%~%")
+               (format stream "Each path is measured over the FUNCTION the engine actually funcalls (the type-support vtable slot), not a hand-rolled stand-in. GC bytes/op is the `dds.pal:bytes-consed` delta over the loop (NFR-PERF-8 oracle; SBCL-exact, AllegroCL reports 0 — a documented NFR-PORT gap). ns/op is total elapsed (`dds.pal:monotonic-ns`, ~~microsecond resolution) divided by the iteration count: a single op reads 0 on this clock, so the per-op figure is the amortised loop time (the same method `perftest.lisp` uses) and is a coarse RELATIVE indicator, not an absolute single-op latency. The TX serialize loop resets the write cursor + re-writes the encap header each iteration (as `%serialize-sample` does); the RX loops re-parse the encap header each iteration (as `%deserialize-sample` does). Reusable write/RX buffers are PAL-static and freed at the end.~%~%")
                (format stream "## Serialize / deserialize / accessor cost — FlatData vs classic (same `fd-abc`)~%~%")
                (format stream "| path | FD bytes/op | FD ns/op | classic bytes/op | classic ns/op | note |~%")
                (format stream "|------|-------------|----------|------------------|---------------|------|~%"))
@@ -2380,7 +2381,7 @@
                                 "read in place IS 0-copy, but returning a >fixnum u64 BOXES a bignum (a Lisp cost, not FlatData)")
                  (format stream "~%## FlatData over Zero-Copy — RX (safe single copy out of SHMEM, NOT literal-0-copy)~%~%")
                  (if (and (zerop new-bytes) (zerop v1-bytes))
-                     (format stream "(SHMEM by-name attach unreliable on this platform — ZC-RX bench skipped; Clasp/macOS gap, ADR 0013)~%~%")
+                     (format stream "(SHMEM by-name attach unreliable on this platform — ZC-RX bench skipped; ADR 0013)~%~%")
                      (progn
                        (format stream "| RX path | GC bytes/sample | vs v1 |~%|---------|-----------------|-------|~%")
                        (format stream "| WP-FLATDATA-over-ZC single-copy (`%zc-resolve-fresh`) | ~d | 1x |~%" new-bytes)
@@ -2393,7 +2394,7 @@
                  (format stream "- The **engine-visible non-ZC RX vtable** (`deserialize-<name>-fd`) allocates ONE FlatData buffer per sample (~,1f bytes/op here) — modestly below the classic per-field decode (~,1f) with 0 per-field work, NOT zero. The classic vtable likewise allocates a fresh sample per call.~%" vdes-bytes cdes-bytes)
                  (format stream "- The **FlatData-over-ZC RX is a SAFE SINGLE COPY out of shared memory** (~~~dx less than WP-ZEROCOPY-v1's sink+re-copy — ~~3 orders of magnitude), **NOT literal-0-copy**. A Lisp octet-buffer cannot wrap a raw foreign SAP, and ZC delivery is into an async store read on another thread with no slot-aware release hook, so a literal-0-copy SHMEM VIEW would be a cross-process use-after-free. **TX still has the one app->slot copy** (a loan-write API is the follow-up). **Literal-0-copy RX is DEFERRED** — it needs SAP-backed accessors plus a DCPS-level refcount-spanning ZC read path (ADR 0015, Phase-D outcome).~%~%"
                          (if (plusp new-bytes) (round v1-bytes new-bytes) 830))
-                 (format stream "Method: ~d iterations (~d for ZC-RX); GC bytes/op = `dds.pal:bytes-consed` delta (SBCL-exact, Clasp=0); ns/op = `dds.pal:monotonic-ns` total/iters (~~us clock, amortised). Impl: ~a ~a on ~a.~%"
+                 (format stream "Method: ~d iterations (~d for ZC-RX); GC bytes/op = `dds.pal:bytes-consed` delta (SBCL-exact, AllegroCL=0); ns/op = `dds.pal:monotonic-ns` total/iters (~~us clock, amortised). Impl: ~a ~a on ~a.~%"
                          iters zc-iters (lisp-implementation-type) (lisp-implementation-version) (machine-instance))
                  (when sbcl-p
                    ;; honest regression guards: the two genuine 0-alloc paths must be ~0; the vtable must not regress past classic
@@ -2426,7 +2427,7 @@
    explicit loan/return CYCLE over ITERS calls — %zc-acquire-for-read (the loan) + a field read off the SAP +
    %zc-release (the return) — on a slot freshly %zc-loan'd each iteration. The honest cost the loan API ADDS over
    a bare read: the explicit acquire + release (each takes the pool mutex) + the app's return obligation. SBCL
-   bytes-consed exact; Clasp reads 0 (NFR-PORT gap)."
+   bytes-consed exact; AllegroCL reads 0 (NFR-PORT gap)."
   (let ((view (dds.types:make-flatdata-view))
         (before (dds.pal:bytes-consed)))
     (dotimes (i iters)
@@ -2451,8 +2452,8 @@
    per-sample OWNED DELIVERY VECTOR (the alloc win); its residue is the bare pool-mutex acquire (a fixed,
    payload-independent CFFI cost the v1 single-copy ALSO pays), and the loan API ADDS an explicit
    %zc-acquire-for-read + %zc-release + the app's return-loan OBLIGATION over a copy-and-forget read — a real
-   cost, stated plainly. SBCL only (ZC + foreign SAP reads, ADR 0013); on Clasp the SHMEM by-name attach is
-   unreliable so the bench pass-skips. NOT cleared for ship — pending counsel (R6)."
+   cost, stated plainly. Asserted on SBCL only (ADR 0013); on AllegroCL it reports without asserting (bytes-consed
+   reads 0); where SHMEM by-name attach is unreliable the bench pass-skips. NOT cleared for ship — pending counsel (R6)."
   (let* ((fd (make-fd-abc-flatdata))
          (sbcl-p (eq (dds.pal:pal-impl-name) :sbcl))
          (have-shmem (dds.xport.shmem:shm-attach-by-name-reliable-p)))
@@ -2488,9 +2489,9 @@
                  (format stream "| pool slot bytes | `+zerocopy-pool-slot-bytes+` = ~d (the WP-ZEROCOPY-v1 sink size) |~%" dds.disc:+zerocopy-pool-slot-bytes+)
                  (format stream "| iters | ~d |~%" iters)
                  (format stream "~%## Method~%~%")
-                 (format stream "Each RX strategy resolves ONE loaned slot `iters` times; the resolve does NOT touch the slot refcount, so a single loaned slot serves every iteration. GC bytes/sample is the `dds.pal:bytes-consed` delta over the loop divided by `iters` (NFR-PERF-8 oracle; SBCL-exact, Clasp reports 0 — a documented NFR-PORT gap). The literal-0-copy loan RX reuses one `flatdata-view` struct (the per-reader view recycling the DCPS loan registry does) and reads a field straight off the slot SAP. The loan/return CYCLE row additionally `%zc-loan`s + `%zc-release`s each iteration to price the explicit loan + return obligation. NOTE: this is the per-sample RX allocation, not end-to-end latency.~%~%")
+                 (format stream "Each RX strategy resolves ONE loaned slot `iters` times; the resolve does NOT touch the slot refcount, so a single loaned slot serves every iteration. GC bytes/sample is the `dds.pal:bytes-consed` delta over the loop divided by `iters` (NFR-PERF-8 oracle; SBCL-exact, AllegroCL reports 0 — a documented NFR-PORT gap). The literal-0-copy loan RX reuses one `flatdata-view` struct (the per-reader view recycling the DCPS loan registry does) and reads a field straight off the slot SAP. The loan/return CYCLE row additionally `%zc-loan`s + `%zc-release`s each iteration to price the explicit loan + return obligation. NOTE: this is the per-sample RX allocation, not end-to-end latency.~%~%")
                  (if (not have-shmem)
-                     (format stream "(SHMEM by-name attach unreliable on this platform — the ZC loan bench pass-skipped; Clasp/macOS gap, ADR 0013)~%~%")
+                     (format stream "(SHMEM by-name attach unreliable on this platform — the ZC loan bench pass-skipped; ADR 0013)~%~%")
                      (progn
                        (format stream "## RX GC bytes/sample — the literal-0-copy progression~%~%")
                        (format stream "| RX strategy | GC bytes/sample | vs literal-0-copy loan | what it allocates |~%")
@@ -2508,7 +2509,7 @@
                        (format stream "| full loan + return CYCLE (`%zc-loan` + acquire + read + `%zc-release`) | ~d |~%~%" cycle-bytes)
                        (format stream "Literal-0-copy RX is the allocation win, but it is **not free**: the loan API adds an explicit `%zc-acquire-for-read` (the loan) and `%zc-release` (the return) — each taking the pool mutex — plus the app's **explicit `return-loan` obligation** (a leaked loan pins a slot until the writer's pool gracefully falls back to non-ZC). The full loan+return cycle costs **~d** GC bytes/sample here (the per-sample mutex traffic of loan + acquire + release), vs the **~d** B the read-only literal-0-copy RX pays. No `0-cost`/`free` claim: the RX *allocation* is eliminated; the loan/return *calls* and the return *obligation* are real.~%~%"
                                cycle-bytes loan-bytes)))
-                 (format stream "Method: ~d iterations; GC bytes/sample = `dds.pal:bytes-consed` delta / iters (SBCL-exact, Clasp=0). Cross-process FlatData-over-ZC is proven byte-exact by `make zc-xproc` (the 16-byte reference resolves across two OS processes; literal-0-copy is a LOCAL read optimization — the wire is byte-identical). Impl: ~a ~a on ~a.~%"
+                 (format stream "Method: ~d iterations; GC bytes/sample = `dds.pal:bytes-consed` delta / iters (SBCL-exact, AllegroCL=0). Cross-process FlatData-over-ZC is proven byte-exact by `make zc-xproc` (the 16-byte reference resolves across two OS processes; literal-0-copy is a LOCAL read optimization — the wire is byte-identical). Impl: ~a ~a on ~a.~%"
                          iters (lisp-implementation-type) (lisp-implementation-version) (machine-instance))
                  (when (and sbcl-p have-shmem)
                    (assert (< loan-bytes new-bytes) () "bench: the literal-0-copy loan RX (~d) must allocate strictly less than the v1 single-copy (~d) — the owned vector eliminated" loan-bytes new-bytes)
@@ -2664,8 +2665,8 @@
    setters → commit (0 copies). PLUS the SEND-SITE arm (the ADR 0042 integration): %zc-change-item on an ARMED
    change (claim the pre-committed slot, no copy) vs a plain change (%zc-ref-builder → %zc-loan's 8 KiB copy),
    over a real disc-node fixture. Prints a markdown report to *standard-output*; when FILE is given, ALSO writes
-   it there. SBCL only (ZC + foreign-SAP writes, ADR 0013); on Clasp the SHMEM by-name attach is unreliable so
-   the bench pass-skips. Per the operating contract no hot-path change lands without a before/after measurement;
+   it there. Asserted on SBCL only (ADR 0013); on AllegroCL it reports without asserting; where SHMEM by-name
+   attach is unreliable the bench pass-skips. Per the operating contract no hot-path change lands without a before/after measurement;
    this is that measurement. NOT cleared for ship — pending counsel (R6)."
   (let* ((sbcl-p (eq (dds.pal:pal-impl-name) :sbcl))
          (have-shmem (dds.xport.shmem:shm-attach-by-name-reliable-p))
@@ -2751,9 +2752,9 @@
                  (format stream "| FlatData type | `fd-abc` (`u8`,`u32`,`u64`) -> `+fd-abc-flatdata-size+` = ~d octets (4 encap + 16 body) |~%" +fd-abc-flatdata-size+)
                  (format stream "| iters | ~d |~%" iters)
                  (format stream "~%## Method~%~%")
-                 (format stream "Each row runs one full writer TX cycle `iters` times over a shared pool. BASELINE = `serialize-fd-abc-fd` (app→payload identity copy) + `%zc-loan` (payload→slot block copy) + `%zc-release`. LOAN-WRITE = `%zc-loan-acquire` + the three SAP Offset setters (`a`,`b`,`c` written straight into the slot) + `%zc-loan-commit` + `%zc-release`. GC bytes/sample = `dds.pal:bytes-consed` delta / iters (SBCL-exact, Clasp=0); ns/sample = `dds.pal:monotonic-ns` total / iters (~~us clock, amortised). Both cycles loan + release one slot, so the delta is exactly the two eliminated copies vs the direct field writes.~%~%")
+                 (format stream "Each row runs one full writer TX cycle `iters` times over a shared pool. BASELINE = `serialize-fd-abc-fd` (app→payload identity copy) + `%zc-loan` (payload→slot block copy) + `%zc-release`. LOAN-WRITE = `%zc-loan-acquire` + the three SAP Offset setters (`a`,`b`,`c` written straight into the slot) + `%zc-loan-commit` + `%zc-release`. GC bytes/sample = `dds.pal:bytes-consed` delta / iters (SBCL-exact, AllegroCL=0); ns/sample = `dds.pal:monotonic-ns` total / iters (~~us clock, amortised). Both cycles loan + release one slot, so the delta is exactly the two eliminated copies vs the direct field writes.~%~%")
                  (if (not have-shmem)
-                     (format stream "(SHMEM by-name attach unreliable on this platform — the loan-write bench pass-skipped; Clasp/macOS gap, ADR 0013)~%~%")
+                     (format stream "(SHMEM by-name attach unreliable on this platform — the loan-write bench pass-skipped; ADR 0013)~%~%")
                      (progn
                        (format stream "## TX per-sample cost — baseline (two copies) vs loan-write (zero copies)~%~%")
                        (format stream "| TX path | GC bytes/sample | ns/sample | copies |~%")
@@ -2793,7 +2794,7 @@
                        (format stream "The RX-side loan path is untouched by this WP (the `%zc-loan` split is behaviour-identical); the literal-0-copy loan RX still allocates ~,1f GC bytes/sample vs the v1 single-copy's ~,1f — no regression vs `bench/report/2026-06-16-wp-flatdata-zc-loan.md`.~%~%"
                                rx-loan-bytes rx-new-bytes)))
                  (format stream "Correctness envelope (ADR 0042 §5 + ADR 0044): loan-write is an OPTIMIZATION of the ZC TX path — every existing case (non-ZC readers, reliable retransmit, late-joiners, pool saturation, multi-destination) is served identically. The PRE-COMMITTED slot is consumed at the FIRST ZC-eligible destination (exactly-one-ZC-destination = the pure end-to-end envelope, proven by `dcps-loan-write-e2e`); any further ZC destination, a non-ZC destination, and a retransmit are served from the sample bytes — for a PINNED eligible writer read ON DEMAND from the still-committed slot (ADR 0044, so no per-write retained heap copy), otherwise from the RETAINED payload `write-loaned` materialised eagerly (the always-correct fallback). A pinned slot is released at the full-ACK purge and every change-drop site (KEEP_LAST eviction, dispose, timeout, teardown) exactly once; a slot the send pass never consumes is released by the fallback decision / the push-pass sweep / the teardown sweep (never a strand, ADR 0042/0044 lifecycle).~%~%")
-                 (format stream "Method: ~d iterations; SBCL-exact (`bytes-consed` + `load/store-sap-u8` are SBCL-only, ZC ADR 0013; Clasp pass-skips). Impl: ~a ~a on ~a.~%"
+                 (format stream "Method: ~d iterations; SBCL-exact (`bytes-consed` is exact only on SBCL, ZC ADR 0013; other implementations report without asserting). Impl: ~a ~a on ~a.~%"
                          iters (lisp-implementation-type) (lisp-implementation-version) (machine-instance))
                  (when (and sbcl-p have-shmem)
                    (assert (< lw-bytes base-bytes) () "bench: loan-write (~,1f) must allocate strictly less than the baseline (~,1f) — the per-sample payload eliminated" lw-bytes base-bytes)
@@ -2814,8 +2815,8 @@
    it to refcount==0 so the next loan re-scans the full pool — so the timing reflects the worst case (every
    slot a reclaim candidate). The honest WRITER-SIDE cost the 0-alloc reader RX trades for: it RISES with
    SLOTS (the O(slots) sensitivity). monotonic-ns total/iters (~us clock, amortised, the same method
-   perftest.lisp uses); SBCL. Pass-returns 0.0d0 where SHMEM by-name attach is unreliable (Clasp/macOS gap,
-   ADR 0013), since the pool's PTHREAD_PROCESS_SHARED mutex needs a usable SHMEM segment."
+   perftest.lisp uses); SBCL. Pass-returns 0.0d0 where SHMEM by-name attach is unreliable
+   (ADR 0013), since the pool's PTHREAD_PROCESS_SHARED mutex needs a usable SHMEM segment."
   (if (not (dds.xport.shmem:shm-attach-by-name-reliable-p))
       0.0d0
       (let* ((slot-bytes +fd-abc-flatdata-size+)
@@ -2848,8 +2849,8 @@
    O(slots) sensitivity. NO `0-cost`/`free` claim: the reader RX is 0-alloc (the win); the WRITER pays a small
    bounded scan (writer-side, amortized — a lock-free freelist to restore O(1) is a noted follow-up). Prints a
    markdown report to *standard-output*; when FILE is given ALSO writes it there (broadcast — captured by make
-   bench-zc-loan-lockfree). SBCL only (ZC + foreign-SAP atomics, ADR 0013); on Clasp the SHMEM by-name attach
-   is unreliable so the bench pass-skips. NOT cleared for ship — pending counsel (R6)."
+   bench-zc-loan-lockfree). Asserted on SBCL only (ADR 0013); on AllegroCL it reports without asserting;
+   where SHMEM by-name attach is unreliable the bench pass-skips. NOT cleared for ship — pending counsel (R6)."
   (let* ((fd (make-fd-abc-flatdata))
          (sbcl-p (eq (dds.pal:pal-impl-name) :sbcl))
          (have-shmem (dds.xport.shmem:shm-attach-by-name-reliable-p)))
@@ -2889,9 +2890,9 @@
                    (format stream "| RX iters | ~d |~%" iters)
                    (format stream "| writer-scan iters | ~d |~%" scan-iters)
                    (format stream "~%## Method~%~%")
-                   (format stream "**RX:** each RX strategy resolves ONE loaned slot `iters` times; the resolve does NOT touch the slot refcount, so a single loaned slot serves every iteration. GC bytes/sample is the `dds.pal:bytes-consed` delta over the loop / `iters` (SBCL-exact, Clasp reports 0 — a documented NFR-PORT gap). The lock-free loan RX reuses one `flatdata-view` struct (the per-reader view recycling the DCPS loan registry does) and reads a field straight off the slot SAP — no mutex, no copy. **Writer:** `%fd-zc-loan-scan-ns` builds a pool of N slots and times `%zc-loan` + `%zc-release` over `writer-scan iters` iterations (`dds.pal:monotonic-ns` total / iters, ~~us clock, amortised — the same method `perftest.lisp` uses); each loan re-scans all N `refcount==0` slots for the lowest pubseq (the worst case — every slot a reclaim candidate), so ns/loan RISES with N (the O(slots) sensitivity). NOTE: these are per-sample RX allocation + per-loan writer time, not end-to-end latency.~%~%")
+                   (format stream "**RX:** each RX strategy resolves ONE loaned slot `iters` times; the resolve does NOT touch the slot refcount, so a single loaned slot serves every iteration. GC bytes/sample is the `dds.pal:bytes-consed` delta over the loop / `iters` (SBCL-exact, AllegroCL reports 0 — a documented NFR-PORT gap). The lock-free loan RX reuses one `flatdata-view` struct (the per-reader view recycling the DCPS loan registry does) and reads a field straight off the slot SAP — no mutex, no copy. **Writer:** `%fd-zc-loan-scan-ns` builds a pool of N slots and times `%zc-loan` + `%zc-release` over `writer-scan iters` iterations (`dds.pal:monotonic-ns` total / iters, ~~us clock, amortised — the same method `perftest.lisp` uses); each loan re-scans all N `refcount==0` slots for the lowest pubseq (the worst case — every slot a reclaim candidate), so ns/loan RISES with N (the O(slots) sensitivity). NOTE: these are per-sample RX allocation + per-loan writer time, not end-to-end latency.~%~%")
                    (if (not have-shmem)
-                       (format stream "(SHMEM by-name attach unreliable on this platform — the ZC lock-free loan bench pass-skipped; Clasp/macOS gap, ADR 0013)~%~%")
+                       (format stream "(SHMEM by-name attach unreliable on this platform — the ZC lock-free loan bench pass-skipped; ADR 0013)~%~%")
                        (progn
                          (format stream "## The headline — loaned RX GC bytes/sample is now LITERAL 0 (lock-free)~%~%")
                          (format stream "| RX strategy | GC bytes/sample | what it allocates |~%")
@@ -2921,7 +2922,7 @@
                          (format stream "| full lock-free loan + return CYCLE (`%zc-loan` + acquire + read + `%zc-release`) | ~d |~%~%" cycle-bytes)
                          (format stream "The RX *allocation* is eliminated (literal 0), but the loan API is **not free**: it adds an explicit `%zc-acquire-for-read` (the loan) and `%zc-release` (the return), plus the app's **explicit `return-loan` obligation** (a leaked loan pins a slot at `refcount>0` until the writer's pool gracefully falls back to non-ZC), plus the writer's O(slots) scan above. The full lock-free loan+return CYCLE costs **~d** GC bytes/sample here (down from the ADR-0017 mutex'd cycle's ~~96 B — the acquire + release mutex traffic is gone). No `0-cost`/`free` claim: the RX *allocation* is 0; the loan/return *calls*, the return *obligation*, and the writer *scan* are real.~%~%"
                                  cycle-bytes)))
-                   (format stream "Method: RX ~d iterations, writer-scan ~d iterations; GC bytes/sample = `dds.pal:bytes-consed` delta / iters (SBCL-exact, Clasp=0); writer ns/loan = `dds.pal:monotonic-ns` total / iters (~~us clock, amortised). The memory-ordering handshake (the writer's payload -> `fence :release` -> generation-store-LAST pairing with the reader's generation acquire-load -> `fence :acquire`; the `cas-sap-u32` full-barrier release) is verified byte-exact CROSS-PROCESS by `make zc-xproc` (the reference resolves across two OS processes — a same-process bench cannot prove the fence pairing) + the `zc-lockfree-stress` / `zc-lockfree-release-biggen` unit tests. Impl: ~a ~a on ~a.~%"
+                   (format stream "Method: RX ~d iterations, writer-scan ~d iterations; GC bytes/sample = `dds.pal:bytes-consed` delta / iters (SBCL-exact, AllegroCL=0); writer ns/loan = `dds.pal:monotonic-ns` total / iters (~~us clock, amortised). The memory-ordering handshake (the writer's payload -> `fence :release` -> generation-store-LAST pairing with the reader's generation acquire-load -> `fence :acquire`; the `cas-sap-u32` full-barrier release) is verified byte-exact CROSS-PROCESS by `make zc-xproc` (the reference resolves across two OS processes — a same-process bench cannot prove the fence pairing) + the `zc-lockfree-stress` / `zc-lockfree-release-biggen` unit tests. Impl: ~a ~a on ~a.~%"
                            iters scan-iters (lisp-implementation-type) (lisp-implementation-version) (machine-instance))
                    (when (and sbcl-p have-shmem)
                      (assert (zerop loan-bytes) () "bench: the lock-free loaned RX (~d) must be LITERAL 0 GC bytes/sample (no mutex, no owned vector)" loan-bytes)
@@ -2963,7 +2964,7 @@
    ns TODAY (N loans) vs MULTI-DEST (1 loan + the N-1 bump) for a PAYLOAD-BYTES-octet sample. The payoff needs >=2
    co-resident ZC participants (NOT the primary 1:1 same-host case) — stated honestly, not overclaimed. Prints a
    markdown report to *standard-output*; when FILE is given ALSO writes it there. SBCL only (ZC + foreign-SAP
-   atomics, ADR 0013); on Clasp the SHMEM by-name attach is unreliable so the bench pass-skips. Counsel R6."
+   atomics, ADR 0013); on AllegroCL, or where SHMEM by-name attach is unreliable, the bench pass-skips. Counsel R6."
   (let* ((sbcl-p (eq (dds.pal:pal-impl-name) :sbcl))
          (have-shmem (dds.xport.shmem:shm-attach-by-name-reliable-p))
          (payload (make-array payload-bytes :element-type '(unsigned-byte 8) :initial-element 42))
@@ -3004,7 +3005,7 @@
              (format stream "| payload | ~d octets |~%" payload-bytes)
              (format stream "| iters (loan ns) | ~d |~%~%" iters)
              (if (not (and sbcl-p have-shmem))
-                 (format stream "(SHMEM by-name attach unreliable on this platform — the multi-dest ZC bench pass-skipped; Clasp/macOS gap, ADR 0013)~%~%")
+                 (format stream "(SHMEM by-name attach unreliable on this platform — the multi-dest ZC bench pass-skipped; ADR 0013)~%~%")
                  (progn
                    (format stream "## The headline — slots + app->slot copies drop from N to 1~%~%")
                    (format stream "| ZC dests N | slots TODAY | slots MULTI-DEST | copies TODAY | copies MULTI-DEST | slots saved | copies saved |~%")
@@ -3085,7 +3086,7 @@
 ;;; getter form is byte-exact to the shipped aref getter. Build a :flatdata value in an owned octet-buffer via
 ;;; the owned setters, then for each field COMPILE %flatdata-sap-getter-form over the buffer's SAP at body
 ;;; offset 4+off and assert the SAP read EQUALS the owned aref accessor — for all widths + signed-negative +
-;;; bool. SBCL only (load-sap-u8 is SBCL-only, ZC is SBCL-only, ADR 0013); Clasp pass-skips cleanly.
+;;; bool. SBCL only (ZC, ADR 0013); on AllegroCL the callers pass-skip (gated on pal-impl-name :sbcl).
 (defun* %fd-sap-getter-byte-exact (spec build-fn getter-fn-alist)
     (function (list function list) t)
   "B1 helper (DRY): SPEC is the define-dds-type member list; BUILD-FN fills + returns an owned FlatData buffer;
@@ -3118,7 +3119,9 @@
   "WP-FLATDATA-ZC-LOAN Task B1 (FR-PF-3/4, R6, ADR 0017): %flatdata-sap-getter-form is byte-exact to the shipped
    aref getter for every width + signed-negative + bool. Builds each value in an owned octet-buffer via the owned
    setters, COMPILEs the SAP getter form over the buffer's SAP at 4+body-offset, and asserts it EQUALS the owned
-   accessor (the byte-exact oracle is the FlatData buffer). SBCL only (load-sap-u8 is SBCL-only); Clasp pass-skips."
+   accessor (the byte-exact oracle is the FlatData buffer). SBCL only;
+   on AllegroCL it pass-skips: the gate is on pal-impl-name :sbcl, and it has not
+   been re-evaluated against the AllegroCL PAL, which does define load-sap-u8."
   (if (eq (dds.pal:pal-impl-name) :sbcl)
       (progn
         ;; unsigned u8/u32/u64
@@ -3184,7 +3187,9 @@
   "WP-FLATDATA-ZC-LOAN Task B2 (FR-PF-3/4, R6, ADR 0017): the single -fd accessor surface reads a flatdata-view
    (SAP path) byte-exactly to an owned octet-buffer (aref path), via the predicted struct-type dispatch branch —
    for every width + signed-negative + bool (the owned read is the oracle). SBCL only (the view holds a live SAP
-   the SAP accessors read; load-sap-u8 is SBCL-only); Clasp pass-skips."
+   the SAP accessors read); on AllegroCL it pass-skips: the gate is on pal-impl-name :sbcl, and it has not
+   been re-evaluated against the AllegroCL PAL, which does define
+   load-sap-u8."
   (if (eq (dds.pal:pal-impl-name) :sbcl)
       (progn
         (%fd-view-accessor-byte-exact
@@ -3242,7 +3247,9 @@
   "WP-FLATDATA-LOAN-WRITE (FR-PF-4, R6, ADR 0042; NOT cleared for ship — pending counsel): the SAP-mode Offset
    SETTER (the loan-write write-side dual of the read-in-place getter) writes a flatdata-view (SAP path) byte-
    IDENTICALLY to the owned octet-buffer (aref path), via the predicted struct-type dispatch branch — for every
-   width + signed-negative + bool. SBCL only (store-sap-u8 is SBCL-only, ZC ADR 0013); Clasp pass-skips."
+   width + signed-negative + bool. SBCL only (ZC ADR 0013);
+   on AllegroCL it pass-skips: the gate is on pal-impl-name :sbcl, and it has not
+   been re-evaluated against the AllegroCL PAL, which does define store-sap-u8."
   (if (eq (dds.pal:pal-impl-name) :sbcl)
       (progn
         (%fd-sap-setter-byte-exact #'make-fd-abc-flatdata
@@ -3339,8 +3346,8 @@
    reads on a bare disc-node struct; both impls (no SAP, no networking).
 
    The PLATFORM gate is part of the predicate: a peer must be able to ATTACH the writer pool by name, which
-   Clasp/macOS-arm64 cannot do (ADR 0013 — a Clasp variadic-ABI defect, MEASURED; see
-   dds.pal::%shm-open-create). The positive check below therefore asks for that capability; every
+   is not possible where the PAL reports by-name attach unreliable (ADR 0013; see
+   dds.pal:shm-create-mode-reliable-p). The positive check below therefore asks for that capability; every
    fail-closed check must hold on EVERY platform regardless."
   (let ((n (dds.disc::%make-disc-node))
         (attachable (dds.xport.shmem:shm-attach-by-name-reliable-p)))
@@ -3412,7 +3419,7 @@
          registry drained).
      (6) CLOSE SWEEP: with batching deferring the flush, the armed change sits in the registry; %zc-armed-sweep
          (the stop-node teardown call) releases it.
-   SBCL only (ZC pool, ADR 0013); Clasp pass-skips."
+   Needs the ZC pool (ADR 0013); pass-skips where SHMEM by-name attach is unreliable."
   (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
     (format t "~&  [skip] loan-write-sendsite: SHMEM by-name attach unreliable (ZC, ADR 0013) — NFR-PORT gap~%")
     (return-from run-loan-write-sendsite-test t))
@@ -3537,7 +3544,7 @@
    added, so the committed slot could never be emitted and MUST be released (pool free-count restored, no strand),
    with the armed registry NOT grown. Asserts: publish returns :timeout cleanly; the slot's refcount is dropped
    (free-count back to baseline); the zc-armed registry is empty (the timeout leg released, never registered).
-   SBCL only (ZC pool, ADR 0013); Clasp pass-skips."
+   Needs the ZC pool (ADR 0013); pass-skips where SHMEM by-name attach is unreliable."
   (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
     (format t "~&  [skip] loan-write-timeout-release: SHMEM by-name attach unreliable (ZC, ADR 0013) — NFR-PORT gap~%")
     (return-from run-loan-write-timeout-release-test t))
@@ -3603,7 +3610,7 @@
          count (a change in 1 group is N=1, no entry) — the emitter count is exact, not the group total.
      (7) SATURATION FALLBACK: with the pool exhausted a non-armed shared loan returns no entry (each dest falls
          back to its own fresh loan / payload — always correct).
-   SBCL only (ZC pool, ADR 0013); Clasp pass-skips."
+   Needs the ZC pool (ADR 0013); pass-skips where SHMEM by-name attach is unreliable."
   (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
     (format t "~&  [skip] multi-dest-refcount: SHMEM by-name attach unreliable (ZC, ADR 0013) — NFR-PORT gap~%")
     (return-from run-multi-dest-refcount-test t))
@@ -3831,8 +3838,7 @@
 (defun* run-flow-backpressure-test ()
     (function () t)
   "WP-ASYNC-FLOW (FR-PF-2/FR-QOS), ADR 0016 §Backpressure: DDS-standard block-up-to-max_blocking_time
-   backpressure in the reliable writer. SBCL-only (real blocking + threads); Clasp pass-skipped (the known
-   Clasp multithread-condvar SIGSEGV, NFR-PORT). Four cases:
+   backpressure in the reliable writer. Runs on SBCL and AllegroCL (real blocking + threads). Four cases:
    (1) BLOCK→TIMEOUT — a KEEP_ALL writer at MAX-SAMPLES with a stalled drain (no purge): a worker-thread
        writer-write of the next sample BLOCKS, then returns the :timeout sentinel after ~max_blocking_time
        (200 ms ± tolerance) with the cache intact and NO SN consumed (the SN stream stays hole-free);
@@ -3843,7 +3849,6 @@
    (3) MAX_BLOCKING = 0 — a full cache returns :timeout IMMEDIATELY (~0 elapsed), the non-blocking degenerate;
    (4) DEFAULT NO-BLOCK regression — an unlimited (max_samples NIL) and a KEEP_LAST writer NEVER block and
        NEVER return :timeout (every writer-write returns an integer SN) — the default path is unchanged."
-  (when (eq (uiop:implementation-type) :clasp) (return-from run-flow-backpressure-test t))
   ;; -- Case 1: block then TIMEOUT at ~max_blocking_time (stalled drain, no purge) --
   (let* ((block-ms 200)
          (w (%bp-writer 3 (* block-ms 1000000)))

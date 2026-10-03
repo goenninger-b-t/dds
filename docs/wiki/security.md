@@ -168,6 +168,29 @@ covers even re-key-orphaned KMs — never freed mid-run, so no live resolver eve
 bytes) is walked by `cm-teardown` from `delete-participant` after `stop-node` joins the receiver
 thread; the disc-node's PVMS bootstrap KeyMaterials are wiped in `stop-node`.
 
+**Proving the wipe: the read-back point.**  `zeroize-key-material` releases each master slot through
+`dds.dare:free-secret-octets`, which runs **wipe, then read-back, then release**: it fills the buffer with
+zeros, calls `dds.dare:*secret-wipe-readback-hook*` (when non-NIL) with the wiped buffer while it is still
+allocated, and only then frees it. Reading a buffer *after* its release is a use-after-free on both SBCL
+and AllegroCL (each frees the whole static vector), so this hook is the only place a test can observe the
+wipe. It is NIL in production and must not retain or write the buffer. `run-security-keymaterial-harden-test`
+uses it on both Lisps:
+
+```lisp
+(let* ((km   (dds.security:generate-key-material :origin-auth t))
+       (salt (dds.security:key-material-master-salt km))   ; captured before the choke, asserted non-zero
+       (seen '()))
+  (let ((dds.dare:*secret-wipe-readback-hook*
+          (lambda (v) (push (cons v (every #'zerop v)) seen))))
+    (dds.security:zeroize-key-material km))
+  ;; exactly the 3 master slots were handed over, each one all-zero at that moment
+  (assert (= 3 (length seen)))
+  (assert (cdr (assoc salt seen :test #'eq))))
+```
+
+A `let` binding is visible only to the binding thread; to observe a wipe that runs on another thread (a
+service shutdown, for instance) `setf` the global value and restore it afterwards.
+
 **Remote-KM drop-on-unmatch (ADR-0034 MINOR-4).**  When a remote participant leases out, `%lease-sweep`
 fires `disc-node-on-participant-lost` → `cm-forget-remote-participant`, which DROPS that peer's
 KeyMaterials from the four ACTIVE lookup registries (`remote-participant-crypto`, `remote-entity-crypto`,

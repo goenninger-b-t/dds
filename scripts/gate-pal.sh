@@ -31,11 +31,6 @@ IMPLS='sbcl|clasp|allegro|ccl|ecl|abcl|lispworks|cmu'
 # (#+(and clasp darwin)), and the keyword :clasp. Case-insensitive, because the reader is.
 CLASP_RE='#[+-]clasp([^a-z0-9-]|$)|#[+-]\([^)]*[( ]clasp[ )]|:clasp([^a-z0-9-]|$)'
 
-# TRANSITIONAL, PINNED, SHRINK-ONLY: the 14 lines carrying :clasp test branches in src/dds-tests/ that WP-0.6
-# deletes (the plan counted 13; a grep on 2026-10-03 finds 14). Counted, never silently skipped: MORE than this fails (a new one), FEWER fails too (lower the pin, so the allowance
-# cannot quietly outlive the code it excuses). When WP-0.6 lands, set it to 0 and delete this allowance.
-CLASP_TESTS_PENDING=14
-
 clasp_hits() {   # $@ = paths; prints file:line: text for every banned Clasp token
   grep -rnEi --include='*.lisp' --include='*.asd' "$CLASP_RE" "$@" 2>/dev/null || true
 }
@@ -108,28 +103,12 @@ fi
 
 # ---- 2. THE CLASP BAN (ADR 0118) ----
 mapfile -t asds < <(ls ./*.asd 2>/dev/null)
-banned="$(clasp_hits src "${asds[@]}" | grep -v '^src/dds-tests/' || true)"
+banned="$(clasp_hits src "${asds[@]}")"
 if [[ -n "$banned" ]]; then
   printf '%s\n' "$banned"
   echo "gate-pal: FAIL — Clasp is withdrawn (ADR 0118): #+clasp / #-clasp / :clasp may not appear in src/ or" >&2
-  echo "          *.asd, not even inside dds-pal/ or in a comment. Delete the branch; reword the prose." >&2
-  exit 1
-fi
-ntests="$(clasp_hits src/dds-tests | grep -c . || true)"
-if (( ntests > CLASP_TESTS_PENDING )); then
-  clasp_hits src/dds-tests
-  echo "gate-pal: FAIL — $ntests Clasp token(s) in src/dds-tests/, above the pinned $CLASP_TESTS_PENDING (WP-0.6)." >&2
-  echo "          A NEW one was added. Clasp is withdrawn (ADR 0118)." >&2
-  exit 1
-fi
-if (( ntests < CLASP_TESTS_PENDING )); then
-  echo "gate-pal: FAIL — only $ntests Clasp token(s) remain in src/dds-tests/, below the pinned" >&2
-  echo "          $CLASP_TESTS_PENDING. Lower CLASP_TESTS_PENDING in scripts/gate-pal.sh to $ntests (0 = delete the" >&2
-  echo "          allowance) so it cannot outlive the code it excuses." >&2
+  echo "          *.asd, not even inside dds-pal/, src/dds-tests/ or a comment. Delete the branch; reword the prose." >&2
   exit 1
 fi
 echo "gate-pal: PASS — no reader conditionals outside dds-pal/, no Clasp token in src/ or *.asd (the gate is"
 echo "          proven able to fail on both rules)."
-if (( ntests > 0 )); then
-  echo "gate-pal: NOTE — $ntests :clasp test branch(es) remain in src/dds-tests/, pinned; WP-0.6 deletes them."
-fi

@@ -1,7 +1,7 @@
 (in-package #:dds.tests)
 
 ;;;; Property-based testing harness (NFR-TEST). Dependency-free and deterministic:
-;;;; a seeded xorshift32 PRNG gives reproducible, non-flaky runs on SBCL + Clasp.
+;;;; a seeded xorshift32 PRNG gives reproducible, non-flaky runs on SBCL and AllegroCL.
 ;;;; Properties: CDR codec round-trip, SequenceNumber/Set round-trip, and parser
 ;;;; robustness against random bytes (the fuzz gate, NFR-SEC-POSTURE). Shrinking
 ;;;; is not implemented; the first failing input is reported verbatim.
@@ -329,9 +329,9 @@
        slot-index + generation; the result MUST be NIL or a length CLAMPED to slot-bytes — the resolver must
        NEVER read past the fixed slot allocation on a forged LEN/generation/index (the min-clamp in
        %zc-slot-payload-len is the defence; this proves it holds against forged input). Skips the ZC half where
-       SHMEM by-name attach is unreliable (Clasp/macOS, ADR 0013); the non-ZC wrap half runs on every impl.
+       shm-attach-by-name-reliable-p is NIL (ADR 0013); the non-ZC wrap half runs on every impl.
 
-   Deterministic + seeded (reproducible on SBCL + Clasp); N iterations. Signals test-failure on any OOB /
+   Deterministic + seeded (reproducible on SBCL and AllegroCL); N iterations. Signals test-failure on any OOB /
    uncaught error / false-REJECT of a conformant payload."
   (let ((prng (make-prng #xF1A7DA7A))
         (iters 4000))
@@ -421,7 +421,8 @@
    guard are the defence; this proves they hold against forged input for the ACQUIRE path the loan API uses).
    Additionally, when a handle IS returned, the SAP-read of every clamped payload octet (load-sap-u8 at
    PAYLOAD-BASE+j) must not signal — the read stays in-bounds by construction. Skips where SHMEM by-name attach
-   is unreliable (Clasp/macOS, ADR 0013; ZC + load-sap-u8 are SBCL-only). Deterministic + seeded; N iterations;
+   is unreliable (ADR 0013) and on any implementation but SBCL (the gate is on pal-impl-name :sbcl; it has not
+   been re-evaluated against the AllegroCL PAL, which does define load-sap-u8). Deterministic + seeded; N iterations;
    signals test-failure on any OOB / uncaught error / over-clamp."
   (when (and (dds.xport.shmem:shm-attach-by-name-reliable-p) (eq (dds.pal:pal-impl-name) :sbcl))
     (let* ((slots 4)
@@ -581,7 +582,7 @@
    check-room/length guards directly; a (safety 0) WRAPPER arm additionally confirms the wrapper + accessor reads
    are safety-independent and reaches the SAME verdict (it does NOT recompile the out-of-line kernel, so it does not
    by itself prove the kernel's bound at safety 0 — the explicit-manual-check argument does). Deterministic + seeded
-   (reproducible on SBCL + Clasp); N iterations; signals test-failure on any OOB / uncontrolled error / false-REJECT."
+   (reproducible on SBCL and AllegroCL); N iterations; signals test-failure on any OOB / uncontrolled error / false-REJECT."
   (let ((prng (make-prng #x7A5C0DE5))
         (iters 4000)
         (size +xcv-flatdata-size+))
@@ -674,7 +675,7 @@
    triple — NEVER SIGNAL (ADR 0064), and never an uncontrolled low-level error, OOB, or crash.  A (safety 0) wrapper additionally confirms the
    explicit-manual-check argument: all parse guards are non-safety-dependent, so the (safety 0)
    wrapper must reach the same verdict (error vs. success) as the production-policy arm.
-   Deterministic + seeded (reproducible on SBCL + Clasp); 2000 iterations."
+   Deterministic + seeded (reproducible on SBCL and AllegroCL); 2000 iterations."
   (let ((prng (make-prng #xD1A9B01F))
         (iters 2000))
     (dotimes (i iters t)
@@ -983,7 +984,7 @@
    wrapper arm (%dare-open-safety0) confirms the explicit manual bounds guards are safety-independent
    and reaches the SAME verdict. Skips cleanly (returns T) when OpenSSL >= 3.5 is unavailable
    (dare-available-p returns NIL, ADR 0064) — the crypto correctness itself is proved by the NIST KATs. Deterministic +
-   seeded (reproducible on SBCL + Clasp); N iterations; signals test-failure on any OOB / uncaught
+   seeded (reproducible on SBCL and AllegroCL); N iterations; signals test-failure on any OOB / uncaught
    error / wrong plaintext / verdict disagreement. The DEK foreign secret is freed in unwind-protect."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
@@ -1106,7 +1107,7 @@
    (safety 0) wrapper. Invariants: a pristine blob (+/- trailing) decodes to the exact plaintext; every
    other input decodes to NIL or the correct plaintext, NEVER a tampered plaintext, OOB, crash, or
    escaping signal; all four arms agree (writer==reader, production==safety0). SKIPs cleanly if
-   OpenSSL<3.5. N>=2000 iterations, deterministic seed; reproducible on SBCL + Clasp."
+   OpenSSL<3.5. N>=2000 iterations, deterministic seed; reproducible on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
       (format t "~&  [submessage-protection-fuzz] SKIP — OpenSSL >= 3.5 not available: ~a~%"
@@ -1223,7 +1224,7 @@
    Invariants: the pristine seed decodes to the exact plaintext; every other input decodes to NIL or the
    correct plaintext, NEVER a tampered plaintext, OOB, unbounded allocation, crash, or escaping signal;
    the MAC/key_id/hostile-count/truncation families are strictly NIL; production==safety0. SKIPs cleanly
-   if OpenSSL<3.5. N>=2000 iterations, deterministic seed; reproducible on SBCL + Clasp."
+   if OpenSSL<3.5. N>=2000 iterations, deterministic seed; reproducible on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
       (format t "~&  [submessage-origin-auth-fuzz] SKIP — OpenSSL >= 3.5 not available: ~a~%"
@@ -1360,7 +1361,7 @@
    decodes to NIL or the correct stream, NEVER a tampered stream, OOB, unbounded allocation, non-terminating
    SIGN walk, crash, or escaping signal; the corruption/hostile-count/truncation families are strictly NIL;
    production==safety0. SKIPs cleanly if OpenSSL<3.5. N>=2000 iterations, deterministic seed; reproducible on
-   SBCL + Clasp."
+   SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
       (format t "~&  [rtps-message-fuzz] SKIP — OpenSSL >= 3.5 not available: ~a~%"
@@ -1782,7 +1783,7 @@
                                (safe (lambda () (dds.rtps.discovery:parse-endpoint-data
                                                  (dds.core.buffer:cursor b) :writer))))))))
     ;; TypeLookup + TypeObject parsers contract NEVER-signal: no safe-wrap, a signal fails
-    ;; RUNS (not 4x): each case feeds all three parsers and rejects signal internally (Clasp cost)
+    ;; RUNS (not 4x): each case feeds all three parsers and rejects signal internally (signalling cost)
     (check-property "typelookup-parser-fuzz-no-signal" prng runs
                     (lambda (p) (gen-tl-fuzz p tlseeds))
                     (lambda (v)

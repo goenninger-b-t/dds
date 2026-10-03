@@ -6956,10 +6956,10 @@
 ;;; WP-ASYNC-FLOW Phase C (FR-PF-2, ADR 0016): the shared flow-controller + its scheduler thread paces the
 ;;; aggregate user-data byte rate of its associated writers via the token bucket, round-robining one datagram
 ;;; per writer per turn (so multiple writers interleave at the shaped rate). Three tests: (1) object lifecycle
-;;; — make/associate/double-associate-rejected/destroy-joins (SBCL+Clasp, no sends); (2) rate-shaping — a
+;;; — make/associate/double-associate-rejected/destroy-joins (SBCL and AllegroCL, no sends); (2) rate-shaping — a
 ;;; low-rate controller drains B (>= burst) bytes in >= ~B/rate wall time vs an unpaced async baseline draining
-;;; far faster (SBCL; Clasp pass-skipped — timing-dependent); (3) multi-writer round-robin — two writers on one
-;;; controller, both delivered, datagrams interleave, aggregate rate shaped (SBCL).
+;;; far faster (timing-dependent); (3) multi-writer round-robin — two writers on one
+;;; controller, both delivered, datagrams interleave, aggregate rate shaped. (2) and (3) run on SBCL and AllegroCL.
 
 (defun* %flow-match-writer-reader (w r topic)
     (function (dds.disc:disc-node dds.disc:disc-node string) t)
@@ -6991,8 +6991,8 @@
    spawns a scheduler thread (the THREAD slot is non-NIL); flow-controller-associate binds a writer node; a
    SECOND associate of the SAME node SIGNALS (one controller per writer); destroy-flow-controller JOINs the
    scheduler (the THREAD slot becomes NIL afterward) and is idempotent. The THREAD slot (non-NIL = running,
-   NIL = joined) is the portable alive signal across SBCL + Clasp (no PAL thread-alive predicate). Runs on
-   SBCL + Clasp."
+   NIL = joined) is the portable alive signal across SBCL and AllegroCL (no PAL thread-alive predicate). Runs on
+   SBCL and AllegroCL."
   (let ((node (%flow-step-build-node #x91 #xA1 7811 '()))   ; a writer node (seeded reader); never published
         (controller (dds.disc:make-flow-controller :tokens-per-period 10000 :period 100000000
                                                    :max-burst 10000)))
@@ -7025,8 +7025,8 @@
    = 100 kB/s, max-burst 10000) paces a writer publishing N large samples totalling B bytes (B well above
    max-burst); the wall time for a BEST_EFFORT reader to receive all N is >= ~(B-burst)/rate within tolerance,
    while an UNPACED enable-async baseline (same payload, no controller) drains far faster — so the elapsed
-   gap is the shaping. Timing-dependent: SBCL only; Clasp is pass-skipped."
-  (when (eq (uiop:implementation-type) :clasp) (return-from run-flow-pacing-test t))   ; timing-flaky on Clasp
+   gap is the shaping. Timing-dependent; runs on SBCL and AllegroCL (AllegroCL currently fails
+   :flow-pace-delivered, a known failure)."
   (let* ((n 30)
          (payload (make-array 1400 :element-type '(unsigned-byte 8) :initial-element #x5a))
          (wire-bytes (* n (+ 1400 24 20)))   ; ~ payload + DATA submsg-prefix (24) + RTPS Header (20) per datagram
@@ -7093,8 +7093,8 @@
    Both writers publish into a single low-rate controller; a BEST_EFFORT reader for EACH writer's topic
    receives all of that writer's samples (both delivered), the controller's scheduler interleaves their
    datagrams (one per writer per RR turn — neither writer's stream is fully drained before the other's
-   begins), and the aggregate send is rate-shaped. SBCL only (timing); Clasp pass-skipped."
-  (when (eq (uiop:implementation-type) :clasp) (return-from run-flow-multiwriter-rr-test t))
+   begins), and the aggregate send is rate-shaped. Runs on SBCL and AllegroCL (timing-dependent; AllegroCL
+   currently fails :flow-rr-a-delivered, a known failure)."
   (let* ((n 12)
          (pa (make-array 600 :element-type '(unsigned-byte 8) :initial-element #x0a))
          (pb (make-array 600 :element-type '(unsigned-byte 8) :initial-element #x0b))
@@ -7151,9 +7151,8 @@
    writers' samples all deliver (neither starves — the per-writer flow-step-state makes their plans independent),
    and the send is paced at the shared aggregate (one bucket, not one-per-writer). Pre-S1b this FAILED: the
    flow-controller-associate fail-fast rejected the 2nd writer, and even lifted-without-per-writer-state only the
-   PRIMARY writer drained (writer B starved). Real threads + UDP ⇒ SBCL only; Clasp pass-skipped (the flow-test
-   NFR-PORT gap, mirrors run-flow-multiwriter-rr-test)."
-  (when (eq (uiop:implementation-type) :clasp) (return-from run-flow-multiwriter-onenode-test t))
+   PRIMARY writer drained (writer B starved). Real threads + UDP; runs on SBCL and AllegroCL
+   (AllegroCL currently fails :onenode-writer-a-drained, a known failure)."
   (let* ((n 10)
          (pa (make-array 600 :element-type '(unsigned-byte 8) :initial-element #x1a))
          (pb (make-array 600 :element-type '(unsigned-byte 8) :initial-element #x1b))
@@ -7250,7 +7249,7 @@
 ;;;; The :edf + :priority policies are PURE SELECTION under the controller lock (the token-bucket pacing is
 ;;;; orthogonal + untouched). The strongest, most deterministic oracle for a pure selection change is to drive
 ;;;; the policy function DIRECTLY over constructed nodes with an injected clock — no threads, no sockets, no
-;;;; timing race — so these run on BOTH impls (unlike the real-thread pacing/RR tests, which Clasp pass-skips).
+;;;; timing race — so these run on BOTH impls (unlike the real-thread pacing/RR tests, which are timing-dependent).
 ;;;; A clock-box is a settable ns counter the controller's clock-fn reads (the same seam the pacing tests use).
 
 (defun* %flow-clock-box ()
@@ -7489,8 +7488,7 @@
    controller each pace two real writers to best-effort readers and deliver ALL samples (the new policies
    drive the real scheduler loop, not just the isolated selector). Oracle = completeness + no crash (strict
    inter-writer ordering is asserted deterministically in the policy tests; e2e order is timing-racy). Real
-   threads ⇒ SBCL only; Clasp pass-skipped (the flow-test NFR-PORT gap, mirrors run-flow-multiwriter-rr-test)."
-  (when (eq (uiop:implementation-type) :clasp) (return-from run-flow-edf-priority-e2e-test t))
+   threads; runs on SBCL and AllegroCL (AllegroCL currently fails :sched-a-delivered, a known failure)."
   (dolist (scheduling '(:edf :priority))
     (let* ((n 8)
            (pa (make-array 600 :element-type '(unsigned-byte 8) :initial-element #x0a))
@@ -7542,15 +7540,15 @@
 ;;; stop-node BLOCKS until the park releases (the barrier) and the node is freed only after; (B) single-writer
 ;;; churn — publish continuously while stop-node races the scheduler, no destroy-first; (C) shared-controller
 ;;; churn — 2 writers/2 threads, stop ONE node mid-drain, assert the OTHER keeps delivering (the scheduler
-;;; survived — a per-node, not whole-scheduler, barrier). Real threads ⇒ SBCL (Clasp pass-skipped: timing +
-;;; the known Clasp multithread-condvar SIGSEGV, NFR-PORT). *datagram-sink* is set GLOBALLY (the scheduler
+;;; survived — a per-node, not whole-scheduler, barrier). Real threads; runs on SBCL and
+;;; AllegroCL. *datagram-sink* is set GLOBALLY (the scheduler
 ;;; runs on its own thread; a LET binding would be thread-local and invisible there) and restored in cleanup.
 
 (defun* run-flow-concurrency-stress-test ()
     (function () t)
   "WP-ASYNC-FLOW (FR-PF-2, ADR 0016 §Teardown): the PER-NODE EMIT BARRIER closes the use-after-free where
    stop-node frees a node's socket/SHMEM/tx-buffers while the SHARED controller's scheduler is mid-emit on it.
-   Three variants on SBCL (Clasp pass-skipped — real-thread timing + the known Clasp condvar SIGSEGV): (A)
+   Three variants, on SBCL and AllegroCL: (A)
    DETERMINISTIC — *datagram-sink* parks the scheduler mid-emit on the writer, a worker thread calls stop-node;
    assert stop-node BLOCKS while parked (CURRENT-EMIT-NODE = node ⇒ unregister waits on EMIT-DONE-CV) and only
    RETURNS after the park releases and the emit completes — and the freed node was never sent on after the
@@ -7560,7 +7558,6 @@
    drain, stop ONE node, assert the OTHER writer keeps being delivered (the scheduler thread SURVIVED a
    per-node teardown, which a whole-scheduler join would not allow) then a clean teardown of the rest. Proves:
    no UAF, no scheduler abort, stop-node clean, controller keeps serving its other nodes."
-  (when (eq (uiop:implementation-type) :clasp) (return-from run-flow-concurrency-stress-test t))
   (%flow-stress-deterministic-park)
   (%flow-stress-single-writer-churn)
   (%flow-stress-shared-controller-churn)
@@ -7725,7 +7722,7 @@
 ;;; ((disc-node-flow-controller node) ...) is NOT engaged (the controller machinery never touches the node —
 ;;; flow-pending / flow-step-state stay NIL), and the wire bytes equal the pre-flow %push-data path exactly.
 ;;; B1's flow-step-equivalence proves step == flush-all; this proves the OFF path never even engages a
-;;; controller (the guard that the opt-in cannot regress the default). SBCL + Clasp (deterministic, no
+;;; controller (the guard that the opt-in cannot regress the default). SBCL and AllegroCL (deterministic, no
 ;;; threads). Reuses %coalesce-capture (= %push-data), %flow-step-build-node, %datagrams-identical-p (DRY).
 
 (defun* %flow-publish-capture (node payload)
@@ -7748,7 +7745,7 @@
    empty — the %flow-signal path never ran) — the opt-in is provably dormant; (2) BYTE-IDENTITY — a single
    publish-sample on a controllerless node (default batch-max-samples 1 ⇒ write + immediate %push-data)
    produces the EXACT datagrams that writer-write + a plain %push-data produce for the same sample, for both
-   a small DATA and a large DATA_FRAG sample. SBCL + Clasp (deterministic, no threads). Flow control is
+   a small DATA and a large DATA_FRAG sample. SBCL and AllegroCL (deterministic, no threads). Flow control is
    wire-invisible (ADR 0016): with the controller OFF the send path is the unchanged pre-flow path."
   ;; -- Part 1: the OFF path never engages the controller machinery (the first cond-clause is dormant) --
   (let ((node (%flow-step-build-node #xC1 #xD1 7821 '())))   ; controllerless writer node, seeded reader
@@ -7799,7 +7796,7 @@
 ;;; FLUSHES the remaining unsent IGNORING the bucket — shutdown must never wait on a slow paced drain, and a
 ;;; partial in-progress plan must not be dropped — and JOINS the scheduler thread; (2) teardown must never
 ;;; WEDGE a writer blocked in writer-write on a full KEEP_ALL cache (block-up-to-max_blocking_time). Real
-;;; threads ⇒ SBCL (Clasp pass-skipped — fine timing + the known Clasp multithread-condvar SIGSEGV, NFR-PORT).
+;;; threads; runs on SBCL and AllegroCL.
 ;;; *datagram-sink* is set GLOBALLY (the scheduler runs on its own thread; a LET binding is thread-local and
 ;;; invisible there) and restored in cleanup. Reuses %flow-step-build-node, %seed-reader-participant,
 ;;; %count-submessages (DRY).
@@ -7910,15 +7907,14 @@
 
 (defun* run-flow-teardown-test ()
     (function () t)
-  "WP-ASYNC-FLOW (FR-PF-2, ADR 0016 §Teardown): explicit teardown — flush-on-destroy + no-wedge. SBCL only
-   (real threads + timing); Clasp pass-skipped (fine timing + the known Clasp multithread-condvar SIGSEGV,
-   NFR-PORT). (1) destroy-flow-controller FLUSHES the remaining unsent IGNORING the bucket (all N samples'
+  "WP-ASYNC-FLOW (FR-PF-2, ADR 0016 §Teardown): explicit teardown — flush-on-destroy + no-wedge. Runs on SBCL
+   and AllegroCL (real threads + timing; AllegroCL currently fails :flow-td-no-wedge, a known failure).
+   (1) destroy-flow-controller FLUSHES the remaining unsent IGNORING the bucket (all N samples'
    DATA reach the wire even though the paced drain had not finished) and JOINS the scheduler thread; (2)
    teardown lets a writer BLOCKED in writer-write on a full KEEP_ALL cache make progress — it returns
    (:timeout at its max_blocking_time deadline, since teardown unblocks it to re-evaluate but a KEEP_ALL cache
    only frees on an ACKNACK purge) within a bounded time, NEVER hanging. The point of §Teardown: shutdown
    never waits on a slow paced drain, no pending change is dropped, and a blocked writer is never wedged."
-  (when (eq (uiop:implementation-type) :clasp) (return-from run-flow-teardown-test t))
   (%flow-teardown-flushes-pending)
   (%flow-teardown-no-wedge)
   t)
@@ -8115,11 +8111,8 @@
    is the startup full bucket + per-datagram granularity); (2) single-writer PACED vs the enable-async UNPACED
    baseline (the added latency made visible); (3) multi-writer AGGREGATE rate shaped to ~R (not 2R) + the
    per-datagram RR interleaving; (4) DATA_FRAG pacing — one large fragmented sample's fragments spread across
-   periods. SBCL-targeted (real threads + timing); on Clasp it pass-returns (the flow tests are Clasp
-   pass-skipped — timing-flaky + the known Clasp multithread-condvar SIGSEGV, NFR-PORT)."
-  (when (eq (uiop:implementation-type) :clasp)
-    (format t "~&  run-bench-async-flow: Clasp pass-skipped (real-thread timing + the known Clasp condvar SIGSEGV, NFR-PORT)~%")
-    (return-from run-bench-async-flow t))
+   periods. Real threads + timing; runs on SBCL and AllegroCL. The numbers are
+   implementation-specific: a report states which Lisp produced it."
   (let ((small (make-array 1400 :element-type '(unsigned-byte 8) :initial-element #x5a)))
     (flet ((emit (stream)
              (format stream "~&# WP-ASYNC-FLOW — rate-shaping + multi-writer aggregate (honest) (FR-PF-2, FR-LANG-7)~%~%")
@@ -8279,7 +8272,7 @@
    Priority: high-priority service share + the low-priority STARVATION BOUND (max consecutive unserved turns)
    — priority favours the high writer yet aging keeps the low writer's gap BOUNDED (RR is fair-but-priority-
    blind; pure highest-first would starve the low writer unboundedly). Prints markdown; writes FILE when given.
-   Deterministic (no threads) so it is not the Clasp-skipped real-thread kind, but reported under SBCL by
+   Deterministic (no threads), so it does not share the real-thread timing sensitivity, but reported under SBCL by
    convention (a bench is a run-bench-* entry, not a suite test)."
   (labels ((emit (stream)
              (format stream "~&# WP-FLOW-EDF-PRIORITY — EDF + priority scheduling vs round-robin (ADR 0016; FR-QOS-1, FR-LANG-7)~%~%")
@@ -8552,7 +8545,6 @@
    (two readings 0.3 s apart are equal — a spin would keep growing it) and is BOUNDED (<= K + slack, not
    unbounded). Phase 2: clear the fault, publish K more; assert the writer RESUMES (the best-effort reader now
    receives the new samples) — a dead scheduler thread could neither stabilise nor resume."
-  (when (eq (uiop:implementation-type) :clasp) (return-from run-flow-emit-fault-no-spin-test t))   ; timing-flaky on Clasp (mirrors the other flow tests)
   (let* ((k 6)
          (slack 4)
          (payload (octets 9 9 9 9 9 9 9 9))
@@ -8626,7 +8618,6 @@
    0.3 s apart are equal — a spin would keep growing it regardless of plan size) and is BOUNDED. Phase 2: clear
    the fault, publish a small sample; assert the writer RESUMES (the best-effort reader receives it) — a dead
    scheduler thread could neither stabilise nor resume."
-  (when (eq (uiop:implementation-type) :clasp) (return-from run-flow-emit-fault-no-spin-multi-test t))   ; timing-flaky on Clasp (mirrors the other flow tests)
   ;; This test's PREMISE is fragmentation: the >=3-entry plan it needs exists only if the 4000-octet sample is
   ;; split into a DATA_FRAG series. So PIN the fragment size it depends on rather than inherit the global default
   ;; — that default is a deployment/performance policy (WP-PERF raised it to 63000 so a large sample rides as ONE
@@ -8816,7 +8807,7 @@
 ;;; host-uuid) discover (SPDP) + match (SEDP) over UDP, then the writer routes user DATA over SHARED
 ;;; MEMORY to the same-host reader (discovery/HB/ACKNACK stay UDP). The reader receives every sample via
 ;;; the SAME %handle-datagram entry point as UDP (engine untouched); a shmem-sends counter proves SHMEM —
-;;; not UDP — carried the bulk data. Pass-skips on the Clasp/macOS by-name-attach gap (ADR 0013), where
+;;; not UDP — carried the bulk data. Pass-skips where SHMEM by-name attach is unreliable (ADR 0013), where
 ;;; *shmem-enabled* is NIL and everything falls back to UDP.
 
 (defun* run-shmem-end-to-end-test ()
@@ -8824,7 +8815,7 @@
   "FR-XPORT-2: same-host user DATA travels over SHMEM (UDP fallback). Two nodes, same host-uuid,
    *shmem-enabled* T; after match, publish 20 samples and assert the reliable reader receives all 20 AND
    the writer's shmem-sends advanced (so SHMEM, not UDP, carried the user data). Skips cleanly where SHMEM
-   is off (Clasp/macOS by-name-attach gap, ADR 0013)."
+   is off (shm-attach-by-name-reliable-p is NIL, ADR 0013)."
   (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
     (dds.pal:note-test-skip "run-shmem-end-to-end-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
     (return-from run-shmem-end-to-end-test t))
@@ -8895,7 +8886,7 @@
          number keeps the assertion correct whatever the destination count is.
    A fix that moved only the HEARTBEAT fails (2); one that moved only the repair fails (1).
    The late-joiner prompt HEARTBEAT (%writer-durability-init) takes the identical two-line change and is NOT
-   separately gated here. Skips cleanly where SHMEM is off (Clasp/macOS gap, ADR 0013)."
+   separately gated here. Skips cleanly where SHMEM is off (shm-attach-by-name-reliable-p is NIL, ADR 0013)."
   (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
     (dds.pal:note-test-skip "run-shmem-control-lane-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
     (return-from run-shmem-control-lane-test t))
@@ -8971,7 +8962,7 @@
 ;;; :shmem-send-fault, and FALLS BACK to UDP so the datagram still delivers. The catch lives in dds.disc (not
 ;;; the dds.xport SHMEM :send lambda) so the counter + hook stay in scope without an upward dds.xport->dds.disc
 ;;; dependency. The fault is injected by the test affordance dds.xport.shmem:*debug-shmem-send-fault* (inert
-;;; NIL = byte-identical production). Pass-skips on the Clasp/macOS by-name-attach gap (ADR 0013).
+;;; NIL = byte-identical production). Pass-skips where SHMEM by-name attach is unreliable (ADR 0013).
 
 (defun* run-shmem-send-self-guard-test ()
     (function () t)
@@ -9147,7 +9138,7 @@
    match the writer publishes N; assert (a) the reader receives all N byte-exact, (b) the writer's zc-sends
    advanced (so a 16-byte reference, not the fragmented payload, crossed), and (c) the writer pool's free
    slots fully recover once the reader has resolved+released every reference (no slot leak). Skips cleanly
-   where SHMEM is off (Clasp/macOS by-name-attach gap, ADR 0013)."
+   where SHMEM is off (shm-attach-by-name-reliable-p is NIL, ADR 0013)."
   (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
     (dds.pal:note-test-skip "run-zerocopy-end-to-end-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
     (return-from run-zerocopy-end-to-end-test t))
@@ -9244,7 +9235,7 @@
    delivery vector at all — the residue is only the pool-mutex acquire/release (a fixed ~32 B CFFI
    pthread-mutex-lock cost, PAYLOAD-INDEPENDENT, the SAME cost the v1 single-copy resolve %zc-resolve-fresh ALSO
    pays on top of its ~46 B owned vector). The eliminated per-sample owned vector is the literal-0-copy win.
-   SBCL-exact; Clasp reads 0 (NFR-PORT gap)."
+   SBCL-exact; AllegroCL reads 0 (NFR-PORT gap)."
   (let ((view (dds.types:make-flatdata-view))
         (before (dds.pal:bytes-consed)))
     (dotimes (i iters)
@@ -9275,8 +9266,8 @@
          async store read on another thread with no slot-aware release hook — a literal-0-copy SHMEM VIEW would
          be a cross-process use-after-free; see ADR 0015). TX still has the one app->slot copy (loan-write API
          is the follow-up).
-   Skips cleanly where SHMEM is off (Clasp/macOS by-name-attach gap, ADR 0013); on SBCL bytes-consed is exact,
-   on Clasp it reads 0 (NFR-PORT gap) so the RX assertion is smoked, not enforced."
+   Skips cleanly where SHMEM is off (shm-attach-by-name-reliable-p is NIL, ADR 0013); on SBCL bytes-consed is exact,
+   on AllegroCL it reads 0 (NFR-PORT gap) so the RX assertion is smoked, not enforced."
   (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
     (dds.pal:note-test-skip "run-flatdata-zerocopy-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
     (return-from run-flatdata-zerocopy-test t))
@@ -9357,7 +9348,7 @@
                          (v1-bytes (%fd-zc-rx-bytes-v1 sap slot gen iters)))
                      (dds.xport.zerocopy::%zc-release sap slot gen)   ; balance the refcount-1 loan
                      (format t "~&  fd-zc-rx: new single-copy = ~d bytes/sample; WP-ZEROCOPY-v1 sink+re-copy = ~d bytes/sample (~a)~%"
-                             new-bytes v1-bytes (if sbcl-p "SBCL exact" "Clasp bytes-consed=0 gap"))
+                             new-bytes v1-bytes (if sbcl-p "SBCL exact" "AllegroCL bytes-consed=0 gap"))
                      (format t "  fd-zc-rx: RX win = one exact-length (~d-octet) owned vector, read in place; no 65536-byte sink, no 2nd copy. TX app->slot copy eliminated by loan-write (WP-FLATDATA-LOAN-WRITE, ADR 0042).~%"
                              (length payload))
                      (when sbcl-p
@@ -9390,7 +9381,7 @@
      (4) READER-CLOSE RETURNS AN OUTSTANDING LOAN: take a fresh loan, do NOT return it, delete the participant —
          the registry-driven reader-close release frees the slot (refcount 0; no leaked refcount pinning the
          pool). The slot lifetime never lets the receiver thread free a slot under the app's read (no UAF) and
-         never leaks a refcount (no wedge). Skips cleanly where SHMEM is off (Clasp/macOS gap, ADR 0013)."
+         never leaks a refcount (no wedge). Skips cleanly where SHMEM is off (shm-attach-by-name-reliable-p is NIL, ADR 0013)."
   (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
     (dds.pal:note-test-skip "run-dcps-loan-roundtrip-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
     (return-from run-dcps-loan-roundtrip-test t))
@@ -9506,7 +9497,7 @@
      (3) BYTE-EXACT: every field read off the view equals what the app wrote through the SAP setters.
      (4) LIFECYCLE: return-loan frees the ONE slot (free-count K); the recycled writer-loan struct is reused by
          the next loan-sample (freelist, no per-sample struct cons).
-   Skips cleanly where SHMEM is off (Clasp/macOS gap, ADR 0013)."
+   Skips cleanly where SHMEM is off (shm-attach-by-name-reliable-p is NIL, ADR 0013)."
   (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
     (dds.pal:note-test-skip "run-dcps-loan-write-e2e-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
     (return-from run-dcps-loan-write-e2e-test t))
@@ -9610,7 +9601,7 @@
          both hold), every field equal to what was written.
      (4) EXACT LIFECYCLE: the slot frees only after BOTH readers return-loan (refcount 2 -> 1 -> 0; free-count
          restored to K) — no leak, no premature free / UAF.
-   Skips cleanly where SHMEM is off (Clasp/macOS gap, ADR 0013)."
+   Skips cleanly where SHMEM is off (shm-attach-by-name-reliable-p is NIL, ADR 0013)."
   (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
     (dds.pal:note-test-skip "run-multi-dest-zc-e2e-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
     (return-from run-multi-dest-zc-e2e-test t))
@@ -9752,7 +9743,7 @@
          ABSENT from the segment — no plaintext ever landed in a pool slot (ADR 0036 Carry-10 at the loan end).
      (3) DATA-PROTECTED (data_protection :encrypt): likewise fallback + marker ABSENT (the loan-write-specific
          %loan-write-data-protected-p gate, ADR 0042 §6 — the slot would hold pre-transform plaintext).
-   Skips cleanly where SHMEM is off (Clasp/macOS gap, ADR 0013)."
+   Skips cleanly where SHMEM is off (shm-attach-by-name-reliable-p is NIL, ADR 0013)."
   (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
     (dds.pal:note-test-skip "run-loan-write-shmem-cleartext-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
     (return-from run-loan-write-shmem-cleartext-test t))
@@ -9805,7 +9796,7 @@
    references V1 — reading a returned loan is invalidated, not a stale read); (3) take-loaned returns EXACTLY ONE
    sample (no stale duplicate of the recycled struct) that reads SAMPLE 2's values (not sample 1, not an alias).
    Pre-fix this FAILS (take-loaned returns two samples, both the recycled V1, both reading sample 2). Skips
-   cleanly where SHMEM is off (Clasp/macOS gap, ADR 0013)."
+   cleanly where SHMEM is off (shm-attach-by-name-reliable-p is NIL, ADR 0013)."
   (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
     (dds.pal:note-test-skip "run-loan-read-return-take-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
     (return-from run-loan-read-return-take-test t))
@@ -9925,8 +9916,8 @@
          overhead (no owned vector); the loan API's cost is the explicit %zc-acquire-for-read + %zc-release calls
          + the app's return-loan OBLIGATION, NOT a free lunch. Cross-process is covered by make zc-xproc (the ZC
          reference resolves across two OS processes; the literal-0-copy loan is a LOCAL read optimization — the
-         wire is byte-identical). Skips cleanly where SHMEM is off (Clasp/macOS gap, ADR 0013); on SBCL
-         bytes-consed is exact, on Clasp it reads 0 (NFR-PORT gap) so the headline assertion is smoked."
+         wire is byte-identical). Skips cleanly where SHMEM is off (shm-attach-by-name-reliable-p is NIL, ADR 0013); on SBCL
+         bytes-consed is exact, on AllegroCL it reads 0 (NFR-PORT gap) so the headline assertion is smoked."
   (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
     (dds.pal:note-test-skip "run-flatdata-zc-loan-e2e-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
     (return-from run-flatdata-zc-loan-e2e-test t))
@@ -9993,7 +9984,7 @@
                        (v1-bytes (%fd-zc-rx-bytes-v1 sap slot gen iters)))
                    (dds.xport.zerocopy::%zc-release sap slot gen)   ; balance the refcount-1 measurement loan
                    (format t "~&  fd-zc-loan-rx: LITERAL-0-COPY loan = ~d bytes/sample (the pool mutex acquire alone, NO owned vector); FlatData+ZC v1 single-copy = ~d (lock + the owned vector); WP-ZEROCOPY-v1 sink = ~d (~a)~%"
-                           loan-bytes new-bytes v1-bytes (if sbcl-p "SBCL exact" "Clasp bytes-consed=0 gap"))
+                           loan-bytes new-bytes v1-bytes (if sbcl-p "SBCL exact" "AllegroCL bytes-consed=0 gap"))
                    (format t "  fd-zc-loan-rx: the eliminated per-sample OWNED VECTOR is the win (~d -> ~d, payload-independent residue = the CFFI mutex lock the v1 path ALSO pays); the loan API's cost is the explicit acquire/release calls + the app's return-loan obligation (FR-LANG-7, no overclaim).~%"
                            new-bytes loan-bytes)
                    (when sbcl-p
@@ -10026,8 +10017,8 @@
    (the conformance link: the view keyhash == the buffer keyhash for the same key bytes); (2) a SECOND key-A sample
    gets the SAME handle (no SN-fold aliasing — the v1 fold would differ on SN); (3) a key-B sample gets a DISTINCT
    handle EQUALP the keyhash of a key-B buffer; (4) the loaned sample is a flatdata-view whose field reads via
-   -fd are byte-correct off the slot. Skips cleanly where SHMEM is off (the ZC loan path is SBCL-only — NFR-PORT
-   gap, ADR 0013; Clasp/macOS pass-skip). NOT cleared for ship — pending counsel (R6)."
+   -fd are byte-correct off the slot. Skips cleanly where SHMEM is off (shm-attach-by-name-reliable-p is
+   NIL, ADR 0013). NOT cleared for ship — pending counsel (R6)."
   (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
     (dds.pal:note-test-skip "run-keyed-flatdata-loan-handle-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
     (return-from run-keyed-flatdata-loan-handle-test t))
@@ -10120,7 +10111,7 @@
    before C1 (the loan path skipped the drop → all 6 of A+B retained). REGRESSION: a NO_KEY FlatData (fd-abc)
    KEEP_LAST-2 loan reader is UNAFFECTED — its per-(GUID,SN)-unique synthetic handles mean each sample is its own
    instance, so the depth-2 cap never fires and all 3 loaned samples are retained. Skips cleanly where SHMEM is off
-   (the ZC loan path is SBCL-only — NFR-PORT gap, ADR 0013; Clasp/macOS pass-skip). NOT cleared for ship (R6)."
+   (shm-attach-by-name-reliable-p is NIL, ADR 0013). NOT cleared for ship (R6)."
   (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
     (dds.pal:note-test-skip "run-keyed-flatdata-loan-keeplast-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
     (return-from run-keyed-flatdata-loan-keeplast-test t))
@@ -10576,7 +10567,7 @@
    drop window); (2) the sample is ULTIMATELY received after the drop clears (reliable, NO silent loss); (3)
    take-loaned reads a/b/c BYTE-EXACT off whatever the retransmit delivered (view OR copy), via the SAME
    <name>-<field>-fd Offset accessors (both a flatdata-view and an owned FlatData octet-buffer answer them).
-   Bounded drive (no unbounded wait). Skips cleanly where SHMEM is off (Clasp/macOS gap, ADR 0013)."
+   Bounded drive (no unbounded wait). Skips cleanly where SHMEM is off (shm-attach-by-name-reliable-p is NIL, ADR 0013)."
   (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
     (dds.pal:note-test-skip "run-reliable-zc-retransmit-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
     (return-from run-reliable-zc-retransmit-test t))
@@ -10690,7 +10681,7 @@
    non-marker sample mixed into a loan-capable reader must deliver copy-backed). Asserts: (1) the writer did
    NOT advance zc-sends for this sample (it fell back, did not loan a ref); (2) take-loaned returns exactly one
    sample that is NOT a flatdata-view (a copy) with NIL in the loans list; (3) its a/b/c read byte-exact.
-   Skips cleanly where SHMEM is off (Clasp/macOS gap, ADR 0013)."
+   Skips cleanly where SHMEM is off (shm-attach-by-name-reliable-p is NIL, ADR 0013)."
   (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
     (dds.pal:note-test-skip "run-reliable-zc-poolfull-fallback-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
     (return-from run-reliable-zc-poolfull-fallback-test t))
@@ -10767,7 +10758,7 @@
    (the ZC sample) and exactly one is a copy (the fallback) — verifying the loan registry / drain handle a
    mixed batch; (3) the loans list has exactly ONE entry (only the view); (4) every field of both reads byte-
    exact; (5) return-loan releases the view (registry empties) and is a no-op for the copy. Skips cleanly where
-   SHMEM is off (Clasp/macOS gap, ADR 0013)."
+   SHMEM is off (shm-attach-by-name-reliable-p is NIL, ADR 0013)."
   (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
     (dds.pal:note-test-skip "run-reliable-zc-mixed-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
     (return-from run-reliable-zc-mixed-test t))
@@ -10859,7 +10850,7 @@
    the ACK the writer's HC no longer holds SN 1 (the change was purged); (2) the held slot's refcount is still
    1 and the view still reads a/b/c byte-exact (the purge did NOT free the slot); (3) after return-loan the
    refcount is 0 and a fresh %zc-loan succeeds (the slot is reclaimable). Skips cleanly where SHMEM is off
-   (Clasp/macOS gap, ADR 0013)."
+   (shm-attach-by-name-reliable-p is NIL, ADR 0013)."
   (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
     (dds.pal:note-test-skip "run-reliable-zc-slot-outlives-purge-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
     (return-from run-reliable-zc-slot-outlives-purge-test t))
@@ -10968,7 +10959,7 @@
    records its true length in zc-len; (2) the live pin count is 1 and the slot's refcount is 2 (the delivery hold +
    the TX pin, ADR 0044 §4.1); (3) the reader receives the sample byte-exact; (4) after the reader ACKs, the
    full-ACK purge drops the HC change AND releases the pin (live pin count back to 0), and after return-loan the
-   slot frees (refcount 0, free-count restored). Skips cleanly where SHMEM is off (Clasp/macOS gap, ADR 0013)."
+   slot frees (refcount 0, free-count restored). Skips cleanly where SHMEM is off (shm-attach-by-name-reliable-p is NIL, ADR 0013)."
   (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
     (dds.pal:note-test-skip "run-acked-slot-pin-happy-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
     (return-from run-acked-slot-pin-happy-test t))
@@ -11371,7 +11362,7 @@
    exactly like a reliable one. Confirms ZC composes orthogonally with reliability (a reliable ZC sample is
    NACKable/retransmittable — scenario 1; a best-effort ZC sample is delivered once — here). The ZC-OFF /
    non-FlatData byte-identity regression is held by the existing suite (flow-off-byte-identical, the corpus,
-   zerocopy-end-to-end). Skips cleanly where SHMEM is off (Clasp/macOS gap, ADR 0013)."
+   zerocopy-end-to-end). Skips cleanly where SHMEM is off (shm-attach-by-name-reliable-p is NIL, ADR 0013)."
   (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
     (dds.pal:note-test-skip "run-reliable-zc-qos-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
     (return-from run-reliable-zc-qos-test t))
@@ -11395,7 +11386,8 @@
    NIL, no wedge), and an explicit final release (the reader-close analogue) STILL returns it (the slot frees).
    Bounded + robust: the writer thread runs a fixed iteration count behind a deadline so a regression FAILS
    rather than wedges (the holder never blocks; the writer's loan just returns NIL when saturated). SBCL only
-   (the ZC pool + foreign SAP reads are SBCL-only, ADR 0013); Clasp pass-skips."
+   (ADR 0013); on AllegroCL it pass-skips (gated on pal-impl-name :sbcl, not yet re-evaluated against the
+   AllegroCL PAL's load-sap-u8)."
   (if (not (eq (dds.pal:pal-impl-name) :sbcl))
       (format t "~&  [skip] flatdata-zc-loan-stress: ZC pool + load-sap-u8 are SBCL-only (ADR 0013) — NFR-PORT gap~%")
       (let* ((k 4)

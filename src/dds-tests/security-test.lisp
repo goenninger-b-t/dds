@@ -13,7 +13,7 @@
    (c) parse-secured-payload fail-closed: truncated / over-declared inputs signal, no OOB read.
    (d) hmac-sha256 matches RFC 4231 HMAC-SHA-256 Test Case 2 (published vector).
    (e) derive-session-key composes 'SessionKey'||salt||session_id under HMAC-SHA256 (§9.5.3.3.4.2; no trailing counter — Fast-DDS/Cyclone-aligned, T-RECONCILE 2026-06-27).
-   Requires OpenSSL >= 3.5; skips only if truly absent. Both SBCL and Clasp must pass identically."
+   Requires OpenSSL >= 3.5; skips only if truly absent. Must pass identically on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
       (format t "~&  [security-secured-payload] SKIP — OpenSSL >= 3.5 not available: ~a~%"
@@ -144,7 +144,7 @@
    (a) N=18 (pad=2): byte-exact vs the reference vector incl. the 2 zero pad octets, then round-trip.
    (b) N in {17,18,19}: the pad = (-N) mod 4 is all-zero, rsm_count lands 4-aligned, and it round-trips.
    (c) N=4 (already 4-aligned): pad=0, total 48 — byte-identical to the shipped corpus (the no-pad guard).
-   Both SBCL and Clasp must pass identically."
+   Must pass identically on SBCL and AllegroCL."
   ;; (a) N=18 ciphertext (NOT a multiple of 4) -> pad = (-18) mod 4 = 2 zero octets between common_mac and rsm_count.
   (let* ((km         (dds.security:make-test-key-material))
          (kind       (dds.security:key-material-transformation-kind km)) ; #(0 0 0 4) AES256-GCM
@@ -223,7 +223,7 @@
    (g)/(h)/(i) close the empty-AAD directed-tamper coverage gap (T10 review fix-3): with AAD now EMPTY, each
    SecureDataHeader field's integrity binding (find_key for kind/key_id; the KDF+nonce for session_id/iv_suffix)
    is exercised by a directed byte flip, not left analytical.
-   Requires OpenSSL >= 3.5; skips only if truly absent. Both SBCL and Clasp must pass identically."
+   Requires OpenSSL >= 3.5; skips only if truly absent. Must pass identically on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
       (format t "~&  [security-payload-roundtrip] SKIP — OpenSSL >= 3.5 not available: ~a~%"
@@ -339,7 +339,7 @@
    (b) decode-serialized-payload-into round-trips the plaintext byte-exact through a static PT-OUT buffer.
    (c) decode-serialized-payload-into on an over-short input fails closed (-> NIL, no read/crash).
    All static buffers are freed under unwind-protect so a %check failure never leaks them.
-   Requires OpenSSL >= 3.5; skips only if truly absent. Both SBCL and Clasp must pass identically."
+   Requires OpenSSL >= 3.5; skips only if truly absent. Must pass identically on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
       (format t "~&  [security-payload-into] SKIP — OpenSSL >= 3.5 not available: ~a~%"
@@ -391,7 +391,7 @@
     (function () t)
   "DDS-Security §9.5.3.3.4.3 data_protection=SIGN payload-tier GMAC (WP-SECURITY-DATA-SIGN-PAYLOAD): a GMAC km
    (make-test-key-material :kind :sign, AES256-GMAC {0,0,0,3}) AUTHENTICATES the VISIBLE serialized payload without
-   encrypting it. Asserts, on BOTH impls (Clasp first):
+   encrypting it. Asserts, on BOTH impls:
    (a) round-trip: decode(km, encode(km, PT)) = PT byte-exact.
    (b) header kind = AES256-GMAC {0,0,0,3} (byte 3 = 3) — the wire signal a peer's find_key dispatches on.
    (c) VISIBLE: the plaintext appears VERBATIM at offset 20 in the SecuredPayload (not hidden as ciphertext).
@@ -412,7 +412,7 @@
    (g) tamper the common_mac -> decode NIL (GMAC mismatch, fail-closed).
    (h) tamper transformation_kind -> decode NIL (find_key gate).
    (i) the zero-alloc -into core round-trips a GMAC payload byte-exact and conses no more than the ENCRYPT -into
-       core (both dominated by the shared EVP FFI residual; SBCL-exact via dds.pal:bytes-consed, Clasp reports 0).
+       core (both dominated by the shared EVP FFI residual; SBCL-exact via dds.pal:bytes-consed, AllegroCL reports 0).
    (j) the ENCRYPT km is UNCHANGED (byte-3 kind = 4, has the length prefix) — the GMAC branch is additive.
    Requires OpenSSL >= 3.5; skips only if truly absent."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
@@ -553,7 +553,7 @@
    fed sub-minimum (< 40) blobs, all-zero 40..80 blobs, and random 60-byte blobs with a MATCHING
    kind/key_id header (so find_key passes and the GMAC verify itself must reject) → always NIL, never
    a tampered accept / OOB / unbounded alloc. Requires OpenSSL >= 3.5; skips only if truly absent.
-   Both SBCL and Clasp must pass identically."
+   Must pass identically on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
       (format t "~&  [security-payload-fuzz] SKIP — OpenSSL >= 3.5 not available: ~a~%"
@@ -669,7 +669,7 @@
    NOTE: cross-vendor Connext-Security wire interop is DEFERRED (ADR 0031 §cross-vendor-deferral);
    the Connext Security plugins are a separate licensed add-on not installed here.
    Requires OpenSSL >= 3.5 (same gate as the lower-layer security tests above).
-   Both SBCL and Clasp must pass identically (Clasp FIRST per the operating contract)."
+   Must pass identically on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
       (format t "~&  [security-encrypted-pubsub] SKIP — OpenSSL >= 3.5 not available: ~a~%"
@@ -789,7 +789,7 @@
     (function () t)
   "Test (WP-DDS-SECURITY-ZEROALLOC-AEAD T5b): the DECODE-side loan eliminates the per-sample plaintext alloc, the
    loan lifecycle is leak-free + byte-exact, and pool exhaustion is SAMPLE_REJECTED (never a GC fallback).
-   Part 1 (the focused decode-path alloc check, SBCL-exact via dds.pal:bytes-consed; Clasp reports 0 -> the delta
+   Part 1 (the focused decode-path alloc check, SBCL-exact via dds.pal:bytes-consed; AllegroCL reports 0 -> the delta
    is not measurable and the assertion is skipped, NFR-PORT): a steady loop of decode-serialized-payload-INTO a
    pooled buffer conses far LESS per sample than the allocating decode-serialized-payload (which copies out a fresh
    plaintext) — the plaintext copy is gone (the loan path's per-sample consing does NOT scale with plaintext size;
@@ -798,7 +798,7 @@
    byte-exact via secured-loan-bytes, and node-return-loan returns its buffer (pool-in-use back to baseline — no
    leak); then samples beyond the pool capacity are fed WITHOUT returning, so the pool exhausts and the surplus is
    rejected (decode-pool-rejects increments, node-sample-count capped) — RESOURCE_LIMITS / SAMPLE_REJECTED, never
-   a GC-heap fallback. Requires OpenSSL >= 3.5; both impls must pass identically (Clasp FIRST)."
+   a GC-heap fallback. Requires OpenSSL >= 3.5; must pass identically on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
       (format t "~&  [secured-decode-loan-alloc] SKIP — OpenSSL >= 3.5 not available: ~a~%"
@@ -838,7 +838,7 @@
              (format t "~&  [secured-decode-loan-alloc] decode-INTO-pool=~,4f B/sample  allocating-decode=~,4f B/sample (plaintext ~d B)~%"
                      (/ (float loan-consed) n) (/ (float old-consed) n) pt-size)
              (if (zerop old-consed)
-                 (format t "  [skip] dds.pal:bytes-consed is 0 on this impl (Clasp NFR-PORT gap) — alloc delta not measurable~%")
+                 (format t "  [skip] dds.pal:bytes-consed is 0 on this impl (AllegroCL NFR-PORT measurement gap) — alloc delta not measurable~%")
                  (progn
                    (%check :loan-alloc-eliminates-plaintext (< (/ loan-consed n) pt-size)
                            "the loan decode path does NOT cons the per-sample plaintext (< plaintext size per sample)")
@@ -902,7 +902,7 @@
    returns the ORIGINAL byte-exact AFTER the duplicate (no silent loss); (b) the duplicate adds no net pin (its
    buffer is freed immediately); (c) pool-in-use returns to baseline 0 once the app returns the original's loan
    (no leak). No sockets — %deliver-user-sample driven directly (the dup is a second call with the same effective
-   GUID+SN, which reader-dedup-accept-p rejects). Requires OpenSSL >= 3.5; both impls must pass identically (Clasp FIRST)."
+   GUID+SN, which reader-dedup-accept-p rejects). Requires OpenSSL >= 3.5; must pass identically on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
       (format t "~&  [secured-decode-loan-dup] SKIP — OpenSSL >= 3.5 not available: ~a~%"
@@ -963,7 +963,7 @@
          safe no-ops (single-owner + membership-guard + node-return-loan idempotence).
      (5) SWEEP: a reader that drained a loan but never returned it -> return-all-loans (reader-close) releases it
          (pool-in-use back to 0) — no lingering plaintext, no leak.
-   Requires OpenSSL >= 3.5 (same gate as the lower-layer secured tests); both impls must pass identically (Clasp FIRST)."
+   Requires OpenSSL >= 3.5 (same gate as the lower-layer secured tests); must pass identically on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
       (format t "~&  [dcps-secured-take-loan] SKIP — OpenSSL >= 3.5 not available: ~a~%"
@@ -1113,7 +1113,7 @@
    decode handle's return-count = 2), and each take-loaned's the ONE stored handle: both deserialize the
    plaintext (no sample-loss), reader-1's early return DEFERS (the shared handle buffer + (guid,SN) survive
    for reader-2), and only reader-2's return (the last, count -> 0) purges the slot + frees the pooled buffer
-   (2C3 return-count purge-defer — no leak, no double-free/UAF). OpenSSL-gated; Clasp FIRST."
+   (2C3 return-count purge-defer — no leak, no double-free/UAF). OpenSSL-gated."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
       (format t "~&  [dcps-same-topic-secured-readers] SKIP — OpenSSL >= 3.5 not available: ~a~%"
@@ -1192,7 +1192,7 @@
    stream MANY secured samples WITHOUT draining. Pre-fix the bare-vector store grew to N; the fix caps it at the
    pool working-set budget and fails closed (RESOURCE_LIMITS / SAMPLE_REJECTED). Skipped if carve-fail is
    unreachable on this impl/platform (the impossibly-large carve unexpectedly succeeded).
-   No sockets — %deliver-user-sample driven directly. Requires OpenSSL >= 3.5; both impls pass identically (Clasp FIRST)."
+   No sockets — %deliver-user-sample driven directly. Requires OpenSSL >= 3.5; must pass identically on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
       (format t "~&  [secured-store-growth] SKIP — OpenSSL >= 3.5 not available: ~a~%"
@@ -1294,7 +1294,7 @@
    ARM (c) BOUNDED TRACKING (NFR-MEM/NFR-SEC-POSTURE): with *decode-fail-track-limit* rebound small, a flood of
    DISTINCT failing SNs never grows the per-writer counter map past the cap (an attacker streaming garbage cannot
    exhaust memory through the counter table), while an already-tracked SN still progresses to suppression.
-   Requires OpenSSL >= 3.5; both impls must pass identically (Clasp FIRST)."
+   Requires OpenSSL >= 3.5; must pass identically on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
       (format t "~&  [decode-fail-suppress] SKIP — OpenSSL >= 3.5 not available: ~a~%"
@@ -1419,7 +1419,7 @@
    (plaintext + ~44-byte SecureDataHeader overhead) fragments into multiple DATA_FRAGs on send.
    Asserts the subscriber receives the EXACT 2000-byte original plaintext byte-exact after
    encode -> fragment -> reassemble -> decode — proving the common-sink decode covers the DATA_FRAG path.
-   Requires OpenSSL >= 3.5; skips only if truly absent. Both SBCL and Clasp must pass identically."
+   Requires OpenSSL >= 3.5; skips only if truly absent. Must pass identically on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
       (format t "~&  [security-encrypted-fragmented] SKIP — OpenSSL >= 3.5 not available: ~a~%"
@@ -1495,7 +1495,7 @@
    + writer-release-payload-buffer) conses materially LESS per iteration than the allocating wrapper
    (encode-serialized-payload, which subseqs a fresh per-sample payload vector) — proving the encode pool removed
    the per-sample payload allocation. The win measured here is at least the payload size per sample. SBCL-exact
-   (dds.pal:bytes-consed); Clasp reports 0 by the NFR-PORT gap, so the inequality is asserted only on a measuring
+   (dds.pal:bytes-consed); AllegroCL reports 0 by the NFR-PORT gap, so the inequality is asserted only on a measuring
    impl. The full live-publish-path 0.0000 proof (publisher AND subscriber) is the T5c gate. Requires OpenSSL >= 3.5."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
@@ -1530,7 +1530,7 @@
                  (format t "~&  [security-encode-pool-alloc] allocating encode: ~,1f B/sample; pooled encode: ~,1f B/sample (~d samples, ~d-byte plaintext)~%"
                          (/ alloc-bytes (float iters)) (/ pool-bytes (float iters)) iters (length pt))
                  ;; on a measuring impl (SBCL) the pooled encode must cons less than the allocating one by AT LEAST
-                 ;; the payload size per sample (the eliminated subseq); Clasp's bytes-consed=0 -> alloc-bytes 0 -> skip
+                 ;; the payload size per sample (the eliminated subseq); AllegroCL's bytes-consed=0 -> alloc-bytes 0 -> skip
                  (when (plusp alloc-bytes)
                    (%check :encode-pool-removed-alloc
                            (< (+ pool-bytes (* iters (length pt))) alloc-bytes)
@@ -1546,7 +1546,7 @@
    framing (no overclaim): enabling data_protection adds 0.0000 B/sample for the encode+decode PAYLOAD codec; it is
    NOT a claim that the whole datagram path is 0 (a full loop still conses pre-existing NON-security allocs — the
    make-cache-change struct, RTPS framing — IDENTICALLY with security on or off, so they cancel in the delta).
-   Part A (live-path delta, SBCL-exact via dds.pal:bytes-consed; Clasp reports 0 -> the deltas are 0 and the
+   Part A (live-path delta, SBCL-exact via dds.pal:bytes-consed; AllegroCL reports 0 -> the deltas are 0 and the
    measured assertions self-skip, NFR-PORT): a steady-state publish-sample loop conses IDENTICALLY with
    data_protection ON vs OFF (delta 0.0000 -> the live publish encode is alloc-free relative to plain); and — since
    T5d pooled the loan wrapper (freelisted secured-loan-handle + fixed-vector registry + reused take vec) — the
@@ -1560,7 +1560,7 @@
    Part C (DECODE pool exhaustion): a secured loan-capable reader fed past its tiny decode pool without returning
    loans increments disc-node-decode-pool-rejects (SAMPLE_REJECTED), caps node-sample-count at the pool capacity,
    and conses far below one plaintext per rejected sample (no GC fallback).
-   Requires OpenSSL >= 3.5; both impls must pass identically (Clasp FIRST)."
+   Requires OpenSSL >= 3.5; must pass identically on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
       (format t "~&  [secured-live-zeroalloc] SKIP — OpenSSL >= 3.5 not available: ~a~%"
@@ -1576,7 +1576,7 @@
            ;; the receive path conses common non-security framing -> get-bytes-consed has a ~64KB GC-boundary
            ;; quantum; a LARGE window (N) resolves the true 0 loan delta (T5d) the same way NPUB does for publish.
            ;; NA (the allocating-decode window) stays small — its per-sample plaintext copy is a huge signal that
-           ;; needs no precision and a large NA would cons 100s of MB. Clasp smokes (tiny windows; bytes-consed 0).
+           ;; needs no precision and a large NA would cons 100s of MB. AllegroCL smokes (tiny windows; bytes-consed 0).
            (n    (if sbcl 100000 2000))
            (na   (if sbcl 8000 2000))
            (npub (if sbcl 200000 2000)))
@@ -1607,7 +1607,7 @@
           (format t "  [secured-live-zeroalloc] WRAPPER-CYCLE (acquire+fill+register+deregister+release+recycle) = ~,4f B/sample (deterministic, exact)~%"
                   wrap-bps)
           (if (not sbcl)
-              (format t "  [skip] dds.pal:bytes-consed is 0 on this impl (Clasp NFR-PORT gap) — delta assertions smoked, not measured~%")
+              (format t "  [skip] dds.pal:bytes-consed is 0 on this impl (AllegroCL NFR-PORT measurement gap) — delta assertions smoked, not measured~%")
               (progn
                 ;; PRIMARY: the live publish path adds 0.0000 B/sample when data_protection is enabled (encode is alloc-free
                 ;; vs plain). Tolerance 2.0 absorbs SBCL get-bytes-consed's ~64KB GC-boundary accounting quantum
@@ -1694,14 +1694,14 @@
    carry a protectable submessage (a required wrap that could not be performed: never emit an unprotected
    datagram to a keyed peer). Regression guard: pre-fix the exhausted path unconditionally returned NIL,
    dropping even a no-wrap datagram (a false REJECT — the worst class). The exhausted path walks headers +
-   the resolver only (no AES-GCM), so this runs UNCONDITIONALLY on BOTH impls (Clasp first).
+   the resolver only (no AES-GCM), so this runs UNCONDITIONALLY on BOTH impls.
      (a) DIRECT pre-scan: %prescan-user-submessages returns LEN for an INFO_DST+INFO_TS datagram and NIL for
          an INFO_DST+DATA datagram — the shared %submessage-extent walk + %user-submessage-protectable-p
          predicate, the SAME the wrap loop uses (so pre-scan and wrap CANNOT diverge into a leak).
      (b) INTEGRATION (pool drained): %maybe-wrap-user-submessages passes the INFO-only datagram THROUGH
          (returns LEN) — the RED->GREEN of the review (pre-fix this returned NIL) — and still DROPS (NIL) the
          DATA datagram (required-wrap fail-closed preserved).
-     (c) ZERO-ALLOC: the pre-scan conses nothing (SBCL-exact dds.pal:bytes-consed; Clasp reports 0 -> skip)."
+     (c) ZERO-ALLOC: the pre-scan conses nothing (SBCL-exact dds.pal:bytes-consed; AllegroCL reports 0 -> skip)."
   (let* ((km   (dds.security:make-test-key-material))
          (node (let ((dds.disc:*shmem-enabled* nil))
                  (dds.disc:make-disc-node :guid-prefix (%make-test-prefix #xE7)
@@ -1751,7 +1751,7 @@
                       (multiple-value-bind (ibuf ilen) (datagram info-specs)
                         (dds.disc::%prescan-user-submessages node ibuf ilen)   ; warm
                         (if (not sbcl)
-                            (format t "~&  [submsg-exhaust] bytes-consed 0 on this impl (Clasp NFR-PORT) — pre-scan alloc not measurable~%")
+                            (format t "~&  [submsg-exhaust] bytes-consed 0 on this impl (AllegroCL NFR-PORT measurement gap) — pre-scan alloc not measurable~%")
                             (let ((before (dds.pal:bytes-consed)))
                               (dotimes (i 50000) (dds.disc::%prescan-user-submessages node ibuf ilen))
                               (let ((per (/ (float (- (dds.pal:bytes-consed) before)) 50000)))
@@ -1780,7 +1780,7 @@
    (8) composition: header || content || footer via ONE cursor, parsed back (the T2/T4 usage pattern).
    (9) Slice-1 byte-identity regression: serialize/parse-secured-payload still produce/round-trip the
        pinned 48-octet vector after the DRY refactor to delegate to this codec.
-   Pure wire codec (no crypto) — both SBCL and Clasp must pass identically (Clasp FIRST)."
+   Pure wire codec (no crypto) — must pass identically on SBCL and AllegroCL."
   ;; (1) CryptoHeader 20-byte byte-exact + round-trip (reuses the Slice-1 known header fields).
   (let* ((kind       (%hex-octets "00000004"))
          (key-id     (%hex-octets "aabbccdd"))
@@ -1929,7 +1929,7 @@
     (function () (or (simple-array (unsigned-byte 8) (*)) null))
   "The deterministic full 88-octet ENCRYPT secured-submessage corpus vector for
    (make-test-key-material, :encrypt, %t2-fixed-plain-submessage) — fresh km (iv_suffix=0, session_id=0),
-   so the AES-256-GCM ciphertext + common_mac are fixed + reproducible on SBCL and Clasp (same OpenSSL).
+   so the AES-256-GCM ciphertext + common_mac are fixed + reproducible on SBCL and AllegroCL (same OpenSSL).
    Pins the framing AND the empty-AAD ENCRYPT crypto output: a change to the AAD decision breaks this."
   (%hex-octets (concatenate 'string
     "31011400" "00000004" "deadbeef" "00000000" "0000000000000000"   ; SEC_PREFIX + CryptoHeader{GCM}
@@ -2127,7 +2127,7 @@
    (4) negatives, fail-closed -> NIL: wrong key; flipped common_mac; flipped ciphertext (ENCRYPT);
        flipped original submessage (SIGN — and NEVER returns the tampered plaintext); truncation;
        a re-ordered bracket; an unknown transformation_kind.
-   Requires OpenSSL >= 3.5; skips only if truly absent. Both SBCL and Clasp must pass identically."
+   Requires OpenSSL >= 3.5; skips only if truly absent. Must pass identically on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
       (format t "~&  [security-submessage] SKIP — OpenSSL >= 3.5 not available: ~a~%"
@@ -2167,7 +2167,7 @@
    byte-identical to the plain T2 ENCRYPT vector; only the SEC_POSTFIX grows: octetsToNextHeader 20->60,
    rsm_count 0->2, then {aaaa0001‖GMAC} {bbbb0002‖GMAC}. The two GMACs are AES-256-GCM tags over the
    common_mac under each receiver-specific session key (same IV as the common_mac), reproducible across
-   SBCL+Clasp (same OpenSSL). A change to the receiver-MAC input/IV/KDF breaks this."
+   SBCL and AllegroCL (same OpenSSL). A change to the receiver-MAC input/IV/KDF breaks this."
   (%hex-octets (concatenate 'string
     "31011400" "00000004" "deadbeef" "00000000" "0000000000000000"   ; SEC_PREFIX + CryptoHeader{GCM}
     "30012400" "00000020"                                            ; SEC_BODY hdr + ct_len=32 BE
@@ -2417,7 +2417,7 @@
    (4) the ZERO-ALLOC into-buffer verify entries (ADR-0039 residual (a)): decode-{datawriter-submessage,
        rtps-message}-into with :my-receiver-key-id/:my-receiver-key round-trip identically + fail-closed,
        so the origin-auth 0 B/sample mem arms are non-vacuous.
-   Requires OpenSSL >= 3.5; skips only if truly absent. Both SBCL and Clasp must pass identically."
+   Requires OpenSSL >= 3.5; skips only if truly absent. Must pass identically on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
       (format t "~&  [security-origin-auth] SKIP — OpenSSL >= 3.5 not available: ~a~%"
@@ -2449,7 +2449,7 @@
     (function () (or (simple-array (unsigned-byte 8) (*)) null))
   "The deterministic full 100-octet ENCRYPT whole-RTPS corpus vector for
    (make-test-key-material, :encrypt, %t4-fixed-stream) — fresh km (iv_suffix=0, session_id=0), so the
-   AES-256-GCM ciphertext + common_mac are fixed + reproducible on SBCL and Clasp (same OpenSSL). Pins the
+   AES-256-GCM ciphertext + common_mac are fixed + reproducible on SBCL and AllegroCL (same OpenSSL). Pins the
    SRTPS framing (SRTPS_PREFIX/SEC_BODY/SRTPS_POSTFIX) AND the empty-AAD ENCRYPT crypto output: a change to
    the AAD decision / kinds / key derivation breaks this."
   (%hex-octets (concatenate 'string
@@ -2635,7 +2635,7 @@
        corrupted SEC_BODY / SRTPS_POSTFIX submessageId; an unknown transformation_kind.
    (5) origin authentication: encode with 2 receivers; decode verifies its OWN entry — right key -> stream;
        wrong key -> NIL (non-vacuous, common_mac valid); absent key_id -> NIL; off -> stream.
-   Requires OpenSSL >= 3.5; skips only if truly absent. Both SBCL and Clasp must pass identically (Clasp FIRST)."
+   Requires OpenSSL >= 3.5; skips only if truly absent. Must pass identically on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
       (format t "~&  [security-rtps-message] SKIP — OpenSSL >= 3.5 not available: ~a~%"
@@ -2705,7 +2705,7 @@
 (defun* %za2-region-into-zeroalloc (sub)
     (function ((simple-array (unsigned-byte 8) (*))) t)
   "ZA-2 zero-alloc proof: the %encode-secured-region-into ENCRYPT core, over a REUSED static out-buffer +
-   REUSED key-material, conses ~0 GC-heap B/call (SBCL-exact via dds.pal:bytes-consed; Clasp reports 0 by
+   REUSED key-material, conses ~0 GC-heap B/call (SBCL-exact via dds.pal:bytes-consed; AllegroCL reports 0 by
    the NFR-PORT gap -> the delta is 0 and the assertion passes vacuously). Proves the core adds no
    per-sample GC-heap allocation (the only residual is the EVP-FFI boxing shared with the T1 KAT)."
   (let ((km    (dds.security:make-test-key-material))
@@ -2734,7 +2734,7 @@
     (function ((simple-array (unsigned-byte 8) (*))) t)
   "ZA-2 zero-alloc proof for the SIGN decode path: %decode-secured-region-into with a REUSED pre-encoded
    SIGN blob + REUSED km + REUSED pt-out must cons ~0 GC-heap B/call after the aad-region fix
-   (was (length plain) B/call from the verbatim-region subseq; Clasp bytes-consed=0 -> skip NFR-PORT)."
+   (was (length plain) B/call from the verbatim-region subseq; AllegroCL bytes-consed=0 -> skip NFR-PORT)."
   (let ((km    (dds.security:make-test-key-material))
         (pt    (dds.core.buffer:make-octet-buffer 128))
         (iters 4000))
@@ -2768,7 +2768,7 @@
        byte-exact (no copy), both tiers (SIGN-WALK-P NIL reads one embedded submessage; T walks the stream).
    (c) fail-closed — a too-short input -> NIL, both tiers.
    (d) zero-alloc — the ENCODE core (ENCRYPT, reused out-buffer) conses ~0 B/call on a measuring impl (SBCL).
-   Requires OpenSSL >= 3.5; skips only if truly absent. Both SBCL and Clasp must pass identically (Clasp FIRST)."
+   Requires OpenSSL >= 3.5; skips only if truly absent. Must pass identically on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
       (format t "~&  [security-secured-region-into] SKIP — OpenSSL >= 3.5 not available: ~a~%"
@@ -2823,7 +2823,7 @@
   "Micro-bench the §8.5.1.10-.12 whole-RTPS-message protection (T4) encode + decode of a representative
    SIZE-octet datagram submessage stream, ITERS each, for SIGN and ENCRYPT, on the static-arena-backed
    encode scratch. Reports ns/op (dds.pal:monotonic-ns) + GC bytes/op (dds.pal:bytes-consed delta; SBCL
-   exact, Clasp reports 0 — NFR-PORT) as a markdown table to STREAM. This is the T4 BASELINE; T10 re-measures
+   exact, AllegroCL reports 0 — NFR-PORT) as a markdown table to STREAM. This is the T4 BASELINE; T10 re-measures
    the integrated send/%handle-datagram path. Encode advances the km iv-counter per call (no nonce reuse);
    decode re-decodes one pre-encoded blob (keyed by the wire iv). SKIPs if OpenSSL<3.5."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
@@ -2849,7 +2849,7 @@
                  (values (/ (- (dds.pal:monotonic-ns) t0) iters)
                          (/ (- (dds.pal:bytes-consed) b0) iters))))))
       (format stream "~&# WP-DDS-SECURITY-SECURE-DISCOVERY T4 — whole-RTPS-message protection micro-bench~%~%")
-      (format stream "Encode + decode of a representative ~d-octet datagram submessage stream, ~d iterations each (§8.5.1.10-.12). Encode scratch is static-arena-backed (dds.pal:alloc-static); the GMAC/GCM core is the shared %seal/%open-with-km over DDS.DARE/OpenSSL. ns/op = dds.pal:monotonic-ns delta / iters; GC bytes/op = dds.pal:bytes-consed delta / iters (SBCL exact; Clasp reports 0, NFR-PORT). T4 BASELINE; T10 re-measures the integrated path.~%~%" size iters)
+      (format stream "Encode + decode of a representative ~d-octet datagram submessage stream, ~d iterations each (§8.5.1.10-.12). Encode scratch is static-arena-backed (dds.pal:alloc-static); the GMAC/GCM core is the shared %seal/%open-with-km over DDS.DARE/OpenSSL. ns/op = dds.pal:monotonic-ns delta / iters; GC bytes/op = dds.pal:bytes-consed delta / iters (SBCL exact; AllegroCL reports 0, NFR-PORT). T4 BASELINE; T10 re-measures the integrated path.~%~%" size iters)
       (format stream "| op | ns/op | GC bytes/op |~%|----|-------|-------------|~%")
       (dolist (kind '(:sign :encrypt))
         (multiple-value-bind (ens enb) (bench-encode kind)
@@ -2873,7 +2873,7 @@
      T10-recv      — the INTEGRATED receive unwrap %handle-datagram does: subseq(buf,20,size) + decode-rtps-message
                      + in-place replace into the REUSED inbound buffer, then re-dispatch (the copy measured here).
    ns/op = dds.pal:monotonic-ns delta / iters; GC bytes/op = dds.pal:bytes-consed delta / iters (SBCL exact;
-   Clasp reports 0 — NFR-PORT). The T10-send/recv vs T4 delta is the documented residual: the codec's →octets
+   AllegroCL reports 0 — NFR-PORT). The T10-send/recv vs T4 delta is the documented residual: the codec's →octets
    return + AEAD intermediates (the inherited T4 carry) PLUS one plain-region subseq per datagram; the node
    send/receive BUFFER is reused in place (no per-datagram message-sized array). SKIPs if OpenSSL<3.5."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
@@ -2894,7 +2894,7 @@
                (dotimes (_ iters) (funcall thunk))
                (values (/ (- (dds.pal:monotonic-ns) t0) iters) (/ (- (dds.pal:bytes-consed) b0) iters)))))
       (format stream "~&# WP-DDS-SECURITY-SECURE-DISCOVERY T10 — rtps_protection integrated send/receive bench~%~%")
-      (format stream "Integrated whole-RTPS-message protection of a representative ~d-octet post-header submessage stream, ~d iterations each, ENCRYPT tier (§8.5.1.10-.12). The send wrap (%maybe-wrap-srtps) and receive unwrap (%handle-datagram) overwrite the REUSED node buffer in place — no fresh per-datagram message-sized array; the residual GC is the codec's →octets return + AEAD intermediates (the inherited T4 carry) + one plain-region subseq per datagram. ns/op = dds.pal:monotonic-ns delta / iters; GC bytes/op = dds.pal:bytes-consed delta / iters (SBCL exact; Clasp 0, NFR-PORT). 'plain' is the unwrapped send (dest not :keyed / rtps NONE) — byte-identical, 0 added.~%~%" size iters)
+      (format stream "Integrated whole-RTPS-message protection of a representative ~d-octet post-header submessage stream, ~d iterations each, ENCRYPT tier (§8.5.1.10-.12). The send wrap (%maybe-wrap-srtps) and receive unwrap (%handle-datagram) overwrite the REUSED node buffer in place — no fresh per-datagram message-sized array; the residual GC is the codec's →octets return + AEAD intermediates (the inherited T4 carry) + one plain-region subseq per datagram. ns/op = dds.pal:monotonic-ns delta / iters; GC bytes/op = dds.pal:bytes-consed delta / iters (SBCL exact; AllegroCL 0, NFR-PORT). 'plain' is the unwrapped send (dest not :keyed / rtps NONE) — byte-identical, 0 added.~%~%" size iters)
       (format stream "| path | ns/op | GC bytes/op |~%|------|-------|-------------|~%")
       (format stream "| plain (no wrap) | ~,1f | ~d |~%" 0.0 0)
       (multiple-value-bind (ns b) (measure (lambda () (dds.security:encode-rtps-message km :encrypt subs)))
@@ -2921,7 +2921,7 @@
    Verifies: (a) the cached key is byte-identical to a fresh derive-session-key result;
    (b) a second call with the same session_id returns the SAME object (cache hit, EQ identity).
    The hit path is lock-free + zero-alloc; the miss derives once and stores the result.
-   Both SBCL and Clasp must pass identically."
+   Must pass identically on SBCL and AllegroCL."
   (let* ((km     (dds.security:make-test-key-material))
          ;; +fixed-session-id+ = all-zeros (not exported; reproduced inline)
          (sid    (make-array 4 :element-type '(unsigned-byte 8) :initial-element 0))
@@ -2955,14 +2955,17 @@
        dereference the freed master buffers (defense-in-depth; km-receiver-descriptor-list must NOT return NIL —
        that would be a fail-OPEN origin-auth bypass);
    (e) the choke is IDEMPOTENT (a second call is a safe no-op).
-   Wipe proof (both impls, no use-after-free): the choke fills-0 THEN releases each MASTER slot, and in the SAME
-   block sets KEY-MATERIAL-ZEROIZED and NULLs the caches — so the flag + a nulled cache are UAF-safe evidence the
-   wipe path ran. The direct read-back-is-all-zero assertion on the master slots is CLASP-only: Clasp free-static
-   RECYCLES the vector (live, zeroed) so the read is safe, whereas SBCL free-static-vector frees the whole object
-   (header+data) so a post-free read is UAF. The off-heap DISCRIMINATION (a heap array / a derived cache -> NIL) is
-   likewise SBCL-only (Clasp/Boehm is non-moving; static-vector-p answers T for any octet vector by design).
-   STORAGE change only — the corpus/KAT/roundtrip tests prove keys + wire are unchanged. Both SBCL and Clasp must
-   pass identically."
+   Wipe proof (SBCL and AllegroCL, no use-after-free): dds.dare:free-secret-octets runs WIPE, then the
+   dds.dare:*secret-wipe-readback-hook* read-back point, then RELEASE. The test binds that hook and records, for
+   every buffer it is handed, the buffer itself and whether all of its octets read zero at that moment. It then
+   asserts that EACH of the three master slots (identified by EQ against the vectors captured before the choke,
+   which were asserted non-zero then, so the check is not vacuous) was handed to the hook exactly once with
+   every octet zero. The read happens before the release, so it is safe on both implementations; a read AFTER
+   release would be a use-after-free on both (SBCL and AllegroCL free the whole static vector). The flag and the
+   nulled caches remain as secondary evidence that the wipe block ran. The off-heap DISCRIMINATION (a heap array /
+   a derived cache -> NIL) is asserted on SBCL only: the AllegroCL dds.pal:static-vector-p answers the type
+   question only and cannot tell a heap vector from a static one (documented in that predicate). STORAGE change
+   only — the corpus/KAT/roundtrip tests prove keys + wire are unchanged."
   (let* ((km   (dds.security:generate-key-material :origin-auth t))
          (salt (dds.security:key-material-master-salt km))
          (mkey (dds.security:key-material-master-sender-key km))
@@ -2975,7 +2978,8 @@
     (%check :km-salt-static (dds.pal:static-vector-p salt) "master_salt must be foreign/static (off GC heap)")
     (%check :km-mkey-static (dds.pal:static-vector-p mkey) "master_sender_key must be foreign/static")
     (%check :km-rkey-static (dds.pal:static-vector-p rkey) "master_receiver_specific_key must be foreign/static")
-    ;; non-vacuous off-heap discrimination is SBCL-only (Clasp/Boehm is non-moving; see the predicate docstring)
+    ;; non-vacuous off-heap discrimination is SBCL-only (the AllegroCL static-vector-p cannot discriminate; see
+    ;; the predicate docstring in pal-allegro.lisp)
     (when sbcl
       (%check :heap-not-static (not (dds.pal:static-vector-p heap))
               "on SBCL a plain GC-heap array must NOT answer static-vector-p (non-vacuous off-heap proof)"))
@@ -3017,8 +3021,24 @@
     ;; (c) zeroize-on-teardown wipes MASTER secrets + drops the caches + marks the KM unusable
     (%check :km-not-yet-zeroized (not (dds.security:key-material-zeroized km))
             "KM must not be marked zeroized before the choke (non-vacuous)")
-    (%check :km-zeroize-returns-nil (null (dds.security:zeroize-key-material km))
-            "zeroize-key-material returns NIL")
+    (let ((seen '()))   ; (buffer . all-zero-at-read-back), one entry per buffer handed to the hook
+      (let ((dds.dare:*secret-wipe-readback-hook*
+              (lambda (v) (push (cons v (and (plusp (length v)) (every #'zerop v))) seen))))
+        (%check :km-zeroize-returns-nil (null (dds.security:zeroize-key-material km))
+                "zeroize-key-material returns NIL"))
+      ;; WIPE-THEN-RELEASE read-back proof: each master slot reached the read-back point (after the wipe, before
+      ;; the release) exactly once, and read all-zero there. Identity is EQ against the pre-choke vectors.
+      (%check :km-readback-count (= 3 (length seen))
+              (format nil "the read-back hook must see exactly the 3 master slots, saw ~d buffer(s)" (length seen)))
+      (flet ((wiped-once-p (slot)
+               (let ((hits (remove-if-not (lambda (e) (eq (car e) slot)) seen)))
+                 (and (= 1 (length hits)) (cdr (first hits))))))
+        (%check :km-salt-wiped (wiped-once-p salt)
+                "master_salt was read back all-zero after the wipe and before the release")
+        (%check :km-mkey-wiped (wiped-once-p mkey)
+                "master_sender_key was read back all-zero after the wipe and before the release")
+        (%check :km-rkey-wiped (wiped-once-p rkey)
+                "master_receiver_specific_key was read back all-zero after the wipe and before the release")))
     (%check :km-zeroized-flag (dds.security:key-material-zeroized km)
             "zeroize-key-material sets the fail-closed KEY-MATERIAL-ZEROIZED marker")
     ;; UAF-safe on both impls: the caches (which held real key bytes) are dropped in the same wipe block
@@ -3026,11 +3046,6 @@
             "derived session-key cache dropped after the choke")
     (%check :km-recv-cache-nulled (null (dds.security::key-material-cached-recv-session km))
             "receiver-key cache dropped after the choke")
-    ;; direct read-back byte-wipe proof is Clasp-only (recycle-safe); SBCL frees the whole object (post-free = UAF)
-    (when (eq (dds.pal:pal-impl-name) :clasp)
-      (%check :km-salt-wiped (every #'zerop salt) "master_salt bytes wiped to all-zero after the choke (Clasp recycle read)")
-      (%check :km-mkey-wiped (every #'zerop mkey) "master_sender_key bytes wiped to all-zero after the choke")
-      (%check :km-rkey-wiped (every #'zerop rkey) "master_receiver_specific_key bytes wiped to all-zero after the choke"))
     ;; (d) FAIL-CLOSED GUARD: the master-secret-reading entries SIGNAL on a zeroized KM (no UAF of freed masters)
     (flet ((fail-closed-p (thunk)
              (handler-case (progn (funcall thunk) nil)
