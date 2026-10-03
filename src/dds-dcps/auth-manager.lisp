@@ -600,7 +600,7 @@
    (%am-on-volatile-secure -> cm-on-crypto-token), so any non-handshake class here is dropped (the prior
    best-effort-PSM +gm-participant-crypto-tokens+ path is RETIRED). The :authenticated->:keyed promotion is
    now mediated by the crypto-manager (%cm-try-promote), not here.
-   FAIL-CLOSED throughout (block/return-from; no handler-case in nested mvb — Clasp): any
+   FAIL-CLOSED throughout (block/return-from; no handler-case in nested mvb, ADR 0064): any
    malformed/unknown/unsolicited message is silently dropped; the receiver thread MUST NOT crash."
   (block %am-on-psm
     (let ((ms (dp-auth-state p)))

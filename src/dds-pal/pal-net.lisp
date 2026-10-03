@@ -1,27 +1,27 @@
-;;;; DDS.PAL — native UDPv4 sockets (FR-XPORT-1). Uses sb-bsd-sockets, which both
-;;;; SBCL (contrib, required in pal-sbcl) and Clasp (bundled) provide natively —
-;;;; each implementation's own socket interface, NOT a portability library. This
-;;;; file carries no reader conditionals; it is loaded after the per-impl PALs so
-;;;; the SB-BSD-SOCKETS package is present. The CLOS in sb-bsd-sockets is control
+;;;; DDS.PAL — native UDPv4 sockets (FR-XPORT-1). Uses each implementation's own socket
+;;;; interface, NOT a portability library: sb-bsd-sockets on SBCL (contrib, required in
+;;;; pal-sbcl) and the SOCKET module on AllegroCL (ADR 0114). The few socket-object calls
+;;;; carry #+allegro/#-allegro arms (permitted inside dds-pal/); every hot path speaks to
+;;;; the fd through CFFI. Loaded after the per-impl PALs so the socket package is present. The CLOS in sb-bsd-sockets is control
 ;;;; plane (socket setup); a raw sendmmsg/recvmmsg fast path is a later perf step.
 
 (in-package #:dds.pal)
 
 ;;; ADR 0114: AllegroCL's socket interface lives in a loadable module, not the base image — without this
-;;; REQUIRE the SOCKET: package does not exist and every reference below is a read-time failure. SBCL and
-;;; Clasp need no equivalent because they bundle SB-BSD-SOCKETS.
+;;; REQUIRE the SOCKET: package does not exist and every reference below is a read-time failure. SBCL needs
+;;; no equivalent here because pal-sbcl.lisp already REQUIREs its SB-BSD-SOCKETS contrib.
 #+allegro (eval-when (:compile-toplevel :load-toplevel :execute) (require :sock))
 
 ;;; ---- wall clock (source_timestamp) ----
-;; clock_gettime is impl-agnostic via CFFI (loaded for both SBCL + Clasp). CLOCK_REALTIME = 0 and struct
+;; clock_gettime is impl-agnostic via CFFI (loaded for both SBCL and AllegroCL). CLOCK_REALTIME = 0 and struct
 ;; timespec { time_t tv_sec; long tv_nsec } is 16 octets (tv_sec@0, tv_nsec@8) on both Linux x86-64 and
 ;; macOS arm64 — the two 64-bit targets — so there is no per-impl divergence to confine.
 
 (cffi:defcfun ("clock_gettime" %clock-gettime) :int (clk-id :int) (tp :pointer))
 
 ;;; ---- monotonic clock (latency measurement + every RTPS timer deadline) ----
-;; ONE clock, ONE code path, BOTH implementations (owner directive 2026-07-13: Clasp uses the CFFI clock too).
-;; Two Clasp-specific costs had to be root-caused first — see *clock-gettime-fp* and *thread-timespec*.
+;; ONE clock, ONE code path, every implementation (owner directive 2026-07-13). Two FFI costs first measured
+;; on the since-withdrawn Clasp target (ADR 0118) shaped it — see *clock-gettime-fp* and *thread-timespec*.
 
 (defparameter *clock-monotonic-id*
   (if (member :darwin *features*) 4 1)
@@ -39,20 +39,20 @@
   (%global-symbol-pointer "clock_gettime")
   "The RESOLVED clock_gettime function pointer, looked up ONCE at load.
 
-   WP-PERF, and this is a Clasp defect worth naming: calling a foreign function BY NAME on Clasp re-resolves
-   the symbol on EVERY call. Measured on this machine — clock_gettime by name 4230 ns/call, and even a bare
-   getpid() by name 4824 ns/call, versus 379 ns through a pre-resolved pointer. ~3.8 us of every by-name
-   Clasp FFI call is dlsym. SBCL does not have this problem (13 ns either way), so it is invisible unless you
-   measure Clasp. Every hot foreign call in this codebase must go through a cached pointer like this one.")
+   WP-PERF: an FFI may re-resolve a by-NAME foreign call on EVERY call. Measured on the since-withdrawn Clasp
+   target (ADR 0118) — clock_gettime by name 4230 ns/call, a bare getpid() by name 4824 ns/call, versus
+   379 ns through a pre-resolved pointer: ~3.8 us of every by-name call was dlsym. SBCL does not have this
+   problem (13 ns either way). A cached pointer costs nothing on any FFI, so the rule stands for every
+   target: every hot foreign call in this codebase goes through a cached pointer like this one.")
 
 (defvar *thread-timespec* nil
   "A per-thread, pre-allocated 16-octet foreign `struct timespec` scratch for MONOTONIC-NS, bound by SPAWN
    for every PAL-created thread (receiver, sender, flow-control, liveliness, ...); NIL in a thread the PAL
    did not create, which then falls back to a per-call WITH-FOREIGN-OBJECT.
 
-   WP-PERF, the second Clasp defect: WITH-FOREIGN-OBJECT is a real malloc on Clasp — measured 3790 ns/call
-   for clock read + per-call buffer vs 518 ns with the buffer hoisted, i.e. ~3.3 us of foreign malloc EVERY
-   call. (On SBCL it is stack-allocated and free: 12 ns either way.) The buffer must therefore be reused —
+   WP-PERF: WITH-FOREIGN-OBJECT is not free on every FFI — on the since-withdrawn Clasp target (ADR 0118) it
+   was a real malloc, measured 3790 ns/call for clock read + per-call buffer vs 518 ns with the buffer
+   hoisted. (On SBCL it is stack-allocated and free: 12 ns either way.) The buffer is therefore reused —
    but it CANNOT simply be a global, because the receiver thread and the user thread read the clock
    concurrently and would tear each other's timespec, corrupting a timestamp. Per-thread is the fix that is
    both fast and race-free.")
@@ -70,12 +70,9 @@
    after RTT/2 — and segment-level profiling of a path whose segments are single microseconds was IMPOSSIBLE,
    not merely noisy. The PAL's own M1 note promised this fast path and it had never landed.
 
-   Measured cost/resolution: SBCL 12 ns/call, 41 ns tick. Clasp 0.5 us/call, 41 ns tick — SAME clock, same
-   resolution, but Clasp cannot reach SBCL's cost: after removing the per-call dlsym (*clock-gettime-fp*) and
-   the per-call foreign malloc (*thread-timespec*), the ~0.5 us residual is Clasp's libffi dynamic dispatch,
-   for which CFFI provides no direct-call compiler macro on Clasp (verified: COMPILER-MACRO-FUNCTION is NIL
-   for FOREIGN-FUNCALL and FOREIGN-FUNCALL-POINTER there). That residual is upstream and not ours to remove.
-   It is affordable because MONOTONIC-NS is NOT on the per-sample path — it serves blocking-wait deadlines,
+   Measured cost/resolution: SBCL 12 ns/call, 41 ns tick. The since-withdrawn Clasp target
+   (ADR 0118) measured 0.5 us/call on the same clock, a libffi dispatch residual. Not re-measured on
+   AllegroCL. Any per-call cost here is affordable because MONOTONIC-NS is NOT on the per-sample path — it serves blocking-wait deadlines,
    the flow-controller token bucket (opt-in async writers) and shmem stress loops."
   ;; MACROLET, not FLET — see REALTIME-NS: a foreign pointer passed across an out-of-line call is BOXED
   ;; (16 B/call), so the scratch must never cross a function boundary. Zero-allocation on ANY thread.
@@ -96,13 +93,13 @@
    bound by SPAWN for every PAL-created thread; NIL in a thread the PAL did not create, which then falls
    back to a per-call WITH-FOREIGN-OBJECT.
 
-   Needed only by the Clasp PAL, whose CAS goes through the C atomic runtime (__atomic_compare_exchange_N),
-   and that ABI takes EXPECTED **by pointer** — it writes the actual value back on failure. A per-call
-   foreign cell would therefore put a WITH-FOREIGN-OBJECT on the CAS retry loop, which on Clasp is a real
-   malloc (~3.3 us/call — the same defect that motivated *THREAD-TIMESPEC*), and CAS sits in the SHMEM lane
-   claim and the zero-copy refcount, i.e. the hot path. Per-thread is the fix that is both fast and
-   race-free: two threads CASing concurrently must not share one EXPECTED cell or they tear each other's
-   operand. Carved out of the SAME allocation as *THREAD-TIMESPEC* (one foreign-alloc per thread).")
+   For a PAL whose CAS goes through the C atomic runtime (__atomic_compare_exchange_N), whose ABI takes
+   EXPECTED **by pointer** and writes the actual value back on failure. Its original consumer was the
+   since-withdrawn Clasp PAL (ADR 0118), where a per-call WITH-FOREIGN-OBJECT on the CAS retry loop was a
+   real malloc (~3.3 us/call). ⚠️ IT HAS NO CONSUMER TODAY: pal-allegro.lisp's %CAS-SAP uses a per-call
+   WITH-FOREIGN-OBJECT, and SBCL's CAS needs no foreign cell. It is kept, carved from the same allocation,
+   for the WP-1.14 pinned-octet work rather than removed and re-added. Per-thread, because two threads
+   CASing concurrently must not share one EXPECTED cell or they tear each other's operand. Carved out of the SAME allocation as *THREAD-TIMESPEC* (one foreign-alloc per thread).")
 
 (defvar *thread-sockaddr* nil
   "A per-thread, pre-allocated 16-octet foreign `struct sockaddr_in` destination scratch for
@@ -141,8 +138,8 @@
 (defparameter *memcpy-fp*
   (%global-symbol-pointer "memcpy")
   "The RESOLVED memcpy pointer, looked up ONCE at load. Cached for the same reason as *clock-gettime-fp*:
-   a by-NAME foreign call on Clasp re-resolves the symbol every call (~3.8 us of dlsym). Every hot foreign
-   call in this codebase goes through a cached pointer.")
+   a by-NAME foreign call may re-resolve the symbol every call (~3.8 us of dlsym, measured on the
+   since-withdrawn Clasp target). Every hot foreign call in this codebase goes through a cached pointer.")
 
 (defun* sap-copy-in (sap offset vec voff len)
     (function (t (integer 0) (simple-array (unsigned-byte 8) (*)) (integer 0) (integer 0)) t)
@@ -177,8 +174,9 @@
     (function (function &key (:name (or null string))) t)
   "Spawn a thread running FN, named NAME (default \"dds\"). Returns the thread. Identical on both impls
    (bordeaux-threads), so it lives here rather than being duplicated per-impl. The body runs inside
-   CALL-WITH-THREAD-CLOCK so every PAL thread gets MONOTONIC-NS's pre-allocated per-thread timespec — without
-   it, a clock read on a Clasp thread pays a ~3.3 us foreign malloc (see *thread-timespec*)."
+   CALL-WITH-THREAD-CLOCK so every PAL thread gets MONOTONIC-NS's and REALTIME-NS's pre-allocated per-thread
+   scratch — without it, each clock read takes the per-call WITH-FOREIGN-OBJECT fallback (see
+   *thread-timespec*)."
   (bordeaux-threads:make-thread (lambda () (call-with-thread-clock fn)) :name (or name "dds")))
 
 (defun* realtime-ns ()
@@ -279,8 +277,8 @@
    sendto/recvfrom/shutdown/setsockopt paths need (ADR 0114).
 
    ⭐ THIS IS THE WHOLE OF THE PORTABILITY SEAM. Every hot path in this file already speaks to the fd
-   through CFFI, not to the socket object, so the three implementations differ only in how the fd is
-   obtained: SBCL and Clasp bundle SB-BSD-SOCKETS, AllegroCL ships its own SOCKET: interface whose
+   through CFFI, not to the socket object, so the implementations differ only in how the fd is
+   obtained: SBCL bundles SB-BSD-SOCKETS, AllegroCL ships its own SOCKET: interface whose
    SOCKET-OS-FD answers the same integer. Verified on AllegroCL 11.0: a raw CFFI sendto/recvfrom pair on
    a SOCKET:MAKE-SOCKET descriptor round-trips a datagram on loopback with the payload intact, so the
    zero-allocation datagram path (NFR-MEM) is preserved across the port rather than traded away."
@@ -544,7 +542,8 @@
   (%global-symbol-pointer "sendto")
   "The RESOLVED sendto(2) function pointer, looked up ONCE at load — never by name per call.
    Same rule, and same reason, as *CLOCK-GETTIME-FP*: a by-name foreign call re-resolves the symbol
-   through dlsym on EVERY call on Clasp (~3.8 us measured), and this one sits on the ACKNACK /
+   through dlsym on EVERY call on some FFIs (~3.8 us measured on the since-withdrawn Clasp target), and
+   this one sits on the ACKNACK /
    discovery-announce send path.")
 
 (defparameter *recvfrom-fp*
@@ -794,18 +793,17 @@
   (ignore-errors (tcp-shutdown socket))      ; wake any thread parked in udp-recv, THEN release the fd
   (%socket-close socket))
 
-;; TCPv4 stream sockets (FR-XPORT-1). Same sb-bsd-sockets substrate as UDP above (native on SBCL
-;; contrib + Clasp bundled); no reader conditionals except the OS-specific SO_NOSIGPIPE below.
+;; TCPv4 stream sockets (FR-XPORT-1). Same substrate as UDP above (sb-bsd-sockets on SBCL, the SOCKET
+;; module on AllegroCL, split by #+allegro/#-allegro arms) plus the OS-specific SO_NOSIGPIPE below.
 ;; A stream is a byte pipe, NOT message-framed: tcp-send loops over short writes and tcp-recv loops
 ;; until LEN bytes are assembled (a large frame splits across segments). socket-send / socket-receive
-;; write/read at buffer[0] with no offset arg (verified both impls), so the continuation reads/writes
+;; write/read at buffer[0] with no offset arg (verified on SBCL), so the continuation reads/writes
 ;; go through a subseq / scratch+replace — the destination offset is honoured in Lisp.
 
 ;; SO_NOSIGPIPE (Darwin, SOL_SOCKET=#xffff optname=#x1022): a write to a peer that has closed returns
-;; EPIPE (-> a catchable SOCKET-ERROR) instead of raising SIGPIPE. On Darwin this also keeps Clasp off
-;; its signal->CLOS-condition path (the known Clasp multithreaded-signal fragility), so BOTH impls take
-;; the identical clean EPIPE->SOCKET-ERROR path on a torn connection. Linux runtimes ignore SIGPIPE
-;; process-wide already (SBCL + Clasp), so the option is Darwin-only.
+;; EPIPE (-> a catchable SOCKET-ERROR) instead of raising SIGPIPE, so a torn connection takes the clean
+;; EPIPE->SOCKET-ERROR path. On Linux SBCL already ignores SIGPIPE process-wide, so the option is
+;; Darwin-only; AllegroCL's own SIGPIPE disposition on Linux has not been separately verified here.
 #+darwin (defconstant +so-nosigpipe+ #x1022 "Darwin SO_NOSIGPIPE optname (suppress SIGPIPE on a dead peer).")
 
 (defun* %tcp-suppress-sigpipe (socket)
@@ -878,7 +876,7 @@
    octets + 4 zero octets — a layout valid for BOTH the Darwin int32 tv_usec (offset 8, 4 tail-pad bytes)
    AND the Linux long tv_usec (offset 8, 8 bytes), so ONE encoding is portable across OSes. SO_RCVTIMEO
    optname is OS-specific (+so-rcvtimeo+: Darwin #x1006 / Linux 20), like the SO_REUSEPORT constants above
-   — never impl-specific, so this carries no #+sbcl/#+clasp conditional. Reuses %setsockopt (DRY)."
+   — never impl-specific, so this carries no implementation reader conditional. Reuses %setsockopt (DRY)."
   (let* ((sec (floor seconds))
          (usec (floor (* (- seconds sec) 1000000))))
     (try (%setsockopt socket +sol-socket+ +so-rcvtimeo+
@@ -946,7 +944,8 @@
                            within the deadline — a STALLED peer, not a closed one.
 
    sb-bsd-sockets:socket-receive returns n=0 on a clean peer-close but n=NIL on an SO_RCVTIMEO timeout OR
-   an EINTR-interrupted receive (verified identical on SBCL + Clasp), which is what lets this split :EOF
+   an EINTR-interrupted receive (verified on SBCL; the #+allegro arm has its own note below), which is what
+   lets this split :EOF
    from :TIMEOUT. EINTR is CONSERVATIVELY classified as :TIMEOUT (n=NIL ⟸ timeout OR EINTR) — the
    disposition is identical either way (drop / reconnect), so folding the rare interrupted-syscall case in
    is safe and keeps the branch minimal. This was a PAL-TIMEOUT condition until the no-conditions rule;
@@ -1011,9 +1010,9 @@
 
 ;; shutdown(2) SHUT_RDWR (disable BOTH directions of a connected stream socket). The value 2 is IDENTICAL
 ;; on Darwin (sys/socket.h) and Linux (bits/socket.h) — a POSIX/OS ABI constant, NOT impl-specific — so it
-;; carries NO #+sbcl/#+clasp conditional (verified against both OS headers: SHUT_RD 0 / SHUT_WR 1 /
-;; SHUT_RDWR 2 on each). Raw foreign-funcall like %setsockopt above (sb-bsd-sockets exposes no portable
-;; shutdown across both impls); the fd comes from socket-file-descriptor, native on SBCL contrib + Clasp.
+;; carries NO implementation reader conditional (verified against both OS headers: SHUT_RD 0 / SHUT_WR 1 /
+;; SHUT_RDWR 2 on each). Raw foreign-funcall like %setsockopt above (neither socket interface exposes a
+;; portable shutdown); the fd comes from %SOCKET-FD, the one per-impl seam (ADR 0114).
 (defconstant +shut-rdwr+ 2
   "shutdown(2) SHUT_RDWR: disable both directions. Value 2 on Darwin + Linux (verified vs sys/socket.h).")
 
@@ -1067,76 +1066,52 @@
     (when (= (cffi:pointer-address p) +map-failed-addr+) (bail :mmap-failed))
     (values p nil)))
 
-#+clasp
-(defvar *native-shm-open*
-  (let ((s (find-symbol "SYS-SHM-OPEN" "CORE"))) (and s (fboundp s) s))
-  "CORE:SYS-SHM-OPEN on a Clasp carrying the native C++ POSIX-shm layer, else NIL. That primitive is
-   ::shm_open(name, oflag, (mode_t)mode) compiled by clang, so the variadic mode is passed by a real C
-   compiler and is correct on EVERY ABI by construction — which is precisely what no CFFI call form could
-   achieve on Darwin/arm64. Looked up by name, not read as CORE:SYS-SHM-OPEN, so this file still compiles
-   on a Clasp predating the layer (there the old, unreliable call form is used and
-   SHM-CREATE-MODE-RELIABLE-P reports NIL). Bound once at load: the symbol cannot appear later.")
-
 (defun* %shm-open-create (name)
     (function (string) fixnum)
-  "shm_open O_CREAT|O_EXCL|O_RDWR, mode 0600. The variadic mode's ABI differs per impl on arm64.
-   SBCL: foreign-funcall-varargs (stack — verified correct). Clasp: the native CORE:SYS-SHM-OPEN when this
-   image has it, else a plain foreign-funcall. Reader conditionals are permitted inside dds-pal/.
+  "shm_open O_CREAT|O_EXCL|O_RDWR, mode 0600. Returns the fd, or a negative value on failure.
 
-   ⚠️ THE macOS-arm64 GAP WAS REAL AND IT WAS NEVER A WRONG CALL FORM — MEASURED, 2026-07-14, because the
-   obvious 'fix' (just use FOREIGN-FUNCALL-VARARGS on Clasp too, as SBCL does) LOOKS like it works. It does
-   not. Over 30 create+reopen trials on Clasp/macOS-arm64, the object was re-openable by name:
+   THE PROTOTYPE, read from the header rather than from memory: glibc declares
+   `extern int shm_open (const char *__name, int __oflag, mode_t __mode);`
+   (/usr/include/x86_64-linux-gnu/sys/mman.h:144) — on Linux the mode is a FIXED argument, NOT variadic —
+   and mode_t is __MODE_T_TYPE = __U32_TYPE = `unsigned int` (bits/typesizes.h:43, bits/types.h:112), hence
+   :UNSIGNED-INT. A plain FOREIGN-FUNCALL is therefore correct on Linux for every implementation; that is
+   the #-sbcl (AllegroCL) arm.
 
-       plain foreign-funcall .......... 10/30
-       foreign-funcall-varargs ......... 0/30   <- the 'obvious fix'
-       varargs, mode as :int ........... 10/30
-       varargs + explicit fchmod 0600 ... 0/30
+   SBCL keeps FOREIGN-FUNCALL-VARARGS, which is correct on BOTH OSes: macOS declares shm_open variadic
+   (`int shm_open(const char *name, int oflag, ...)`, as recorded from the SDK in ADR 0103 §1), and on
+   Darwin arm64 a variadic argument travels on the STACK, so a plain call there lands the mode as garbage.
+   Measured 2026-07-14 on the since-withdrawn Clasp target: over 30 create+reopen trials the object was
+   re-openable by name only 0-11 times for every CFFI call form that FFI offered, because the garbage bits
+   only sometimes included owner-rw (ADR 0013, ADR 0103). A one-shot probe therefore 'proves' whichever
+   answer you want — see SHM-CREATE-MODE-RELIABLE-P.
 
-   NONE of them is correct; the mode lands as GARBAGE, and a single trial passes or fails by whether those
-   garbage bits happened to include owner-rw. A one-shot probe therefore 'proves' whichever answer you want
-   — which is exactly how this was nearly declared fixed. The permission bits are fixed at creation on
-   macOS (fchmod afterwards does not repair them), so there was no Lisp-side repair either.
-
-   ✅ CLOSED 2026-07-31 by the fix landing where it belonged, UPSTREAM IN CLASP: a C++ binding of shm_open
-   (CORE:SYS-SHM-OPEN). Re-running the same 30-trial protocol on that image, with the three old call forms
-   kept as CONTROLS to prove the measurement can still detect failure:
-
-       plain foreign-funcall ........ 11/30, 9/30    <- control, still broken, matches the 2026 baseline
-       foreign-funcall-varargs ....... 8/30, 6/30    <- control, still broken
-       varargs, mode as :int ........ 10/30, 10/30   <- control, still broken
-       CORE:SYS-SHM-OPEN ........... 30/30, 30/30    and fstat reports st_mode = 0600 on every trial
-
-   The mode is now observed DIRECTLY (fstat) rather than inferred from a reopen succeeding, so the result is
-   the requested value landing, not garbage that happened to contain owner-rw. See ADR 0103."
-  (let ((native #+clasp *native-shm-open* #-clasp nil))
-    (if native
-        (values (funcall native name +o-create-excl-rdwr+ #o600))
-        #+sbcl (cffi:foreign-funcall-varargs "shm_open" (:string name :int +o-create-excl-rdwr+) :unsigned-int #o600 :int)
-        #-sbcl (cffi:foreign-funcall "shm_open" :string name :int +o-create-excl-rdwr+ :unsigned-int #o600 :int))))
+   Reader conditionals are permitted inside dds-pal/."
+  #+sbcl (cffi:foreign-funcall-varargs "shm_open" (:string name :int +o-create-excl-rdwr+) :unsigned-int #o600 :int)
+  #-sbcl (cffi:foreign-funcall "shm_open" :string name :int +o-create-excl-rdwr+ :unsigned-int #o600 :int))
 
 (defun* shm-create-mode-reliable-p ()
     (function () t)
-  "T iff %SHM-OPEN-CREATE's variadic mode_t actually lands, so an object this process creates is re-openable
-   BY NAME (mode 0600 grants the owner rw; a garbage mode denies even the owner, and macOS fixes the bits at
+  "T iff %SHM-OPEN-CREATE's mode_t actually lands, so an object this process creates is re-openable BY NAME
+   (mode 0600 grants the owner rw; a garbage mode denies even the owner, and macOS fixes the bits at
    creation). The SHMEM transport REQUIRES by-name attach — the sender opens the receiver's named segment —
    so DDS.XPORT.SHMEM:SHM-ATTACH-BY-NAME-RELIABLE-P is exactly this predicate, re-exported to a package where
    reader conditionals are banned.
 
-   Arms, each with a reason rather than an assumption: SBCL uses FOREIGN-FUNCALL-VARARGS, verified correct on
-   every platform. Clasp with the native C++ CORE:SYS-SHM-OPEN is correct by construction on every ABI. Clasp
-   WITHOUT it is correct only where varargs go in registers, i.e. not Darwin/arm64 (ADR 0013, ADR 0103).
+   Arms, each with a reason rather than an assumption:
+     - SBCL: T. FOREIGN-FUNCALL-VARARGS is correct on every platform.
+     - any other implementation on Linux: T. glibc's shm_open takes the mode as a FIXED argument
+       (see %SHM-OPEN-CREATE), so the plain call is correct.
+     - any other implementation on macOS: NIL. There shm_open IS variadic and the plain call mispasses the
+       mode on arm64. No such platform is admitted (ADR 0118 §4 leaves macOS to owner decision D1), and NIL
+       is the safe answer: SHMEM is switched off rather than half-working.
 
    ⚠️ DELIBERATELY NOT A RUNTIME PROBE, unlike its sibling SYSV-SEM-SETVAL-RELIABLE-P — and the difference is
    the whole lesson. A broken mode is GARBAGE, not zero, so a single create+reopen trial succeeds whenever
    those random bits happen to include owner-rw: measured at 9-11 times in 30. A one-shot probe would
    therefore report T about a third of the time ON A BROKEN IMAGE. SETVAL can be probed because its failure
-   is deterministic (the value silently does not change); this one cannot. Requiring N consecutive successes
-   would work, but it buys nothing here: when the answer is T the native binding makes it T by construction,
-   and when it is wrongly T the 31 SHMEM/zero-copy/loan tests FAIL LOUDLY rather than silently pass-skipping,
-   which is the safe direction to be wrong in."
-  #+(and clasp darwin)       (and *native-shm-open* t)
-  #+(and clasp (not darwin)) t
-  #-clasp                    t)
+   is deterministic (the value silently does not change); this one cannot."
+  #+sbcl t
+  #-sbcl (not (or (member :darwin *features*) (member :macosx *features*))))
 
 (defun* shm-create (name size)
     (function (string (integer 1)) (values (or null shm-segment) (or null keyword)))
@@ -1322,10 +1297,13 @@
    its data-available flag (measured value 1, ADR 0081 §5.0). Returns (values T NIL), or
    (values NIL :SEMCTL-FAILED). Never signals.
 
-   semctl is VARIADIC in its value argument, so it has the same Darwin-arm64 hazard as shm_open's mode: a
-   plain foreign-funcall passes the value in a register where the stack-based variadic ABI expects it. SBCL
-   uses FOREIGN-FUNCALL-VARARGS (stack, correct); Clasp uses a plain call (correct on Linux's register
-   varargs, the documented NFR-PORT gap on Darwin-arm64, ADR 0013). Reader conditionals permitted here."
+   semctl is VARIADIC in its value argument on every OS (glibc: `extern int semctl (int __semid, int
+   __semnum, int __cmd, ...)`, /usr/include/x86_64-linux-gnu/sys/sem.h:52), so it has the Darwin-arm64 hazard
+   shm_open's mode has there: a plain foreign-funcall passes the value in a register where the stack-based
+   variadic ABI expects it. SBCL uses FOREIGN-FUNCALL-VARARGS (correct everywhere); AllegroCL uses a plain
+   call, which is correct on x86_64 Linux, where variadic integer arguments travel in the same registers as
+   fixed ones (and SYSV-SEM-SETVAL-RELIABLE-P probes it at runtime regardless). Reader conditionals are
+   permitted here."
   (if (minusp #+sbcl (cffi:foreign-funcall-varargs "semctl" (:int (sysv-sem-set-id set) :int semnum :int +sem-setval+) :int value :int)
               #-sbcl (cffi:foreign-funcall "semctl" :int (sysv-sem-set-id set) :int semnum :int +sem-setval+ :int value :int))
       (bail :semctl-failed)
@@ -1346,9 +1324,9 @@
 
 (defun* sysv-sem-setval-reliable-p ()
     (function () t)
-  "T iff semctl(SETVAL) actually sets the value on this implementation+platform. FALSE on Clasp/macOS-arm64,
-   whose CFFI mispasses semctl's variadic value the same way it mispasses shm_open's mode (ADR 0013) — there
-   SETVAL silently no-ops, which would leave an RTI receiver un-woken and, worse, block a subsequent take on
+  "T iff semctl(SETVAL) actually sets the value on this implementation+platform. FALSE wherever the plain
+   call mispasses semctl's variadic value (measured on the since-withdrawn Clasp/macOS-arm64 target, ADR
+   0013; the same would hold for any non-SBCL implementation on Darwin arm64) — there SETVAL silently no-ops, which would leave an RTI receiver un-woken and, worse, block a subsequent take on
    an un-raised semaphore forever. A runtime PROBE, not a reader conditional: create a fresh IPC_PRIVATE set,
    SETVAL 42, read it back, and require 42. Never touches another process's semaphore; never blocks (GETVAL
    only). The RTI-SHMEM writer and its test gate on this, exactly as the SHMEM transport gates on

@@ -8,9 +8,8 @@
 # LargeData sample (> the ZC threshold) into its pool and sends only a 16-byte REFERENCE; the subscriber
 # resolves it against the writer's pool CROSS-PROCESS and verifies the payload byte-exact. Proof = the sub
 # received the samples (byte-exact) AND the pub's disc-node-zc-sends > 0 (i.e. a reference, not the
-# fragmented payload, crossed the OS-process boundary). SBCL only: the by-name SHMEM attach the pool relies
-# on is reliable on SBCL everywhere + Clasp/Linux; Clasp/macOS falls back (ADR 0013), so this harness pins
-# SBCL and a non-default domain to dodge stray peers.
+# fragmented payload, crossed the OS-process boundary). This harness pins SBCL (the by-name SHMEM attach the
+# pool relies on is reliable on SBCL on every platform) and a non-default domain to dodge stray peers.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 

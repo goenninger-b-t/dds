@@ -412,10 +412,10 @@
    :IMPLAUSIBLE-SEGMENT-PROPERTIES / :SHMAT-FAILED), or :NO-MUTEX / :NO-DATA-SEMAPHORE when a semaphore set
    is missing. Never signals.
 
-   GATED on DDS.PAL:SYSV-SEM-SETVAL-RELIABLE-P. On Clasp/macOS-arm64 `semctl SETVAL` mispasses its variadic
-   value (ADR 0013), so it cannot wake the receiver; the write is REFUSED (:SETVAL-UNAVAILABLE) rather than
-   landing a record no one is signalled to read. Same NFR-PORT gap as the SHMEM transport; the primary
-   platform (Linux) and SBCL are unaffected.
+   GATED on DDS.PAL:SYSV-SEM-SETVAL-RELIABLE-P. Where a plain call mispasses `semctl SETVAL`'s variadic value
+   (measured on the since-withdrawn Clasp/macOS-arm64 target, ADR 0013) it cannot wake the receiver; the write
+   is then REFUSED (:SETVAL-UNAVAILABLE) rather than landing a record no one is signalled to read. SBCL
+   everywhere and AllegroCL on x86_64 Linux pass the value correctly.
 
    SAFETY. The record is written under the ring mutex, taken with SEM_UNDO so a crash of this process cannot
    leave the mutex locked and deadlock RTI's receiver. The mutex is released on every exit path. LEN is
@@ -739,8 +739,8 @@
      3. the mutex is back at 1 (taken and released, not left locked);
      4. a datagram larger than message_size_max is refused with :DATAGRAM-TOO-LARGE, not written.
 
-   Pass-skips where SETVAL is unavailable (Clasp/macOS-arm64, ADR 0013) — there the writer correctly refuses
-   with :SETVAL-UNAVAILABLE and there is nothing to round-trip; asserting that refusal IS the Clasp check."
+   Where SETVAL is unavailable (DDS.PAL:SYSV-SEM-SETVAL-RELIABLE-P NIL) the writer correctly refuses with
+   :SETVAL-UNAVAILABLE and there is nothing to round-trip; asserting that refusal IS the check there."
   (let* ((port +rti-shmem-write-test-port+)
          (segkey (rti-shmem-segment-key port))
          (mtxkey (+ +rti-shmem-mutex-key-base+ port))
@@ -780,7 +780,7 @@
                  (%rti-shmem-put-u32-le sap +rti-shmem-off-b-counter+ 1)
                  (cond
                    ((not (dds.pal:sysv-sem-setval-reliable-p))
-                    ;; Clasp/macOS-arm64: the writer must REFUSE, not write.
+                    ;; SETVAL unreliable on this image: the writer must REFUSE, not write.
                     (multiple-value-bind (ok st) (rti-shmem-write-record port rec-a (length rec-a))
                       (assert (and (null ok) (eq st :setval-unavailable)) ()   ; HOTPATH-COND(TEST): in-file self-test
                               "SETVAL unavailable here, write must refuse, got ~s/~s" ok st)))

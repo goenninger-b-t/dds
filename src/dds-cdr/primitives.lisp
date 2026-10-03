@@ -314,7 +314,7 @@
                    ;; representable (below the 16-bit limit). It is deliberately NOT silent: the application
                    ;; receives the replacement character and can see it, where dropping the sample or
                    ;; returning a status the generated codecs ignore would both hide the loss.
-                   ;; On SBCL and Clasp CODE-CHAR never fails for a valid scalar value, so this is
+                   ;; On SBCL CODE-CHAR never fails for a valid scalar value, so this is
                    ;; byte-identical there — the OR arm is unreachable.
                    (setf (char s k) (or (code-char cp) +replacement-character+))
                    (incf k)

@@ -6,7 +6,7 @@
 ;;; HSM/KMS backend can keep the key off-process.
 
 ;;; Perms mechanism: set with `chmod 600 <key>` / `chmod 700 <dir>` via uiop:run-program
-;;; (impl-agnostic, no #+sbcl/#+clasp).  Check via `LC_ALL=C ls -la <key>` — parse the
+;;; (impl-agnostic, no reader conditionals — the operating contract §4).  Check via `LC_ALL=C ls -la <key>` — parse the
 ;;; 10-char POSIX mode string; positions 4,5 (group r/w) and 7,8 (other r/w) must be '-'.
 ;;; LC_ALL=C pins the mode-string format regardless of host locale.  Fail-CLOSED: if the
 ;;; mode string cannot be obtained/parsed, refuse to load (signal), never open.
@@ -103,7 +103,7 @@
     (function (pathname) (or null string))
   "Return the 10-char POSIX mode string for PATH via `LC_ALL=C ls -la`, or NIL on failure.
    LC_ALL=C pins the POSIX mode-string format regardless of host locale.
-   Mechanism: uiop:run-program (impl-agnostic; no #+sbcl/#+clasp).
+   Mechanism: uiop:run-program (impl-agnostic; no reader conditionals).
    `ls -la` output line format: `<mode> <nlinks> <user> <group> <size> <date> <name>`."
   (handler-case
       (let* ((native (uiop:native-namestring path))
@@ -131,7 +131,7 @@
 (defun* enforce-directory-perms-0700 (dir-path)
     (function (pathname) t)
   "Set directory DIR-PATH to 0700 (owner-only) via chmod. uiop:run-program is impl-agnostic
-   (no #+sbcl/#+clasp; the operating contract §4). Public seam so any directory holding sensitive
+   (no reader conditionals; the operating contract §4). Public seam so any directory holding sensitive
    cleartext (the durability store dir D — cleartext frame metadata) gets the SAME 0700 enforcement
    as the key dir K, reusing one mechanism (DRY; ADR 0026 §10.12)."
   (uiop:run-program (list "chmod" "700" (uiop:native-namestring dir-path)))
@@ -158,7 +158,7 @@
 (defun* %enforce-key-perms (priv-path dir-path)
     (function (pathname pathname) t)
   "Set private-key file to 0600 and key directory to 0700 via chmod.
-   uiop:run-program is impl-agnostic (no #+sbcl/#+clasp; the operating contract §4).
+   uiop:run-program is impl-agnostic (no reader conditionals; the operating contract §4).
    The 0700 directory step reuses ENFORCE-DIRECTORY-PERMS-0700 (DRY, shared with the store dir D)."
   (uiop:run-program (list "chmod" "600" (uiop:native-namestring priv-path)))
   (enforce-directory-perms-0700 dir-path)

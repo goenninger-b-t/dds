@@ -93,14 +93,38 @@ check_ceiling () {   # $1 = column label, $2 = the value read from the row
 check_ceiling RETURN "$CEILING_RETURN"
 check_ceiling INTO   "$CEILING_INTO"
 
-# SBCL only: dds.pal:bytes-consed returns 0 on Clasp, so a Clasp run would measure NOTHING and "pass"
-# vacuously. Refuse rather than pretend (the documented NFR-PORT gap).
 LISP="${LISP:-./scripts/with-sbcl.sh}"
-case "$LISP" in
-  *clasp*) echo "gate-mem: FAIL — Clasp cannot run this gate (dds.pal:bytes-consed returns 0 there, so it" >&2
-           echo "          would measure nothing and pass vacuously). Run with LISP=./scripts/with-sbcl.sh." >&2
-           exit 1 ;;
-esac
+
+# ⛔ THE COUNTER MUST BE PROVEN TO MOVE BEFORE ANY NUMBER IT REPORTS IS BELIEVED (ADR 0118). A ratchet on a
+# counter that never moves reads 0.0 B/sample on every arm, prints "NFR-MEM's target is MET", and PASSES —
+# the most dangerous green there is. That is not hypothetical: dds.pal:bytes-consed was the literal 0 on
+# Clasp (where its zero-allocation claims turned out to be 3056 B/call once measured with a real counter)
+# and IS the literal 0 on AllegroCL today. This gate used to refuse that case by matching the launcher's
+# NAME (*clasp*), which waved AllegroCL straight through. It now asks the counter itself: cons a known
+# CANARY_BYTES in a fresh process and FAIL unless bytes-consed advanced by AT LEAST that much. No name is
+# matched, so any image whose counter is dead is refused — including one nobody has thought of yet.
+CANARY_BYTES=1048576
+CANARY_FORM="(let* ((b0 (dds.pal:bytes-consed))
+                    (v (make-array $CANARY_BYTES :element-type '(unsigned-byte 8) :initial-element 1))
+                    (b1 (dds.pal:bytes-consed)))
+               (setf (symbol-value (intern \"*GATE-MEM-CANARY-SINK*\" :cl-user)) v)
+               (format t \"~&CANARY-DELTA ~d~%\" (- b1 b0)))"
+canary_out="$("$LISP" --eval '(asdf:load-system :dds-pal)' --eval "$CANARY_FORM" --eval '(uiop:quit 0)' 2>&1)"
+CANARY_DELTA="$(grep -o 'CANARY-DELTA -\?[0-9]*' <<<"$canary_out" | awk '{print $2}')"
+if [[ -z "$CANARY_DELTA" ]]; then
+  echo "gate-mem: FAIL — the allocation-counter canary did not run under LISP=$LISP:" >&2
+  printf '%s\n' "$canary_out" | tail -5 >&2
+  exit 1
+fi
+if (( CANARY_DELTA < CANARY_BYTES )); then
+  echo "gate-mem: FAIL: allocation counter does not move — consed a $CANARY_BYTES-byte canary and" >&2
+  echo "          dds.pal:bytes-consed advanced by $CANARY_DELTA under LISP=$LISP. Every arm below would" >&2
+  echo "          measure NOTHING and pass vacuously, so the gate refuses to run (ADR 0118). AllegroCL's" >&2
+  echo "          bytes-consed is the constant 0 (an NFR-PORT measurement gap); run with" >&2
+  echo "          LISP=./scripts/with-sbcl.sh until the AllegroCL PAL has a real counter." >&2
+  exit 1
+fi
+echo "gate-mem: canary OK — consed $CANARY_BYTES bytes, bytes-consed advanced by $CANARY_DELTA."
 
 # One arm = one FRESH PROCESS on its OWN domain (see the header: sharing either lets the arms discover
 # each other and reads high). $1 = the mem-per-sample keyword arguments that DEFINE the arm, $2 = domain.

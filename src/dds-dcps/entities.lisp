@@ -2092,11 +2092,11 @@
          (ln (or (pop (dw-loan-freelist dw)) (%make-writer-loan))))
     (setf (writer-loan-done ln) nil)
     ;; Gated on the CAPABILITY, not on the implementation NAME. This used to read
-    ;; (eq (dds.pal:pal-impl-name) :sbcl) because the Clasp PAL stubbed store-sap-u8 out; that stub is gone
-    ;; (it is cffi:mem-ref, exactly as SBCL's sap-ref-8 is), so the foreign-SAP writes work on both impls.
-    ;; What zero-copy still needs is by-name SHMEM attach — and node-loan-write-eligible-p now asks for it,
-    ;; so Clasp/Linux (the primary platform) takes the loan-write path exactly as SBCL does, while
-    ;; Clasp/macOS-arm64 (the residual ADR 0013 defect) degrades gracefully.
+    ;; (eq (dds.pal:pal-impl-name) :sbcl) because a since-withdrawn PAL stubbed store-sap-u8 out; every
+    ;; PAL now implements it (cffi:mem-ref on AllegroCL, sap-ref-8 on SBCL), so the foreign-SAP writes work
+    ;; on both impls. What zero-copy still needs is by-name SHMEM attach — and node-loan-write-eligible-p
+    ;; asks for it, so any image where that attach is reliable takes the loan-write path, and one where it
+    ;; is not (DDS.PAL:SHM-CREATE-MODE-RELIABLE-P NIL) degrades gracefully.
     (when (and size (dds.disc:node-loan-write-eligible-p node size))
       (multiple-value-bind (sap slot base gen) (dds.disc:node-loan-write-acquire node size)
         (when sap                                        ; NIL ⇒ pool saturated ⇒ fall through to the fallback

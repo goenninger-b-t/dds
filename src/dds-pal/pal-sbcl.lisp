@@ -7,7 +7,7 @@
 (in-package #:dds.pal)
 
 ;; SBCL ships sb-bsd-sockets as a contrib; load it so pal-net.lisp (the shared
-;; native UDP layer) compiles. Clasp bundles sb-bsd-sockets preloaded.
+;; native UDP layer) compiles. AllegroCL uses its own SOCKET module instead (ADR 0114).
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (require :sb-bsd-sockets))
 
@@ -15,7 +15,7 @@
 (eval-when (:compile-toplevel :load-toplevel :execute)
   ;; A diagnostic, not a condition (ADR 0064: nothing in our code signals). WARN would unwind into the
   ;; loading image's handlers and, under a warnings-as-errors build policy, fail a build that is merely
-  ;; loading the wrong PAL for its implementation (mirrors pal-clasp.lisp's #-clasp notice).
+  ;; loading the wrong PAL for its implementation (mirrors pal-allegro.lisp's #-allegro notice).
   (format *error-output*
           "~&dds.pal: pal-sbcl.lisp loaded on a non-SBCL build — this PAL is not the one for this image.~%"))
 
@@ -338,7 +338,8 @@
   "Persist the DIRENT of a newly-created or renamed file: open(PATH, O_RDONLY), fsync(fd), close(fd).
    POSIX requires fsyncing the CONTAINING DIRECTORY (not just the file contents) so a create/rename
    survives a power loss (ADR 0026 §10.10 / §10.11, ADR 0029). The CFFI open/fsync/close path is
-   impl-agnostic (identical body in pal-clasp.lisp — no NFR-PORT split needed, unlike fsync-stream).
+   impl-agnostic (pal-allegro.lisp takes the same CFFI route — no NFR-PORT split needed, unlike
+   fsync-stream).
    O_RDONLY = 0 on Linux and macOS. On macOS fsync(2) on a directory fd is valid and flushes the
    dirent to the drive; F_FULLFSYNC (full platter flush) is a stronger guarantee not required here.
    Returns (VALUES T STATUS): STATUS is NIL on success, or :FSYNC-FAILED on open/fsync failure — a dirent

@@ -40,7 +40,7 @@
 
 ;;; ADR 0114: CDR-MODE is defined HERE, in the first-loaded file, and not beside its users in
 ;;; primitives.lisp — because cdr.lisp is compiled BEFORE primitives.lisp and declaims an ftype that
-;;; mentions it. A type referenced before its DEFTYPE is a deferred style-warning on SBCL and Clasp and a
+;;; mentions it. A type referenced before its DEFTYPE is a deferred style-warning on SBCL and a
 ;;; HARD ERROR on AllegroCL, which reported it as "(FUNCTION ((UNSIGNED-BYTE 16)) (:DEFAULT)) is not a
 ;;; valid type specifier" and blocked 12 of the 18 systems from loading. The forward reference was always
 ;;; a latent defect; only a third implementation made it fatal.

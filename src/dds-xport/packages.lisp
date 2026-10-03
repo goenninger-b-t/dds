@@ -34,7 +34,7 @@
   (:documentation
    "POSIX shared-memory intra-host transport ring (FR-XPORT-2). Per-receiver
     segment: header + a pshared notify block (mutex+cond) + K per-sender SPSC
-    lanes. Lane claim is mutex-guarded (no foreign CAS -> full Clasp parity); the
+    lanes. Lane claim is mutex-guarded (no foreign CAS -> identical on every PAL); the
     SPSC enqueue/drain hot path is raw SAP read/write with release/acquire fences.
     Public API: make-shmem-transport returns a participant's receive segment + the
     frozen transport record; the receiver thread cond-waits on the notify block.
@@ -89,7 +89,7 @@
     the payload; a same-host reader resolves the reference (bounds + generation
     guarded) and copies the slot out. All slot state (per-slot
     refcount/generation/len/pubseq) is mutated UNDER the pool's PTHREAD_PROCESS_SHARED
-    mutex (no foreign-SAP CAS -> full Clasp parity); the freelist was dropped, so a
+    mutex (no foreign-SAP CAS -> identical on every PAL); the freelist was dropped, so a
     slot is reclaimable iff refcount==0 and the writer scans for the oldest such slot
     (WP-ZC-LOAN-LOCKFREE, ADR 0018). Generation is the single guard for
     stale refs, force-reclaim mid-read, and untrusted cross-process references.

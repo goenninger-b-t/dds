@@ -11,7 +11,7 @@
 ;;;; INSIDE every measured loop, so it cancels in the KEEP_LAST-vs-KEEP_ALL delta; the keyhash
 ;;;; allocation is measured on its own line so it can be attributed precisely. Timing is
 ;;;; dds.pal:monotonic-ns (~us resolution, amortised over the loop); GC bytes/sample is the
-;;;; dds.pal:bytes-consed delta / N (the NFR-PERF-8 oracle, SBCL-exact; Clasp reports 0 — a
+;;;; dds.pal:bytes-consed delta / N (the NFR-PERF-8 oracle, SBCL-exact; AllegroCL reports 0 — a
 ;;;; documented NFR-PORT gap, so the SBCL numbers are the record). No "0-cost" claim: the keyed
 ;;;; KEEP_LAST keyhash is a real ~16-byte/sample allocation + the index cons; KEEP_ALL and the
 ;;;; unkeyed collapse stay as before. The reader-side per-instance O(N) drop is a SEPARATE cost
@@ -52,7 +52,7 @@
    NIL threads no handle (every change collapses to the single :unkeyed bucket = global KEEP_LAST /
    the prior behavior). The cache-change cons is INSIDE the loop in every mode (pre-existing, cancels
    in the delta); ns/sample is the dds.pal:monotonic-ns total / SAMPLES (~us clock, amortised),
-   bytes/sample the dds.pal:bytes-consed delta / SAMPLES (SBCL-exact, Clasp 0 by NFR-PORT gap)."
+   bytes/sample the dds.pal:bytes-consed delta / SAMPLES (SBCL-exact, AllegroCL 0 by NFR-PORT gap)."
   (let* ((hc (dds.rtps.history:make-history-cache kind depth nil nil))
          (khs (when keyed (%keeplast-keyhashes instances)))
          (t0 (dds.pal:monotonic-ns))
@@ -114,11 +114,11 @@
    retains all SAMPLES, KEEP_LAST evicts to DEPTH*INSTANCES) and the report calls that out. SAMPLES is
    the per-mode add count, INSTANCES the distinct keyed instances (SAMPLES spread round-robin so each
    bucket overflows DEPTH and the per-instance evict fires), DEPTH the KEEP_LAST per-instance depth.
-   Honest measurement: SBCL bytes are the record (Clasp dds.pal:bytes-consed reports 0, a documented
+   Honest measurement: SBCL bytes are the record (AllegroCL dds.pal:bytes-consed reports 0, a documented
    NFR-PORT gap); no 0-cost claim. The reader-side per-instance O(N) drop is a separate cost."
   (let ((*standard-output* stream))
     (format t "~&# WP-KEEPLAST — writer-side per-instance KEEP_LAST HISTORY-machinery cost (FR-LANG-7)~%~%")
-    (format t "Drives dds.rtps.history:hc-add-change directly (the unit WP-KEEPLAST modified) so the measurement isolates the HISTORY add path, not the transport/serialization path. Clock: dds.pal:monotonic-ns (~~us, amortised over ~d samples). GC bytes/sample: dds.pal:bytes-consed delta / samples (SBCL-exact; Clasp reports 0 — a documented NFR-PORT gap, so SBCL is the record). The cache-change cons is held INSIDE every measured loop (pre-existing — history.lisp:25 flags pooling as a follow-up); the keyhash allocation is measured on its own line. HONESTY CAVEAT (FR-LANG-7): KEEP_ALL and KEEP_LAST differ in RETENTION (KEEP_ALL retains all ~d changes — its change-table grows + rehashes; KEEP_LAST evicts to dep*instances), so the KEEP_ALL-vs-KEEP_LAST byte delta is dominated by retention, NOT machinery. The clean isolation of the per-instance machinery is KEEP_LAST keyed vs KEEP_LAST unkeyed (same kind, same retention — only the per-instance index/bucketing differs) plus the keyhash line; both are reported below.~%~%" samples samples)
+    (format t "Drives dds.rtps.history:hc-add-change directly (the unit WP-KEEPLAST modified) so the measurement isolates the HISTORY add path, not the transport/serialization path. Clock: dds.pal:monotonic-ns (~~us, amortised over ~d samples). GC bytes/sample: dds.pal:bytes-consed delta / samples (SBCL-exact; AllegroCL reports 0 — a documented NFR-PORT gap, so SBCL is the record). The cache-change cons is held INSIDE every measured loop (pre-existing — history.lisp:25 flags pooling as a follow-up); the keyhash allocation is measured on its own line. HONESTY CAVEAT (FR-LANG-7): KEEP_ALL and KEEP_LAST differ in RETENTION (KEEP_ALL retains all ~d changes — its change-table grows + rehashes; KEEP_LAST evicts to dep*instances), so the KEEP_ALL-vs-KEEP_LAST byte delta is dominated by retention, NOT machinery. The clean isolation of the per-instance machinery is KEEP_LAST keyed vs KEEP_LAST unkeyed (same kind, same retention — only the per-instance index/bucketing differs) plus the keyhash line; both are reported below.~%~%" samples samples)
     (format t "Parameters: samples=~d, instances=~d, KEEP_LAST depth=~d (samples spread round-robin so each instance bucket overflows depth and the per-instance evict fires).~%~%" samples instances depth)
     (format t "**Regression this bench surfaced + fixed (Task E1):** the WP's `%hc-store` originally appended to the per-instance index UNCONDITIONALLY via `nconc` (an O(bucket-length) tail-walk). For KEEP_ALL the index bucket is never evicted, so it grew unbounded → O(N) per insert = **O(N²) total** on the KEEP_ALL write path (a regression vs pre-WP O(1)). FIX: the per-instance index is the KEEP_LAST eviction mechanism, so `%hc-index-append`/`%hc-index-drop` now no-op for KEEP_ALL — KEEP_ALL is the O(1) change-table insert it was pre-WP (measured below: KEEP_ALL ns/sample is now FLAT across N, ~~70 ns/sample at any size, vs ~~3.6/7.3/14.1 us/sample climbing at N=10k/20k/40k before the fix).~%~%")
     (format t "## HistoryCache add-path cost per mode~%~%")

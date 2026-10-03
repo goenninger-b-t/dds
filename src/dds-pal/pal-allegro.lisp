@@ -2,16 +2,14 @@
 ;;;; This file is the ONLY location permitted to carry #+allegro conditionals.
 ;;;;
 ;;;; Verified against International Allegro CL Enterprise Edition 11.0, 64-bit Linux (x86-64) SMP.
-;;;; Every implementation choice below was PROBED on that build, not inferred: the three backends genuinely
-;;;; disagree (SBCL's single-float-bits is SIGNED, Clasp's is UNSIGNED, Allegro's is a pair of unsigned
-;;;; shorts; SBCL's atomic-incf returns the OLD value, Allegro's incf-atomic returns the NEW), and absorbing
-;;;; exactly that is what the PAL exists for.
+;;;; Every implementation choice below was PROBED on that build, not inferred: the backends genuinely
+;;;; disagree (SBCL's single-float-bits is SIGNED, Allegro's is a pair of unsigned shorts; SBCL's
+;;;; atomic-incf returns the OLD value, Allegro's incf-atomic returns the NEW), and absorbing exactly that is
+;;;; what the PAL exists for.
 ;;;;
-;;;; ⚠️ SCOPE: this file completes the 36 per-implementation symbols of the PAL CONTRACT. The SOCKET layer
-;;;; in pal-net.lisp is separate and NOT yet ported — 16 of its 68 functions are written against
-;;;; SB-BSD-SOCKETS, which SBCL and Clasp both bundle and AllegroCL does not, so :DDS-PAL still does not
-;;;; load here. The other 32 pal-net functions are pure CFFI (mmap, POSIX/SysV shm, semaphores, pshared
-;;;; mutex+condvar) and are expected to work unchanged. See ADR 0113.
+;;;; ⚠️ SCOPE: this file completes the 36 per-implementation symbols of the PAL CONTRACT (ADR 0113). The
+;;;; SOCKET layer lives in pal-net.lisp, whose socket-object calls carry #+allegro arms over AllegroCL's
+;;;; SOCKET module (ADR 0114), because SBCL bundles SB-BSD-SOCKETS and AllegroCL does not.
 
 (in-package #:dds.pal)
 
@@ -28,9 +26,8 @@
 ;;; ---- FOREIGN ATOMICS AVAILABILITY -------------------------------------------------------------------
 ;;;
 ;;; ⛔ LIBATOMIC MUST BE LOADED EXPLICITLY HERE. The SAP atomics below call the GCC/C11 primitives
-;;; __atomic_compare_exchange_4/_8 and __atomic_fetch_add_8 through %GLOBAL-SYMBOL-POINTER, exactly as the
-;;; Clasp PAL does. On Clasp they resolve for free because its runtime already links libatomic; in an
-;;; Allegro image they resolve to NIL until the library is mapped — PROBED: all three answer NIL before
+;;; __atomic_compare_exchange_4/_8 and __atomic_fetch_add_8 through %GLOBAL-SYMBOL-POINTER. In an
+;;; Allegro image they resolve to NIL until libatomic is mapped — PROBED: all three answer NIL before
 ;;; this load and a valid pointer after it. Without this the SHMEM lane claim and the Zero-Copy refcount
 ;;; would fail at their first call rather than at load, which is the worst place to discover it.
 (eval-when (:load-toplevel :execute)
@@ -73,7 +70,7 @@
 
 (defun* static-vector-p (vec)
     (function (t) boolean)
-  "T iff VEC is usable as a static octet vector. Like the Clasp PAL, this cannot DISCRIMINATE an off-heap
+  "T iff VEC is usable as a static octet vector. Unlike the SBCL PAL, this cannot DISCRIMINATE an off-heap
    vector from a heap one — that discrimination is SBCL-only (ADR 0034) — so it answers the type question
    only. A documented NFR-PORT gap, not a silent difference: the teardown WIPE still runs; what is missing
    is the ability to REJECT a heap array handed in by mistake."
@@ -109,7 +106,7 @@
 (defun* load-sap-u64 (sap offset)
     (function (t (integer 0)) (unsigned-byte 64))
   "Aligned 64-bit read of the foreign location at SAP+OFFSET (bytes), masked to unsigned — the same guard
-   the Clasp PAL carries, because a CFFI :uint64 mem-ref that sign-extends a high-bit-set word would make
+   a CFFI-only backend needs, because a CFFI :uint64 mem-ref that sign-extends a high-bit-set word would make
    every SHMEM cursor comparison wrong at the 2^63 boundary."
   (logand (cffi:mem-ref sap :uint64 offset) #xFFFFFFFFFFFFFFFF))
 
@@ -136,8 +133,7 @@
 (defconstant +atomic-seq-cst+ 5
   "The C11 memory_order_seq_cst enumerator, passed to the __atomic_* builtins. Pinned from the GCC/C11
    __atomic builtins ABI, where the memory-order enumerators are 0=relaxed, 1=consume, 2=acquire,
-   3=release, 4=acq_rel, 5=seq_cst — the same value the Clasp PAL uses, and not a value to reconstruct
-   from memory.")
+   3=release, 4=acq_rel, 5=seq_cst — and not a value to reconstruct from memory.")
 
 (defmacro %cas-sap (fp sap offset old new ctype)
   "Compare-and-swap the CTYPE-wide foreign word at SAP+OFFSET, returning the PREVIOUS value. The C11
@@ -252,8 +248,9 @@
 (defun* bytes-consed ()
     (function () integer)
   "Total heap octets consed by this image. Returns 0 on AllegroCL — a documented NFR-PORT MEASUREMENT gap,
-   identical to the Clasp PAL's, and the reason `make gate-mem` runs on SBCL. It is a gap in the ability to
-   MEASURE allocation here, never a difference in how much is allocated."
+   and the reason `make gate-mem` runs on SBCL: gate-mem's canary (ADR 0118) conses a known number of bytes
+   first and FAILS when this counter does not move, so an AllegroCL run of that gate is refused, loudly. It is
+   a gap in the ability to MEASURE allocation here, never a difference in how much is allocated."
   0)
 
 (defun* gc-suggest ()
@@ -264,7 +261,7 @@
 
 (defmacro with-gc-inhibited (&body body)
   "Evaluate BODY with the GC inhibited where the implementation supports it. On AllegroCL this is a plain
-   PROGN, exactly as on Clasp: the hot paths that would need it draw from the static arena and touch no
+   PROGN: the hot paths that would need it draw from the static arena and touch no
    GC-managed memory, so inhibiting nothing changes nothing. Kept as a macro so the contract has one
    spelling on every implementation."
   `(progn ,@body))
@@ -279,7 +276,7 @@
   "T iff CONDITION signals an IMPLEMENTATION-INTERNAL invariant violation (as opposed to an ordinary
    runtime failure) — ADR 0100 uses it to latch a corrupt structure out of the send path instead of
    folding it into routine fallback. NIL on AllegroCL: no distinguished internal-bug condition type is
-   relied upon, so this is a documented NFR-PORT gap, the same one Clasp carries. The consequence is
+   relied upon, so this is a documented NFR-PORT gap. The consequence is
    explicit — an internal bug here is treated as a routine emit failure, which is the pre-ADR-0100
    behaviour, never a silent change."
   (declare (ignore condition))
@@ -290,8 +287,8 @@
   "Install CALLBACK for each of SIGNALS (keywords, e.g. :INT :TERM). EXCL::SET-SIGNAL-HANDLER takes the
    signal NUMBER, so the keywords are mapped from the POSIX numbers on Linux/x86-64: SIGINT 2, SIGTERM 15,
    SIGHUP 1. An unrecognised keyword is skipped rather than guessed at."
-  ;; ⛔ ALLEGRO CALLS THE HANDLER WITH ARGUMENTS; the PAL contract is a 0-ARG callback (as SBCL and Clasp
-  ;; deliver it). Passing CALLBACK straight to SET-SIGNAL-HANDLER made the signal invoke it with two, and
+  ;; ⛔ ALLEGRO CALLS THE HANDLER WITH ARGUMENTS; the PAL contract is a 0-ARG callback (as SBCL
+  ;; delivers it). Passing CALLBACK straight to SET-SIGNAL-HANDLER made the signal invoke it with two, and
   ;; the handler died with "got 2 args, wanted an unknown number of args" — inside a signal handler, where
   ;; nothing reports it. The trampoline discards them.
   (dolist (s signals t)
@@ -315,7 +312,7 @@
 
 (defun* fsync-stream (stream)
     (function (stream) (values (or null (eql t)) (or null keyword)))
-  "Flush STREAM's buffers toward the device. Lisp-level flush only, as on Clasp — a documented durability
+  "Flush STREAM's buffers toward the device. Lisp-level flush only — a documented durability
    gap versus the SBCL PAL, which reaches the file descriptor. Returns (values T NIL)."
   (finish-output stream)
   (force-output stream)
@@ -324,7 +321,7 @@
 (defun* fsync-directory (path)
     (function ((or pathname string)) (eql t))
   "fsync(2) the DIRECTORY at PATH, so a rename into it is durable. Opens O_RDONLY through CFFI — the same
-   portable route the Clasp PAL takes, since no Lisp-level operation reaches a directory fd."
+   portable route the SBCL PAL takes, since no Lisp-level operation reaches a directory fd."
   (let* ((native (uiop:native-namestring (uiop:ensure-directory-pathname path)))
          (fd (cffi:foreign-funcall "open" :string native :int 0 :int)))
     (when (minusp (the (signed-byte 32) fd))

@@ -744,7 +744,7 @@
 ;;; threshold) into its pool and sends a 16-byte REFERENCE; the subscriber resolves it from the writer's pool
 ;;; cross-process and verifies the payload byte-exact. Proof = the sub received the samples AND the pub's
 ;;; disc-node-zc-sends > 0 (a reference, not the fragmented payload, crossed the OS-process boundary). SBCL
-;;; only: the by-name SHMEM attach the pool relies on is reliable on SBCL but not Clasp/macOS (ADR 0013).
+;;; only: the driver pins SBCL, on which the by-name SHMEM attach the pool relies on is reliable everywhere.
 
 (defun* %zc-xproc-payload (size id)
     (function ((integer 1) (integer 0)) (simple-array (unsigned-byte 8) (*)))

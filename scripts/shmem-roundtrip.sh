@@ -6,9 +6,8 @@
 # no multicast so the macOS app-firewall LAN-UDP drop is irrelevant), the publisher
 # routes user DATA over SHARED MEMORY. Proof = the sub received the samples AND the
 # pub's disc-node-shmem-sends > 0 (i.e. SHMEM, not UDP, carried the user data across
-# the OS-process boundary). SBCL only: SHMEM is on for SBCL everywhere + Clasp/Linux;
-# Clasp/macOS falls back to UDP (ADR 0013 shm_open variadic-mode ABI gap), so this
-# harness pins SBCL and a different domain than the default 0 to dodge stray peers.
+# the OS-process boundary). This harness pins SBCL (SHMEM is on for SBCL on every
+# platform) and a different domain than the default 0 to dodge stray peers.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 

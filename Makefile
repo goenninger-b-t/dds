@@ -1,24 +1,23 @@
-# M0 quality gates (the operating contract §6). Landed targets: Clasp + SBCL + AllegroCL.
+# M0 quality gates (the operating contract §6). Targets: SBCL + AllegroCL (ADR 0118 withdrew Clasp).
 # Live gates this milestone: build, test, gate-hotpath. The rest are M1+ stubs.
 #
-# Bare `build`/`test` use $(LISP) (default Clasp); override with LISP=... or use
-# the per-impl / -all variants. `make all` runs all three landed impls, and each launcher exits 127 when
+# Bare `build`/`test` use $(LISP) (default SBCL); override with LISP=... or use
+# the per-impl / -all variants. `make all` runs both targets, and each launcher exits 127 when
 # its binary is absent — deliberately, so a run cannot report success without validating that impl. The
 # per-impl targets (`make test-sbcl`) are the escape hatch on a machine lacking one (AllegroCL is
-# commercially licensed; the Mac has no alisp and 192.168.2.180 has no Clasp).
+# commercially licensed).
 
-CLASP := ./scripts/with-clasp.sh
 SBCL  := ./scripts/with-sbcl.sh
 # ADR 0004's tracked follow-up, closed 2026-08-07. The launcher translates --eval to AllegroCL's -e, so
 # every target below keeps ONE spelling (ADR 0116 does the same for CHILD processes).
 ALLEGRO := ./scripts/with-allegro.sh
-LISP  ?= $(CLASP)
+LISP  ?= $(SBCL)
 
-.PHONY: all build test build-clasp build-sbcl build-allegro test-clasp test-sbcl test-allegro gate-build gate-mem gate-pal gate-nocond gate-quickload gate-verification gate-drivers \
+.PHONY: all build test build-sbcl build-allegro test-sbcl test-allegro gate-build gate-mem gate-pal gate-nocond gate-quickload gate-verification gate-drivers \
         build-all test-all gate-hotpath gate-types corpus fuzz wire interop \
         square-pub square-sub square-spy large-pub large-sub gated-sub corpus-capture \
         nokey-pub nokey-sub keyed-flat-pub keyed-flat-sub \
-        fastdds-pub fastdds-sub fastdds-tl-probe fastdds-type-probe fastdds-keyed-flat-pub fastdds-keyed-flat-sub bench bench-shmem bench-zerocopy bench-flatdata bench-flatdata-zc-loan bench-flatdata-loan-write bench-zc-loan-lockfree bench-multi-dest-zc bench-async-flow bench-flow-edf-priority bench-keeplast bench-rtps-message bench-rtps-message-clasp bench-rtps-protection shmem-xproc zc-xproc mem sbom hooks clean \
+        fastdds-pub fastdds-sub fastdds-tl-probe fastdds-type-probe fastdds-keyed-flat-pub fastdds-keyed-flat-sub bench bench-shmem bench-zerocopy bench-flatdata bench-flatdata-zc-loan bench-flatdata-loan-write bench-zc-loan-lockfree bench-multi-dest-zc bench-async-flow bench-flow-edf-priority bench-keeplast bench-rtps-message bench-rtps-protection shmem-xproc zc-xproc mem sbom hooks clean \
         gate-arena gate-nlx test-linux linux-run linux-shell linux-image linux-clean-cache
 
 DOMAIN   ?= 0
@@ -102,14 +101,12 @@ test:
 	$(LISP) --eval '(asdf:load-system :dds-tests)' \
 	        --eval '(handler-case (progn (asdf:test-system :dds-tests) (uiop:quit 0)) (error (e) (format t "~&~a~%" e) (uiop:quit 1)))'
 
-build-clasp:   ; $(MAKE) build LISP=$(CLASP)
 build-sbcl:    ; $(MAKE) build LISP=$(SBCL)
 build-allegro: ; $(MAKE) build LISP=$(ALLEGRO)
-test-clasp:    ; $(MAKE) test  LISP=$(CLASP)
 test-sbcl:     ; $(MAKE) test  LISP=$(SBCL)
 test-allegro:  ; $(MAKE) test  LISP=$(ALLEGRO)
-build-all: build-clasp build-sbcl build-allegro
-test-all:  test-clasp test-sbcl test-allegro
+build-all: build-sbcl build-allegro
+test-all:  test-sbcl test-allegro
 
 gate-hotpath:
 	./scripts/gate-hotpath.sh
@@ -152,7 +149,8 @@ gate-build: ; ./scripts/gate-build.sh $(LISP)
 # NFR-MEM ALLOCATION RATCHET (ADR 0062). `mem` above measures the CODEC in isolation (~0 B/iter) — a real
 # assertion, but NOT the per-sample budget it is credited with, which is why it stayed green while the live
 # DCPS path allocated ~3.9 KB/sample. gate-mem measures the END-TO-END path and ratchets it DOWN toward 0.
-# Fails on regression AND on an un-lowered ceiling after an improvement. SBCL only (bytes-consed is 0 on Clasp).
+# Fails on regression AND on an un-lowered ceiling after an improvement. A canary first proves the allocation
+# counter moves (ADR 0118), so it FAILS on AllegroCL, whose dds.pal:bytes-consed is the constant 0.
 gate-mem: ; ./scripts/gate-mem.sh
 
 # FR-PF-7 STATIC-MEMORY PROPERTY (ADR 0095). Asserts what `make mem` was credited with and does not check:
@@ -387,7 +385,7 @@ bench-zc-loan-lockfree:
 	        --eval '(handler-case (progn (uiop:symbol-call :dds.tests :run-bench-zc-loan-lockfree :file "bench/report/2026-06-16-wp-zc-loan-lockfree.md") (uiop:quit 0)) (error (e) (format t "~&~a~%" e) (uiop:quit 1)))'
 
 # WP-ZC-MULTI-DEST-REFCOUNT (FR-PF-4, FR-LANG-7; R6, ADR 0047): one shared Zero-Copy slot across N co-resident
-# ZC destinations — slots + app->slot copies drop from N to 1 at fan-out. SBCL only (Clasp SHMEM pass-skips).
+# ZC destinations — slots + app->slot copies drop from N to 1 at fan-out. SBCL only (the bench convention).
 bench-multi-dest-zc:
 	$(SBCL) --eval '(asdf:load-system :dds-tests)' \
 	        --eval '(handler-case (progn (uiop:symbol-call :dds.tests :run-bench-multi-dest-zc :file "bench/report/2026-07-05-wp-zc-multi-dest.md") (uiop:quit 0)) (error (e) (format t "~&~a~%" e) (uiop:quit 1)))'
@@ -396,7 +394,7 @@ bench-multi-dest-zc:
 # single-writer paced vs the enable-async UNPACED baseline (pacing ADDS latency by design — no 0-cost claim),
 # multi-writer AGGREGATE rate shaped to R (not 2R) + per-datagram RR, and DATA_FRAG fragment cadence (the
 # FR-PF-2 headline). Standard DDS, NOT R6 (ADR 0016). Writes bench/report/2026-06-15-wp-async-flow.md. SBCL
-# only (real threads + timing; Clasp pass-skips — the flow tests' known Clasp condvar SIGSEGV, NFR-PORT).
+# only (real threads + timing; the bench convention).
 bench-async-flow:
 	$(SBCL) --eval '(asdf:load-system :dds-tests)' \
 	        --eval '(handler-case (progn (uiop:symbol-call :dds.tests :run-bench-async-flow :file "bench/report/2026-06-15-wp-async-flow.md") (uiop:quit 0)) (error (e) (format t "~&~a~%" e) (uiop:quit 1)))'
@@ -414,7 +412,7 @@ bench-flow-edf-priority:
 # KEEP_LAST. Drives dds.rtps.history:hc-add-change directly so the KEEP_LAST-vs-KEEP_ALL delta
 # isolates the per-instance index + evict (not the transport path). Writer throughput + GC
 # bytes/sample for KEEP_ALL/KEEP_LAST x keyed/unkeyed + the keyhash-derivation line; SBCL is the
-# record (Clasp bytes-consed=0, NFR-PORT gap). Writes bench/report/2026-06-16-wp-keeplast.md.
+# record (AllegroCL bytes-consed=0, NFR-PORT gap). Writes bench/report/2026-06-16-wp-keeplast.md.
 bench-keeplast:
 	$(SBCL) --eval '(asdf:load-system :dds-bench)' \
 	        --eval '(with-open-file (s "bench/report/2026-06-16-wp-keeplast.md" :direction :output :if-exists :supersede :if-does-not-exist :create) (uiop:symbol-call :dds.bench :run-keeplast-bench :samples $(KLSAMPLES) :instances $(KLINSTANCES) :depth $(KLDEPTH) :stream s))' \
@@ -422,17 +420,12 @@ bench-keeplast:
 
 # WP-DDS-SECURITY-SECURE-DISCOVERY T4 (§8.5.1.10-.12): whole-RTPS-message protection (SRTPS) encode+decode
 # micro-bench of a representative datagram submessage stream (SIGN + ENCRYPT); ns/op + GC bytes/op. T4
-# BASELINE (T10 re-measures the integrated path). SBCL is the record (Clasp bytes-consed=0, NFR-PORT).
+# BASELINE (T10 re-measures the integrated path). SBCL is the record (AllegroCL bytes-consed=0, NFR-PORT).
 # Writes bench/report/2026-06-27-wp-secure-discovery-t4.md.
 bench-rtps-message:
 	$(SBCL) --eval '(asdf:load-system :dds-tests)' \
 	        --eval '(with-open-file (s "bench/report/2026-06-27-wp-secure-discovery-t4.md" :direction :output :if-exists :supersede :if-does-not-exist :create) (uiop:symbol-call :dds.tests :run-rtps-message-bench :iters $(RTPSITERS) :size $(RTPSSIZE) :stream s))' \
 	        --eval '(uiop:quit 0)'
-
-bench-rtps-message-clasp:
-	$(CLASP) --eval '(asdf:load-system :dds-tests)' \
-	         --eval '(with-open-file (s "bench/report/2026-06-27-wp-secure-discovery-t4-clasp.md" :direction :output :if-exists :supersede :if-does-not-exist :create) (uiop:symbol-call :dds.tests :run-rtps-message-bench :iters $(RTPSITERS) :size $(RTPSSIZE) :stream s))' \
-	         --eval '(uiop:quit 0)'
 
 bench-rtps-protection:
 	$(SBCL) --eval '(asdf:load-system :dds-tests)' \
@@ -442,7 +435,7 @@ bench-rtps-protection:
 # WP-SHMEM Task F1 (FR-XPORT-2): REAL two-OS-process cross-process SHMEM round-trip.
 # Two SEPARATE SBCL processes discover over loopback UDP (:peers, no multicast) and the
 # pub routes user DATA over SHARED MEMORY; PASS iff the sub received the samples AND the
-# pub's shmem-sends > 0. SBCL only — SHMEM is on for SBCL; Clasp/macOS would use UDP.
+# pub's shmem-sends > 0. SBCL only — the harness launches two SBCL processes.
 shmem-xproc:
 	./scripts/shmem-roundtrip.sh
 

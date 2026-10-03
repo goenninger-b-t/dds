@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # M0 SBCL launcher: loads Quicklisp, points ASDF at the repo tree, then
-# evaluates the forms passed as arguments. Mirrors scripts/with-clasp.sh.
+# evaluates the forms passed as arguments. Mirrored by scripts/with-allegro.sh.
 set -euo pipefail
 
 SBCL_BIN="${SBCL_BIN:-sbcl}"

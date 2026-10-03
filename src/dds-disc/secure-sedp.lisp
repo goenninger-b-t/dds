@@ -1103,11 +1103,11 @@
        (A2) rtps_protection :encrypt/:sign -> predicate T and %zc-change-item returns NIL (ZC NOT taken —
             %zc-loan never called) even with zc-readers>0 + a large payload; likewise metadata_protection
             :encrypt; resetting both kinds to :none restores eligibility (non-secured fast path untouched).
-     Part B (SHMEM-gated live-segment inspection; skips where SHMEM/ZC is off — Clasp/macOS, ADR 0013): with a
+     Part B (SHMEM-gated live-segment inspection; skips where SHMEM/ZC is off — SHM-ATTACH-BY-NAME-RELIABLE-P NIL): with a
        REAL writer pool, a NON-secured writer DOES loan the marker into the pool (zc-sends advances, the marker
        bytes ARE in the segment — the leak the gate closes, so the probe is non-vacuous), while the SAME node
        under rtps_protection :encrypt with a FRESH marker does NOT (zc-sends unchanged, and the fresh marker is
-       provably ABSENT from the ENTIRE pool segment — no cleartext user payload in SHMEM). Both impls (Clasp first)."
+       provably ABSENT from the ENTIRE pool segment — no cleartext user payload in SHMEM). Both impls (SBCL and AllegroCL)."
   (let ((pa (make-array 12 :element-type '(unsigned-byte 8) :initial-element 91))
         (*zerocopy-min-payload-bytes* 8))                 ; small threshold so the short ASCII markers are ZC-size-eligible
     ;; Part A — deterministic, portable: the security gate short-circuits BEFORE any pool/SHMEM access.
@@ -1138,8 +1138,8 @@
              (assert (not (%zc-payload-wire-protected-p node)) ()
                      "A2: resetting both kinds to :none must restore ZC eligibility (the non-secured fast path is untouched)"))
         (stop-node node)))
-    ;; Part B — SHMEM-gated live-segment inspection (skips where the pool is not carved: Clasp/macOS, ADR 0013).
-    (let ((*zerocopy-enabled* t))                          ; arm ZC (default OFF, R6); *shmem-enabled* stays ambient (t on SBCL, nil on Clasp/macOS)
+    ;; Part B — SHMEM-gated live-segment inspection (skips where the pool is not carved: SHMEM by-name attach unreliable).
+    (let ((*zerocopy-enabled* t))                          ; arm ZC (default OFF, R6); *shmem-enabled* stays ambient (see dds.disc:*shmem-enabled*)
       (let ((node (make-disc-node :guid-prefix pa :host "127.0.0.1" :port 0)))
         (unwind-protect
              (when (disc-node-zc-pool node)                ; pool carved iff SHMEM available -> run Part B; else skip cleanly
@@ -1210,7 +1210,7 @@
        datagram, silently dropping the integrity the SIGN tier exists to provide).
      Part B (SHMEM-gated live-segment): the sealed slot holds CIPHERTEXT — the plaintext marker is provably
        ABSENT from the entire pool segment (with a non-secured control whose plaintext IS present), and
-       zc-sends advances (the overlay DID take ZC). Both impls (Clasp first; Part B skips cleanly on Clasp/macOS)."
+       zc-sends advances (the overlay DID take ZC). Both impls (Part B skips cleanly where the pool is not carved)."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
       (format t "~&  [zc-shmem-secured-overlay] SKIP — AES-GCM not available: ~a~%" %dare-reason)
@@ -1243,7 +1243,7 @@
                (assert (null (%zc-change-item node big 1)) ()
                        "A: an over-slot payload (SecuredPayload > slot-bytes) must fail closed to NIL, never signal buffer-overflow")))
         (stop-node node)))
-    ;; Part B — SHMEM-gated live-segment inspection (skips where the pool is not carved: Clasp/macOS, ADR 0013).
+    ;; Part B — SHMEM-gated live-segment inspection (skips where the pool is not carved: SHMEM by-name attach unreliable).
     (let ((*zerocopy-enabled* t))
       (let ((node (make-disc-node :guid-prefix pa :host "127.0.0.1" :port 0)))
         (unwind-protect
@@ -1300,7 +1300,7 @@
                                         "C: the reader must recover the overlay plaintext byte-exact through the copy-on-read decode"))))
                        (stop-node reader))))))
           (stop-node node))))
-    ;; Part D — fail-closed proofs (SHMEM-gated, ADR 0051; skips cleanly where the pool is not carved — Clasp/macOS):
+    ;; Part D — fail-closed proofs (SHMEM-gated, ADR 0051; skips cleanly where the pool is not carved):
     ;;   (i) a reader with NO EntityCrypto key for the writer resolves the overlay ref but DROPS it — the resolved km is
     ;;       nil, so %deliver-user-sample takes the missing-KM early return (nothing delivered, no crash, uncounted).
     ;;   (ii) with the KM installed a NON-tampered control of the SAME shape DELIVERS (the harness is sound), then
@@ -1406,7 +1406,7 @@
          through the pooled RX path and delivers the inner user DATA byte-EXACT — exercising BOTH rewired paths; the
          send-scratch pool + SECURE-RX-POOL are carved (lazy) after the first wrap/unwrap.
      (b) ZERO-ALLOC (send): a steady-state SRTPS wrap over the reused tx-msg + pooled scratch conses ~0 GC-heap
-         B/datagram (SBCL-exact via dds.pal:bytes-consed; Clasp reports 0 -> skip, NFR-PORT), vs the pre-rewire
+         B/datagram (SBCL-exact via dds.pal:bytes-consed; AllegroCL reports 0 -> skip, NFR-PORT), vs the pre-rewire
          subseq+encode-rtps-message path. The check is written to FAIL if the new wrap still allocates.
      (c) EXHAUSTION: with the send-scratch pool fully drained, %maybe-wrap-srtps returns NIL (fail-closed drop,
          RESOURCE_LIMITS backpressure) — never a GC fallback.
@@ -1415,8 +1415,8 @@
          pre-fix single shared RX buffer, verified RED before the fix). Plus a deterministic distinctness check: two
          concurrent RX-pool borrows return distinct buffers.
      (f) ZERO-ALLOC (RX): a steady-state pooled RX borrow + decode-rtps-message-into conses ~0 GC-heap B/datagram
-         (SBCL-exact; Clasp skip, NFR-PORT) — the pooled RX borrow adds no allocation over the pre-review single buffer.
-   Requires AES-GCM; skips gracefully if absent. Both impls (Clasp first)."
+         (SBCL-exact; AllegroCL skip, NFR-PORT) — the pooled RX borrow adds no allocation over the pre-review single buffer.
+   Requires AES-GCM; skips gracefully if absent. Both impls (SBCL and AllegroCL)."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
       (format t "~&  [rtps-protection-zeroalloc] SKIP — AES-GCM not available: ~a~%" %dare-reason)
@@ -1485,7 +1485,7 @@
                  (format t "~&  [rtps-protection-zeroalloc] SRTPS wrap bytes/datagram: before(subseq+encode-rtps-message)=~,2f  after(pooled -into)=~,2f (~d iters)~%"
                          old-per new-per iters)
                  (if (zerop (dds.pal:bytes-consed))
-                     (format t "  [skip] dds.pal:bytes-consed is 0 on this impl (Clasp NFR-PORT gap) — SRTPS wrap alloc not measurable~%")
+                     (format t "  [skip] dds.pal:bytes-consed is 0 on this impl (AllegroCL NFR-PORT gap) — SRTPS wrap alloc not measurable~%")
                      (progn
                        (assert (< new-per 1.0) ()
                                "ZA-2: the pooled SRTPS wrap must cons ~~0 GC-heap B/datagram; got ~,2f (would FAIL on the pre-rewire subseq+encode-rtps-message path, ~,2f)" new-per old-per)
@@ -1541,7 +1541,7 @@
                      "ZA-2 concurrency: ~d cross-thread RX-buffer contaminations over ~d threads x ~d SRTPS-ENCRYPT decodes — concurrent receiver threads must NOT share a mutable decode sink" total-mismatch nthreads iters))
            ;; (f) ZERO-ALLOC (RX): a steady-state pooled RX borrow + decode-rtps-message-into over the reused SRTPS
            ;; ciphertext conses ~0 GC-heap B/datagram — the pooled borrow (O(1) index ops under the RX lock) adds no
-           ;; allocation over the pre-review single reused buffer. SBCL-exact; Clasp bytes-consed=0 -> skip (NFR-PORT).
+           ;; allocation over the pre-review single reused buffer. SBCL-exact; AllegroCL bytes-consed=0 -> skip (NFR-PORT).
            (when srtps-dg
              (%ensure-secure-rx-pool node-b)
              (let ((slen (- (length srtps-dg) 20)) (iters 4000))
@@ -1555,7 +1555,7 @@
                  (let ((rx-per (/ (float rx-b) iters)))
                    (format t "~&  [rtps-protection-zeroalloc] SRTPS RX unwrap (pooled borrow + decode-rtps-message-into) bytes/datagram: ~,2f (~d iters)~%" rx-per iters)
                    (if (zerop (dds.pal:bytes-consed))
-                       (format t "  [skip] dds.pal:bytes-consed is 0 on this impl (Clasp NFR-PORT gap) — SRTPS RX alloc not measurable~%")
+                       (format t "  [skip] dds.pal:bytes-consed is 0 on this impl (AllegroCL NFR-PORT gap) — SRTPS RX alloc not measurable~%")
                        (assert (< rx-per 1.0) ()
                                "ZA-2: the pooled SRTPS RX unwrap must cons ~~0 GC-heap B/datagram; got ~,2f" rx-per))))))
            t)
@@ -1781,7 +1781,7 @@
          trailing 4-align pad (the SEC_BODY carries the metadata pad, not the plaintext).
      (2) NON-VACUOUS two-tier round-trip: decode-serialized-payload(km-payload, recovered) = the original
          non-4-aligned plaintext.
-   Requires the AES-GCM primitive; skips gracefully if absent. Both impls (Clasp first)."
+   Requires the AES-GCM primitive; skips gracefully if absent. Both impls (SBCL and AllegroCL)."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
       (format t "~&  [user-submsg-data-protection] SKIP — AES-GCM not available: ~a~%" %dare-reason)
@@ -1857,13 +1857,13 @@
    re-dispatch decodes the bracket via decode-datawriter-submessage-into into a REUSED per-node SECURE-RX buffer
    (dropping the pre-ZA-2 per-call make-octet-buffer + decode-datawriter-submessage →octets subseq). A is the sender; B
    the receiver holding A's user-writer EntityCrypto (resolved by transformation_key_id). Deterministic, no auth
-   handshake (manual KMs, like run-user-submessage-protection-test). Asserts (both impls, Clasp first):
+   handshake (manual KMs, like run-user-submessage-protection-test). Asserts (both impls):
      (a) ENCRYPT + SIGN ROUND-TRIP byte-exact through the pooled send + reused-RX re-dispatch (a single DATA) — the
          payload is recovered byte-EXACT for BOTH modes (the -into cores are byte-identical to the allocating pair).
      (b) MULTI-SUBMESSAGE: a datagram of THREE user DATA submessages is wrapped bracket-by-bracket + each recovered
          byte-EXACT in order (the multi-bracket walk — the pre-ZA-2 per-submessage subseq path replaced by BY-OFFSET).
      (c) BYTES-CONSED: the pooled SEND wrap AND the pooled RX decode-into each cons ~0 GC-heap B/datagram (SBCL-exact
-         via dds.pal:bytes-consed; Clasp reports 0 -> skip, NFR-PORT), FAR below the pre-rewire allocating path
+         via dds.pal:bytes-consed; AllegroCL reports 0 -> skip, NFR-PORT), FAR below the pre-rewire allocating path
          (subseq + encode/decode-datawriter-submessage) — the < 1.0 assertion WOULD FAIL on the pre-rewire +8192/subseq code.
      (d) EXHAUSTION: with the submessage-scratch pool drained, the SEND wrap returns NIL (fail-closed drop) — never a
          GC fallback (RESOURCE_LIMITS backpressure; NFR-MEM).
@@ -1963,7 +1963,7 @@
                    (format t "~&  [user-submsg-zeroalloc] SEND wrap bytes/datagram: before(subseq+encode-datawriter-submessage)=~,2f  after(pooled -into)=~,2f (~d iters)~%" so sn iters)
                    (format t "  [user-submsg-zeroalloc] RX decode bytes/bracket: before(decode-datawriter-submessage)=~,2f  after(pooled decode-into)=~,2f~%" ro rn)
                    (if (zerop (dds.pal:bytes-consed))
-                       (format t "  [skip] dds.pal:bytes-consed is 0 on this impl (Clasp NFR-PORT gap) — metadata_protection alloc not measurable~%")
+                       (format t "  [skip] dds.pal:bytes-consed is 0 on this impl (AllegroCL NFR-PORT gap) — metadata_protection alloc not measurable~%")
                        (progn
                          (assert (< sn 1.0) ()
                                  "ZA-2: the pooled metadata_protection SEND wrap must cons ~~0 GC-heap B/datagram; got ~,2f (would FAIL on the pre-rewire +8192/subseq path, ~,2f)" sn so)
@@ -2014,7 +2014,7 @@
      (c) rtps_protection SEND        — %maybe-wrap-srtps, resolver OFF vs ON (pooled SRTPS wrap over the send-scratch pool).
      (d) rtps_protection RECEIVE     — the SRTPS unwrap: decode-rtps-message-into into a pooled secure-rx buffer + the
                                         in-place copy-back (the exact transform %handle-datagram runs).
-   SBCL asserts each delta is < 1.0 B/sample (dds.pal:bytes-consed is exact); Clasp bytes-consed is 0 (NFR-PORT gap) so
+   SBCL asserts each delta is < 1.0 B/sample (dds.pal:bytes-consed is exact); AllegroCL bytes-consed is 0 (NFR-PORT gap) so
    the arms run the SAME code paths (smoke) and only report 0.0000. EXHAUSTION (both send + receive): with the submsg-
    scratch / send-scratch pool drained the SEND wrap returns NIL (fail-closed drop, RESOURCE_LIMITS backpressure — never
    a GC fallback), and with the bracket-rx pool drained a metadata datagram is DROPPED (its on-data hook never fires — a
@@ -2172,7 +2172,7 @@
              ;; the delta is the %put-receiver-macs-into cost (cached receiver session key + GMAC-into) + the
              ;; resolver (memoized -> 0 B). RECV baseline = decode-rtps-message-into WITHOUT the gate; secured = the
              ;; SAME decode RESOLVING my-receiver-key via the memoized resolver WITH the gate (%verify-receiver-mac-
-             ;; into, in-place GMAC verify). Both over reused buffers + warmed caches -> an EXACT 0.0000 on SBCL (Clasp smokes).
+             ;; into, in-place GMAC verify). Both over reused buffers + warmed caches -> an EXACT 0.0000 on SBCL (AllegroCL smokes).
              (let* ((oa-kid (map '(simple-array (unsigned-byte 8) (*)) #'identity #(#xab #xcd #x12 #x34)))
                     (oa-mk  (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x5e))
                     (km-oa  (dds.security:make-key-material                 ; origin-auth KM = the resolver's descriptor source
@@ -2375,7 +2375,7 @@
      (3) LEGITIMATE PATH: the SAME user bracket delivered INSIDE the proper SRTPS wrap IS delivered byte-exact
          (outer SRTPS decode -> re-dispatch rtps-unwrapped=t -> ENFORCE-RTPS NIL -> user bracket decoded), so
          the fix drops ONLY the bare bracket, never the conformant wrapped one (no false-REJECT).
-   Requires the AES-GCM primitive; skips gracefully if absent. Both impls (Clasp first)."
+   Requires the AES-GCM primitive; skips gracefully if absent. Both impls (SBCL and AllegroCL)."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
       (format t "~&  [rtps-enforce-user-bracket] SKIP — AES-GCM not available: ~a~%" %dare-reason)

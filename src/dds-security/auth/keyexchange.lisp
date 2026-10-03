@@ -391,7 +391,8 @@
    the 'dds.cryp.keymat' value must be exactly 116 bytes (nonce+ct+tag). A wrong KX-KEY
    or any byte flip in the ciphertext or tag causes AES-GCM authentication failure -> NIL.
    NFR-SEC-POSTURE: never crashes on adversarial input; handler-bind wraps dds.dare:aes-256-gcm-open
-   so EVP allocation errors signal->NIL (not handler-case in nested mvb — Clasp miscompiles that).
+   so EVP allocation errors signal->NIL (not handler-case in a nested mvb — a shape that miscompiled on the
+   since-withdrawn Clasp target, ADR 0118).
    Uses block/return-from throughout. Spike §6.1 / §3.3."
   (block %parse-crypto-token
     (let ((tok (dataholder->handshake-token octets)))

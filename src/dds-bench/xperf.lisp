@@ -295,7 +295,7 @@
    PAYLOAD-BYTES defaults to 0 to measure the FIXED per-sample overhead, which is what dominates: at zero
    payload the path still allocates thousands of bytes, so the payload copy is not the problem.
 
-   SBCL only in practice — `dds.pal:bytes-consed` returns 0 on Clasp, so a Clasp run measures nothing.
+   SBCL only in practice — `dds.pal:bytes-consed` returns 0 on AllegroCL, so an AllegroCL run measures nothing.
    Callers must gate on that (scripts/gate-mem.sh does).
 
    SAMPLES DEFAULTS TO 60000, AND THE SIZE OF IT IS THE POINT. The measured window contains a FIXED per-run

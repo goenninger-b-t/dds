@@ -5,12 +5,20 @@
 # DID NOT EXIST — and there was no CI to run it in either (the only workflow was publish-wiki). The rule
 # happened to hold, by luck, not by enforcement. This is that lint.
 #
-# WHY THE RULE. #+sbcl / #+clasp / #+allegro outside the PAL is how a portability layer rots: the impl split
-# leaks into the engine, and the "one behaviour, three impls" guarantee quietly stops being checkable.
+# WHY THE RULE. #+sbcl / #+allegro outside the PAL is how a portability layer rots: the impl split
+# leaks into the engine, and the "one behaviour, every impl" guarantee quietly stops being checkable.
 # Everything impl-specific belongs behind dds-pal/.
 #
-# Docstrings and comments may MENTION the conditionals (several say "no #+sbcl/#+clasp here"), so only
+# Docstrings and comments may MENTION the conditionals (several say "no #+sbcl here"), so only
 # READER-CONDITIONAL FORMS count: a #+/#- at the start of a form, not inside a string or after a ';'.
+#
+# SECOND RULE (ADR 0118): Clasp is withdrawn, so `#+clasp`, `#-clasp`, a feature expression naming clasp,
+# and the keyword `:clasp` are banned EVERYWHERE in src/ and the *.asd files — INCLUDING dds-pal/, where
+# other reader conditionals are allowed, and including comments and strings (a branch for a target that is
+# never built cannot be verified, and prose that names one invites it back). This is the Phase 0 exit check
+# `git grep -nE '#[+-]clasp|:clasp' -- src '*.asd'`, made a gate.
+# KNOWN LIMIT: the scan is line-based, so a feature expression deliberately split across lines
+# (`#+(or sbcl` / ` clasp)`) evades it. Single-line forms, including negated and nested ones, are caught.
 #
 # --self-test falsifies it: plants a real conditional and asserts the scan REJECTS it. A gate never proven
 # able to fail proves nothing.
@@ -18,6 +26,19 @@ set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 IMPLS='sbcl|clasp|allegro|ccl|ecl|abcl|lispworks|cmu'
+
+# ADR 0118. Extended regex: #+clasp / #-clasp, a feature expression containing the word clasp
+# (#+(and clasp darwin)), and the keyword :clasp. Case-insensitive, because the reader is.
+CLASP_RE='#[+-]clasp([^a-z0-9-]|$)|#[+-]\([^)]*[( ]clasp[ )]|:clasp([^a-z0-9-]|$)'
+
+# TRANSITIONAL, PINNED, SHRINK-ONLY: the 14 lines carrying :clasp test branches in src/dds-tests/ that WP-0.6
+# deletes (the plan counted 13; a grep on 2026-10-03 finds 14). Counted, never silently skipped: MORE than this fails (a new one), FEWER fails too (lower the pin, so the allowance
+# cannot quietly outlive the code it excuses). When WP-0.6 lands, set it to 0 and delete this allowance.
+CLASP_TESTS_PENDING=14
+
+clasp_hits() {   # $@ = paths; prints file:line: text for every banned Clasp token
+  grep -rnEi --include='*.lisp' --include='*.asd' "$CLASP_RE" "$@" 2>/dev/null || true
+}
 
 # A reader conditional in CODE: a #+/#- token that is NOT preceded on the line by a ';' (comment) and is
 # not inside a docstring. Lexical, but sufficient: we require the #+/#- to be the first non-space token or
@@ -54,6 +75,23 @@ if [[ "$n" -ne 1 || "$hits" != *":5:"* ]]; then
   exit 1
 fi
 
+# ---- 0b. FALSIFICATION of the Clasp ban ----
+cat > "$tmp/clasp-canary.lisp" <<'EOF'
+(defun a () #+clasp (core:quit) nil)
+(defun b () #-clasp nil)
+(defun c () #+(and clasp darwin) 1 2)
+(defun d () (eq (pal-impl-name) :clasp))
+(defun e () "mentions :CLASP in a string" nil)
+;; clasp-ffi, :claspish and a plain word clasp must NOT count
+(defun f () (list :claspish 'clasp-ffi "clasp"))
+EOF
+chits="$(clasp_hits "$tmp/clasp-canary.lisp" | cut -d: -f1 | tr '\n' ' ')"
+if [[ "$chits" != "1 2 3 4 5 " ]]; then
+  echo "gate-pal: FAIL — self-test: the Clasp ban must flag canary lines 1-5 exactly and not 6-7; got: '$chits'." >&2
+  echo "          The ban is BLIND or over-eager — a green run would prove nothing." >&2
+  exit 1
+fi
+
 # ---- 1. THE SCAN ----
 violations=0
 while IFS= read -r f; do
@@ -67,4 +105,31 @@ if [[ "$violations" -ne 0 ]]; then
   echo "          Everything impl-specific belongs behind the PAL." >&2
   exit 1
 fi
-echo "gate-pal: PASS — no reader conditionals outside dds-pal/ (and the gate is proven able to fail)."
+
+# ---- 2. THE CLASP BAN (ADR 0118) ----
+mapfile -t asds < <(ls ./*.asd 2>/dev/null)
+banned="$(clasp_hits src "${asds[@]}" | grep -v '^src/dds-tests/' || true)"
+if [[ -n "$banned" ]]; then
+  printf '%s\n' "$banned"
+  echo "gate-pal: FAIL — Clasp is withdrawn (ADR 0118): #+clasp / #-clasp / :clasp may not appear in src/ or" >&2
+  echo "          *.asd, not even inside dds-pal/ or in a comment. Delete the branch; reword the prose." >&2
+  exit 1
+fi
+ntests="$(clasp_hits src/dds-tests | grep -c . || true)"
+if (( ntests > CLASP_TESTS_PENDING )); then
+  clasp_hits src/dds-tests
+  echo "gate-pal: FAIL — $ntests Clasp token(s) in src/dds-tests/, above the pinned $CLASP_TESTS_PENDING (WP-0.6)." >&2
+  echo "          A NEW one was added. Clasp is withdrawn (ADR 0118)." >&2
+  exit 1
+fi
+if (( ntests < CLASP_TESTS_PENDING )); then
+  echo "gate-pal: FAIL — only $ntests Clasp token(s) remain in src/dds-tests/, below the pinned" >&2
+  echo "          $CLASP_TESTS_PENDING. Lower CLASP_TESTS_PENDING in scripts/gate-pal.sh to $ntests (0 = delete the" >&2
+  echo "          allowance) so it cannot outlive the code it excuses." >&2
+  exit 1
+fi
+echo "gate-pal: PASS — no reader conditionals outside dds-pal/, no Clasp token in src/ or *.asd (the gate is"
+echo "          proven able to fail on both rules)."
+if (( ntests > 0 )); then
+  echo "gate-pal: NOTE — $ntests :clasp test branch(es) remain in src/dds-tests/, pinned; WP-0.6 deletes them."
+fi

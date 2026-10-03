@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The ASDF fasl-cache root for this project. Sourced by every Lisp entry point
-# (scripts/with-sbcl.sh, scripts/with-clasp.sh, scripts/gate-build.sh).
+# (scripts/with-sbcl.sh, scripts/with-allegro.sh, scripts/gate-build.sh).
 #
 # WHY THIS EXISTS: ASDF's default output-translations put every project's fasls in ONE shared
 # root, ~/.cache/common-lisp/, keyed only by implementation+version. Two things follow, and both

@@ -411,16 +411,16 @@
    the sender opens the receiver's named segment. Where this is NIL the transport's tests pass-skip.
 
    Asks the PAL for the CAPABILITY rather than testing the platform (ADR 0064): the reliability of
-   shm_open's variadic mode_t is an implementation+ABI fact that belongs to dds-pal, and dds-xport is
+   shm_open's mode_t argument is an implementation+ABI fact that belongs to dds-pal, and dds-xport is
    outside dds-pal, where reader conditionals are banned. DDS.PAL:SHM-CREATE-MODE-RELIABLE-P carries the
    per-arm reasoning.
 
    ⚠️ DO NOT 'FIX' A NIL HERE BY SWITCHING THE CFFI CALL FORM. It was tried (2026-07-14) and it looked like
-   it worked. Over 30 create+reopen trials on Clasp/macOS-arm64: plain foreign-funcall 10/30,
-   foreign-funcall-varargs 0/30, varargs-as-:int 10/30, varargs+fchmod 0/30. The mode lands as GARBAGE and a
-   single trial passes or fails on whether those bits happened to include owner-rw — so a one-shot probe
-   'proves' whichever answer you want. The fix was upstream in Clasp and landed 2026-07-31 as a C++ binding
-   of shm_open, so Clasp/macOS-arm64 is now fully fitted. See dds.pal::%shm-open-create and ADR 0103."
+   it worked. Over 30 create+reopen trials on the since-withdrawn Clasp/macOS-arm64 target: plain
+   foreign-funcall 10/30, foreign-funcall-varargs 0/30, varargs-as-:int 10/30, varargs+fchmod 0/30. The mode
+   lands as GARBAGE and a single trial passes or fails on whether those bits happened to include owner-rw —
+   so a one-shot probe 'proves' whichever answer you want. See dds.pal::%shm-open-create, ADR 0103 and
+   ADR 0118."
   (dds.pal:shm-create-mode-reliable-p))
 
 (defun* %test-guid (b)
@@ -432,7 +432,7 @@
     (function () (eql t))
   "Transport-level SHMEM loopback in one image: tx SEND -> rx OWN-segment drain.
    tx and rx are distinct participants (distinct guids, same host); asserts 4 octets round-trip.
-   Pass-skips on the Clasp/macOS-arm64 by-name-attach gap (ADR 0013)."
+   Pass-skips where by-name attach is unreliable (SHM-ATTACH-BY-NAME-RELIABLE-P NIL)."
   (unless (shm-attach-by-name-reliable-p)
     (dds.pal:note-test-skip "run-shmem-transport-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
     (return-from run-shmem-transport-test t))
@@ -475,7 +475,7 @@
    the race hard enough that a regression is likely to be caught, and assert the INVARIANT (one dest per
    name, no errors) that unsynchronised access cannot reliably maintain.
 
-   Pass-skips on the Clasp/macOS-arm64 by-name-attach gap (ADR 0013)."
+   Pass-skips where by-name attach is unreliable (SHM-ATTACH-BY-NAME-RELIABLE-P NIL)."
   (unless (shm-attach-by-name-reliable-p)
     (dds.pal:note-test-skip "run-shmem-attach-cache-race-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
     (return-from run-shmem-attach-cache-race-test t))
@@ -530,7 +530,7 @@
         (this is what would go red if the cache ever drifted from the ring's own ownership table);
      4. every record from both senders arrives with its own payload intact.
 
-   Pass-skips on the Clasp/macOS-arm64 by-name-attach gap (ADR 0013)."
+   Pass-skips where by-name attach is unreliable (SHM-ATTACH-BY-NAME-RELIABLE-P NIL)."
   (unless (shm-attach-by-name-reliable-p)
     (dds.pal:note-test-skip "run-shmem-dest-cache-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
     (return-from run-shmem-dest-cache-test t))
@@ -652,7 +652,8 @@
    the pure blocking behaviour on a CPU-constrained node.
 
    Iterations, not nanoseconds, deliberately: a time-based spin must read the clock every turn, and
-   MONOTONIC-NS costs ~633 ns on Clasp (libffi) — the clock read would dominate the spin itself.")
+   MONOTONIC-NS cost ~633 ns per read on the since-withdrawn Clasp target (libffi) — on any FFI where a clock
+   read is not nearly free it would dominate the spin itself.")
 
 (defun* %rx-spin-for-work (sap)
     (function (t) t)
@@ -732,8 +733,8 @@
 (defun* run-shmem-receiver-test ()
     (function () (eql t))
   "SHMEM receiver-thread loopback: a background thread cond-waits, drains, and records a datagram;
-   assert it arrives within a bounded wait. Returns T. Pass-skips on the Clasp/macOS-arm64
-   by-name-attach gap (ADR 0013); on Clasp the receiver thread also needs GC_DONT_GC=1."
+   assert it arrives within a bounded wait. Returns T. Pass-skips where by-name attach is unreliable
+   (SHM-ATTACH-BY-NAME-RELIABLE-P NIL)."
   (unless (shm-attach-by-name-reliable-p)
     (dds.pal:note-test-skip "run-shmem-receiver-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
     (return-from run-shmem-receiver-test t))
@@ -781,8 +782,7 @@
    lanes; assert the receiver delivers EXACTLY senders*per-sender records within DEADLINE-SECONDS. A lost
    wakeup (the hazard of %shmem-send skipping the signal when parked=0) surfaces as a delivered-count
    SHORTFALL or a hang — the watchdog deadline turns a hang into a failed assertion rather than an infinite
-   block. Pass-skips on the Clasp/macOS-arm64 by-name-attach gap (ADR 0013); on Clasp the receiver thread
-   also needs GC_DONT_GC=1. Each sender uses a distinct GUID (distinct lane token), so they exercise the
+   block. Pass-skips where by-name attach is unreliable (SHM-ATTACH-BY-NAME-RELIABLE-P NIL). Each sender uses a distinct GUID (distinct lane token), so they exercise the
    per-lane SPSC rings concurrently against the single shared notify block."
   (unless (shm-attach-by-name-reliable-p)
     (dds.pal:note-test-skip "run-shmem-stress-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")

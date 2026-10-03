@@ -650,8 +650,8 @@
     (function (pathname (unsigned-byte 32) (simple-array (unsigned-byte 8) (*)))
               (values (or null (eql t)) (or null keyword)))
   "Append one {epoch-id -> kem-ct} entry to epochs.dat in DIR and fsync it to the OS before
-   returning (open→write→dds.pal:fsync-stream→close — SBCL fdatasync(2), Clasp finish-output per
-   the NFR-PORT split; same group-commit primitive the file store uses, no #+sbcl/#+clasp here).
+   returning (open→write→dds.pal:fsync-stream→close — SBCL fdatasync(2), AllegroCL finish-output per
+   the NFR-PORT split; same group-commit primitive the file store uses, no reader conditionals here).
    Caller MUST call this BEFORE writing any record that references EPOCH-ID, so the ordering
    invariant holds — every record's epoch-id resolves after a crash (spec §9, ADR 0026). Returns
    (VALUES T STATUS): :FSYNC-FAILED on a content/dirent flush failure (ADR 0064 — TRY bails it)."
@@ -1016,7 +1016,7 @@
    nonce reuse is structurally impossible (there is no counter to resume). Spec §6 / ADR 0025 §5.
 
    All secret material (DEKs, shared secrets) lives in foreign-backed buffers via the PAL
-   (static-vector, Clasp-deterministic per clasp#1793); the transient shared secret is freed once
+   (static-vectors, off the GC heap so a wipe is reliable); the transient shared secret is freed once
    each DEK is derived. Topics/purge/count delegate to inner-store unchanged (metadata cleartext)."
   (if epoch-dir
       (%make-epoch-encrypted-store inner-store key-provider

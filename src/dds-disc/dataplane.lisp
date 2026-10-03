@@ -4333,7 +4333,7 @@
    slots, reused per take). These are plain Lisp heap objects (NOT arena/SAP — like type-support's sample-pool),
    allocated once at carve; only the off-heap plaintext BUFFERS come from the static arena."
   ;; WP-SECURED-STORE-GROWTH: the guard catches storage-condition too (a real off-heap/static-alloc OOM signals
-  ;; storage-condition, NOT error, on SBCL/Clasp) so carve-fail is graceful as documented — leave NIL ->
+  ;; storage-condition, NOT error, on SBCL) so carve-fail is graceful as documented — leave NIL ->
   ;; bounded allocating-decode fallback, never propagate (operating contract §4 NFR-MEM).
   (let ((capacity (+ *secured-pool-capacity* *secured-pool-headroom*)))
     (%lazy-carve-pool (pool node :pool  disc-node-decode-pool
@@ -4424,7 +4424,7 @@
 
    On arena exhaustion this leaves the pool NIL — never an error, and never a GC-silent claim of a zero it
    did not achieve (operating contract §4 / NFR-MEM). storage-condition is caught alongside error because a
-   static/off-heap allocation failure signals storage-condition, not error, on SBCL and Clasp."
+   static/off-heap allocation failure signals storage-condition, not error, on SBCL."
   ;; arena-exhausted / static-alloc failure: leave the pool NIL -> allocating copy, and LATCH it.
   ;; Without the latch a NIL pool reads as "not carved yet" and every later sample retries the
   ;; carve (64 static allocations each), hammering a node that is already short of memory.
@@ -5323,7 +5323,7 @@
    (d) no-cross-free: two distinct secured-loan handles in the shared registry — releasing one leaves the other's
    buffer + registration + stored slot intact (the identity-guarded %secured-loan-release; disjoint different-topic
    slots). The deterministic arms are DARE-free (a <44-octet plaintext fails the SecuredPayload length gate before
-   any AES); the live ENCRYPT-decode arm is DARE-gated. Clasp FIRST."
+   any AES); the live ENCRYPT-decode arm is DARE-gated."
   (let ((km (dds.security:make-test-key-material :kind :encrypt))
         (payl (make-array 6 :element-type '(unsigned-byte 8) :initial-contents '(#xD1 #xD2 #xD3 #xD4 #xD5 #xD6))))
     (flet ((dres (tp) (declare (type string tp)) (if (string= tp "TENC") :encrypt :none))
@@ -5466,8 +5466,8 @@
      (3) reader-B returns (1->0) and only THEN is the slot reclaimable (frees at the true 0, after ALL K holders),
      (4) GENERATION-GUARD: after force-reclaim (a re-loan bumps the generation), reader-B's stale acquire/release at
          the OLD generation is a validated no-op (NIL) — never a decrement of the reused slot.
-   SBCL-only: the ZC refcount primitives are cas-sap-u32 (SBCL PAL; NFR-PORT ZC gap on Clasp, ADR 0013). NOT cleared
-   for ship — pending counsel (R6)."
+   SBCL-only: gated on PAL-IMPL-NAME :SBCL. The ZC refcount primitive cas-sap-u32 also exists in the AllegroCL
+   PAL (ADR 0113), but this arm has not been enabled or run there. NOT cleared for ship — pending counsel (R6)."
   (if (not (eq (dds.pal:pal-impl-name) :sbcl))
       (progn (format t "~&  [skip] n-reader-2c3-zc-uaf: %zc-bump/%zc-release use cas-sap-u32 (SBCL-only, ADR 0018) — NFR-PORT gap~%") t)
       (let ((m (dds.pal:alloc-static (dds.xport.zerocopy::%zc-bytes 1 64)))
@@ -5548,8 +5548,9 @@
    omits dr-drained), so every reader that ACTUALLY drains IS counted (A here) -> the refcount never underflows -> a
    drainer's slot is never freed under its read (A's read is asserted refcount-protected). ELIGIBLE>=1 invariant: with
    the never-frozen first reader A present ELIGIBLE >= 1 (unit-checked); with only frozen readers ELIGIBLE=0
-   (unit-checked) -> the `(> eligible 1)` demux guard clamps the delta to >= 0 (never a -1 bump). SBCL-only: the ZC
-   refcount primitives are cas-sap-u32 (SBCL PAL; NFR-PORT ZC gap on Clasp, ADR 0018). NOT cleared for ship (R6)."
+   (unit-checked) -> the `(> eligible 1)` demux guard clamps the delta to >= 0 (never a -1 bump). SBCL-only: gated on
+   PAL-IMPL-NAME :SBCL; AllegroCL's cas-sap-u32 (ADR 0113) has not been enabled here (ADR 0018). NOT cleared for
+   ship (R6)."
   (if (not (eq (dds.pal:pal-impl-name) :sbcl))
       (progn (format t "~&  [skip] n-reader-2c3-zc-refcount-leak: %zc-bump/%zc-release use cas-sap-u32 (SBCL-only, ADR 0018) — NFR-PORT gap~%") t)
       (let ((m (dds.pal:alloc-static (dds.xport.zerocopy::%zc-bytes 1 64)))
@@ -5628,8 +5629,8 @@
    path is memory-safe via independent-struct deserialize). Model-level, mirrors run-n-reader-s4-decode-tier-test (d)
    but on ONE shared (guid,sn) handle drained by K=2 co-located same-topic secured readers (return-count 2). Reader-A's
    early return-loan must NOT purge (guid,sn) nor free the pooled buffer (a not-yet-drained reader-B would otherwise
-   LOSE the sample); only reader-B's return (the LAST, count -> 0) purges the store slot + frees the buffer. Clasp
-   FIRST (no cas — pool-acquire/release only)."
+   LOSE the sample); only reader-B's return (the LAST, count -> 0) purges the store slot + frees the buffer. No
+   cas — pool-acquire/release only, so it runs on both impls."
   (let ((zn (make-disc-node :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element #x5E)
                             :host "127.0.0.1" :port 0)))
     (unwind-protect

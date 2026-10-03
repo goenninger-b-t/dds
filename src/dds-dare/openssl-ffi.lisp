@@ -50,9 +50,11 @@
 ;;; OSSL_PARAM_END sentinel: key=NULL, all zeros.
 
 ;;; --- impl-agnostic libcrypto path resolution ---
-;;; On macOS, Clasp loads /usr/lib/libcrypto.46.dylib (LibreSSL 2.0.0 = 0x20000000) at
-;;; startup via its own dependencies. CFFI name-based foreign-funcall then resolves to
-;;; that already-resident symbol rather than the homebrew OpenSSL 3.x we need.
+;;; An image may already have a DIFFERENT libcrypto resident before this file loads: on macOS
+;;; the since-withdrawn Clasp target mapped /usr/lib/libcrypto.46.dylib (LibreSSL 2.0.0 =
+;;; 0x20000000) at startup, and on Linux the system libcrypto.so.3 may already be mapped
+;;; (plan WP-0.9 adds a check). CFFI name-based foreign-funcall then resolves to whichever copy is
+;;; already resident rather than the OpenSSL 3.x we need.
 ;;; Fix: resolve and load the real OpenSSL dylib path at load time, store its handle,
 ;;; and dispatch ALL OpenSSL calls through cffi:foreign-symbol-pointer on that handle.
 ;;; Candidate paths in preference order (DDS_DARE_LIBCRYPTO env override first):
@@ -352,7 +354,7 @@
 ;;; X.509 / EVP_PKEY primitives for DDS-Security 1.1 §8.7 Authentication plugin (Auth T1).
 ;;;
 ;;; All function pointers resolved via (%ossl-sym ...) on *LIBCRYPTO* — the same handle-based
-;;; pattern as Task 1-3 (clasp#1793-safe, LibreSSL-collision-safe).
+;;; pattern as Task 1-3 (collision-safe against a different resident libcrypto).
 ;;;
 ;;; Signatures verified against installed OpenSSL 3.6.2 headers:
 ;;;   /opt/homebrew/opt/openssl@3/include/openssl/{pem.h,x509.h,x509_vfy.h,evp.h}

@@ -8,7 +8,7 @@
 *.o
 *.a
 
-# ASDF/Clasp caches
+# ASDF fasl caches
 .cache/
 /bench/report/*.tmp
 

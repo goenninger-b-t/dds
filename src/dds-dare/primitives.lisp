@@ -831,8 +831,7 @@
   "Zeroize then release a foreign-backed secret buffer returned by %MAKE-SECRET-OCTETS /
    %FOREIGN->SECRET (the ML-KEM private key, shared secret, or DEK; design spec §6).
    The (fill V 0) reliably wipes because the storage is pinned/foreign. Release is via the PAL
-   FREE-STATIC: SBCL frees; Clasp recycles into a lock-guarded pool (never the buggy
-   interior-pointer GC_FREE of clasp#1793) and re-zeros on reuse. Returns NIL so callers can
+   FREE-STATIC (static-vectors on SBCL and AllegroCL). Returns NIL so callers can
    write (setf slot (free-secret-octets slot)). Idempotent: a NIL argument is a no-op."
   (when v
     (fill v 0)

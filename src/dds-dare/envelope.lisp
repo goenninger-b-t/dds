@@ -29,7 +29,7 @@
   "HKDF-SHA384 info label for DEK derivation (ASCII, pinned; change = new version byte).
    The boundp guard keeps the value pinned to \"dds-dare/dek/v1\" while making the string
    constant reload-safe (DEFCONSTANT-UNEQL on recompile — strings are not self-eql), identically
-   on SBCL and Clasp with no reader conditional.")
+   on SBCL and AllegroCL with no reader conditional.")
 
 (defvar *dek-info-octets* nil
   "Cached octet vector for +dek-info-str+, built lazily on first use.")
@@ -45,7 +45,7 @@
   "HKDF-SHA384 info label for durability log-MAC-key derivation (ASCII, pinned; change = new
    format version). Distinct domain separator from +dek-info-str+ so the log-MAC key is
    cryptographically independent of every DEK (ADR 0045 §4.3). Same reload-safe boundp guard
-   as +dek-info-str+ (DEFCONSTANT-UNEQL — strings are not self-eql — identical SBCL/Clasp).")
+   as +dek-info-str+ (DEFCONSTANT-UNEQL — strings are not self-eql — identical SBCL/AllegroCL).")
 
 (defvar *logmac-info-octets* nil
   "Cached octet vector for +logmac-info-str+, built lazily on first use.")
@@ -81,7 +81,7 @@
    pinned; change = new format version). Distinct domain separator from +dek-info-str+ AND
    +logmac-info-str+ so k_meta is cryptographically independent of every DEK and of the log-MAC key
    (ADR 0025 §10 item 3c). Same reload-safe boundp guard as +dek-info-str+ (DEFCONSTANT-UNEQL —
-   strings are not self-eql — identical SBCL/Clasp).")
+   strings are not self-eql — identical SBCL/AllegroCL).")
 
 (defvar *metakey-info-octets* nil
   "Cached octet vector for +metakey-info-str+, built lazily on first use.")
@@ -117,7 +117,7 @@
    new format version). Distinct domain separator from +dek-info-str+, +logmac-info-str+ AND
    +metakey-info-str+ so the epochs-MAC key is cryptographically independent of every DEK, the log-MAC
    key and k_meta (ADR 0045 §7.2). Same reload-safe boundp guard as +dek-info-str+ (DEFCONSTANT-UNEQL —
-   strings are not self-eql — identical SBCL/Clasp).")
+   strings are not self-eql — identical SBCL/AllegroCL).")
 
 (defvar *epochs-info-octets* nil
   "Cached octet vector for +epochs-info-str+, built lazily on first use.")

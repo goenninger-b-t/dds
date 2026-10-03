@@ -2,36 +2,30 @@
 
 ## Prerequisites
 
-- **SBCL** and/or **Clasp** (64-bit), with **Quicklisp** installed. AllegroCL is a planned
-  target but not yet wired in.
-- The `Makefile` drives per-implementation builds via `scripts/with-sbcl.sh` and
-  `scripts/with-clasp.sh` (they load Quicklisp and point ASDF at the repo).
-- `with-clasp.sh` takes the **first Clasp it finds** from a candidate list — an installed
-  `/opt/clasp/bin/clasp` first, then a local source-tree build — and `CLASP_BIN=<path>` overrides both.
-  It fails loudly naming every path it tried rather than falling back to a `PATH` lookup.
-
-> ⚠️ **An INSTALLED Clasp and a SOURCE-TREE Clasp of the same version are not interchangeable for
-> dependencies.** `SYS:` resolves into the install prefix rather than the source tree, so ASDF loads
-> Quicklisp's CFFI instead of Clasp's bundled contrib CFFI, and the two differ in behaviour
-> (ADR 0104 — the PAL no longer depends on the difference). They also report the **same version string**, so
-> ASDF gives them the **same fasl-cache directory**: if you compare two Clasp builds, give each its own
-> `XDG_CACHE_HOME` or you are measuring whichever one compiled first.
+- **SBCL** and **AllegroCL 11.0** (`alisp`), 64-bit Linux x86_64, with **Quicklisp** installed. Those
+  are the two targets; Clasp was withdrawn on 2026-10-03 (ADR 0118; the last Clasp-bearing tree is the git
+  tag `clasp-last`). Whether `mlisp`, `alisp8`/`mlisp8` or macOS arm64 are also targets is open owner
+  decision D1.
+- The `Makefile` drives per-implementation builds via `scripts/with-sbcl.sh` (`SBCL_BIN` overrides the
+  binary) and `scripts/with-allegro.sh` (`ALISP_BIN` / `ALLEGRO_BIN`); both load Quicklisp and point ASDF at
+  the repo, and both exit 127 when their binary is absent.
 
 ## Build & test
 
 ```sh
-make build         # load all systems (default LISP = Clasp; override LISP=./scripts/with-sbcl.sh)
+make build         # load all systems (default LISP = SBCL; override LISP=./scripts/with-allegro.sh)
 make test          # run the unit/integration suite once
 make build-allegro # build on AllegroCL (ALISP_BIN / ALLEGRO_BIN override the binary)
 make test-allegro  # test on AllegroCL
-make build-all     # build on all three landed impls (Clasp + SBCL + AllegroCL); each launcher exits 127
-make test-all      # test on all three — where an impl is absent, use the per-impl targets above
+make build-all     # build on both targets (SBCL + AllegroCL); each launcher exits 127 when absent
+make test-all      # test on both — where an impl is absent, use the per-impl targets above
 make gate-build    # THE build gate: clean-cache rebuild + a falsification self-test (see below)
 make gate-types    # every defun has a single-line ftype declaim (FR-LANG-8)
-make gate-pal      # no reader conditionals outside dds-pal/ (contract §10, NFR-PORT)
+make gate-pal      # no reader conditionals outside dds-pal/ (contract §10, NFR-PORT); no Clasp token anywhere (ADR 0118)
 make gate-hotpath  # no CLOS dispatch (NFR-CLOS) + no UNJUSTIFIED allocation (NFR-MEM) in hot-path files
 make mem           # CODEC-only: 0 bytes/sample serialize + deserialize (NFR-PERF-8) — see the caveat below
-make gate-mem      # NFR-MEM RATCHET: END-TO-END bytes/sample, must not regress (ADR 0062). SBCL only.
+make gate-mem      # NFR-MEM RATCHET: END-TO-END bytes/sample, must not regress (ADR 0062). SBCL only:
+                   # a canary first proves bytes-consed moves, so it FAILS on AllegroCL (ADR 0118).
 make gate-arena    # FR-PF-7: the process static-memory budget is real, charged and RETURNED (ADR 0095). SBCL only.
 make wire          # validate emitted RTPS against the tshark RTPS dissector (FR-TOOL-3)
 make interop       # LIVE cross-vendor interop: Connext 7.3.1 + Fast DDS (FR-IO)
@@ -99,9 +93,9 @@ lint had never been written. `gates.yml` and `make gate-pal` make them true.
 
 **What CI does NOT cover — stated loudly, never silently skipped:**
 
-- **Clasp.** It is a source build, impractical on a hosted runner. The standing rule is that **Clasp AND
-  SBCL must both validate**, so this stays a **human step**:
-  `make test-clasp && make gate-build LISP=./scripts/with-clasp.sh`.
+- **AllegroCL.** It is commercially licensed and not on the hosted runner. The rule is that **SBCL AND
+  AllegroCL must both validate** (ADR 0118), so this stays a **human step**:
+  `make test-allegro && make gate-build LISP=./scripts/with-allegro.sh`.
 - **Interop.** Needs licensed RTI Connext + a Fast DDS build. Human step: `make interop`.
 
 ### ⚠️ `make bench` is a REPORT, not a gate
@@ -127,12 +121,16 @@ wrong-arity call and aborts if the build machinery *fails to reject it*. A gate 
 proves nothing, so the gate proves it on every run. Run it on both impls before calling work done:
 
 ```sh
-make gate-build LISP=./scripts/with-clasp.sh
 make gate-build LISP=./scripts/with-sbcl.sh
+make gate-build LISP=./scripts/with-allegro.sh
 ```
 
+⚠️ On AllegroCL the second line is expected to **fail its own falsification step** until the plan's Phase 2
+lands: ASDF's compile-failure behaviour there is `:warn`, so the wrong-arity canary is not rejected
+(`docs/plans/2026-10-03-sbcl-allegro-full-ok.md` §1). That red is the honest answer, not a flake.
+
 **The fasl cache is private to this project.** Every Lisp entry point (`scripts/with-sbcl.sh`,
-`scripts/with-clasp.sh`, `scripts/gate-build.sh`) sources `scripts/lisp-cache-env.sh`, which sets
+`scripts/with-allegro.sh`, `scripts/gate-build.sh`) sources `scripts/lisp-cache-env.sh`, which sets
 `XDG_CACHE_HOME` to `~/.cache/hofvarpnir` unless you have already exported one. This matters because
 ASDF's default puts every project's fasls in one shared `~/.cache/common-lisp` keyed only by
 implementation+version — so `gate-build`'s `rm -rf` would delete the fasls of any *other* project's Lisp

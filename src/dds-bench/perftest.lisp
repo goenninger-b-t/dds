@@ -2,7 +2,7 @@
 ;;;; participant data plane (dds.disc) on UDP loopback. One-way latency is RTT/2 from a single
 ;;;; in-flight ping echoed by a second in-process node, timed with the PAL monotonic clock
 ;;;; (dds.pal:monotonic-ns); bytes/sample is the dds.pal:bytes-consed delta over the measured
-;;;; loop (NFR-PERF-8 oracle, SBCL-exact; Clasp reports 0 — a documented NFR-PORT gap). This is
+;;;; loop (NFR-PERF-8 oracle, SBCL-exact; AllegroCL reports 0 — a documented NFR-PORT gap). This is
 ;;;; a baseline harness: it reports the CURRENT numbers so the P4 features (batching, async,
 ;;;; zero-copy, FlatData) have a measured before/after (FR-LANG-7). Clock resolution is the PAL
 ;;;; clock's (currently microseconds via get-internal-real-time); a higher-resolution PAL clock
@@ -77,7 +77,7 @@
     (function (keyword) t)
   "T iff TRANSPORT routes user DATA over the SHMEM data plane (:shmem OR :zerocopy), NIL for :udp — the
    bench's transport switch. Both bench nodes run in ONE process (same host-uuid), so with *shmem-enabled*
-   T (its default on SBCL and Clasp/Linux) the user-DATA push auto-routes over shared memory (%shmem-dest);
+   T (its default wherever by-name SHMEM attach is reliable — see dds.disc:*shmem-enabled*) the user-DATA push auto-routes over shared memory (%shmem-dest);
    rebinding it NIL forces the all-UDP baseline. :zerocopy also rides SHMEM (the ZC pool is a SHMEM segment,
    the ref still crosses over the SHMEM transport). NOT a wire constant — a local transport switch (WP-SHMEM)."
   (ecase transport (:udp nil) (:shmem t) (:zerocopy t)))
@@ -312,10 +312,10 @@
    *standard-output* quantifying the SHMEM-vs-UDP delta (NFR-PERF-6, FR-LANG-7). Captured into bench/report/
    by the make bench-shmem target. Each :shmem run asserts disc-node-shmem-sends advanced, so the SHMEM
    columns are PROVEN to have traversed shared memory, not a silent UDP fallback. bytes/sample is the
-   NFR-PERF-8 0-alloc oracle (SBCL-exact; Clasp reports 0 — a documented NFR-PORT gap, so on Clasp the
-   bytes/sample column is uninformative)."
+   NFR-PERF-8 0-alloc oracle (SBCL-exact; AllegroCL reports 0 — a documented NFR-PORT gap, so on AllegroCL
+   the bytes/sample column is uninformative)."
   (format t "~&# dds-bench — SHMEM vs UDP-loopback (WP-SHMEM)~%~%")
-  (format t "Both bench nodes run in ONE process (same host-uuid), so with dds.disc:*shmem-enabled* T the user-DATA push auto-routes over shared memory; the UDP rows rebind it NIL to force the loopback baseline. Clock: dds.pal:monotonic-ns (~~us resolution). bytes/sample: dds.pal:bytes-consed delta over the measured loop (whole path, all threads; SBCL-exact, Clasp=0). Each SHMEM run is asserted to have advanced disc-node-shmem-sends (proof it measured SHMEM, not UDP).~%~%")
+  (format t "Both bench nodes run in ONE process (same host-uuid), so with dds.disc:*shmem-enabled* T the user-DATA push auto-routes over shared memory; the UDP rows rebind it NIL to force the loopback baseline. Clock: dds.pal:monotonic-ns (~~us resolution). bytes/sample: dds.pal:bytes-consed delta over the measured loop (whole path, all threads; SBCL-exact, AllegroCL=0). Each SHMEM run is asserted to have advanced disc-node-shmem-sends (proof it measured SHMEM, not UDP).~%~%")
   (format t "## One-way latency — SHMEM vs UDP (ns; RTT/2, single in-flight)~%~%")
   (format t "| payload |  UDP p50 |  UDP p99 |  UDP max | SHM p50 | SHM p99 | SHM max | p50 spdup | SHM b/samp |~%")
   (format t "|---------|----------|----------|----------|---------|---------|---------|-----------|------------|~%")
@@ -330,7 +330,7 @@
     (let ((u (run-throughput :samples throughput-samples :payload-bytes (car spec) :batch (cdr spec) :transport :udp))
           (s (run-throughput :samples throughput-samples :payload-bytes (car spec) :batch (cdr spec) :transport :shmem)))
       (%print-throughput-cmp u s)))
-  (format t "~%Legend: p50 spdup = UDP-p50 / SHMEM-p50 (>1 = SHMEM faster). spr ratio = SHMEM-send-samples/s / UDP (>1 = SHMEM faster). SHM b/samp is the SHMEM bytes-consed/sample (NFR-PERF-8; ~~0 = the steady path allocates nothing; Clasp reports 0 by gap).~%")
+  (format t "~%Legend: p50 spdup = UDP-p50 / SHMEM-p50 (>1 = SHMEM faster). spr ratio = SHMEM-send-samples/s / UDP (>1 = SHMEM faster). SHM b/samp is the SHMEM bytes-consed/sample (NFR-PERF-8; ~~0 = the steady path allocates nothing; AllegroCL reports 0 by gap).~%")
   t)
 
 ;;;; ---- WP-ZEROCOPY large-sample bench (FR-PF-3, FR-LANG-7; NOT cleared for ship — pending counsel R6) ----
@@ -403,7 +403,7 @@
   (flet ((thr-n (size) (or throughput-samples (%zc-throughput-samples size))))
     (format t "~&# dds-bench — WP-ZEROCOPY vs SHMEM vs UDP-loopback (FR-PF-3, large samples)~%~%")
     (format t "NOT cleared for ship — pending counsel (R6); see ADR 0014. dds.disc:*zerocopy-enabled* is default OFF.~%~%")
-    (format t "All three transports run as 2 in-process participants (same host-uuid). UDP rebinds dds.disc:*shmem-enabled* NIL; SHMEM routes the serialized payload over shared memory; ZEROCOPY additionally binds dds.disc:*zerocopy-enabled* T so a sample LARGER than *zerocopy-min-payload-bytes* (1024) crosses as a 16-byte SHMEM-pool reference, not the payload. Clock: dds.pal:monotonic-ns (~~us). bytes/sample: dds.pal:bytes-consed delta over the measured loop (whole path; SBCL-exact, Clasp=0 by NFR-PORT gap). Each ZEROCOPY run is asserted to have advanced disc-node-zc-sends (a reference crossed, not a payload).~%~%")
+    (format t "All three transports run as 2 in-process participants (same host-uuid). UDP rebinds dds.disc:*shmem-enabled* NIL; SHMEM routes the serialized payload over shared memory; ZEROCOPY additionally binds dds.disc:*zerocopy-enabled* T so a sample LARGER than *zerocopy-min-payload-bytes* (1024) crosses as a 16-byte SHMEM-pool reference, not the payload. Clock: dds.pal:monotonic-ns (~~us). bytes/sample: dds.pal:bytes-consed delta over the measured loop (whole path; SBCL-exact, AllegroCL=0 by NFR-PORT gap). Each ZEROCOPY run is asserted to have advanced disc-node-zc-sends (a reference crossed, not a payload).~%~%")
     (format t "## One-way latency — ZC vs SHMEM vs UDP (ns; RTT/2, single in-flight, N=~d)~%~%" latency-samples)
     (format t "| payload |  UDP p50 |  UDP p99 |  UDP b/samp | SHM p50 | SHM p99 | SHM b/samp |  ZC p50 |  ZC p99 |  ZC b/samp | ZC/SHM p50 | zc-sends |~%")
     (format t "|---------|----------|----------|-------------|---------|---------|------------|---------|---------|------------|------------|----------|~%")
@@ -444,7 +444,7 @@
   "Suite-friendly self-check of the WP-SHMEM bench path: a tiny :shmem latency + throughput run, asserting
    every sample round-trips AND that disc-node-shmem-sends advanced (so CI catches a SHMEM-routing
    regression — the bench measuring UDP while claiming SHMEM — without a long run). Pass-SKIPS where SHMEM
-   is off (dds.disc:*shmem-enabled* NIL, e.g. Clasp/macOS per ADR 0013) so it never false-fails on a platform
+   is off (dds.disc:*shmem-enabled* NIL, e.g. a non-SBCL image on macOS, ADR 0118) so it never false-fails on a platform
    with no usable SHMEM. Signals an error on failure (the dds.tests runner treats that as a test failure)."
   (if (not dds.disc:*shmem-enabled*)
       (format t "(SHMEM off on this platform — skipped) ")
@@ -463,7 +463,7 @@
    R6): a tiny :zerocopy latency + throughput run at a payload ABOVE *zerocopy-min-payload-bytes*, asserting
    every sample round-trips byte-exact AND that disc-node-zc-sends advanced (so CI catches a ZC-routing
    regression — the bench fragmenting the payload while claiming a reference crossed — without a long run).
-   Pass-SKIPS where SHMEM is not reliably by-name-attachable (Clasp/macOS per ADR 0013) so it never
+   Pass-SKIPS where SHMEM is not reliably by-name-attachable (a non-SBCL image on macOS, ADR 0118) so it never
    false-fails on a platform with no usable SHMEM pool. Signals an error on failure."
   (if (not (dds.xport.shmem:shm-attach-by-name-reliable-p))
       (format t "(SHMEM by-name attach unreliable on this platform — ZC bench skipped) ")

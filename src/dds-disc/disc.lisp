@@ -18,15 +18,15 @@
              (and s (fboundp s) (funcall s) t))))
   "Master switch (read once per node at make-disc-node into the SHMEM slot) for routing same-host user
    DATA over the shared-memory transport (FR-XPORT-2) instead of UDP. Default: T wherever the SHMEM package
-   is present AND by-name attach actually works there — which since 2026-07-31 is every supported
-   implementation and platform (ADR 0103 closed the last gap, Clasp/macOS-arm64).
+   is present AND by-name attach actually works there — on SBCL everywhere and on AllegroCL on Linux; a
+   non-SBCL image on macOS answers NIL (DDS.PAL:SHM-CREATE-MODE-RELIABLE-P, ADR 0118).
 
    ⚠️ ASKS THE TRANSPORT, AND MUST KEEP ASKING IT. This used to re-derive the platform test itself —
-   literally `(not (and (eq (pal-impl-name) :clasp) (uiop:os-macosx-p)))`, a second copy of what
+   literally an implementation-and-OS test on PAL-IMPL-NAME and UIOP:OS-MACOSX-P, a second copy of what
    DDS.XPORT.SHMEM:SHM-ATTACH-BY-NAME-RELIABLE-P already decided. Two copies of one capability judgement is
-   one too many: when the Clasp gap closed, flipping the predicate alone would have left THIS switch NIL, so
-   the transport would have been declared usable while discovery still routed every sample over UDP — a
-   silent, green, all-UDP run that no test asserts against. The soft FIND-SYMBOL reference (not a direct
+   one too many: when the (since-withdrawn) Clasp/macOS gap closed (ADR 0103), flipping the predicate alone
+   would have left THIS switch NIL, so the transport would have been declared usable while discovery still
+   routed every sample over UDP — a silent, green, all-UDP run that no test asserts against. The soft FIND-SYMBOL reference (not a direct
    call) is deliberate: dds-disc must still load when dds-xport.shmem is absent.
 
    Rebind to NIL before make-disc-node to force the all-UDP path (e.g. cross-host deployments where no
@@ -2655,8 +2655,7 @@
    they name the caller's own binding — pass NODE as a variable, not an expression.
 
    CONDITIONS is the condition type the carve is guarded by (default ERROR; sites whose allocation can exhaust
-   real off-heap memory pass (or error storage-condition), which is what a static-alloc OOM signals on SBCL and
-   Clasp). ON-FAILURE runs when the guard fires, for a site that latches its failure rather than retrying the
+   real off-heap memory pass (or error storage-condition), which is what a static-alloc OOM signals on SBCL). ON-FAILURE runs when the guard fires, for a site that latches its failure rather than retrying the
    carve on every sample.
 
    ADR 0064: an exhausted arena is a STATUS, not a condition, so a NIL pool MUST be tested — an unchecked NIL

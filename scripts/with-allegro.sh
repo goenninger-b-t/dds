@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # AllegroCL launcher: loads Quicklisp, points ASDF at the repo tree, then evaluates the forms passed as
-# arguments. Mirrors scripts/with-sbcl.sh and scripts/with-clasp.sh — and closes the follow-up ADR 0004
+# arguments. Mirrors scripts/with-sbcl.sh — and closes the follow-up ADR 0004
 # named in 2026-06-04 ("scripts/with-allegro.sh remains a tracked follow-up").
 #
-# ⛔ IT ACCEPTS SBCL/CLASP SYNTAX AND TRANSLATES. Callers — the Makefile above all — pass `--eval FORM`,
-# because that is what the other two implementations take. AllegroCL evaluates with `-e FORM` and has no
+# ⛔ IT ACCEPTS SBCL SYNTAX AND TRANSLATES. Callers — the Makefile above all — pass `--eval FORM`,
+# because that is what SBCL takes. AllegroCL evaluates with `-e FORM` and has no
 # `--eval` at all, so this script rewrites the argument vector rather than making every caller branch.
 # That keeps ONE spelling in the Makefile and confines the divergence to the launcher, exactly as
 # dds.pal:lisp-eval-command confines it for CHILD processes (ADR 0116).

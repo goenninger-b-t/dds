@@ -1,6 +1,6 @@
 ;;;; DDS.PAL — L0 Platform Abstraction Layer contract (frozen M0).
 ;;;; Impl-agnostic surface only. Per-impl code lives in pal-<impl>.lisp and is
-;;;; the ONLY place where #+sbcl/#+allegro/#+clasp reader conditionals may appear.
+;;;; the ONLY place where #+sbcl/#+allegro reader conditionals may appear.
 
 (defpackage #:net.goenninger.dds.pal
   (:nicknames #:dds.pal)
@@ -26,14 +26,14 @@
    #:cas-sap-u64 #:cas-sap-u32 #:atomic-incf-sap-u64 #:load-sap-u64 #:store-sap-u64
    ;; foreign-SAP fixed-width unsigned reads — back the FlatData-ZC read-in-place
    ;; accessors (WP-FLATDATA-ZC-LOAN; R6, NOT cleared for ship — see ADR 0017).
-   ;; IMPLEMENTED ON BOTH IMPLS (the Clasp stubs are gone — see the PAL-UNIMPLEMENTED note below).
+   ;; IMPLEMENTED ON BOTH IMPLS (SBCL and AllegroCL; see the PAL-UNIMPLEMENTED note below).
    ;; IEEE 754 bit-pattern conversion (ADR 0111 §2.3). The XCDR float codecs are built from these plus the
    ;; existing u32/u64 writers, so endianness and MODE-capped alignment are inherited, never restated.
    ;; Here because no portable ANSI CL spelling is both correct across denormals/NaN/Inf and fast — which
    ;; is precisely what the PAL exists for, and the only place a reader conditional may live.
    #:f32-bits #:f32-from-bits #:f64-bits #:f64-from-bits
    ;; ADR 0116: the command line that launches a CHILD of THIS Lisp evaluating a list of forms. Per-impl
-   ;; because the eval flag and the memory flags differ (SBCL/Clasp --eval, AllegroCL -e; only SBCL takes
+   ;; because the eval flag and the memory flags differ (SBCL --eval, AllegroCL -e; only SBCL takes
    ;; --dynamic-space-size), and a wrong flag is not an error the child reports — it hangs.
    #:lisp-eval-command
    #:load-sap-u8 #:load-sap-u16 #:load-sap-u32
@@ -93,7 +93,7 @@
    #:internal-bug-p
    ;; optimization hints
    #:with-hot-optimizations
-   ;; file sync (group-commit; fdatasync on SBCL, finish-output on Clasp — NFR-PORT)
+   ;; file sync (group-commit; fdatasync on SBCL, finish-output on AllegroCL — NFR-PORT)
    #:fsync-stream
    ;; directory sync: open(dir,O_RDONLY)+fsync+close so a newly-created/renamed dirent
    ;; (log file, epochs.dat, compaction rename) survives power loss — POSIX requires
@@ -108,13 +108,13 @@
    code). It carries no subclasses any more."))
 
 ;; PAL-UNIMPLEMENTED is GONE, and not because it was converted to a status — because THE GAP IT NAMED DOES
-;; NOT EXIST. It was signalled by seven Clasp capability stubs (load-sap-u8/u16/u32, store-sap-u8,
-;; cas-sap-u64/u32, atomic-incf-sap-u64) on the claim that Clasp cannot read, write, or atomically
-;; compare-and-swap a raw foreign cell. cffi:mem-ref does the loads/stores on Clasp exactly as
-;; sb-sys:sap-ref-N does on SBCL, and the C atomic runtime linked into the Clasp image
-;; (__atomic_compare_exchange_8/_4, __atomic_fetch_add_8) gives real hardware CAS over a plain pointer —
-;; measured: full-width 2^64-1 operands round-trip and 8-thread contention loses nothing. All seven are
-;; implemented; the Clasp PAL is now capability-equal to the SBCL PAL (owner directive 2026-07-14).
+;; NOT EXIST. It was signalled by seven capability stubs (load-sap-u8/u16/u32, store-sap-u8,
+;; cas-sap-u64/u32, atomic-incf-sap-u64) in the since-withdrawn Clasp PAL (ADR 0118), on the claim that a
+;; CFFI-only backend cannot read, write, or atomically compare-and-swap a raw foreign cell. It can:
+;; cffi:mem-ref does the loads/stores exactly as sb-sys:sap-ref-N does on SBCL, and the C atomic runtime
+;; (__atomic_compare_exchange_8/_4, __atomic_fetch_add_8 from libatomic) gives real hardware CAS over a plain
+;; pointer. pal-allegro.lisp implements all seven that way (ADR 0113), so every per-impl PAL symbol exists
+;; on both targets (owner directive 2026-07-14).
 
 ;; PAL-TIMEOUT is GONE (operating contract: no Lisp conditions in our code). TCP-RECV's read/idle timeout
 ;; was the one PAL condition on a data path; it is now the STATUS VALUE :TIMEOUT, returned as TCP-RECV's
@@ -138,29 +138,19 @@
     (function (string) t)
   "Resolve NAME in the process-global foreign namespace (RTLD_DEFAULT) to a callable pointer, or NIL.
    The ONE way any PAL site turns a libc symbol into a pointer — clock_gettime, memcpy, sendto,
-   recvfrom, and Clasp's __atomic_* CAS primitives all go through here. Callers cache the result and
-   invoke it with CFFI:FOREIGN-FUNCALL-POINTER; a by-name foreign call re-resolves through dlsym on
-   EVERY call on Clasp (~3.8 us measured), which is why these are pointers and not names.
+   recvfrom, and AllegroCL's libatomic __atomic_* CAS primitives all go through here. Callers cache the
+   result and invoke it with CFFI:FOREIGN-FUNCALL-POINTER, so no hot foreign call pays a per-call symbol
+   lookup (on some FFIs a by-name call re-resolves through dlsym every time — measured ~3.8 us/call on the
+   since-withdrawn Clasp target).
 
-   ⚠️ DO NOT 'SIMPLIFY' THIS BACK TO A BARE (CFFI:FOREIGN-SYMBOL-POINTER NAME) ON CLASP. That form
-   is NOT portable across Clasp installations, because two DIFFERENT CFFI distributions answer it:
+   NIL is a real answer (the symbol is not mapped into this image — e.g. libatomic before pal-allegro
+   loads it), and callers that need the pointer check for it.
 
-     - Clasp's BUNDLED contrib CFFI (present when SYS: resolves into a Clasp SOURCE TREE) translates
-       CFFI's :DEFAULT library marker to :RTLD-DEFAULT before calling the Clasp primitive, so it works.
-     - Quicklisp's upstream CFFI passes :DEFAULT straight through to
-       CLASP-FFI:%FOREIGN-SYMBOL-POINTER, which does not know that keyword and returns NIL.
-
-   An INSTALLED Clasp (e.g. /opt/clasp/...) ships no contrib lisp tree, so ASDF falls through to the
-   Quicklisp CFFI and EVERY bare lookup silently yields NIL. Measured on one host with two builds of
-   the SAME Clasp version (3.0.1-112-gc7faba5ec, arm64): all six symbols above resolved from the
-   source tree and NONE resolved from the /opt install. The failure is silent and catastrophic — a
-   NIL *RECVFROM-FP* reaches CFFI:FOREIGN-FUNCALL-POINTER as 'PTR may not be NIL' from inside the UDP
-   receiver thread, killing the suite, and a NIL CAS pointer would take the foreign-SAP atomics with it.
-
-   Calling the Clasp primitive with :RTLD-DEFAULT directly removes the dependence on WHICH CFFI got
-   loaded — verified to resolve all six on BOTH builds. Reader conditionals are permitted in dds-pal/."
-  #+clasp (clasp-ffi:%foreign-symbol-pointer name :rtld-default)
-  #-clasp (cffi:foreign-symbol-pointer name))
+   History: this used to carry a Clasp-only branch calling CLASP-FFI:%FOREIGN-SYMBOL-POINTER with
+   :RTLD-DEFAULT, because Quicklisp's upstream CFFI passed :DEFAULT to that primitive and got NIL on an
+   installed Clasp (ADR 0104). Clasp is withdrawn (ADR 0118); on SBCL and AllegroCL the bare CFFI lookup
+   below resolves in the process-global namespace."
+  (cffi:foreign-symbol-pointer name))
 
 ;;; ---- atomics: the ATOMIC-CELL the per-impl CAS / ATOMIC-INCF target ----
 ;;; Impl-agnostic (identical defstruct on both impls), so it lives in the contract; only the
@@ -169,12 +159,11 @@
 (defstruct* (atomic-cell (:constructor make-atomic-cell))
   "A PAL atomic counter cell: a single (unsigned-byte 64) VALUE slot that CAS and ATOMIC-INCF
    operate on atomically. It is the CONCRETE PLACE the M0 generic atomics needed to close their
-   stub (ADR 0041): the native read-modify-write primitives (SBCL sb-ext:, Clasp mp:) are
-   place-form MACROS that must see a compile-time-known place, so the old runtime place-fn
-   indirection could not be lowered to a hardware atomic (ADR 0013) — a first-class cell whose
-   FIXED slot those macros target is the portable way to expose them as ordinary functions. A
-   single (unsigned-byte 64) slot is the one representation both sb-ext:cas/atomic-incf and
-   mp:cas/atomic-incf accept for BOTH ops (probed). Build with MAKE-ATOMIC-CELL (VALUE defaults
+   stub (ADR 0041): the native read-modify-write primitives (SBCL sb-ext:cas/atomic-incf, AllegroCL
+   excl::atomic-conditional-setf/incf-atomic) are place-form MACROS that must see a compile-time-known
+   place, so the old runtime place-fn indirection could not be lowered to a hardware atomic (ADR 0013) —
+   a first-class cell whose FIXED slot those macros target is the portable way to expose them as ordinary
+   functions. A single (unsigned-byte 64) slot is what both backends target for BOTH ops (ADR 0113). Build with MAKE-ATOMIC-CELL (VALUE defaults
    0); read the live value with ATOMIC-CELL-VALUE — a plain (relaxed) load, so use CAS/ATOMIC-INCF
    for an atomic RMW and FENCE for standalone ordering."
   (value 0 :type (unsigned-byte 64)))
