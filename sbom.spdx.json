@@ -3,7 +3,7 @@
   "@graph": [
     {
       "@id": "_:creationinfo",
-      "created": "2026-10-04T02:42:52Z",
+      "created": "2026-10-04T03:45:38Z",
       "createdBy": [
         "https://github.com/goenninger-b-t/dds/sbom#agent/goenninger-b-t"
       ],
@@ -109,8 +109,8 @@
       "software_declaredLicense": "https://github.com/goenninger-b-t/dds/sbom#license/CC-BY-ND-4.0",
       "software_downloadLocation": "https://github.com/goenninger-b-t/dds",
       "software_homePage": "https://github.com/goenninger-b-t/dds",
-      "software_packageUrl": "pkg:github/goenninger-b-t/dds@95187dd",
-      "software_packageVersion": "0.0.0-dev+git.95187dd",
+      "software_packageUrl": "pkg:github/goenninger-b-t/dds@22895c4",
+      "software_packageVersion": "0.0.0-dev+git.22895c4",
       "software_primaryPurpose": "library",
       "spdxId": "https://github.com/goenninger-b-t/dds/sbom#package/neodds",
       "suppliedBy": "https://github.com/goenninger-b-t/dds/sbom#agent/goenninger-b-t",
@@ -306,18 +306,25 @@
       "type": "Organization"
     },
     {
-      "comment": "Native crypto backend for dds-dare (CNSA-2.0 DARE: AES-256-GCM, ML-KEM-1024, SHA-384/HKDF via libcrypto). >= 3.5 is a HARD runtime requirement (ML-KEM landed in 3.5 LTS); runtime-checked at startup (dare-available-p), hard-error if absent (no plaintext fallback). Version 3.6.2 verified on this host (docs/provenance.md, FR-SEC-2).",
+      "comment": "Native crypto backend for dds-dare (CNSA-2.0 DARE: AES-256-GCM, ML-KEM-1024, SHA-384/HKDF via libcrypto). >= 3.5 is a HARD runtime requirement (ML-KEM landed in 3.5 LTS); runtime-checked at startup (dare-available-p); loaded by absolute path from DDS_DARE_LIBCRYPTO and rejected, never replaced by another copy, when that file is missing, is not the object its symbols resolve in, or a second libcrypto is mapped (ADR 0123). Built from the release tarball by scripts/build-openssl.sh; the hash is the tarball's, verified against the published SHA-256 and OpenPGP signature (docs/provenance.md, FR-SEC-2).",
       "creationInfo": "_:creationinfo",
       "name": "openssl",
       "software_declaredLicense": "https://github.com/goenninger-b-t/dds/sbom#license/Apache-2.0",
-      "software_downloadLocation": "https://www.openssl.org/source/",
+      "software_downloadLocation": "https://github.com/openssl/openssl/releases/download/openssl-3.5.9/openssl-3.5.9.tar.gz",
       "software_homePage": "https://www.openssl.org/",
-      "software_packageUrl": "pkg:generic/openssl@3.6.2",
-      "software_packageVersion": "3.6.2",
+      "software_packageUrl": "pkg:generic/openssl@3.5.9",
+      "software_packageVersion": "3.5.9",
       "software_primaryPurpose": "library",
       "spdxId": "https://github.com/goenninger-b-t/dds/sbom#package/openssl",
       "suppliedBy": "https://github.com/goenninger-b-t/dds/sbom#agent/The-OpenSSL-Project",
-      "type": "software_Package"
+      "type": "software_Package",
+      "verifiedUsing": [
+        {
+          "algorithm": "sha256",
+          "hashValue": "603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a",
+          "type": "Hash"
+        }
+      ]
     },
     {
       "comment": "native runtime dependency (dds-dare CNSA-2.0 DARE; OpenSSL >= 3.5)",

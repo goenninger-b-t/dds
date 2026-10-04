@@ -49,10 +49,13 @@ COMPONENTS = {
     # OpenSSL is a NATIVE runtime dependency of dds-dare (CNSA-2.0 DARE: AES-256-GCM +
     # ML-KEM-1024 + SHA-384/HKDF via libcrypto, loaded through CFFI — not an ASDF :depends-on),
     # so it is emitted as a native runtime package below (mirroring the SBCL runtime entry),
-    # not via the ASDF scan. >= 3.5 is a HARD deployment requirement (ML-KEM landed in 3.5 LTS);
-    # 3.6.2 is the version verified on this host (docs/provenance.md, FR-SEC-2 vetted crypto).
-    "openssl":          {"version": "3.6.2", "license": "Apache-2.0",
-                         "download": "https://www.openssl.org/source/",
+    # not via the ASDF scan. >= 3.5 is a HARD deployment requirement (ML-KEM landed in 3.5 LTS).
+    # The pin is the 3.5 LTS release scripts/build-openssl.sh builds from source and
+    # scripts/openssl-env.sh points DDS_DARE_LIBCRYPTO at (WP-0.8, ADR 0123); version and sha256 MUST
+    # equal OPENSSL_VERSION / OPENSSL_SHA256 there (docs/provenance.md records the verification).
+    "openssl":          {"version": "3.5.9", "license": "Apache-2.0",
+                         "download": "https://github.com/openssl/openssl/releases/download/openssl-3.5.9/openssl-3.5.9.tar.gz",
+                         "sha256": "603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a",
                          "supplier": "The OpenSSL Project"},
     # cl-sqlite (ASDF system "sqlite") is a top-level :depends-on of dds-durability (the SQLite
     # persistence backend, ADR 0049) — auto-discovered from the .asd scan below. Public-domain
@@ -279,14 +282,20 @@ def main():
                   "software_downloadLocation": ossl["download"],
                   "software_homePage": "https://www.openssl.org/",
                   "software_packageUrl": "pkg:generic/openssl@" + ossl["version"],
+                  "verifiedUsing": [{"type": "Hash", "algorithm": "sha256",
+                                     "hashValue": ossl["sha256"]}],
                   "software_primaryPurpose": "library",
                   "software_declaredLicense": lic_apache,
                   "suppliedBy": suppliers[ossl_sup],
                   "comment": "Native crypto backend for dds-dare (CNSA-2.0 DARE: AES-256-GCM, "
                              "ML-KEM-1024, SHA-384/HKDF via libcrypto). >= 3.5 is a HARD runtime "
                              "requirement (ML-KEM landed in 3.5 LTS); runtime-checked at startup "
-                             "(dare-available-p), hard-error if absent (no plaintext fallback). "
-                             "Version 3.6.2 verified on this host (docs/provenance.md, FR-SEC-2)."})
+                             "(dare-available-p); loaded by absolute path from DDS_DARE_LIBCRYPTO and "
+                             "rejected, never replaced by another copy, when that file is missing, is not "
+                             "the object its symbols resolve in, or a second libcrypto is mapped (ADR 0123). "
+                             "Built from the release tarball by scripts/build-openssl.sh; the hash is the "
+                             "tarball's, verified against the published SHA-256 and OpenPGP signature "
+                             "(docs/provenance.md, FR-SEC-2)."})
     elements.append(openssl_pkg)
     ossl_rel = NS + "relationship/runtime-openssl"
     relationships.append(ossl_rel)

@@ -35,11 +35,26 @@ name: Gates
 # failure injected into the FIRST test, 590 tests still ran, the summary read "622 passed, 1 FAILED,
 # 623 total", and make exited 2.
 #
+# OPENSSL 3.5 (WP-0.8, ADR 0123) — OFF BY DEFAULT, BY NAME. The DARE / DDS-Security arms need OpenSSL >= 3.5
+# and ubuntu-latest ships 3.0, so without it about a hundred of them record an ADR 0122 skip. The step below
+# builds the pinned release with scripts/build-openssl.sh (SHA-256 + OpenPGP verified), caches the install
+# keyed on the pinned version AND hash read out of that script, and exports ONLY DDS_DARE_LIBCRYPTO through
+# $GITHUB_ENV. It is gated by the switch NEODDS_CI_OPENSSL35 (repository variable = 'on', or the
+# `openssl35` input of a manual run). It is OFF by default for one reason: the governing plan
+# (docs/plans/2026-10-03-sbcl-allegro-full-ok.md, WP-0.10) enables OpenSSL 3.5 in hosted CI in the same commit
+# as ADR 0122 step 2, and this path has not yet run on a hosted runner. Locally (2026-10-04, SBCL 2.2.9,
+# OpenSSL 3.5.9) the suite was 652/652 with 0 skips and fuzz/corpus/mem passed, so turning it on is not
+# expected to go red. While it is off, the coverage step at the bottom prints "NOT COVERED: openssl35@sbcl".
 on:
   push:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      openssl35:
+        description: "Build/cache the pinned OpenSSL 3.5 and run the suite against it (NEODDS_CI_OPENSSL35)"
+        type: boolean
+        default: false
 
 jobs:
   gates:
@@ -74,6 +89,36 @@ jobs:
             --eval '(ql:quickload :dds-tests :silent t)' \
             --eval '(ql:quickload :dds-bench :silent t)' \
             --eval '(uiop:quit 0)'
+
+      - name: OpenSSL 3.5 pin (read from scripts/build-openssl.sh)
+        id: osslpin
+        if: ${{ vars.NEODDS_CI_OPENSSL35 == 'on' || inputs.openssl35 }}
+        run: |
+          set -euo pipefail
+          ver="$(sed -n 's/^OPENSSL_VERSION="\(.*\)"$/\1/p' scripts/build-openssl.sh)"
+          sha="$(sed -n 's/^OPENSSL_SHA256="\(.*\)"$/\1/p' scripts/build-openssl.sh)"
+          test -n "$ver" && test -n "$sha"
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "sha256=$sha" >> "$GITHUB_OUTPUT"
+          echo "prefix=$HOME/.local/opt/openssl-3.5" >> "$GITHUB_OUTPUT"
+
+      - name: Cache OpenSSL 3.5 install
+        if: ${{ vars.NEODDS_CI_OPENSSL35 == 'on' || inputs.openssl35 }}
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.osslpin.outputs.prefix }}
+          key: openssl-${{ runner.os }}-${{ runner.arch }}-${{ steps.osslpin.outputs.version }}-${{ steps.osslpin.outputs.sha256 }}
+
+      - name: Build OpenSSL 3.5 (no-op on a cache hit) and export DDS_DARE_LIBCRYPTO only
+        if: ${{ vars.NEODDS_CI_OPENSSL35 == 'on' || inputs.openssl35 }}
+        run: |
+          set -euo pipefail
+          # Cache miss: a full verified build (SHA-256 mandatory; OpenPGP required here). Cache hit: the
+          # stamp matches and the script exits at once.
+          DDS_OPENSSL_REQUIRE_PGP=1 ./scripts/build-openssl.sh
+          . scripts/openssl-env.sh
+          echo "DDS_DARE_LIBCRYPTO=$DDS_DARE_LIBCRYPTO" >> "$GITHUB_ENV"
+          echo "openssl35@sbcl" >> "$RUNNER_TEMP/ci-covered"
 
       # THE build gate: clears the fasl cache, rebuilds from scratch, and falsifies itself.
       # `make build` is incremental and can pass on a tree that does not compile — that is the whole point.
@@ -153,7 +198,7 @@ jobs:
           for lisp in sbcl allegro; do
             for leg in build test corpus fuzz; do required+=("${leg}@${lisp}"); done
           done
-          required+=(wire interop)
+          required+=(wire interop openssl35@sbcl)
           missing=()
           for r in "${required[@]}"; do
             grep -qxF "$r" "$RUNNER_TEMP/ci-covered" || missing+=("$r")
@@ -163,6 +208,9 @@ jobs:
           for m in "${missing[@]}"; do echo "::warning::NOT COVERED: $m"; done
           if printf '%s\n' "${missing[@]}" | grep -q '@allegro$'; then
             echo "::warning::ALLEGROCL NOT RUN — CI cannot run AllegroCL yet (licensed). Human step: make gate-build LISP=./scripts/with-allegro.sh && make test LISP=./scripts/with-allegro.sh"
+          fi
+          if printf '%s\n' "${missing[@]}" | grep -qx 'openssl35@sbcl'; then
+            echo "::warning::OPENSSL 3.5 NOT PROVISIONED — the DARE / DDS-Security arms recorded skips. Switch: repository variable NEODDS_CI_OPENSSL35=on (off by default until ADR 0122 step 2; ADR 0123)"
           fi
           if printf '%s\n' "${missing[@]}" | grep -qx 'interop'; then
             echo "::warning::INTEROP NOT RUN — needs licensed RTI Connext + Fast DDS. Human step: make interop"

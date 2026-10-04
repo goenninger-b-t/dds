@@ -3431,3 +3431,30 @@ neither emitted nor interpreted. Naming a field we have not identified is what A
   and `(lisp-implementation-type)` = `International Allegro CL Enterprise Edition`, run through
   `scripts/with-allegro.sh`.
 - No external source was consulted for this change beyond that query; no third-party text was copied.
+
+## 2026-10-04 — WP-0.8 + WP-0.9: OpenSSL 3.5.9 build and the fail-closed libcrypto loader (ADR 0123)
+
+- **OpenSSL 3.5.9 (Apache-2.0, The OpenSSL Project)** is now built from the release tarball by
+  `scripts/build-openssl.sh` into a user prefix and pinned in `scripts/generate-sbom.py` (replacing the macOS
+  3.6.2 pin). Latest 3.5 LTS patch on 2026-10-04, read from the GitHub releases API
+  (`openssl-3.5.9`, published 2026-09-29).
+- **Integrity, as verified on the reference host on 2026-10-04:**
+  - SHA-256 `603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a`: identical in
+    `openssl-3.5.9.tar.gz.sha256` on GitHub and at `https://www.openssl.org/source/`, and recomputed locally.
+  - OpenPGP: **verified**. `gpg --verify` reported a good signature (2026-09-29 14:05:24 UTC) by signing subkey
+    `C46E D3F2 CBEF DA1F DAAD A442 64ED 7B1D CCE7 1CB2` of `B146 647E 45A7 B339 47AB 226B 2A2C 87D1 6169 2D40`
+    ("OpenSSL <openssl@openssl.org>"). That primary fingerprint was checked against three sources: the trust
+    anchor named on `https://openssl-library.org/source/`, the copy served by `keys.openpgp.org`, and the
+    certification by the previous release key `BA54 73A2 B058 7B07 FB27 CF2D 2160 94DF D0CB 81EF` carried in
+    `https://openssl-library.org/source/pubkeys.asc` (`gpg --check-sigs`: 4 good signatures). No key was
+    marked trusted locally; the check is the fingerprint pin.
+- **Headers read, not copied:** `include/openssl/core.h` of 3.5.9 (`struct ossl_param_st`, lines 85-91; the
+  `OSSL_PARAM_*` type defines, lines 106-123) through `scripts/probes/ossl-param-layout.c`; glibc 2.39
+  `/usr/include/dlfcn.h` (lines 56, 64, 82, 88-98) and `/usr/include/x86_64-linux-gnu/bits/dlfcn.h`
+  (lines 25, 38) through `scripts/probes/dlfcn-layout.c`; `/usr/include/stdlib.h:940` (`realpath`).
+  OpenSSL's `NOTES-UNIX.md` (rpath idiom) and `INSTALL.md` (`no-docs`, `no-tests`, `--libdir`) were read for
+  the build options.
+- **CFFI behaviour** (`%foreign-symbol-pointer` ignores `:library`) was read in the installed
+  `cffi-20260101-git` sources, `src/cffi-sbcl.lisp:399-403` and `src/cffi-allegro.lisp:407-410` (MIT); nothing
+  was copied.
+- No third-party code was copied into the repository.
