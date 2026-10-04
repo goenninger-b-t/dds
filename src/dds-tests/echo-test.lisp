@@ -898,7 +898,7 @@
    check is not merely refusing everything near the boundary. Then every corrupt-cursor reason that a
    synthetic lane can produce is driven and asserted by name."
   (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
-    (dds.pal:note-test-skip "run-shmem-lane-poison-page-end-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
+    (note-skip "run-shmem-lane-poison-page-end-test" :shm-attach-by-name "shm-attach-by-name unreliable on this platform (ADR 0013)")
     (return-from run-shmem-lane-poison-page-end-test t))
   (let* ((page (%os-page-size))
          (cap (- page (- (dds.xport.shmem::%segment-bytes 1 8) 8)))   ; header + 1 descriptor + cap = page
@@ -987,7 +987,7 @@
      - the poisoned lane's sender gets the UDP-fallback answer (send returns 0) once its ring fills, because
        its read cursor no longer moves."
   (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
-    (dds.pal:note-test-skip "run-shmem-lane-poison-observable-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
+    (note-skip "run-shmem-lane-poison-observable-test" :shm-attach-by-name "shm-attach-by-name unreliable on this platform (ADR 0013)")
     (return-from run-shmem-lane-poison-observable-test t))
   (let* ((cap 4096)
          (rx (dds.xport.shmem:make-shmem-transport :participant-guid (dds.xport.shmem::%test-guid #x71)
@@ -1085,7 +1085,7 @@
    been re-evaluated against the AllegroCL PAL, which does define cas-sap-u32."
   (if (not (eq (dds.pal:pal-impl-name) :sbcl))
       (progn
-        (format t "~&  [skip] zc-pool-loan: %zc-release uses cas-sap-u32 (SBCL-only since WP-ZC-LOAN-LOCKFREE, ADR 0018) — NFR-PORT gap~%")
+        (note-skip "zc-pool-loan" :zc-sap-primitives "%zc-release uses cas-sap-u32 (SBCL-only since WP-ZC-LOAN-LOCKFREE, ADR 0018) — NFR-PORT gap")
         t)
       (let ((m (dds.pal:alloc-static (dds.xport.zerocopy::%zc-bytes 2 32)))
             (payload (octets 1 2 3 4)))
@@ -1267,7 +1267,7 @@
                t)
           (dds.pal:free-static m)))
       (progn
-        (format t "~&  [skip] zc-loan-acquire: load-sap-u8 is SBCL-only (ZC, ADR 0013) — NFR-PORT gap~%")
+        (note-skip "zc-loan-acquire" :zc-sap-primitives "load-sap-u8 is SBCL-only (ZC, ADR 0013) — NFR-PORT gap")
         t)))
 
 (defun* run-zc-reclaim-skips-loaned-test ()
@@ -1283,7 +1283,7 @@
    been re-evaluated against the AllegroCL PAL, which does define cas-sap-u32."
   (if (not (eq (dds.pal:pal-impl-name) :sbcl))
       (progn
-        (format t "~&  [skip] zc-reclaim-skips-loaned: %zc-release uses cas-sap-u32 (SBCL-only since WP-ZC-LOAN-LOCKFREE, ADR 0018) — NFR-PORT gap~%")
+        (note-skip "zc-reclaim-skips-loaned" :zc-sap-primitives "%zc-release uses cas-sap-u32 (SBCL-only since WP-ZC-LOAN-LOCKFREE, ADR 0018) — NFR-PORT gap")
         t)
       (let ((m (dds.pal:alloc-static (dds.xport.zerocopy::%zc-bytes 2 32)))
             (pa (octets 91 92 93 94 95))
@@ -1337,7 +1337,7 @@
    lock-free double-return-safety also has run-zc-lockfree-release-test."
   (if (not (eq (dds.pal:pal-impl-name) :sbcl))
       (progn
-        (format t "~&  [skip] zc-release-idempotent: %zc-release uses cas-sap-u32 (SBCL-only since WP-ZC-LOAN-LOCKFREE, ADR 0018) — NFR-PORT gap~%")
+        (note-skip "zc-release-idempotent" :zc-sap-primitives "%zc-release uses cas-sap-u32 (SBCL-only since WP-ZC-LOAN-LOCKFREE, ADR 0018) — NFR-PORT gap")
         t)
       (let ((m (dds.pal:alloc-static (dds.xport.zerocopy::%zc-bytes 2 32)))
             (payload (octets 7 8 9)))
@@ -1447,7 +1447,7 @@
                t)
           (progn (dds.pal:free-static m1) (dds.pal:free-static m3))))
       (progn
-        (format t "~&  [skip] zc-loan-nofreelist: Zero-Copy is SBCL-only (ADR 0013) — NFR-PORT gap~%")
+        (note-skip "zc-loan-nofreelist" :zc-sap-primitives "Zero-Copy is SBCL-only (ADR 0013) — NFR-PORT gap")
         t)))
 
 (defun* run-zc-lockfree-acquire-test ()
@@ -1511,7 +1511,7 @@
                t)
           (dds.pal:free-static m)))
       (progn
-        (format t "~&  [skip] zc-lockfree-acquire: load-sap-u8 + bytes-consed are SBCL-only (ZC, ADR 0013) — NFR-PORT gap~%")
+        (note-skip "zc-lockfree-acquire" :zc-sap-primitives "load-sap-u8 + bytes-consed are SBCL-only (ZC, ADR 0013) — NFR-PORT gap")
         t)))
 
 (defun* run-zc-lockfree-release-test ()
@@ -1583,7 +1583,7 @@
                t)
           (dds.pal:free-static m)))
       (progn
-        (format t "~&  [skip] zc-lockfree-release: cas-sap-u32 + bytes-consed are SBCL-only (ZC, ADR 0013) — NFR-PORT gap~%")
+        (note-skip "zc-lockfree-release" :zc-sap-primitives "cas-sap-u32 + bytes-consed are SBCL-only (ZC, ADR 0013) — NFR-PORT gap")
         t)))
 
 (defun* run-zc-lockfree-release-biggen-test ()
@@ -1662,7 +1662,7 @@
                t)
           (dds.pal:free-static m)))
       (progn
-        (format t "~&  [skip] zc-lockfree-release-biggen: cas-sap-u32 + bytes-consed are SBCL-only (ZC, ADR 0013) — NFR-PORT gap~%")
+        (note-skip "zc-lockfree-release-biggen" :zc-sap-primitives "cas-sap-u32 + bytes-consed are SBCL-only (ZC, ADR 0013) — NFR-PORT gap")
         t)))
 
 (defun* run-zc-lockfree-stress-test ()
@@ -1680,7 +1680,7 @@
    on AllegroCL it pass-skips (gated on pal-impl-name :sbcl)."
   (if (not (eq (dds.pal:pal-impl-name) :sbcl))
       (progn
-        (format t "~&  [skip] zc-lockfree-stress: ZC pool + load-sap-u8 are SBCL-only (ADR 0013) — NFR-PORT gap~%")
+        (note-skip "zc-lockfree-stress" :zc-sap-primitives "ZC pool + load-sap-u8 are SBCL-only (ADR 0013) — NFR-PORT gap")
         t)
       (let* ((k 8)
              (slot-bytes 64)
@@ -1882,7 +1882,7 @@
    input: %zc-attach-pool tolerates a garbage source prefix (attach fails -> :none -> drop) and %zc-resolve
    bounds-checks slot-index + validates generation. Skips where SHMEM (hence a ZC pool) is unavailable."
   (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
-    (dds.pal:note-test-skip "run-zc-resolve-drop-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
+    (note-skip "run-zc-resolve-drop-test" :shm-attach-by-name "shm-attach-by-name unreliable on this platform (ADR 0013)")
     (return-from run-zc-resolve-drop-test t))
   (let* ((dds.disc:*shmem-enabled* t)
          (dds.disc:*zerocopy-enabled* t)
@@ -1946,7 +1946,7 @@
          the slot WAS released (refcount 0, freed) — the shipped resolve-copy-release path, byte-unchanged.
    Skips where SHMEM (hence a ZC pool) is unavailable (shm-attach-by-name-reliable-p is NIL, ADR 0013)."
   (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
-    (dds.pal:note-test-skip "run-zc-defer-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
+    (note-skip "run-zc-defer-test" :shm-attach-by-name "shm-attach-by-name unreliable on this platform (ADR 0013)")
     (return-from run-zc-defer-test t))
   (let* ((dds.disc:*shmem-enabled* t)
          (dds.disc:*zerocopy-enabled* t)
@@ -2019,7 +2019,7 @@
          arm (1) and FAILS arm (2).
    Skips where SHMEM (hence a ZC pool) is unavailable (shm-attach-by-name-reliable-p is NIL, ADR 0013)."
   (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
-    (dds.pal:note-test-skip "run-zc-unrouted-release-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
+    (note-skip "run-zc-unrouted-release-test" :shm-attach-by-name "shm-attach-by-name unreliable on this platform (ADR 0013)")
     (return-from run-zc-unrouted-release-test t))
   (let* ((dds.disc:*shmem-enabled* t)
          (dds.disc:*zerocopy-enabled* t)
@@ -2363,7 +2363,12 @@
       (format t "~&  fd-mem: TX serialize = ~,4f (0-alloc win); RX non-ZC vtable = ~,4f vs classic = ~,4f; ~
                  literal-0-copy+0-alloc RX deferred beyond v1 (engine-contract change; loaned-target path = ~,4f).~%"
               ser-per vtable-per classic-per loan-per)
-      (when sbcl-p
+      (if (not sbcl-p)
+        ;; ADR 0122: this arm was a silent WHEN; the three allocation guards did not run.
+        (note-skip "flatdata-zero-alloc/alloc-guards" :alloc-counter
+                   "zero-alloc and vtable-bound guards gated on pal-impl-name :SBCL (bytes-consed does not move elsewhere)"
+                   :scope :arm)
+       (progn
         ;; the two genuine 0-alloc paths: serialize=identity (TX) and the loaned-target inner copy (Phase-D ZC)
         (%check :fd-serialize-zero-alloc (< ser-per 1.0)
                 (format nil "serialize-id: ~,4f bytes/sample (expected ~~0, the FlatData TX win)" ser-per))
@@ -2384,7 +2389,7 @@
                              NOT 0 until Phase D pools the buffer. Measured: arm64 ~~80, x86-64 ~~128 — the ~
                              two paths' ORDERING flips by arch, so a vtable-vs-classic comparison is not a ~
                              portable assertion)"
-                        vtable-per +fd-vtable-max-bytes+))))
+                        vtable-per +fd-vtable-max-bytes+)))))
     (dds.pal:free-static (dds.core.buffer:octet-buffer-vec fd))
     (dds.pal:free-static (dds.core.buffer:octet-buffer-vec target))
     (dds.pal:free-static (dds.core.buffer:octet-buffer-vec wbuf))
@@ -2601,7 +2606,7 @@
                                 "read in place IS 0-copy, but returning a >fixnum u64 BOXES a bignum (a Lisp cost, not FlatData)")
                  (format stream "~%## FlatData over Zero-Copy — RX (safe single copy out of SHMEM, NOT literal-0-copy)~%~%")
                  (if (and (zerop new-bytes) (zerop v1-bytes))
-                     (format stream "(SHMEM by-name attach unreliable on this platform — ZC-RX bench skipped; ADR 0013)~%~%")
+                     (note-bench-skip stream "bench-flatdata/zc-rx" :shm-attach-by-name "SHMEM by-name attach unreliable on this platform (ADR 0013)")
                      (progn
                        (format stream "| RX path | GC bytes/sample | vs v1 |~%|---------|-----------------|-------|~%")
                        (format stream "| WP-FLATDATA-over-ZC single-copy (`%zc-resolve-fresh`) | ~d | 1x |~%" new-bytes)
@@ -2711,7 +2716,7 @@
                  (format stream "~%## Method~%~%")
                  (format stream "Each RX strategy resolves ONE loaned slot `iters` times; the resolve does NOT touch the slot refcount, so a single loaned slot serves every iteration. GC bytes/sample is the `dds.pal:bytes-consed` delta over the loop divided by `iters` (NFR-PERF-8 oracle; SBCL-exact, AllegroCL reports 0 — a documented NFR-PORT gap). The literal-0-copy loan RX reuses one `flatdata-view` struct (the per-reader view recycling the DCPS loan registry does) and reads a field straight off the slot SAP. The loan/return CYCLE row additionally `%zc-loan`s + `%zc-release`s each iteration to price the explicit loan + return obligation. NOTE: this is the per-sample RX allocation, not end-to-end latency.~%~%")
                  (if (not have-shmem)
-                     (format stream "(SHMEM by-name attach unreliable on this platform — the ZC loan bench pass-skipped; ADR 0013)~%~%")
+                     (note-bench-skip stream "bench-flatdata-zc-loan" :shm-attach-by-name "SHMEM by-name attach unreliable on this platform (ADR 0013)")
                      (progn
                        (format stream "## RX GC bytes/sample — the literal-0-copy progression~%~%")
                        (format stream "| RX strategy | GC bytes/sample | vs literal-0-copy loan | what it allocates |~%")
@@ -2974,7 +2979,7 @@
                  (format stream "~%## Method~%~%")
                  (format stream "Each row runs one full writer TX cycle `iters` times over a shared pool. BASELINE = `serialize-fd-abc-fd` (app→payload identity copy) + `%zc-loan` (payload→slot block copy) + `%zc-release`. LOAN-WRITE = `%zc-loan-acquire` + the three SAP Offset setters (`a`,`b`,`c` written straight into the slot) + `%zc-loan-commit` + `%zc-release`. GC bytes/sample = `dds.pal:bytes-consed` delta / iters (SBCL-exact, AllegroCL=0); ns/sample = `dds.pal:monotonic-ns` total / iters (~~us clock, amortised). Both cycles loan + release one slot, so the delta is exactly the two eliminated copies vs the direct field writes.~%~%")
                  (if (not have-shmem)
-                     (format stream "(SHMEM by-name attach unreliable on this platform — the loan-write bench pass-skipped; ADR 0013)~%~%")
+                     (note-bench-skip stream "bench-flatdata-loan-write" :shm-attach-by-name "SHMEM by-name attach unreliable on this platform (ADR 0013)")
                      (progn
                        (format stream "## TX per-sample cost — baseline (two copies) vs loan-write (zero copies)~%~%")
                        (format stream "| TX path | GC bytes/sample | ns/sample | copies |~%")
@@ -3112,7 +3117,7 @@
                    (format stream "~%## Method~%~%")
                    (format stream "**RX:** each RX strategy resolves ONE loaned slot `iters` times; the resolve does NOT touch the slot refcount, so a single loaned slot serves every iteration. GC bytes/sample is the `dds.pal:bytes-consed` delta over the loop / `iters` (SBCL-exact, AllegroCL reports 0 — a documented NFR-PORT gap). The lock-free loan RX reuses one `flatdata-view` struct (the per-reader view recycling the DCPS loan registry does) and reads a field straight off the slot SAP — no mutex, no copy. **Writer:** `%fd-zc-loan-scan-ns` builds a pool of N slots and times `%zc-loan` + `%zc-release` over `writer-scan iters` iterations (`dds.pal:monotonic-ns` total / iters, ~~us clock, amortised — the same method `perftest.lisp` uses); each loan re-scans all N `refcount==0` slots for the lowest pubseq (the worst case — every slot a reclaim candidate), so ns/loan RISES with N (the O(slots) sensitivity). NOTE: these are per-sample RX allocation + per-loan writer time, not end-to-end latency.~%~%")
                    (if (not have-shmem)
-                       (format stream "(SHMEM by-name attach unreliable on this platform — the ZC lock-free loan bench pass-skipped; ADR 0013)~%~%")
+                       (note-bench-skip stream "bench-zc-loan-lockfree" :shm-attach-by-name "SHMEM by-name attach unreliable on this platform (ADR 0013)")
                        (progn
                          (format stream "## The headline — loaned RX GC bytes/sample is now LITERAL 0 (lock-free)~%~%")
                          (format stream "| RX strategy | GC bytes/sample | what it allocates |~%")
@@ -3225,7 +3230,8 @@
              (format stream "| payload | ~d octets |~%" payload-bytes)
              (format stream "| iters (loan ns) | ~d |~%~%" iters)
              (if (not (and sbcl-p have-shmem))
-                 (format stream "(SHMEM by-name attach unreliable on this platform — the multi-dest ZC bench pass-skipped; ADR 0013)~%~%")
+                 (note-bench-skip stream "bench-multi-dest-zc" (if sbcl-p :shm-attach-by-name :zc-sap-primitives)
+                                  "SHMEM by-name attach unreliable, or the ZC SAP primitives gated off on this implementation (ADR 0013)")
                  (progn
                    (format stream "## The headline — slots + app->slot copies drop from N to 1~%~%")
                    (format stream "| ZC dests N | slots TODAY | slots MULTI-DEST | copies TODAY | copies MULTI-DEST | slots saved | copies saved |~%")
@@ -3375,7 +3381,7 @@
                       b))
          (list (cons 'a #'fd-narrow-a-fd) (cons 'b #'fd-narrow-b-fd)
                (cons 'c #'fd-narrow-c-fd) (cons 'd #'fd-narrow-d-fd))))
-      (format t "~&  [skip] flatdata-sap-getter: load-sap-u8 is SBCL-only (ZC, ADR 0013) — NFR-PORT gap~%"))
+      (note-skip "flatdata-sap-getter" :zc-sap-primitives "load-sap-u8 is SBCL-only (ZC, ADR 0013) — NFR-PORT gap"))
   t)
 
 ;;; WP-FLATDATA-ZC-LOAN Task B2 (FR-PF-3/4, R6, ADR 0017): the re-emitted <name>-<field>-fd dispatches owned
@@ -3435,7 +3441,7 @@
                       (setf (fd-narrow-a-fd b) 0 (fd-narrow-b-fd b) 0 (fd-narrow-c-fd b) nil (fd-narrow-d-fd b) 0)
                       b))
          (list (cons 'c #'fd-narrow-c-fd))))
-      (format t "~&  [skip] flatdata-view-accessor: load-sap-u8 is SBCL-only (ZC, ADR 0013) — NFR-PORT gap~%"))
+      (note-skip "flatdata-view-accessor" :zc-sap-primitives "load-sap-u8 is SBCL-only (ZC, ADR 0013) — NFR-PORT gap"))
   t)
 
 (defun* %fd-sap-setter-byte-exact (ctor-fn field-value-alist)
@@ -3483,7 +3489,7 @@
                (cons #'(setf fd-narrow-c-fd) t) (cons #'(setf fd-narrow-d-fd) -42)))
         (%fd-sap-setter-byte-exact #'make-fd-narrow-flatdata   ; bool nil branch
          (list (cons #'(setf fd-narrow-c-fd) nil))))
-      (format t "~&  [skip] flatdata-sap-setter: store-sap-u8 is SBCL-only (ZC, ADR 0013) — NFR-PORT gap~%"))
+      (note-skip "flatdata-sap-setter" :zc-sap-primitives "store-sap-u8 is SBCL-only (ZC, ADR 0013) — NFR-PORT gap"))
   t)
 
 (defun* run-loan-write-primitive-test ()
@@ -3495,7 +3501,7 @@
    NOW %zc-acquire-for-read succeeds and the fields read back byte-exactly (the SAP setters wrote the slot); a
    single %zc-release frees it (acquire held refcount=1). SBCL only (store/load-sap-u8 SBCL-only, ZC ADR 0013)."
   (if (not (eq (dds.pal:pal-impl-name) :sbcl))
-      (progn (format t "~&  [skip] loan-write-primitive: store/load-sap-u8 SBCL-only (ZC, ADR 0013) — NFR-PORT gap~%") t)
+      (progn (note-skip "loan-write-primitive" :zc-sap-primitives "store/load-sap-u8 SBCL-only (ZC, ADR 0013) — NFR-PORT gap") t)
       (let ((m (dds.pal:alloc-static (dds.xport.zerocopy::%zc-bytes 2 +fd-abc-flatdata-size+))))
         (unwind-protect
              (let ((sap (dds.pal:static-pointer m)))
@@ -3533,7 +3539,7 @@
    readers, ADR 0042 §2), is idempotent (double-abort is a no-op), and a subsequent acquire reuses the slot.
    SBCL only (the pool primitives; ZC ADR 0013)."
   (if (not (eq (dds.pal:pal-impl-name) :sbcl))
-      (progn (format t "~&  [skip] loan-write-abort: pool primitives SBCL-only (ZC, ADR 0013) — NFR-PORT gap~%") t)
+      (progn (note-skip "loan-write-abort" :zc-sap-primitives "pool primitives SBCL-only (ZC, ADR 0013) — NFR-PORT gap") t)
       (let ((m (dds.pal:alloc-static (dds.xport.zerocopy::%zc-bytes 2 +fd-abc-flatdata-size+))))
         (unwind-protect
              (let ((sap (dds.pal:static-pointer m)))
@@ -3641,7 +3647,7 @@
          (the stop-node teardown call) releases it.
    Needs the ZC pool (ADR 0013); pass-skips where SHMEM by-name attach is unreliable."
   (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
-    (format t "~&  [skip] loan-write-sendsite: SHMEM by-name attach unreliable (ZC, ADR 0013) — NFR-PORT gap~%")
+    (note-skip "loan-write-sendsite" :shm-attach-by-name "SHMEM by-name attach unreliable (ZC, ADR 0013) — NFR-PORT gap")
     (return-from run-loan-write-sendsite-test t))
   (let* ((dds.disc:*shmem-enabled* t)
          (dds.disc:*zerocopy-enabled* t)
@@ -3766,7 +3772,7 @@
    (free-count back to baseline); the zc-armed registry is empty (the timeout leg released, never registered).
    Needs the ZC pool (ADR 0013); pass-skips where SHMEM by-name attach is unreliable."
   (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
-    (format t "~&  [skip] loan-write-timeout-release: SHMEM by-name attach unreliable (ZC, ADR 0013) — NFR-PORT gap~%")
+    (note-skip "loan-write-timeout-release" :shm-attach-by-name "SHMEM by-name attach unreliable (ZC, ADR 0013) — NFR-PORT gap")
     (return-from run-loan-write-timeout-release-test t))
   (let* ((dds.disc:*shmem-enabled* t)
          (dds.disc:*zerocopy-enabled* t)
@@ -3832,7 +3838,7 @@
          back to its own fresh loan / payload — always correct).
    Needs the ZC pool (ADR 0013); pass-skips where SHMEM by-name attach is unreliable."
   (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
-    (format t "~&  [skip] multi-dest-refcount: SHMEM by-name attach unreliable (ZC, ADR 0013) — NFR-PORT gap~%")
+    (note-skip "multi-dest-refcount" :shm-attach-by-name "SHMEM by-name attach unreliable (ZC, ADR 0013) — NFR-PORT gap")
     (return-from run-multi-dest-refcount-test t))
   (let* ((dds.disc:*shmem-enabled* t)
          (dds.disc:*zerocopy-enabled* t)
@@ -4214,9 +4220,12 @@
 
 (defun* run-all-tests ()
     (function () t)
-  "Run every landed test (a failure is recorded and the run continues), report skips, stuck teardown joins
-   and leaked dds-* threads (ADR 0121), then signal TEST-FAILURE if any test failed or any dds-* thread the
-   suite started is still alive; else return T."
+  "Run every landed test (a failure is recorded and the run continues), then report. Before the first test
+   it prints the ADR 0122 capability preflight; while each test runs, *CURRENT-TEST* names it, so every
+   NOTE-SKIP is charged to it. Afterwards it prints the pass/fail line, the ADR 0122 coverage line (FULL /
+   PARTIAL / SKIPPED / FAILED per test) and per-capability skip table, stuck teardown joins and leaked dds-*
+   threads (ADR 0121), then signals TEST-FAILURE if any test failed or any dds-* thread the suite started is
+   still alive; else returns T. Skips do not change the outcome (ADR 0122 step 1 is report-only)."
   (let ((tests '(("md5-rfc1321"               . run-md5-test)
                  ("endpoint-registry"        . run-endpoint-registry-test)
                  ("echo-over-mock-transport" . run-echo-test)
@@ -4886,18 +4895,28 @@
     ;; and break its successors. Read the FIRST failure as the real one and treat the rest as suspect until
     ;; re-run in isolation. That is still strictly better than learning nothing about them.
     (let ((failures '()) (passed 0)
+          ;; ADR 0122: (NAME . FAILED-P) per test, in run order, for the FULL/PARTIAL/SKIPPED/FAILED report
+          (results '())
           ;; ADR 0121: the threads alive BEFORE the first test. Anything else still alive after the last one
           ;; (and a short grace period) was started by a test and never stopped.
           (threads-before (dds.pal:live-threads))
           ;; thread -> the test after which it was FIRST seen alive, so a leak names its likely source
           (started-by (make-hash-table :test 'eq)))
+      ;; ADR 0122: say what this host can do BEFORE any test can skip because of it.
+      (capability-preflight)
+      (reset-skip-events)
       (dolist (test tests)
         (format t "~&  [test] ~a ... " (car test))
         (finish-output)
-        (handler-case (progn (funcall (cdr test)) (incf passed) (format t "ok~%"))   ; HOTPATH-COND(TEST): the run-every-test harness — a failure is recorded, never allowed to end the run
+        ;; SETF, not LET: a skip noted from a thread the test spawned is still charged to this test.
+        (setf *current-test* (car test))
+        (handler-case (progn (funcall (cdr test)) (incf passed) (push (cons (car test) nil) results)
+                             (format t "ok~%"))   ; HOTPATH-COND(TEST): the run-every-test harness — a failure is recorded, never allowed to end the run
           (error (e)
             (push (cons (car test) (princ-to-string e)) failures)
+            (push (cons (car test) t) results)
             (format t "FAIL~%           ~a~%" e)))
+        (setf *current-test* nil)
         (dolist (th (dds.pal:live-threads))
           (unless (or (member th threads-before :test #'eq) (gethash th started-by))
             (setf (gethash th started-by) (car test)))))
@@ -4913,19 +4932,10 @@
       ;; always fires is an alarm nobody reads.
       ;; A suite that prints "N passed" while some of those did NOTHING reports a number wider than its
       ;; coverage — exactly how the DDS-Security suite sat entirely un-run on Linux behind an OpenSSL
-      ;; pass-skip. A skip is legitimate when the platform lacks the capability; INVISIBLE is what is not.
-      (multiple-value-bind (nskip skips) (dds.pal:test-skips)
-        (if (plusp nskip)
-            (progn
-              (format t "~&⚠️ SKIPPED: ~d of ~d test(s) did NOT run — this suite's coverage is narrower than~%"
-                      nskip (length tests))
-              (format t "   its pass count. Reasons:~%")
-              (let ((by-reason (make-hash-table :test 'equal)))
-                (dolist (s skips) (push (car s) (gethash (cdr s) by-reason)))
-                (maphash (lambda (why names)
-                           (format t "     ~d x ~a~%       ~{~a~^, ~}~%" (length names) why (reverse names)))
-                         by-reason)))
-            (format t "~&skipped: 0 — every test ran.~%")))
+      ;; pass-skip, and how about 100 tests printed "ok" on this host while the old registry printed
+      ;; "skipped: 0" (ADR 0122). Every skip now arrives through NOTE-SKIP, so this report is complete by
+      ;; construction. Step 1 is REPORT-ONLY: nothing here changes the exit code.
+      (print-skip-report (reverse results) (skip-events))
       (multiple-value-bind (stuck sites) (dds.pal:stuck-teardown-joins)
         (declare (ignorable stuck))
         (let* ((fixtures (remove-if-not (lambda (s) (%test-fixture-site-p (car s))) sites))

@@ -589,7 +589,7 @@
    tx and rx are distinct participants (distinct guids, same host); asserts 4 octets round-trip.
    Pass-skips where by-name attach is unreliable (SHM-ATTACH-BY-NAME-RELIABLE-P NIL)."
   (unless (shm-attach-by-name-reliable-p)
-    (dds.pal:note-test-skip "run-shmem-transport-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
+    (dds.pal:note-test-skip "run-shmem-transport-test" :shm-attach-by-name "shm-attach-by-name unreliable on this platform (ADR 0013)")
     (return-from run-shmem-transport-test t))
   (let ((rx (make-shmem-transport :participant-guid (%test-guid 1) :host-uuid 7))
         (tx (make-shmem-transport :participant-guid (%test-guid 2) :host-uuid 7)))
@@ -632,7 +632,7 @@
 
    Pass-skips where by-name attach is unreliable (SHM-ATTACH-BY-NAME-RELIABLE-P NIL)."
   (unless (shm-attach-by-name-reliable-p)
-    (dds.pal:note-test-skip "run-shmem-attach-cache-race-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
+    (dds.pal:note-test-skip "run-shmem-attach-cache-race-test" :shm-attach-by-name "shm-attach-by-name unreliable on this platform (ADR 0013)")
     (return-from run-shmem-attach-cache-race-test t))
   (let ((rxs (loop for i from 40 below 46
                    collect (make-shmem-transport :participant-guid (%test-guid i) :host-uuid 7)))
@@ -687,7 +687,7 @@
 
    Pass-skips where by-name attach is unreliable (SHM-ATTACH-BY-NAME-RELIABLE-P NIL)."
   (unless (shm-attach-by-name-reliable-p)
-    (dds.pal:note-test-skip "run-shmem-dest-cache-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
+    (dds.pal:note-test-skip "run-shmem-dest-cache-test" :shm-attach-by-name "shm-attach-by-name unreliable on this platform (ADR 0013)")
     (return-from run-shmem-dest-cache-test t))
   (let ((rx (make-shmem-transport :participant-guid (%test-guid 11) :host-uuid 7))
         (a (make-shmem-transport :participant-guid (%test-guid 12) :host-uuid 7))
@@ -902,7 +902,7 @@
    assert it arrives within a bounded wait. Returns T. Pass-skips where by-name attach is unreliable
    (SHM-ATTACH-BY-NAME-RELIABLE-P NIL)."
   (unless (shm-attach-by-name-reliable-p)
-    (dds.pal:note-test-skip "run-shmem-receiver-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
+    (dds.pal:note-test-skip "run-shmem-receiver-test" :shm-attach-by-name "shm-attach-by-name unreliable on this platform (ADR 0013)")
     (return-from run-shmem-receiver-test t))
   (let ((rx (make-shmem-transport :participant-guid (%test-guid 3) :host-uuid 7))
         (tx (make-shmem-transport :participant-guid (%test-guid 4) :host-uuid 7))
@@ -951,7 +951,7 @@
    block. Pass-skips where by-name attach is unreliable (SHM-ATTACH-BY-NAME-RELIABLE-P NIL). Each sender uses a distinct GUID (distinct lane token), so they exercise the
    per-lane SPSC rings concurrently against the single shared notify block."
   (unless (shm-attach-by-name-reliable-p)
-    (dds.pal:note-test-skip "run-shmem-stress-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
+    (dds.pal:note-test-skip "run-shmem-stress-test" :shm-attach-by-name "shm-attach-by-name unreliable on this platform (ADR 0013)")
     (return-from run-shmem-stress-test t))
   (let* ((total (* senders per-sender))
          (count-lock (dds.pal:make-lock "shmem-stress"))

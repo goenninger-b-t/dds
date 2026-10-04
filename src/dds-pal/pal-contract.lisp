@@ -79,7 +79,9 @@
    ;; Bounded-teardown REPORT (ADR 0092): every wait that hits its deadline is counted where it is
    ;; DETECTED, so a caller that ignores the status value still cannot make the failure silent.
    #:note-stuck-teardown #:stuck-teardown-joins #:reset-stuck-teardown-joins
-   #:note-test-skip #:test-skips #:reset-test-skips
+   ;; Test-body skip reporting (ADR 0122): production files that hold test bodies report a skip through this
+   ;; hook; the registry and the accounting live in the test harness (dds.tests::note-skip).
+   #:note-test-skip #:*test-skip-hook*
    ;; The zero-allocation raw sendto(2)/recvfrom(2) datagram paths (NFR-MEM, ADR 0065/0066):
    ;; the A/B levers + escape hatches
    #:*udp-raw-sendto* #:*udp-raw-recvfrom*

@@ -253,7 +253,7 @@
    (c) Fail-closed: wrong local-subject → NIL; tampered governance.p7s → NIL. Must pass on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [access-plugin-validate] SKIP: ~a~%" %dare-reason)
+      (note-dare-skip "access-plugin-validate" %dare-reason)
       (return-from run-access-plugin-validate-test t)))
   (let* ((perm-ca  (%read-ac-fixture-pem "perm-ca-cert.pem"))
          (gov-p7s  (%read-ac-fixture-pem "governance.p7s"))
@@ -527,8 +527,7 @@
    Requires OpenSSL >= 3.5; skips gracefully if absent. Must pass on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [ac-allow-deny] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "ac-allow-deny" %dare-reason)
       (return-from run-access-control-allow-deny-test t)))
 
   (let* ((ca-pem      (%read-fixture-pem "ca/ca-cert.pem"))
@@ -719,8 +718,7 @@
    Must pass on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [ac-local-deny] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "ac-local-deny" %dare-reason)
       (return-from run-access-control-local-deny-test t)))
 
   (let* ((ca-pem    (%read-fixture-pem "ca/ca-cert.pem"))

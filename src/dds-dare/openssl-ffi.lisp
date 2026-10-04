@@ -139,25 +139,31 @@
 ;; instead of signalling; the crypto capability probe fails CLOSED by returning NIL, never a plaintext fallback.
 
 (defun* dare-available-p ()
-    (function () (values boolean (or null string)))
-  "Return (VALUES AVAILABLE REASON): AVAILABLE is T iff libcrypto is loaded, OpenSSL_version_num >= 3.5.0,
-   and ML-KEM-1024 is fetchable from the default provider (FIPS 203, CNSA 2.0 requirement); REASON is NIL
-   then, or a human-readable string naming why DARE is unavailable. ADR 0064: the crypto capability probe
-   fails CLOSED by RETURNING NIL (never a DARE-UNAVAILABLE signal, never a plaintext fallback) — a caller
-   checks AVAILABLE and, on NIL, skips/refuses with REASON. The one boundary handler-case catches CFFI's
-   own load-foreign-library-error (an external library condition) and folds it to the REASON string."
+    (function () (values boolean (or null string) (or null (member :libcrypto :openssl-pqc))))
+  "Return (VALUES AVAILABLE REASON CAPABILITY): AVAILABLE is T iff libcrypto is loaded, OpenSSL_version_num
+   >= 3.5.0, and ML-KEM-1024 is fetchable from the default provider (FIPS 203, CNSA 2.0 requirement); REASON
+   is NIL then, or a human-readable string naming why DARE is unavailable; CAPABILITY is NIL then, or the
+   missing capability in the ADR 0122 skip vocabulary: :LIBCRYPTO when no libcrypto could be loaded or it
+   lacks OpenSSL_version_num, :OPENSSL-PQC when a libcrypto is loaded but is older than 3.5.0 or cannot
+   fetch ML-KEM-1024 (or lacks EVP_KEM_fetch). A two-value caller is unaffected by the third value.
+   ADR 0064: the crypto capability probe fails CLOSED by RETURNING NIL (never a DARE-UNAVAILABLE signal,
+   never a plaintext fallback) — a caller checks AVAILABLE and, on NIL, skips/refuses with REASON. The one
+   boundary handler-case catches CFFI's own load-foreign-library-error (an external library condition) and
+   folds it to the REASON string."
   (handler-case
       (progn
         (unless *libcrypto*
-          (return-from dare-available-p (values nil "libcrypto not loaded (no suitable path found)")))
+          (return-from dare-available-p
+            (values nil "libcrypto not loaded (no suitable path found)" :libcrypto)))
         (let* ((ver-ptr (%ossl-sym "OpenSSL_version_num"))
                (ver (if ver-ptr
                         (cffi:foreign-funcall-pointer ver-ptr nil :unsigned-long)
-                        (return-from dare-available-p (values nil "OpenSSL_version_num symbol not found")))))
+                        (return-from dare-available-p
+                          (values nil "OpenSSL_version_num symbol not found" :libcrypto)))))
           ;; 3.5.0 dev threshold = 0x30500000; any release of 3.5+ is >= 0x3050000f
           (unless (>= ver #x30500000)
             (return-from dare-available-p
-              (values nil (format nil "OpenSSL version 0x~8,'0x < 3.5.0 (0x30500000)" ver))))
+              (values nil (format nil "OpenSSL version 0x~8,'0x < 3.5.0 (0x30500000)" ver) :openssl-pqc)))
           (let* ((kem-fetch-ptr (%ossl-sym "EVP_KEM_fetch"))
                  (kem (if kem-fetch-ptr
                           (cffi:foreign-funcall-pointer kem-fetch-ptr nil
@@ -165,15 +171,17 @@
                                                         :string "ML-KEM-1024"
                                                         :pointer (cffi:null-pointer)
                                                         :pointer)
-                          (return-from dare-available-p (values nil "EVP_KEM_fetch symbol not found")))))
+                          (return-from dare-available-p
+                            (values nil "EVP_KEM_fetch symbol not found" :openssl-pqc)))))
             (if (cffi:null-pointer-p kem)
-                (return-from dare-available-p (values nil "ML-KEM-1024 not fetchable from default provider"))
+                (return-from dare-available-p
+                  (values nil "ML-KEM-1024 not fetchable from default provider" :openssl-pqc))
                 (progn
                   (cffi:foreign-funcall-pointer (%ossl-sym "EVP_KEM_free") nil
                                                 :pointer kem :void)
-                  (values t nil))))))
+                  (values t nil nil))))))
     (cffi:load-foreign-library-error (e)
-      (values nil (format nil "libcrypto load failed: ~a" e)))))
+      (values nil (format nil "libcrypto load failed: ~a" e) :libcrypto))))
 
 ;;; --- internal helpers ---
 

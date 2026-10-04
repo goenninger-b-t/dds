@@ -384,33 +384,35 @@
    REPORTED-not-printed form the operating contract requires: a queryable snapshot, like
    DDS.LOG:LOGGER-SHED-COUNTS and DDS.DISC:DISC-NODE-STUCK-RECEIVER-TEARDOWNS.")
 
-(defvar *test-skips-lock* (make-lock "dds-test-skips")
-  "Guards *TEST-SKIPS*.")
+(defvar *test-skip-hook* nil
+  "NIL, or the function a test-body skip is reported through: called as (FUNCALL HOOK SITE CAPABILITY REASON
+   SCOPE) by DDS.PAL:NOTE-TEST-SKIP. The test harness (dds.tests::note-skip, ADR 0122) installs it when it
+   loads; nothing in production sets it.
 
-(defvar *test-skips* nil
-  "Every test that SKIPPED rather than ran, as an alist of (NAME . REASON). Read with DDS.PAL:TEST-SKIPS.
+   WHY A HOOK AND NOT A REGISTRY. The skip registry belongs to the test harness, which records each skip
+   against the test that is running, keeps every event (no dedup) and prints the per-capability accounting
+   (ADR 0122). It used to live here, as an alist keyed by test name, deduplicated, with no capability. But
+   some test bodies live in production files (dds-xport/shmem.lisp, dds-disc/secure-sedp.lisp, ...), which
+   load BEFORE the harness and cannot name its package. This variable is the one seam they share: the PAL
+   is the only package every one of them can see.")
 
-   It exists because a suite that prints \"629 passed\" while 31 of those did nothing is REPORTING A NUMBER
-   WIDER THAN ITS COVERAGE — which is exactly how the DDS-Security suite sat entirely un-run on Linux for
-   weeks behind an OpenSSL pass-skip. A skip is legitimate when a platform genuinely lacks a capability; it
-   is never legitimate for it to be INVISIBLE.")
-
-(defun* note-test-skip (name reason)
-    (function (t t) (eql t))
-  "Record that test NAME skipped for REASON. Called by a pass-skip guard instead of silently returning T."
-  (with-lock (*test-skips-lock*)
-    (pushnew (cons name reason) *test-skips* :key #'car :test #'equal))
+(defun* note-test-skip (site capability reason &optional (scope :test))
+    (function (t keyword t &optional keyword) (eql t))
+  "Report that a test body skipped work: SITE names what did not run (a string), CAPABILITY is the missing
+   capability, a member of the closed ADR 0122 vocabulary (DDS.TESTS:*SKIP-CAPABILITIES*: :openssl-pqc
+   :libcrypto :alloc-counter :zc-sap-primitives :shm-attach-by-name :subprocess-mode :rx-store-pool
+   :static-vector-p :carve-refusal :verified-elsewhere), REASON is a human-readable
+   string, and SCOPE is :TEST when the whole test returned without running (the default) or :ARM when only
+   one arm of it was skipped. Forwards to *TEST-SKIP-HOOK*, which the test harness installs and which
+   validates CAPABILITY and SCOPE. With no hook installed (a test body called outside the harness) the skip
+   is written to *ERROR-OUTPUT* instead, so it is never silent. Returns T, so a pass-skip guard can return
+   its value. Test-only: never called on a production path."
+  (let ((hook *test-skip-hook*))
+    (if hook
+        (funcall (the function hook) site capability reason scope)
+        (format *error-output* "~&  [skip] ~a (~(~a~), ~(~a~)): ~a  [no test harness hook installed]~%"
+                site capability scope reason)))
   t)
-
-(defun* test-skips ()
-    (function () (values (integer 0) list))
-  "(values COUNT ALIST) of the tests that skipped."
-  (with-lock (*test-skips-lock*) (values (length *test-skips*) (copy-alist *test-skips*))))
-
-(defun* reset-test-skips ()
-    (function () (eql t))
-  "Clear the skip registry."
-  (with-lock (*test-skips-lock*) (setf *test-skips* nil)) t)
 
 (defun* note-stuck-teardown (site)
     (function (keyword) (eql t))

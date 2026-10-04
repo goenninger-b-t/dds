@@ -108,14 +108,21 @@ result; plan `docs/plans/2026-10-03-sbcl-allegro-full-ok.md`):
 
 - **SBCL 2.2.9:** `make test` reports **646/646 passed**, but that total is wider than its coverage: the host's
   OpenSSL is 3.0.13, below the 3.5 the CNSA-2.0 / DDS-Security paths need, so **105 in-test `SKIP` lines**
-  are printed by tests that still report `ok`, and the summary line says `skipped: 0`. Provisioning OpenSSL 3.5
-  (WP-0.8) and making every skip counted and fail-closed (WP-0.10) are Phase 0 work.
+  are printed by tests that still report `ok`, and the summary line says `skipped: 0`. **Since WP-0.10 step 1
+  (ADR 0122, measured 2026-10-04)** every skip goes through one channel,
+  `dds.tests:note-skip`, with a capability from a closed vocabulary, and the run prints a capability preflight
+  and the true coverage: SBCL **650 passed = 547 FULL, 3 PARTIAL, 100 SKIPPED**, 106 skip events, all
+  `:openssl-pqc`; AllegroCL **504 FULL, 10 PARTIAL, 118 SKIPPED, 18 FAILED**, 142 events (`:openssl-pqc` 106,
+  `:zc-sap-primitives` 18, `:static-vector-p` 11, `:alloc-counter` 5, `:subprocess-mode` 2). `make fuzz`,
+  `make mem` and `make corpus` print the same accounting (`make corpus` counts its deferred vector as a
+  `:verified-elsewhere` skip). The step is report-only: exit codes are unchanged. Provisioning OpenSSL 3.5 (WP-0.8) and failing a run on an
+  unbaselined skip (WP-0.10 step 2) are Phase 0 work.
 - **AllegroCL 11.0 (`alisp`):** `make test` reports **627/646** — 19 known failures (`AAO-FIRED`,
   `AUTO-MATCHED`, `DD-AUTO-SERVE-DYNC`, `DIS-ENABLE-RELEASES`, `FLOW-PACE-DELIVERED`, `FLOW-RR-A-DELIVERED`,
   `FLOW-TD-NO-WEDGE`, `LEASE-MATCHED`, `OFF-DEADLINE-FIRES`, `ONENODE-WRITER-A-DRAINED`, `RUNNER-C1-GOT-OWN`,
   `SCHED-A-DELIVERED`, `shmem-ring-drain-fuzz`, `SUP-REVIVED`, `TG4-TIMEOUT-MATCH`, `TLE-TIMEOUT`,
   `TLS-INDEX-HIT`, the `rti-shmem-recognition` test (`:SHMAT-FAILED`) and the `pvms-reliable-bootstrap` test) —
-  and the process **hung at exit**. **Since WP-0.11 (ADR 0121, uncommitted working tree, measured 2026-10-04)**
+  and the process **hung at exit**. **Since WP-0.11 (ADR 0121, measured 2026-10-04)**
   the suite **exits by itself** in about 3 minutes (188 s; it was killed at 1654 s before): every Lisp exit in
   `src/` and in the `Makefile` now goes through `dds.pal:exit-process`, which runs a bounded shutdown-hook
   chain (log-sink flush, durability store fsync, DARE secret wipe, `shm_unlink`) and then a hard exit that
@@ -261,6 +268,7 @@ make test-all      # test on both
 make gate-types    # every defun has a single-line ftype declaim (FR-LANG-8)
 make gate-hotpath  # no CLOS dispatch / per-sample alloc in hot-path files (NFR-CLOS)
 make gate-nocond   # NO Lisp conditions in our code — failures are returned, never signalled (ADR 0064)
+make gate-skip-lint # a test skip goes through note-skip with a known capability, never a bare SKIP print (ADR 0122)
 make mem           # measured 0 bytes/sample serialize/deserialize (NFR-PERF-8)
 make wire          # validate emitted RTPS against the tshark RTPS dissector (FR-TOOL-3)
 make all           # build-all + test-all + gates + mem

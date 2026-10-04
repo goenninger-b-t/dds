@@ -887,9 +887,13 @@
                       (per (/ (float delta) iters)))
                  (format t "~&  mem[~11a]: ~9d bytes / ~d iters = ~,4f bytes/sample (~a)~%"
                          label delta iters per (dds.pal:pal-impl-name))
-                 (when (eq (dds.pal:pal-impl-name) :sbcl)
-                   (%check :zero-alloc (< per 1.0)
-                           (format nil "~a: ~,4f bytes/sample (expected ~~0)" label per)))))))
+                 (if (eq (dds.pal:pal-impl-name) :sbcl)
+                     (%check :zero-alloc (< per 1.0)
+                             (format nil "~a: ~,4f bytes/sample (expected ~~0)" label per))
+                     ;; ADR 0122: the arm ran (smoke); its zero-alloc assertion did not.
+                     (note-skip (format nil "mem/~a" label) :alloc-counter
+                                "zero-alloc assertion gated on pal-impl-name :SBCL (bytes-consed does not move elsewhere)"
+                                :scope :arm))))))
       (measure "serialize"
                (lambda () (dds.core.buffer:cursor-reset wc) (serialize-mline src wc :xcdr2)))
       (measure "deserialize"
@@ -911,7 +915,7 @@
    covered the security path (ADR-0036 Carry-3)."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [mem-secure] SKIP — AES-GCM not available: ~a~%" %dare-reason)
+      (note-dare-skip "mem-secure" %dare-reason :scope :arm)   ; an arm of make mem (run-mem-test)
       (return-from run-mem-test-secure t)))
   (let* ((km (dds.security:make-test-key-material))
          (pt (map '(simple-array (unsigned-byte 8) (*)) #'char-code "zero-alloc steady-state payload"))
@@ -927,9 +931,13 @@
                (let* ((delta (- (dds.pal:bytes-consed) before)) (per (/ (float delta) iters)))
                  (format t "~&  mem[~11a]: ~9d bytes / ~d iters = ~,4f bytes/sample (~a)~%"
                          label delta iters per (dds.pal:pal-impl-name))
-                 (when (eq (dds.pal:pal-impl-name) :sbcl)
-                   (%check :zero-alloc-secure (< per 1.0)
-                           (format nil "~a: ~,4f bytes/sample (expected ~~0)" label per)))))))
+                 (if (eq (dds.pal:pal-impl-name) :sbcl)
+                     (%check :zero-alloc-secure (< per 1.0)
+                             (format nil "~a: ~,4f bytes/sample (expected ~~0)" label per))
+                     ;; ADR 0122: the arm ran (smoke); its zero-alloc assertion did not.
+                     (note-skip (format nil "mem-secure/~a" label) :alloc-counter
+                                "zero-alloc assertion gated on pal-impl-name :SBCL (bytes-consed does not move elsewhere)"
+                                :scope :arm))))))
       (measure "aead-encode" (lambda () (dds.security:encode-serialized-payload-into out km pt)))
       ;; decode over a fixed sealed blob copied once into a reused static input buffer (no per-iter alloc)
       (let ((sealed (dds.core.buffer:make-octet-buffer slen)))
@@ -941,7 +949,11 @@
       ;; handshake order; crypto-manager) — must lazily carve the encode pool on the first secured publish and
       ;; then run zero-alloc. Build that exact shape and measure the steady-state pooled encode (SBCL only: this
       ;; binds one ephemeral UDP socket via make-disc-node, and bytes-consed is only meaningful on SBCL).
-      (when (eq (dds.pal:pal-impl-name) :sbcl)
+      (if (not (eq (dds.pal:pal-impl-name) :sbcl))
+        ;; ADR 0122: this arm was a silent WHEN.
+        (note-skip "mem-secure/aead-encode-live" :alloc-counter
+                   "live-shape pooled-encode measurement gated on pal-impl-name :SBCL (bytes-consed does not move elsewhere)"
+                   :scope :arm)
         (let ((node (dds.disc:make-disc-node :domain (test-domain +td-mem-secure+))))
           (unwind-protect
                (progn
@@ -966,7 +978,11 @@
       ;; make-cache-change + flush) conses IDENTICALLY with crypto ON vs OFF, so the data_protection delta is 0.0000.
       ;; T5d pools the RECEIVE loan wrapper too (freelisted handle + fixed-vector registry + reused take vec), so
       ;; the secured RECEIVE delta is now 0.0000 as well — asserted in run-secured-live-zeroalloc-test Part A.
-      (when (eq (dds.pal:pal-impl-name) :sbcl)
+      (if (not (eq (dds.pal:pal-impl-name) :sbcl))
+        ;; ADR 0122: this arm was a silent WHEN.
+        (note-skip "mem-secure/aead-live-pub-rx" :alloc-counter
+                   "live publish/receive delta gated on pal-impl-name :SBCL (bytes-consed does not move elsewhere)"
+                   :scope :arm)
         (let* ((live-pt (make-array 256 :element-type '(unsigned-byte 8) :initial-element 7))
                (npub 200000)                             ; publish delta is ~0: a large window puts the ~64KB GC-boundary quantum at ~0.33 B/sample
                (rx-wrap (%secured-wrapper-cycle-bps km 200000)))   ; T5d: the RECEIVE loan wrapper, measured DETERMINISTICALLY (exact 0.0000, no cross-node GC noise)
@@ -1300,7 +1316,7 @@
     ("interop/connext/common/ShapeType.idl"    . "shape-type")
     ("interop/perftest/common/PerfData.idl"    . "perf-data"))
   "IDL file -> registered type, for run-idl-name-parity-test. Add a row whenever a type gains a
-   committed IDL; a row whose IDL or type is missing is SKIPPED with a note, never silently passed.")
+   committed IDL; a row whose IDL or type is missing FAILS the test (a fixture defect, ADR 0122).")
 
 (defun* %idl-member-names (path)
     (function (string) list)
@@ -1350,8 +1366,12 @@
              (ts (dds.types:find-type-support tyname))
              (idl (%idl-member-names path)))
         (cond
-          ((null idl) (format t "~&  -- idl-name-parity: ~a unreadable/absent — SKIPPED~%" path))
-          ((null ts)  (format t "~&  -- idl-name-parity: type ~a not registered — SKIPPED~%" tyname))
+          ;; ADR 0122: a committed IDL or a registered type is a FIXTURE, not a host capability. Its absence
+          ;; is a repository defect, so it fails here instead of being skipped with a note.
+          ((null idl) (%check :idl-name-parity-fixture nil
+                              (format nil "~a is unreadable or absent (run from the repository root)" path)))
+          ((null ts)  (%check :idl-name-parity-fixture nil
+                              (format nil "type ~a is not registered" tyname)))
           (t
            (incf checked)
            (let* ((to (dds.types:type-support-typeobject ts))

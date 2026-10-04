@@ -27,7 +27,7 @@ BENCH_TIMEOUT ?= 7200
 RUN_TIMEOUT   ?= 24h
 RUN           := $(TIMEOUT) --foreground $(RUN_TIMEOUT)
 
-.PHONY: all build test build-sbcl build-allegro test-sbcl test-allegro gate-build gate-mem gate-pal gate-quit-lint gate-nocond gate-quickload gate-verification gate-drivers \
+.PHONY: all build test build-sbcl build-allegro test-sbcl test-allegro gate-build gate-mem gate-pal gate-quit-lint gate-skip-lint gate-nocond gate-quickload gate-verification gate-drivers \
         build-all test-all gate-hotpath gate-types corpus fuzz wire interop \
         square-pub square-sub square-spy large-pub large-sub gated-sub corpus-capture \
         nokey-pub nokey-sub keyed-flat-pub keyed-flat-sub \
@@ -137,6 +137,12 @@ gate-pal: ; ./scripts/gate-pal.sh
 # bans uiop:quit and the implementations' own exit/quit outside src/dds-pal/; it falsifies itself.
 gate-quit-lint: ; ./scripts/gate-quit-lint.sh
 
+# ADR 0122: a test reports a skip through ONE channel, dds.tests::note-skip, with a capability from a closed
+# vocabulary. On 2026-10-03 the suite printed "skipped: 0 — every test ran" while ~100 tests returned early
+# behind a bare "SKIP" print. This lint bans bare skip prints in tests (and in run-*-test bodies in production
+# files) and checks every capability keyword against *skip-capabilities*; it falsifies itself.
+gate-skip-lint: ; ./scripts/gate-skip-lint.sh
+
 # Quicklisp may PROVIDE our dependencies; it must never GATE our own code. ql:quickload muffles every
 # compile warning, so a system loaded through it cannot fail on one. The Makefile was swept long ago;
 # two scripts were missed and kept the Linux fallback harness structurally unable to go red.
@@ -197,13 +203,16 @@ linux-clean-cache: ; docker volume rm -f neodds-linux-fasl-cache
 # FR-CDR-8: our codec MUST reproduce, byte for byte, the SerializedPayloads RTI Connext puts ON THE WIRE.
 # The vectors in corpus/xcdr2/ are captured from a live Connext writer (scripts/capture-corpus.sh); this
 # target only VERIFIES them, so it needs no Connext install and runs anywhere.
+# ADR 0122: run under the skip accounting (preflight + coverage line); a deferred vector is reported as a
+# :verified-elsewhere skip. A mismatch is signalled inside the accounted run (so the coverage line says
+# FAILED) and turned into exit 1; the exit code is unchanged: 0 iff corpus-verify found no mismatch.
 corpus:
-	$(TIMEOUT) $(GATE_TIMEOUT) $(LISP) --eval '(asdf:load-system :dds-bench)' \
-	        --eval '(dds.pal:exit-process (if (zerop (dds.bench:corpus-verify)) 0 1))'
+	$(TIMEOUT) $(GATE_TIMEOUT) $(LISP) --eval '(asdf:load-system :dds-tests)' \
+	        --eval '(handler-case (progn (dds.tests:run-with-skip-report "corpus" (lambda () (let ((bad (dds.bench:corpus-verify))) (unless (zerop bad) (error "corpus: ~d mismatch(es)" bad)) bad))) (dds.pal:exit-process 0)) (error (e) (format t "~&~a~%" e) (dds.pal:exit-process 1)))'
 
 fuzz:
 	$(TIMEOUT) $(GATE_TIMEOUT) $(LISP) --eval '(asdf:load-system :dds-tests)' \
-	        --eval '(handler-case (progn (dds.tests:run-pbt-tests) (dds.pal:exit-process 0)) (error (e) (format t "~&~a~%" e) (dds.pal:exit-process 1)))'
+	        --eval '(handler-case (progn (dds.tests:run-with-skip-report "pbt-fuzz" (function dds.tests:run-pbt-tests)) (dds.pal:exit-process 0)) (error (e) (format t "~&~a~%" e) (dds.pal:exit-process 1)))'
 
 wire:
 	$(TIMEOUT) $(GATE_TIMEOUT) ./scripts/wire-check.sh
@@ -469,7 +478,7 @@ zc-xproc:
 
 mem:
 	$(TIMEOUT) $(BENCH_TIMEOUT) $(SBCL) --eval '(asdf:load-system :dds-tests)' \
-	        --eval '(handler-case (progn (dds.tests:run-mem-test) (dds.pal:exit-process 0)) (error (e) (format t "~&~a~%" e) (dds.pal:exit-process 1)))'
+	        --eval '(handler-case (progn (dds.tests:run-with-skip-report "mem" (function dds.tests:run-mem-test)) (dds.pal:exit-process 0)) (error (e) (format t "~&~a~%" e) (dds.pal:exit-process 1)))'
 
 clean:
 	find . -name '*.fasl' -o -name '*.fasp' -o -name '*.faso' -o -name '*.fasc' | xargs -r rm -f

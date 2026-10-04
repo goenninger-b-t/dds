@@ -282,3 +282,268 @@
   "ADR 0121 isolation offset: the durability-service SUBPROCESS that the exit-process test SIGTERMs. The
    child runs a real participant, so a foreign participant on the domain would only add discovery traffic,
    but a sibling test's participant on the same domain could match its endpoints and delay its teardown.")
+
+;;; ================================================================================================
+;;; ONE SKIP CHANNEL (ADR 0122, WP-0.10 step 1: report-only)
+;;;
+;;; A test that returns early, or skips one arm, because the host lacks a capability reports it HERE and
+;;; nowhere else: (note-skip SITE CAPABILITY REASON). Every event is recorded against the test that is
+;;; running (*CURRENT-TEST*), nothing is deduplicated, and CAPABILITY must come from the closed vocabulary
+;;; *SKIP-CAPABILITIES*. RUN-ALL-TESTS turns the events into a per-test FULL / PARTIAL / SKIPPED / FAILED
+;;; classification and a per-capability table. A bare "[skip]" or "SKIP" print in a test is banned by
+;;; `make gate-skip-lint`; it is how about 100 tests reported "ok" on this host while doing nothing.
+;;;
+;;; Step 1 changes NO exit code: the accounting is printed and the run ends as before. Step 2 (enforce,
+;;; with the ADR 0120 skip baseline) is a later work package.
+;;; ================================================================================================
+
+(defparameter *skip-capabilities*
+  '(:openssl-pqc :libcrypto :alloc-counter :zc-sap-primitives :shm-attach-by-name :subprocess-mode
+    :rx-store-pool :static-vector-p :carve-refusal :verified-elsewhere)
+  "The CLOSED vocabulary of capabilities a test may report as missing (ADR 0122 §2.2). Each names one host
+   or implementation fact, not a test:
+     :OPENSSL-PQC        a libcrypto is loaded but it is older than OpenSSL 3.5.0 or cannot fetch ML-KEM-1024
+                         (DDS.DARE:DARE-AVAILABLE-P's third value);
+     :LIBCRYPTO          no libcrypto could be loaded at all;
+     :ALLOC-COUNTER      DDS.PAL:BYTES-CONSED does not move, so an allocation assertion cannot be measured
+                         (AllegroCL: the constant 0);
+     :ZC-SAP-PRIMITIVES  the Zero-Copy / FlatData SAP primitives (cas-sap-u32, load-/store-sap-u8) are not
+                         cleared for this implementation (today gated on pal-impl-name :SBCL, WP-1.15);
+     :SHM-ATTACH-BY-NAME a POSIX shm segment cannot be reliably re-opened by name
+                         (DDS.XPORT.SHMEM:SHM-ATTACH-BY-NAME-RELIABLE-P is NIL);
+     :SUBPROCESS-MODE    the durability service's subprocess execution mode is not available on this
+                         implementation (dds-durability/runner.lisp gates it on pal-impl-name :SBCL);
+     :RX-STORE-POOL      DDS.DISC:*RX-STORE-POOL-ENABLED* is NIL, so the pooled receive-store arm is off;
+     :STATIC-VECTOR-P    DDS.PAL:STATIC-VECTOR-P cannot tell a GC-heap array from a static one on this
+                         implementation (AllegroCL), so a 'this key is NOT foreign-static' check is vacuous;
+     :CARVE-REFUSAL      the host GRANTS an absurd (2^48-octet) static carve (overcommit), so an arm that
+                         needs the carve to fail cannot reach its failure path;
+     :VERIFIED-ELSEWHERE a gate does not check an artefact itself because another gate does (today: a
+                         `make corpus` vector named in DDS.BENCH::*CORPUS-VERIFIED-ELSEWHERE*, which
+                         dds-bench cannot verify because it does not load the system the vector's type
+                         lives in). Counted as a skip of THIS gate, so a deferral is never silent.
+   The first seven are the plan's vocabulary; the last three are the ADR 0122 §2.2 extensions, each justified
+   there by a site no other capability describes. NOTE-SKIP rejects any other keyword. Extending the list
+   requires a justification in ADR 0122.")
+
+(defvar *current-test* nil
+  "The name (a string) of the test RUN-ALL-TESTS is running, or NIL outside a suite run. Set with SETF, not
+   bound with LET, by the runner around each test: tests run one at a time, and a skip noted from a thread
+   the test spawned must still be charged to that test (a LET binding is invisible in other threads).")
+
+(defstruct (skip-event (:constructor %make-skip-event (test site capability reason scope)))
+  "One reported skip (ADR 0122): TEST is *CURRENT-TEST* when it was noted (or NIL), SITE names what did not
+   run, CAPABILITY is a member of *SKIP-CAPABILITIES*, REASON is the printed explanation, and SCOPE is :TEST
+   (the test returned without running) or :ARM (one arm of a test that otherwise ran)."
+  (test nil) (site "" ) (capability nil :type keyword) (reason "") (scope :test :type keyword))
+
+(defvar *skip-events-lock* (dds.pal:make-lock "dds-test-skip-events")
+  "Guards *SKIP-EVENTS*: a skip may be noted from a thread the test spawned.")
+
+(defvar *skip-events* '()
+  "Every SKIP-EVENT noted since the last RESET-SKIP-EVENTS, newest first. Read it with SKIP-EVENTS.")
+
+(defun* note-skip (site capability reason &key (scope :test))
+    (function (t keyword t &key (:scope keyword)) (eql t))
+  "Report that SITE did not run because CAPABILITY is missing, for REASON: print one line and record a
+   SKIP-EVENT against *CURRENT-TEST*. CAPABILITY must be a member of *SKIP-CAPABILITIES* and SCOPE one of
+   :TEST (the whole test returns without running: the default) or :ARM (one arm skipped, the rest ran);
+   anything else signals an ERROR, which fails the calling test, because an unclassified skip is exactly the
+   invisible coverage hole this channel exists to close. Every call is recorded: two calls are two events.
+   Returns T, so a pass-skip guard can return its value. ADR 0122."
+  (unless (member capability *skip-capabilities*)
+    (error "note-skip ~a: capability ~s is not in the closed ADR 0122 vocabulary ~s"
+           site capability *skip-capabilities*))
+  (unless (member scope '(:test :arm))
+    (error "note-skip ~a: scope ~s must be :TEST or :ARM" site scope))
+  (let ((ev (%make-skip-event *current-test* (princ-to-string site) capability (princ-to-string reason) scope)))
+    (dds.pal:with-lock (*skip-events-lock*) (push ev *skip-events*))
+    (format t "~&  [skip] ~a (~(~a~), ~(~a~)): ~a~%" site capability scope reason))
+  t)
+
+(defun* note-dare-skip (site reason &key (scope :test))
+    (function (t t &key (:scope keyword)) (eql t))
+  "NOTE-SKIP for a DARE / DDS-Security site, with the capability taken from DDS.DARE:DARE-AVAILABLE-P's third
+   value: :LIBCRYPTO when no libcrypto loaded, :OPENSSL-PQC when the loaded one is older than 3.5 or lacks
+   ML-KEM-1024. Called only after DARE-AVAILABLE-P returned NIL; should it now return T (it cannot change
+   within a run), the skip is still recorded, under :OPENSSL-PQC, rather than dropped."
+  (note-skip site (or (nth-value 2 (dds.dare:dare-available-p)) :openssl-pqc) reason :scope scope))
+
+(defun* %skip-hook (site capability reason scope)
+    (function (t keyword t keyword) (eql t))
+  "The DDS.PAL:*TEST-SKIP-HOOK* this harness installs: production-file test bodies report through
+   DDS.PAL:NOTE-TEST-SKIP, which lands here, in the same registry as every other skip."
+  (note-skip site capability reason :scope scope))
+
+(setf dds.pal:*test-skip-hook* #'%skip-hook)
+
+(defun* skip-events ()
+    (function () list)
+  "A fresh list of every SKIP-EVENT noted since the last RESET-SKIP-EVENTS, oldest first."
+  (dds.pal:with-lock (*skip-events-lock*) (reverse *skip-events*)))
+
+(defun* reset-skip-events ()
+    (function () (eql t))
+  "Forget every noted SKIP-EVENT. RUN-ALL-TESTS calls it before the first test."
+  (dds.pal:with-lock (*skip-events-lock*) (setf *skip-events* '()))
+  t)
+
+(defun* classify-test (name failed-p events)
+    (function (t t list) keyword)
+  "The ADR 0122 coverage class of test NAME: :FAILED if FAILED-P; else :SKIPPED if any of EVENTS charged to
+   NAME has scope :TEST; else :PARTIAL if any is charged to NAME at all; else :FULL."
+  (let ((mine (remove-if-not (lambda (e) (equal (skip-event-test e) name)) events)))
+    (cond (failed-p :failed)
+          ((find :test mine :key #'skip-event-scope) :skipped)
+          (mine :partial)
+          (t :full))))
+
+(defun* print-skip-report (results events &optional (stream *standard-output*))
+    (function (list list &optional t) (eql t))
+  "Print the ADR 0122 accounting to STREAM. RESULTS is a list of (NAME . FAILED-P), one per test run, in run
+   order; EVENTS is the SKIP-EVENTS list. Prints the FULL / PARTIAL / SKIPPED / FAILED counts, then one row
+   per capability of *SKIP-CAPABILITIES* (events, distinct tests, and the tests by name), then any event noted
+   outside a test. Report-only: it returns T and decides nothing (step 2 enforces)."
+  (let ((counts (list :full 0 :partial 0 :skipped 0 :failed 0)))
+    (dolist (r results)
+      (incf (getf counts (classify-test (car r) (cdr r) events))))
+    (format stream "~&coverage: ~d FULL, ~d PARTIAL, ~d SKIPPED, ~d FAILED of ~d test(s); ~d skip event(s).~%"
+            (getf counts :full) (getf counts :partial) (getf counts :skipped) (getf counts :failed)
+            (length results) (length events))
+    (format stream "~&skips by capability (ADR 0122; every event counted, no dedup):~%")
+    (format stream "  ~20a ~7@a ~6@a ~5@a~%" "capability" "events" "tests" "arms")
+    (dolist (cap *skip-capabilities*)
+      (let* ((evs (remove-if-not (lambda (e) (eq (skip-event-capability e) cap)) events))
+             (tests (remove-duplicates (mapcar #'skip-event-test evs) :test #'equal :from-end t)))
+        (format stream "  ~20a ~7d ~6d ~5d~%" (string-downcase (symbol-name cap)) (length evs) (length tests)
+                (count :arm evs :key #'skip-event-scope))))
+    ;; then, per capability that fired, the tests it was charged to (xN = N events in that test)
+    (dolist (cap *skip-capabilities*)
+      (let* ((evs (remove-if-not (lambda (e) (eq (skip-event-capability e) cap)) events))
+             (tests (remove-duplicates (mapcar #'skip-event-test evs) :test #'equal :from-end t)))
+        (when evs
+          (format stream "~&  ~(~a~):~{~<~%   ~1,110:; ~a~>~^,~}~%" cap
+                  (mapcar (lambda (tn)
+                            (let ((n (count tn evs :key #'skip-event-test :test #'equal)))
+                              (if (> n 1) (format nil "~a x~d" (or tn "<no test>") n) (or tn "<no test>"))))
+                          tests)))))
+    (let ((stray (remove-if #'skip-event-test events)))
+      (when stray
+        (format stream "~&  ~d skip event(s) noted outside a running test:~{ ~a~^,~}~%"
+                (length stray) (mapcar #'skip-event-site stray)))))
+  t)
+
+(defvar *preflight-sink* nil
+  "Holds the probe allocation of CAPABILITY-PREFLIGHT so the compiler cannot elide it.")
+
+(defun* %libcrypto-mapped-paths ()
+    (function () list)
+  "The distinct file paths containing \"libcrypto\" in /proc/self/maps: the libcrypto the dynamic loader
+   actually mapped into this process, which is the answer to 'which OpenSSL did this run use' that a load
+   name like libcrypto.so.3 does not give. NIL where /proc/self/maps cannot be read."
+  (let ((paths '()))
+    (ignore-errors
+     (with-open-file (in "/proc/self/maps" :direction :input)
+       (loop for line = (read-line in nil nil) while line
+             do (let ((slash (position #\/ line)))
+                  (when (and slash (search "libcrypto" line :start2 slash))
+                    (pushnew (subseq line slash) paths :test #'string=))))))
+    (nreverse paths)))
+
+(defun* %openssl-version-text ()
+    (function () (values (or null integer) (or null string)))
+  "(VALUES VERSION-NUM VERSION-TEXT) of the loaded libcrypto, or NILs when none is loaded. VERSION-TEXT is
+   OpenSSL_version(OPENSSL_VERSION); OPENSSL_VERSION is 0, read from /usr/include/openssl/crypto.h:153
+   (OpenSSL 3.0.13 headers on the reference host; the selector is unchanged in 3.5's crypto.h)."
+  (if (null dds.dare::*libcrypto*)
+      (values nil nil)
+      (let ((num-ptr (dds.dare::%ossl-sym "OpenSSL_version_num"))
+            (txt-ptr (dds.dare::%ossl-sym "OpenSSL_version")))
+        (values (and num-ptr (cffi:foreign-funcall-pointer num-ptr nil :unsigned-long))
+                (and txt-ptr (cffi:foreign-funcall-pointer txt-ptr nil :int 0 :string))))))
+
+(defun* %shm-attach-probe ()
+    (function () (values t t))
+  "Create a 4096-octet POSIX shm segment, write a marker, attach it again BY NAME and read the marker back.
+   (VALUES WORKS-P DETAIL): WORKS-P is T iff the by-name attach saw the marker; DETAIL is the attach status or
+   the condition, for the preflight line. A failed SHM-CREATE reports its own status (e.g. :SHM-OPEN-FAILED)
+   rather than the type error that touching its NIL segment would raise; the name is still unlinked, since
+   SHM-CREATE's :FTRUNCATE-FAILED / :MMAP-FAILED paths close the fd but leave the name behind."
+  (let ((name (format nil "/dds-preflight-~a-~a" (dds.pal:process-id) (random 1000000))) (size 4096))
+    (handler-case
+        (multiple-value-bind (seg create-status) (dds.pal:shm-create name size)
+          (if (null seg)
+              (progn (dds.pal:shm-destroy name) (values nil create-status))
+              (unwind-protect
+                   (progn
+                     (setf (cffi:mem-ref (dds.pal:shm-sap seg) :uint32 0) #xCAFEF00D)
+                     (multiple-value-bind (seg2 status) (dds.pal:shm-attach name size)
+                       (if status
+                           (values nil status)
+                           (unwind-protect
+                                (values (= #xCAFEF00D (cffi:mem-ref (dds.pal:shm-sap seg2) :uint32 0)) :attached)
+                             (dds.pal:shm-detach seg2)))))
+                (dds.pal:shm-detach seg)
+                (dds.pal:shm-destroy name))))
+      (error (e) (values nil (princ-to-string e))))))
+
+(defun* capability-preflight (&optional (stream *standard-output*))
+    (function (&optional t) (eql t))
+  "Print, before the first test, what this host and implementation actually provide for every capability in
+   *SKIP-CAPABILITIES* (ADR 0122): the OpenSSL version and the libcrypto path the loader mapped, whether
+   DDS.PAL:BYTES-CONSED moves across a known allocation, whether a shm segment can be attached by name (a
+   live probe, next to the PAL's declared answer), and the gates the remaining capabilities use. It decides
+   nothing and returns T; its job is that a run's skip table can be read against the facts that caused it."
+  (format stream "~&preflight (ADR 0122): ~a ~a on ~a~%"
+          (lisp-implementation-type) (lisp-implementation-version) (dds.pal:pal-impl-name))
+  (multiple-value-bind (ok reason cap) (dds.dare:dare-available-p)
+    (multiple-value-bind (num text) (ignore-errors (%openssl-version-text))
+      (format stream "  openssl:            ~:[UNAVAILABLE (~(~a~)): ~a~;available~2*~]; version ~a~@[ (0x~8,'0x)~]~%"
+              ok cap reason (or text "n/a") num))
+    (format stream "  libcrypto loaded:   ~a~%"
+            (or (ignore-errors (and dds.dare::*libcrypto*
+                                    (cffi:foreign-library-pathname dds.dare::*libcrypto*)))
+                "none"))
+    (format stream "  libcrypto mapped:   ~{~a~^, ~}~%" (or (%libcrypto-mapped-paths) '("none"))))
+  (let* ((before (dds.pal:bytes-consed))
+         (_ (setf *preflight-sink* (make-list 4096)))
+         (delta (- (dds.pal:bytes-consed) before)))
+    (declare (ignore _))
+    (setf *preflight-sink* nil)
+    (format stream "  alloc-counter:      ~:[DOES NOT MOVE~;moves~] (bytes-consed delta ~d across a 4096-cons list)~%"
+            (plusp delta) delta))
+  (multiple-value-bind (works detail) (%shm-attach-probe)
+    (format stream "  shm-attach-by-name: live probe ~:[FAILED~;works~] (~a); PAL declares reliable-p = ~a~%"
+            works detail (dds.xport.shmem:shm-attach-by-name-reliable-p)))
+  (format stream "  zc-sap-primitives:  ~:[gated OFF~;enabled~] (tests gate on pal-impl-name :SBCL until WP-1.15)~%"
+          (eq (dds.pal:pal-impl-name) :sbcl))
+  (format stream "  subprocess-mode:    ~:[gated OFF~;enabled~] (dds-durability runner gates on pal-impl-name :SBCL)~%"
+          (eq (dds.pal:pal-impl-name) :sbcl))
+  (format stream "  rx-store-pool:      dds.disc:*rx-store-pool-enabled* = ~a~%" dds.disc:*rx-store-pool-enabled*)
+  t)
+
+(defun* note-bench-skip (stream site capability reason)
+    (function (t t keyword t) (eql t))
+  "A bench harness's skip (ADR 0122): record it through NOTE-SKIP (scope :ARM — the bench still writes the
+   rest of its report) and, when STREAM is a report file rather than *STANDARD-OUTPUT*, also write the same
+   fact into the report, so the published numbers carry their own gap. Returns T."
+  (note-skip site capability reason :scope :arm)
+  (unless (eq stream *standard-output*)
+    (format stream "(~a not measured: capability ~(~a~) missing — ~a; ADR 0122)~%~%" site capability reason))
+  t)
+
+(defun* run-with-skip-report (name thunk)
+    (function (string function) t)
+  "Run THUNK as the single test NAME outside RUN-ALL-TESTS, with the ADR 0122 skip accounting: print the
+   capability preflight, charge every NOTE-SKIP to NAME, and print the FULL / PARTIAL / SKIPPED / FAILED line
+   and the per-capability table afterwards, whether THUNK returns or signals. Returns THUNK's values; a
+   condition THUNK signals propagates unchanged after the report, so the caller's exit code is exactly what it
+   was without the report (step 1 is report-only). Used by `make fuzz`, `make mem` and `make corpus`."
+  (capability-preflight)
+  (reset-skip-events)
+  (setf *current-test* name)
+  (let ((ok nil))
+    (unwind-protect
+         (multiple-value-prog1 (funcall thunk) (setf ok t))
+      (setf *current-test* nil)
+      (print-skip-report (list (cons name (not ok))) (skip-events)))))

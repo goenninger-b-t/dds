@@ -360,7 +360,10 @@
                  :detail (format nil "iter ~d len ~d: production verdict ~a != (safety 0)-wrapper verdict ~a (a wrapper guard depends on SAFETY)"
                                  i n prod s0)))))
     ;; (B) ZC slot resolve clamp fuzz — FORGED recorded-len + adversarial idx/gen; skip where SHMEM is unusable
-    (when (dds.xport.shmem:shm-attach-by-name-reliable-p)
+    (if (not (dds.xport.shmem:shm-attach-by-name-reliable-p))
+        ;; ADR 0122: this arm was a silent WHEN.
+        (note-skip "flatdata-wrap-fuzz/zc-clamp" :shm-attach-by-name "SHMEM by-name attach unreliable on this platform (ADR 0013)" :scope :arm)
+        (progn
       (let* ((slots 4)
              (slot-bytes 64)
              (seg-bytes (dds.xport.zerocopy::%zc-bytes slots slot-bytes))
@@ -398,7 +401,7 @@
                    ;; release at the loaned generation to recycle the slot (best-effort; forged gens are no-ops)
                    (dds.xport.zerocopy::%zc-release sap slot gen))))
           (dds.xport.zerocopy::%zc-destroy sap)
-          (dds.pal:free-static mem))))
+          (dds.pal:free-static mem)))))
     t))
 
 ;;; ---- WP-FLATDATA-ZC-LOAN untrusted loan-acquire fuzz (FR-PF-3/4, NFR-SEC-POSTURE; R6, ADR 0017) ----
@@ -424,7 +427,15 @@
    is unreliable (ADR 0013) and on any implementation but SBCL (the gate is on pal-impl-name :sbcl; it has not
    been re-evaluated against the AllegroCL PAL, which does define load-sap-u8). Deterministic + seeded; N iterations;
    signals test-failure on any OOB / uncaught error / over-clamp."
-  (when (and (dds.xport.shmem:shm-attach-by-name-reliable-p) (eq (dds.pal:pal-impl-name) :sbcl))
+  (cond
+    ((not (dds.xport.shmem:shm-attach-by-name-reliable-p))
+     ;; ADR 0122: this arm was a silent WHEN.
+     (note-skip "flatdata-zc-loan-acquire-fuzz" :shm-attach-by-name
+                "SHMEM by-name attach unreliable on this platform (ADR 0013)" :scope :arm))
+    ((not (eq (dds.pal:pal-impl-name) :sbcl))
+     (note-skip "flatdata-zc-loan-acquire-fuzz" :zc-sap-primitives
+                "gated on pal-impl-name :SBCL; not yet re-evaluated against this PAL's load-sap-u8 (WP-1.15)" :scope :arm))
+    (t
     (let* ((slots 4)
            (slot-bytes 64)
            (seg-bytes (dds.xport.zerocopy::%zc-bytes slots slot-bytes))
@@ -467,7 +478,7 @@
                  ;; release at the loaned generation to recycle the slot (best-effort; forged gens are no-ops)
                  (dds.xport.zerocopy::%zc-release sap slot gen))))
         (dds.xport.zerocopy::%zc-destroy sap)
-        (dds.pal:free-static mem))))
+        (dds.pal:free-static mem)))))
   t)
 
 ;;; ---- WP-FLATDATA-XCDR-TRANSCODE untrusted foreign-rep transcode fuzz (FR-PF-4, NFR-SEC-POSTURE; R6) ----
@@ -988,8 +999,7 @@
    error / wrong plaintext / verdict disagreement. The DEK foreign secret is freed in unwind-protect."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [dare-open-payload-fuzz] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "dare-open-payload-fuzz" %dare-reason :scope :arm)
       (return-from fuzz-dare-open-payload t)))
   (let* ((prng   (make-prng #xDA7EC0DE))
          (iters  3000)
@@ -1110,8 +1120,7 @@
    OpenSSL<3.5. N>=2000 iterations, deterministic seed; reproducible on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [submessage-protection-fuzz] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "submessage-protection-fuzz" %dare-reason :scope :arm)
       (return-from fuzz-submessage-protection t)))
   (let* ((prng  (make-prng #x5EC5B2))
          (iters 2500)
@@ -1227,8 +1236,7 @@
    if OpenSSL<3.5. N>=2000 iterations, deterministic seed; reproducible on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [submessage-origin-auth-fuzz] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "submessage-origin-auth-fuzz" %dare-reason :scope :arm)
       (return-from fuzz-submessage-origin-auth t)))
   (let* ((prng  (make-prng #x0A1A2A3))
          (iters 2500)
@@ -1364,8 +1372,7 @@
    SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [rtps-message-fuzz] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "rtps-message-fuzz" %dare-reason :scope :arm)
       (return-from fuzz-rtps-message t)))
   (let* ((prng   (make-prng #x537A7B5))
          (iters  2500)
@@ -1828,7 +1835,7 @@
     (fuzz-rtps-message)
     ;; WP-DURABILITY-PERSISTENT crash-injection fuzz: tail-truncation + garbage-append + mid-file-corruption against file-store replay (NFR-SEC-POSTURE)
     (fuzz-file-store-crash-injection)
-    (format t "~&  pbt: 6 properties x ~d cases each + ring-drain fuzz 2000 iters + zc-resolve fuzz 2500 iters + flatdata-wrap fuzz 4000 iters (non-ZC wrap + safety-0 + forged-len ZC clamp) + flatdata-zc-loan-acquire fuzz 4000 iters (forged loan-acquire clamp, SBCL) + flatdata-transcode fuzz 4000 iters (foreign-rep transcode: 3 transcodable reps + native + random rep-id x swept body lengths, prod + safety-0) + durability-config fuzz 2000 iters (random argv/env -> clean error or valid, prod + safety-0) + owi-parse fuzz 2000 iters (PID_ORIGINAL_WRITER_INFO parse: random/short/oversized/off-end octets + inline-QoS blob walk; BOTH arms prod + safety-0, NFR-SEC-POSTURE) + dare-open-payload fuzz 3000 iters (adversarial sealed blobs -> NIL or correct plaintext, fail-closed + bounds-checked, prod + safety-0; SKIP if OpenSSL<3.5, NFR-SEC-POSTURE) + submessage-protection fuzz 2500 iters (adversarial SEC_PREFIX/BODY/POSTFIX brackets -> NIL or correct plaintext, never tampered; writer+reader x prod+safety-0; SKIP if OpenSSL<3.5, §8.5.1.7-.9 NFR-SEC-POSTURE) + submessage-origin-auth fuzz 2500 iters (adversarial receiver_specific_macs footers: flipped MAC/key_id, hostile/oversized rsm_count hitting the T1 cap, footer truncation, random, all-zero -> NIL or correct plaintext, never tampered/unbounded-alloc; prod+safety-0; SKIP if OpenSSL<3.5, §9.5.3.3.4.3 NFR-SEC-POSTURE) + rtps-message fuzz 2500 iters + 256 origin-auth iters (adversarial SRTPS_PREFIX/SEC_BODY/SRTPS_POSTFIX whole-RTPS brackets: mutation/truncation/random/all-zero/trailing/corrupt-prefix-or-postfix-id/hostile rsm_count hitting the T1 cap -> NIL or correct stream, never tampered/OOB/non-terminating SIGN walk; prod+safety-0; SKIP if OpenSSL<3.5, §8.5.1.10-.12 NFR-SEC-POSTURE) + crash-injection fuzz 4 arms (tail-truncation / garbage-append / mid-file-corruption against file-store replay + epochs.dat torn-tail/mid-file recovery, NFR-SEC-POSTURE), deterministic seed.~%" runs)
+    (format t "~&  pbt: 6 properties x ~d cases each + ring-drain fuzz 2000 iters + zc-resolve fuzz 2500 iters + flatdata-wrap fuzz 4000 iters (non-ZC wrap + safety-0 + forged-len ZC clamp) + flatdata-zc-loan-acquire fuzz 4000 iters (forged loan-acquire clamp, SBCL) + flatdata-transcode fuzz 4000 iters (foreign-rep transcode: 3 transcodable reps + native + random rep-id x swept body lengths, prod + safety-0) + durability-config fuzz 2000 iters (random argv/env -> clean error or valid, prod + safety-0) + owi-parse fuzz 2000 iters (PID_ORIGINAL_WRITER_INFO parse: random/short/oversized/off-end octets + inline-QoS blob walk; BOTH arms prod + safety-0, NFR-SEC-POSTURE) + dare-open-payload fuzz 3000 iters (adversarial sealed blobs -> NIL or correct plaintext, fail-closed + bounds-checked, prod + safety-0; runs only with OpenSSL >= 3.5, else counted by the ADR 0122 capability report, NFR-SEC-POSTURE) + submessage-protection fuzz 2500 iters (adversarial SEC_PREFIX/BODY/POSTFIX brackets -> NIL or correct plaintext, never tampered; writer+reader x prod+safety-0; runs only with OpenSSL >= 3.5, else counted by the ADR 0122 capability report, §8.5.1.7-.9 NFR-SEC-POSTURE) + submessage-origin-auth fuzz 2500 iters (adversarial receiver_specific_macs footers: flipped MAC/key_id, hostile/oversized rsm_count hitting the T1 cap, footer truncation, random, all-zero -> NIL or correct plaintext, never tampered/unbounded-alloc; prod+safety-0; runs only with OpenSSL >= 3.5, else counted by the ADR 0122 capability report, §9.5.3.3.4.3 NFR-SEC-POSTURE) + rtps-message fuzz 2500 iters + 256 origin-auth iters (adversarial SRTPS_PREFIX/SEC_BODY/SRTPS_POSTFIX whole-RTPS brackets: mutation/truncation/random/all-zero/trailing/corrupt-prefix-or-postfix-id/hostile rsm_count hitting the T1 cap -> NIL or correct stream, never tampered/OOB/non-terminating SIGN walk; prod+safety-0; runs only with OpenSSL >= 3.5, else counted by the ADR 0122 capability report, §8.5.1.10-.12 NFR-SEC-POSTURE) + crash-injection fuzz 4 arms (tail-truncation / garbage-append / mid-file-corruption against file-store replay + epochs.dat torn-tail/mid-file recovery, NFR-SEC-POSTURE), deterministic seed.~%" runs)
     (loop for b across fuzzbufs
           do (dds.pal:free-static (dds.core.buffer:octet-buffer-vec b)))
     (dds.core.arena:pool-release pool buf)

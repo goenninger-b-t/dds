@@ -23,6 +23,7 @@ make gate-build    # THE build gate: clean-cache rebuild + a falsification self-
 make gate-types    # every defun has a single-line ftype declaim (FR-LANG-8)
 make gate-pal      # no reader conditionals outside dds-pal/ (contract §10, NFR-PORT); no Clasp token anywhere (ADR 0118)
 make gate-quit-lint # src/ exits only via dds.pal:exit-process — no uiop:quit / sb-ext:exit / excl:exit (ADR 0121)
+make gate-skip-lint # a test skip goes through dds.tests:note-skip with a known capability — no bare SKIP print (ADR 0122)
 make gate-hotpath  # no CLOS dispatch (NFR-CLOS) + no UNJUSTIFIED allocation (NFR-MEM) in hot-path files
 make mem           # CODEC-only: 0 bytes/sample serialize + deserialize (NFR-PERF-8) — see the caveat below
 make gate-mem      # NFR-MEM RATCHET: END-TO-END bytes/sample, must not regress (ADR 0062). SBCL only:
@@ -41,6 +42,54 @@ Every Lisp form in the Makefile ends the process with `(dds.pal:exit-process COD
 thread parked in a foreign call (the AllegroCL suite used to, after printing its summary). `make test` also
 **fails on a leaked `dds-*` thread**: `run-all-tests` lists every thread it started that is still alive after
 the last test and a 5 s grace period.
+
+### Skips are counted, not printed (ADR 0122)
+
+A test that cannot run because the host lacks something does not just print `SKIP`: it calls
+`dds.tests:note-skip`, naming **what** did not run (the site), **which capability** was missing, and **why**.
+Until WP-0.10 about 100 tests printed a bare `SKIP` line, returned, and were reported `ok`, while the summary
+said `skipped: 0 — every test ran`.
+
+- **The capability vocabulary is closed** (`dds.tests:*skip-capabilities*`): `:openssl-pqc` (OpenSSL < 3.5
+  or no ML-KEM-1024), `:libcrypto` (none loaded), `:alloc-counter` (`dds.pal:bytes-consed` does not move),
+  `:zc-sap-primitives`, `:shm-attach-by-name`, `:subprocess-mode`, `:rx-store-pool`, `:static-vector-p`,
+  `:carve-refusal` and `:verified-elsewhere` (a gate defers an artefact to another gate, e.g. `make corpus`'s
+  LogEvent vector, which `make test` verifies). Any other keyword signals an error, which fails the test.
+- **`:scope`** is `:test` (the default: the test returned without running) or `:arm` (one assertion block
+  was skipped and the rest ran).
+- **No dedup.** Every call is one event, charged to the test that was running (`dds.tests:*current-test*`).
+- A test body in a production file reports through `dds.pal:note-test-skip`, which forwards to the harness.
+  That covers every suite entry that lives outside `src/dds-tests/` (the `run-…-test` bodies and the
+  `dds.bench` perftest smokes alike); `make gate-skip-lint` finds them from the `run-all-tests` registry.
+
+```lisp
+(multiple-value-bind (ok reason) (dds.dare:dare-available-p)
+  (unless ok
+    (note-dare-skip "my-secure-test" reason)        ; capability :openssl-pqc or :libcrypto, from DARE itself
+    (return-from run-my-secure-test t)))
+(if (eq (dds.pal:pal-impl-name) :sbcl)
+    (%check :zero-alloc (< per 1.0) "…")
+    (note-skip "my-test/zero-alloc" :alloc-counter "bytes-consed does not move here" :scope :arm))
+```
+
+`make test` (and `make fuzz`, `make mem`, `make corpus`) print a **preflight** before the first test (the OpenSSL version and
+the libcrypto file the loader actually mapped, whether `bytes-consed` moves, whether a shm segment attaches by
+name) and, after the last, the **accounting**. On this host with SBCL 2.2.9 and OpenSSL 3.0.13:
+
+```
+preflight (ADR 0122): SBCL 2.2.9.debian on SBCL
+  openssl:            UNAVAILABLE (openssl-pqc): OpenSSL version 0x300000D0 < 3.5.0 (0x30500000); version OpenSSL 3.0.13 30 Jan 2024 (0x300000D0)
+  libcrypto mapped:   /usr/lib/x86_64-linux-gnu/libcrypto.so.3
+  alloc-counter:      moves (bytes-consed delta 65024 across a 4096-cons list)
+  shm-attach-by-name: live probe works (ATTACHED); PAL declares reliable-p = T
+…
+tests: 650 passed, 0 FAILED, 650 total.
+coverage: 547 FULL, 3 PARTIAL, 100 SKIPPED, 0 FAILED of 650 test(s); 106 skip event(s).
+```
+
+FULL = ran with no skip; PARTIAL = passed but skipped at least one arm; SKIPPED = returned without running;
+FAILED = failed (whatever it skipped). **Step 1 is report-only: skips do not change the exit code.** Step 2
+(WP-0.10, with the ADR 0120 skip baseline) will fail a run on a skip that is not in the baseline.
 
 ### `make mem` vs `make gate-mem` — read this before trusting either
 

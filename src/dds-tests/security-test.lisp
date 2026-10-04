@@ -16,8 +16,7 @@
    Requires OpenSSL >= 3.5; skips only if truly absent. Must pass identically on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [security-secured-payload] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "security-secured-payload" %dare-reason)
       (return-from run-security-secured-payload-corpus-test t)))
 
   ;; (a) byte-exact serialize. Known field set (spike §6 header fields + a fixed ct/tag).
@@ -226,8 +225,7 @@
    Requires OpenSSL >= 3.5; skips only if truly absent. Must pass identically on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [security-payload-roundtrip] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "security-payload-roundtrip" %dare-reason)
       (return-from run-security-payload-roundtrip-test t)))
 
   (let* ((km (dds.security:make-test-key-material))
@@ -342,8 +340,7 @@
    Requires OpenSSL >= 3.5; skips only if truly absent. Must pass identically on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [security-payload-into] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "security-payload-into" %dare-reason)
       (return-from run-security-payload-into-test t)))
   (let* ((km     (dds.security:make-test-key-material))      ; CORE km under test, iv-counter 0
          (km-or  (dds.security:make-test-key-material))      ; ORACLE km, same fixed master key/salt, counter 0
@@ -417,8 +414,7 @@
    Requires OpenSSL >= 3.5; skips only if truly absent."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [security-gmac-payload] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "security-gmac-payload" %dare-reason)
       (return-from run-security-gmac-payload-test t)))
   (let* ((km   (dds.security:make-test-key-material :kind :sign))   ; GMAC km under test, iv-counter 0
          (pt   (make-array 16 :element-type '(unsigned-byte 8)
@@ -529,9 +525,14 @@
                     (ebps (let ((b (dds.pal:bytes-consed)))
                             (dotimes (i iters) (dds.security:encode-serialized-payload-into out ke pt))
                             (/ (float (- (dds.pal:bytes-consed) b)) iters))))
-               (%check :gmac-into-alloc-parity
-                       (or (not sbcl) (<= gbps (+ ebps 8.0)))
-                       (format nil "GMAC encode-into must cons no more than ENCRYPT (~,4f vs ~,4f B/op)" gbps ebps))))
+               (if sbcl
+                   (%check :gmac-into-alloc-parity
+                           (<= gbps (+ ebps 8.0))
+                           (format nil "GMAC encode-into must cons no more than ENCRYPT (~,4f vs ~,4f B/op)" gbps ebps))
+                   ;; ADR 0122: this was (OR (NOT SBCL) ...), an assertion that silently passed off SBCL.
+                   (note-skip "security-gmac-payload/alloc-parity" :alloc-counter
+                              "alloc-parity assertion gated on pal-impl-name :SBCL (bytes-consed does not move elsewhere)"
+                              :scope :arm))))
         (dds.pal:free-static (dds.core.buffer:octet-buffer-vec out))
         (dds.pal:free-static (dds.core.buffer:octet-buffer-vec pt-out))))
     ;; (j) the ENCRYPT tier is UNCHANGED (byte-3 kind = 4, carries the 4-byte crypto_content.length prefix)
@@ -556,8 +557,7 @@
    Must pass identically on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [security-payload-fuzz] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "security-payload-fuzz" %dare-reason)
       (return-from run-security-payload-fuzz-test t)))
 
   (let* ((km    (dds.security:make-test-key-material))
@@ -672,8 +672,7 @@
    Must pass identically on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [security-encrypted-pubsub] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "security-encrypted-pubsub" %dare-reason)
       (return-from run-security-encrypted-pubsub-test t)))
 
   ;; ONE shared km instance: both pub and sub share the same iv-counter so nonces never collide.
@@ -801,8 +800,7 @@
    a GC-heap fallback. Requires OpenSSL >= 3.5; must pass identically on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [secured-decode-loan-alloc] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "secured-decode-loan-alloc" %dare-reason)
       (return-from run-secured-decode-loan-alloc-test t)))
   ;; -- Part 1: the focused decode-path alloc proof (isolated codec + pool; no node) --
   (let* ((km (dds.security:make-test-key-material))
@@ -838,7 +836,8 @@
              (format t "~&  [secured-decode-loan-alloc] decode-INTO-pool=~,4f B/sample  allocating-decode=~,4f B/sample (plaintext ~d B)~%"
                      (/ (float loan-consed) n) (/ (float old-consed) n) pt-size)
              (if (zerop old-consed)
-                 (format t "  [skip] dds.pal:bytes-consed is 0 on this impl (AllegroCL NFR-PORT measurement gap) — alloc delta not measurable~%")
+                 (note-skip "secured-decode-loan-alloc/alloc-delta" :alloc-counter
+                            "dds.pal:bytes-consed does not move on this impl — alloc delta not measurable" :scope :arm)
                  (progn
                    (%check :loan-alloc-eliminates-plaintext (< (/ loan-consed n) pt-size)
                            "the loan decode path does NOT cons the per-sample plaintext (< plaintext size per sample)")
@@ -905,8 +904,7 @@
    GUID+SN, which reader-dedup-accept-p rejects). Requires OpenSSL >= 3.5; must pass identically on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [secured-decode-loan-dup] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "secured-decode-loan-dup" %dare-reason)
       (return-from run-secured-decode-loan-dup-test t)))
   (let* ((km (dds.security:make-test-key-material))
          (pt (make-array 8 :element-type '(unsigned-byte 8)
@@ -966,8 +964,7 @@
    Requires OpenSSL >= 3.5 (same gate as the lower-layer secured tests); must pass identically on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [dcps-secured-take-loan] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "dcps-secured-take-loan" %dare-reason)
       (return-from run-dcps-secured-take-loan-test t)))
   (let* ((km (dds.security:make-test-key-material))
          (ts (dds.types:find-type-support "shape-type"))
@@ -1116,8 +1113,7 @@
    (2C3 return-count purge-defer — no leak, no double-free/UAF). OpenSSL-gated."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [dcps-same-topic-secured-readers] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "dcps-same-topic-secured-readers" %dare-reason)
       (return-from run-dcps-same-topic-secured-readers-test t)))
   (let* ((km (dds.security:make-test-key-material))
          (ts (dds.types:find-type-support "shape-type"))
@@ -1195,8 +1191,7 @@
    No sockets — %deliver-user-sample driven directly. Requires OpenSSL >= 3.5; must pass identically on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [secured-store-growth] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "secured-store-growth" %dare-reason)
       (return-from run-secured-store-growth-test t)))
   (let* ((km (dds.security:make-test-key-material))
          (pt (make-array 16 :element-type '(unsigned-byte 8) :initial-element #x5A))
@@ -1258,7 +1253,8 @@
                    (dds.disc:*secured-pool-headroom* head))
                (ignore-errors (dds.disc:set-secured-loan-capable node t))
                (if (dds.disc:disc-node-decode-pool node)
-                   (format t "~&  [secured-store-growth] SKIP ARM 2 — carve-fail unreachable (huge static alloc succeeded on this platform)~%")
+                   (note-skip "secured-store-growth/carve-fail" :carve-refusal
+                              "carve-fail unreachable: a 2^48-octet static carve succeeded on this host" :scope :arm)
                    (progn
                      (dotimes (i n)
                        (dds.disc::%deliver-user-sample node wid (1+ i) secured src guid (1+ i) kh))   ; NO drain -> pre-fix grows unbounded
@@ -1297,8 +1293,7 @@
    Requires OpenSSL >= 3.5; must pass identically on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [decode-fail-suppress] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "decode-fail-suppress" %dare-reason)
       (return-from run-decode-fail-suppress-test t)))
   (let* ((km (dds.security:make-test-key-material))
          (pt (make-array 8 :element-type '(unsigned-byte 8)
@@ -1422,8 +1417,7 @@
    Requires OpenSSL >= 3.5; skips only if truly absent. Must pass identically on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [security-encrypted-fragmented] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "security-encrypted-fragmented" %dare-reason)
       (return-from run-security-encrypted-fragmented-test t)))
 
   ;; ONE shared km — two instances would collide nonces under the same master key (ADR 0031 §T2).
@@ -1499,8 +1493,7 @@
    impl. The full live-publish-path 0.0000 proof (publisher AND subscriber) is the T5c gate. Requires OpenSSL >= 3.5."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [security-encode-pool-alloc] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "security-encode-pool-alloc" %dare-reason)
       (return-from run-security-encode-pool-alloc-test t)))
   (let* ((km (dds.security:make-test-key-material))
          (pt (make-array 256 :element-type '(unsigned-byte 8) :initial-element 7))
@@ -1563,8 +1556,7 @@
    Requires OpenSSL >= 3.5; must pass identically on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [secured-live-zeroalloc] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "secured-live-zeroalloc" %dare-reason)
       (return-from run-secured-live-zeroalloc-test t)))
   (let ((km (dds.security:make-test-key-material))
         (sbcl (eq (dds.pal:pal-impl-name) :sbcl)))
@@ -1607,7 +1599,9 @@
           (format t "  [secured-live-zeroalloc] WRAPPER-CYCLE (acquire+fill+register+deregister+release+recycle) = ~,4f B/sample (deterministic, exact)~%"
                   wrap-bps)
           (if (not sbcl)
-              (format t "  [skip] dds.pal:bytes-consed is 0 on this impl (AllegroCL NFR-PORT measurement gap) — delta assertions smoked, not measured~%")
+              (note-skip "secured-live-zeroalloc/part-a-deltas" :alloc-counter
+                         "delta assertions gated on pal-impl-name :SBCL (bytes-consed does not move elsewhere): smoked, not measured"
+                         :scope :arm)
               (progn
                 ;; PRIMARY: the live publish path adds 0.0000 B/sample when data_protection is enabled (encode is alloc-free
                 ;; vs plain). Tolerance 2.0 absorbs SBCL get-bytes-consed's ~64KB GC-boundary accounting quantum
@@ -1650,7 +1644,10 @@
              (%check :encode-exhaust-admitted-bounded
                      (<= (count t results) 3)
                      (format nil "only pool-capacity (3) publishes are admitted before exhaustion; got ~d admitted" (count t results)))
-             (when sbcl
+             (if (not sbcl)
+               ;; ADR 0122: this arm was a silent WHEN.
+               (note-skip "secured-live-zeroalloc/encode-exhaust-no-gc" :alloc-counter
+                          "no-GC-fallback assertion gated on pal-impl-name :SBCL" :scope :arm)
                (let ((before (dds.pal:bytes-consed)))
                  (dotimes (i 5000) (dds.disc:publish-sample node big))   ; all exhausted -> :timeout
                  (let ((per (/ (float (- (dds.pal:bytes-consed) before)) 5000)))
@@ -1678,7 +1675,10 @@
                (%check :decode-exhaust-capped
                        (<= (dds.disc:node-sample-count node) (+ cap head))
                        (format nil "only pool-capacity (~d) samples are admitted; got ~d" (+ cap head) (dds.disc:node-sample-count node)))
-               (when sbcl
+               (if (not sbcl)
+                 ;; ADR 0122: this arm was a silent WHEN.
+                 (note-skip "secured-live-zeroalloc/decode-exhaust-no-gc" :alloc-counter
+                            "no-GC-fallback assertion gated on pal-impl-name :SBCL" :scope :arm)
                  (let ((per (/ (float (- (dds.pal:bytes-consed) before)) 5000)))
                    (%check :decode-exhaust-no-gc (< per 256.0)
                            (format nil "exhausted deliver conses ~,4f B/sample — far below the ~d-B plaintext (no GC fallback)"
@@ -1751,7 +1751,9 @@
                       (multiple-value-bind (ibuf ilen) (datagram info-specs)
                         (dds.disc::%prescan-user-submessages node ibuf ilen)   ; warm
                         (if (not sbcl)
-                            (format t "~&  [submsg-exhaust] bytes-consed 0 on this impl (AllegroCL NFR-PORT measurement gap) — pre-scan alloc not measurable~%")
+                            (note-skip "submsg-exhaust/prescan-alloc" :alloc-counter
+                                       "pre-scan zero-alloc assertion gated on pal-impl-name :SBCL (bytes-consed does not move elsewhere)"
+                                       :scope :arm)
                             (let ((before (dds.pal:bytes-consed)))
                               (dotimes (i 50000) (dds.disc::%prescan-user-submessages node ibuf ilen))
                               (let ((per (/ (float (- (dds.pal:bytes-consed) before)) 50000)))
@@ -2130,8 +2132,7 @@
    Requires OpenSSL >= 3.5; skips only if truly absent. Must pass identically on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [security-submessage] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "security-submessage" %dare-reason)
       (return-from run-security-submessage-corpus-test t)))
   (let ((sub (%t2-fixed-plain-submessage)))
     (%t2-corpus-encrypt sub)
@@ -2420,8 +2421,7 @@
    Requires OpenSSL >= 3.5; skips only if truly absent. Must pass identically on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [security-origin-auth] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "security-origin-auth" %dare-reason)
       (return-from run-security-origin-auth-test t)))
   (let ((sub (%t2-fixed-plain-submessage)))
     (%t3-corpus-encode sub)
@@ -2638,8 +2638,7 @@
    Requires OpenSSL >= 3.5; skips only if truly absent. Must pass identically on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [security-rtps-message] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "security-rtps-message" %dare-reason)
       (return-from run-security-rtps-message-corpus-test t)))
   (let ((stream (%t4-fixed-stream)))
     (%t4-corpus-encrypt stream)
@@ -2749,7 +2748,8 @@
                (format t "~&  [secured-region-into] SIGN decode-into (reused blob+pt) = ~,4f B/call (~d iters, ~d B total)~%"
                        per iters delta)
                (if (zerop (dds.pal:bytes-consed))
-                   (format t "  [skip] dds.pal:bytes-consed is 0 on this impl — SIGN decode alloc not measurable~%")
+                   (note-skip "security-secured-region-into/sign-decode-alloc" :alloc-counter
+                              "dds.pal:bytes-consed does not move on this impl — SIGN decode alloc not measurable" :scope :arm)
                    (%check :za2-sign-decode-zeroalloc (< per 1.0)
                            (format nil "SIGN decode-into must cons ~~0 GC-heap B/call after the region fix; got ~,4f" per))))))
       (dds.pal:free-static (dds.core.buffer:octet-buffer-vec pt))))
@@ -2771,8 +2771,7 @@
    Requires OpenSSL >= 3.5; skips only if truly absent. Must pass identically on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [security-secured-region-into] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "security-secured-region-into" %dare-reason)
       (return-from run-security-secured-region-into-test t)))
   (let ((sub    (%t2-fixed-plain-submessage))
         (stream (%t4-fixed-stream)))
@@ -2826,10 +2825,9 @@
    exact, AllegroCL reports 0 — NFR-PORT) as a markdown table to STREAM. This is the T4 BASELINE; T10 re-measures
    the integrated send/%handle-datagram path. Encode advances the km iv-counter per call (no nonce reuse);
    decode re-decodes one pre-encoded blob (keyed by the wire iv). SKIPs if OpenSSL<3.5."
-  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+  (multiple-value-bind (%dare-ok %dare-reason %dare-cap) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format stream "~&  [rtps-message-bench] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-bench-skip stream "rtps-message-bench" (or %dare-cap :openssl-pqc) %dare-reason)
       (return-from run-rtps-message-bench t)))
   (let ((subs (%t4-bench-stream size)))
     (flet ((bench-encode (kind)
@@ -2876,10 +2874,9 @@
    AllegroCL reports 0 — NFR-PORT). The T10-send/recv vs T4 delta is the documented residual: the codec's →octets
    return + AEAD intermediates (the inherited T4 carry) PLUS one plain-region subseq per datagram; the node
    send/receive BUFFER is reused in place (no per-datagram message-sized array). SKIPs if OpenSSL<3.5."
-  (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
+  (multiple-value-bind (%dare-ok %dare-reason %dare-cap) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format stream "~&  [rtps-protection-bench] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-bench-skip stream "rtps-protection-bench" (or %dare-cap :openssl-pqc) %dare-reason)
       (return-from run-rtps-protection-bench t)))
   (let* ((subs (%t4-bench-stream size))                                   ; the post-header submessage stream
          (km   (dds.security:make-test-key-material))
@@ -2980,17 +2977,22 @@
     (%check :km-rkey-static (dds.pal:static-vector-p rkey) "master_receiver_specific_key must be foreign/static")
     ;; non-vacuous off-heap discrimination is SBCL-only (the AllegroCL static-vector-p cannot discriminate; see
     ;; the predicate docstring in pal-allegro.lisp)
-    (when sbcl
-      (%check :heap-not-static (not (dds.pal:static-vector-p heap))
-              "on SBCL a plain GC-heap array must NOT answer static-vector-p (non-vacuous off-heap proof)"))
+    (if sbcl
+        (%check :heap-not-static (not (dds.pal:static-vector-p heap))
+                "on SBCL a plain GC-heap array must NOT answer static-vector-p (non-vacuous off-heap proof)")
+        ;; ADR 0122: this arm was a silent WHEN.
+        (note-skip "km-zeroize/heap-not-static" :static-vector-p
+                   "dds.pal:static-vector-p cannot tell a GC-heap array from a static one on this impl" :scope :arm))
     (%check :km-salt-real (notevery #'zerop salt) "master_salt must carry real (non-zero) key bytes pre-wipe")
     (%check :km-mkey-real (notevery #'zerop mkey) "master_sender_key must carry real key bytes pre-wipe")
     (%check :km-rkey-real (notevery #'zerop rkey) "master_receiver_specific_key must carry real bytes pre-wipe")
     ;; derived §9.5.3.3.4.2 session-key cache is EPHEMERAL GC-HEAP (NOT foreign-static) + non-zero — the A2 revert
     (let ((sk (dds.security::%km-session-key-at km sid 0)))
-      (when sbcl
-        (%check :km-sesskey-heap (not (dds.pal:static-vector-p sk))
-                "derived session key must be GC-heap (not foreign-static) — no per-session_id foreign leak"))
+      (if sbcl
+          (%check :km-sesskey-heap (not (dds.pal:static-vector-p sk))
+                  "derived session key must be GC-heap (not foreign-static) — no per-session_id foreign leak")
+          (note-skip "km-zeroize/sesskey-heap" :static-vector-p
+                     "dds.pal:static-vector-p cannot tell a GC-heap array from a static one on this impl" :scope :arm))
       (%check :km-sesskey-real (notevery #'zerop sk) "derived session key must be non-zero"))
     (%check :km-cache-populated (not (null (dds.security::key-material-cached-send-session km)))
             "session-key cache populated after derive (pre-wipe)")
@@ -3001,7 +3003,10 @@
              (rk   (dds.security::%km-receiver-session-key-at km rkid rkey rsid 0)))
         (%check :km-rot-common-real (notevery #'zerop ck) "rotated common session key non-zero")
         (%check :km-rot-recv-real   (notevery #'zerop rk) "rotated receiver session key non-zero")
-        (when sbcl
+        (if (not sbcl)
+          (note-skip "km-zeroize/rotation-heap" :static-vector-p
+                     "dds.pal:static-vector-p cannot tell a GC-heap array from a static one on this impl" :scope :arm)
+          (progn
           (%check :km-rot-common-heap (not (dds.pal:static-vector-p ck))
                   "each rotated common session key is GC-heap (not foreign-static) — no session_id-rotation leak")
           (%check :km-rot-recv-heap (not (dds.pal:static-vector-p rk))
@@ -3010,9 +3015,11 @@
                   (not (dds.pal:static-vector-p
                         (dds.security::session-cache-recv-master-key
                          (dds.security::key-material-cached-recv-session km))))
-                  "the recv session-cache's master-key discriminant is GC-heap (not foreign-static)"))))
+                  "the recv session-cache's master-key discriminant is GC-heap (not foreign-static)")))))
     ;; after rotation the cache slot still holds ONE heap vector (bounded single slot, GC-reclaimable — no leak)
-    (when sbcl
+    (if (not sbcl)
+      (note-skip "km-zeroize/cache-slot-heap" :static-vector-p
+                 "dds.pal:static-vector-p cannot tell a GC-heap array from a static one on this impl" :scope :arm)
       (%check :km-cache-slot-heap
               (not (dds.pal:static-vector-p
                     (dds.security::session-cache-key

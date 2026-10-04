@@ -728,8 +728,19 @@ wrap the inner store in the decorator backed by a file key-provider:
 
 DARE uses **OpenSSL ≥ 3.5** (`libcrypto`) for all three CNSA-2.0 algorithms — **ML-KEM landed in the
 3.5 LTS**, so this is a **hard runtime requirement**. It is checked at startup
-(`dds.dare:dare-available-p`); if OpenSSL is absent, below 3.5, or ML-KEM-1024 is not fetchable, DARE
-signals `dds.dare:dare-unavailable` — a **hard error, never a silent plaintext fallback**. On macOS
+(`dds.dare:dare-available-p`, which returns `(values available reason capability)`); if OpenSSL is absent,
+below 3.5, or ML-KEM-1024 is not fetchable, it returns NIL with a reason and DARE **refuses** (ADR 0064: a
+status, not a condition) — **never a silent plaintext fallback**. The third value names the missing
+capability in the ADR 0122 skip vocabulary: `:libcrypto` when no libcrypto loaded, `:openssl-pqc` when the
+loaded one is older than 3.5 or lacks ML-KEM-1024. The test harness charges a DARE skip to that capability.
+
+```lisp
+(multiple-value-bind (ok reason capability) (dds.dare:dare-available-p)
+  (unless ok (format t "DARE unavailable (~(~a~)): ~a~%" capability reason)))
+;; on a host with OpenSSL 3.0.13:
+;; DARE unavailable (openssl-pqc): OpenSSL version 0x300000D0 < 3.5.0 (0x30500000)
+```
+ On macOS
 the bindings resolve the real homebrew `libcrypto` explicitly (a `$DDS_DARE_LIBCRYPTO` env override is
 honoured first) to avoid binding the system LibreSSL, which lacks ML-KEM; on Linux they fall back to
 `libcrypto.so.3`. No hand-rolled crypto (FR-SEC-2); OpenSSL is SBOM-pinned and recorded in
@@ -1108,8 +1119,8 @@ closes that gap for the **encrypted/epoch (keyed) store**:
 
 The PERSISTENT tier is **always DARE-wrapped**, so the §7.3 deployment requirement applies in full:
 **OpenSSL ≥ 3.5 (`libcrypto`) is a hard runtime requirement** (ML-KEM landed in the 3.5 LTS),
-checked at startup (`dds.dare:dare-available-p`); if it is absent/below 3.5/ML-KEM-less, the service
-signals `dds.dare:dare-unavailable` — a **hard error, never a silent plaintext-on-disk path**. The
+checked at startup (`dds.dare:dare-available-p`, §7.3); if it is absent/below 3.5/ML-KEM-less, the service
+refuses the encrypted tier (a returned status, ADR 0064) — **never a silent plaintext-on-disk path**. The
 file store itself adds no new dependency (plain-file IO). `dds.pal:fsync-stream` is an **NFR-PORT
 split**: SBCL issues a true `fdatasync(2)`; **AllegroCL falls back to `finish-output`** (a Lisp-level
 flush; no stream-fd `fdatasync` is exposed there), so the SBCL path carries the production OS-level durability guarantee.

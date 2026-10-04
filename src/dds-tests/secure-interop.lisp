@@ -154,7 +154,10 @@
    the outbound side. Fail-soft: a peer-config error is reported, never crashes the harness."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&RESULT: SKIP — OpenSSL >= 3.5 unavailable: ~a~%" %dare-reason)
+      ;; ADR 0122: the skip goes through the one channel; the RESULT line only terminates the protocol the
+      ;; orchestrator reads (it greps RESULT: PASS, so this run never counts as one).
+      (note-dare-skip "secure-interop-peer" %dare-reason)
+      (format t "~&RESULT: NOT RUN (capability missing, reported above)~%")
       (finish-output) (return-from run-secure-interop-peer t)))
   ;; Surface §8.7 handshake / crypto-token events from the receiver thread (global, not a dynamic
   ;; binding: the handshake runs on the receiver thread) — the cross-vendor reject-reason diagnostic.

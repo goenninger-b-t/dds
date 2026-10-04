@@ -5376,14 +5376,17 @@
                      (%deliver-user-sample n2 #x00000102 1 payl src-pl gpl 1)   ; plaintext to the PLAIN reader
                      (assert (equalp payl (node-sample n2 (cons gpl 1))) ()
                              "S4 GATE: the plain reader must RECEIVE its plaintext under its OWN NONE tier — a node-single ENCRYPT upgrade would decode-attempt + DROP it (false-REJECT)")
-                     (when (dds.dare:dare-available-p)   ; ADR 0064: dare-available-p returns AVAILABLE directly
-                       (let* ((src-sec (make-array 12 :element-type '(unsigned-byte 8) :initial-element #x6A))
-                              (gsec (%source-guid src-sec #x00000102))
-                              (sealed (dds.security:encode-serialized-payload km payl)))
-                         (%reader-route-add n2 gsec id-sec)
-                         (%deliver-user-sample n2 #x00000102 1 sealed src-sec gsec 1)   ; real ENCRYPT payload to the SECURED reader
-                         (assert (equalp payl (node-sample n2 (cons gsec 1))) ()
-                                 "S4: the secured reader must DECODE a real ENCRYPT payload to plaintext under its OWN tier")))))))
+                     (multiple-value-bind (dare-ok dare-reason dare-cap) (dds.dare:dare-available-p)   ; ADR 0064: AVAILABLE directly
+                       (if dare-ok
+                           (let* ((src-sec (make-array 12 :element-type '(unsigned-byte 8) :initial-element #x6A))
+                                  (gsec (%source-guid src-sec #x00000102))
+                                  (sealed (dds.security:encode-serialized-payload km payl)))
+                             (%reader-route-add n2 gsec id-sec)
+                             (%deliver-user-sample n2 #x00000102 1 sealed src-sec gsec 1)   ; real ENCRYPT payload to the SECURED reader
+                             (assert (equalp payl (node-sample n2 (cons gsec 1))) ()
+                                     "S4: the secured reader must DECODE a real ENCRYPT payload to plaintext under its OWN tier"))
+                           ;; ADR 0122: this arm was a silent WHEN; the secured-reader decode did not run.
+                           (dds.pal:note-test-skip "n-reader-s4-secured-decode" (or dare-cap :openssl-pqc) dare-reason :arm)))))))
           (stop-node n2)))
       ;; --- (d) no-cross-free: releasing reader-A's secured loan must not free reader-B's buffer ---
       (let ((zn (make-disc-node :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element #x53)
@@ -5469,7 +5472,7 @@
    SBCL-only: gated on PAL-IMPL-NAME :SBCL. The ZC refcount primitive cas-sap-u32 also exists in the AllegroCL
    PAL (ADR 0113), but this arm has not been enabled or run there. NOT cleared for ship — pending counsel (R6)."
   (if (not (eq (dds.pal:pal-impl-name) :sbcl))
-      (progn (format t "~&  [skip] n-reader-2c3-zc-uaf: %zc-bump/%zc-release use cas-sap-u32 (SBCL-only, ADR 0018) — NFR-PORT gap~%") t)
+      (progn (dds.pal:note-test-skip "n-reader-2c3-zc-uaf" :zc-sap-primitives "%zc-bump/%zc-release use cas-sap-u32 (SBCL-only, ADR 0018) — NFR-PORT gap") t)
       (let ((m (dds.pal:alloc-static (dds.xport.zerocopy::%zc-bytes 1 64)))
             (pa (make-array 12 :element-type '(unsigned-byte 8) :initial-element #x5C))
             (payload (make-array 8 :element-type '(unsigned-byte 8) :initial-contents '(#xC1 #xC2 #xC3 #xC4 #xC5 #xC6 #xC7 #xC8)))
@@ -5552,7 +5555,7 @@
    PAL-IMPL-NAME :SBCL; AllegroCL's cas-sap-u32 (ADR 0113) has not been enabled here (ADR 0018). NOT cleared for
    ship (R6)."
   (if (not (eq (dds.pal:pal-impl-name) :sbcl))
-      (progn (format t "~&  [skip] n-reader-2c3-zc-refcount-leak: %zc-bump/%zc-release use cas-sap-u32 (SBCL-only, ADR 0018) — NFR-PORT gap~%") t)
+      (progn (dds.pal:note-test-skip "n-reader-2c3-zc-refcount-leak" :zc-sap-primitives "%zc-bump/%zc-release use cas-sap-u32 (SBCL-only, ADR 0018) — NFR-PORT gap") t)
       (let ((m (dds.pal:alloc-static (dds.xport.zerocopy::%zc-bytes 1 64)))
             (pa (make-array 12 :element-type '(unsigned-byte 8) :initial-element #x60))
             (payload (make-array 8 :element-type '(unsigned-byte 8) :initial-contents '(#xA1 #xA2 #xA3 #xA4 #xA5 #xA6 #xA7 #xA8)))

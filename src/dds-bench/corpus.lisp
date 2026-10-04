@@ -603,7 +603,12 @@
              (incf n)
              (incf bad (%corpus-verify-mutable-decode f)))
             ((member name *corpus-verified-elsewhere* :test #'string=)
-             (format t "~&  --   ~a (verified elsewhere — see *corpus-verified-elsewhere*)~%" name))
+             (format t "~&  --   ~a (verified elsewhere — see *corpus-verified-elsewhere*)~%" name)
+             ;; ADR 0122 / plan row 0.10: a deferred vector counts as a skip OF THIS GATE. One :arm event per
+             ;; vector, through the PAL seam (dds-bench does not load the harness; `make corpus` installs it
+             ;; via run-with-skip-report, otherwise the seam writes the skip to *error-output*).
+             (dds.pal:note-test-skip (concatenate 'string "corpus/" name) :verified-elsewhere
+                                     "deferred to another gate (*corpus-verified-elsewhere*)" :arm))
             (t
              (incf bad)
              (format t "~&  FAIL ~a: unrecognised corpus vector — this gate verifies nothing for it.~%~

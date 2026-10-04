@@ -5,6 +5,9 @@
    "M0 test harness. run-all-tests is invoked by (asdf:test-system :dds-tests)
     and signals on any failure so the build gate goes red.")
   (:export #:*test-domain* #:test-domain #:test-domain-from-env
+           ;; ADR 0122: the one skip channel and its accounting
+           #:note-skip #:note-dare-skip #:note-bench-skip #:*skip-capabilities* #:*current-test*
+           #:skip-events #:reset-skip-events #:print-skip-report #:capability-preflight #:run-with-skip-report
            #:run-all-tests #:run-echo-test #:run-mem-test #:run-mem-test-secure #:run-pbt-tests
            #:run-pal-signal-handler-test
            #:run-bench-flatdata #:run-bench-flatdata-zc-loan #:run-bench-zc-loan-lockfree

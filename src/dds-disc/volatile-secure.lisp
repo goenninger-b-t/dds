@@ -600,6 +600,14 @@
           () "PVMS test: SPDP discovery did not complete")
   t)
 
+(defun* %note-dare-test-skip (site reason)
+    (function (t t) (eql t))
+  "Test-only: report through DDS.PAL:NOTE-TEST-SKIP (ADR 0122) that the DDS-Security test body SITE returned
+   without running because DARE is unavailable, for REASON. The capability is DDS.DARE:DARE-AVAILABLE-P's
+   third value (:LIBCRYPTO or :OPENSSL-PQC); should the probe now succeed, :OPENSSL-PQC is reported rather
+   than nothing. Shared by the test bodies in this file and in secure-sedp.lisp."
+  (dds.pal:note-test-skip site (or (nth-value 2 (dds.dare:dare-available-p)) :openssl-pqc) reason))
+
 (defun* run-volatile-secure-reliable-test ()
     (function () (eql t))
   "Reliable, bootstrap-protected ParticipantVolatileMessageSecure delivery (DDS-Security 1.1 §7.4.5 /
@@ -666,7 +674,7 @@
    an UNRELATED peer untouched. Requires AES-GCM (the derived bootstrap KM); skips gracefully if absent."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [pvms-prune] SKIP — AES-GCM not available: ~a~%" %dare-reason)
+      (%note-dare-test-skip "pvms-prune" %dare-reason)
       (return-from run-pvms-peer-loss-prune-test t)))
   (let* ((p1    (make-array 12 :element-type '(unsigned-byte 8) :initial-element 33))
          (node  (make-disc-node :guid-prefix p1 :host "127.0.0.1" :port 0))

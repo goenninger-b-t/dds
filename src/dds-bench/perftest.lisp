@@ -443,11 +443,15 @@
     (function () t)
   "Suite-friendly self-check of the WP-SHMEM bench path: a tiny :shmem latency + throughput run, asserting
    every sample round-trips AND that disc-node-shmem-sends advanced (so CI catches a SHMEM-routing
-   regression — the bench measuring UDP while claiming SHMEM — without a long run). Pass-SKIPS where SHMEM
-   is off (dds.disc:*shmem-enabled* NIL, e.g. a non-SBCL image on macOS, ADR 0118) so it never false-fails on a platform
-   with no usable SHMEM. Signals an error on failure (the dds.tests runner treats that as a test failure)."
+   regression — the bench measuring UDP while claiming SHMEM — without a long run). Reports a
+   :SHM-ATTACH-BY-NAME skip through DDS.PAL:NOTE-TEST-SKIP (ADR 0122) and returns T where SHMEM is off
+   (dds.disc:*shmem-enabled* NIL, e.g. a non-SBCL image on macOS, ADR 0118) so it never false-fails on a
+   platform with no usable SHMEM. Signals an error on failure (the dds.tests runner treats that as a test failure)."
   (if (not dds.disc:*shmem-enabled*)
-      (format t "(SHMEM off on this platform — skipped) ")
+      ;; ADR 0122: report through the one skip channel. *SHMEM-ENABLED* defaults to
+      ;; DDS.XPORT.SHMEM:SHM-ATTACH-BY-NAME-RELIABLE-P, so its NIL is that capability being absent.
+      (dds.pal:note-test-skip "perftest-shmem-smoke" :shm-attach-by-name
+                              "dds.disc:*shmem-enabled* is NIL (SHMEM by-name attach not reliable here)")
       (let ((lat (run-latency :samples 30 :payload-bytes 32 :warmup 5 :transport :shmem))
             (thr (run-throughput :samples 50 :payload-bytes 32 :transport :shmem)))
         (assert (plusp (getf lat :p50)) () "shmem latency smoke: non-positive p50 latency")
@@ -463,10 +467,12 @@
    R6): a tiny :zerocopy latency + throughput run at a payload ABOVE *zerocopy-min-payload-bytes*, asserting
    every sample round-trips byte-exact AND that disc-node-zc-sends advanced (so CI catches a ZC-routing
    regression — the bench fragmenting the payload while claiming a reference crossed — without a long run).
-   Pass-SKIPS where SHMEM is not reliably by-name-attachable (a non-SBCL image on macOS, ADR 0118) so it never
+   Reports a :SHM-ATTACH-BY-NAME skip through DDS.PAL:NOTE-TEST-SKIP (ADR 0122) and returns T where SHMEM is
+   not reliably by-name-attachable (a non-SBCL image on macOS, ADR 0118) so it never
    false-fails on a platform with no usable SHMEM pool. Signals an error on failure."
   (if (not (dds.xport.shmem:shm-attach-by-name-reliable-p))
-      (format t "(SHMEM by-name attach unreliable on this platform — ZC bench skipped) ")
+      (dds.pal:note-test-skip "perftest-zerocopy-smoke" :shm-attach-by-name
+                              "dds.xport.shmem:shm-attach-by-name-reliable-p is NIL")
       (let ((lat (run-latency :samples 20 :payload-bytes 2048 :warmup 5 :transport :zerocopy))
             (thr (run-throughput :samples 30 :payload-bytes 2048 :transport :zerocopy)))
         (assert (plusp (getf lat :p50)) () "zc latency smoke: non-positive p50 latency")

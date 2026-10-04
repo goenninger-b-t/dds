@@ -56,8 +56,7 @@
    Requires OpenSSL >= 3.5; skips gracefully if absent. Must pass on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [auth-identity] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "auth-identity" %dare-reason)
       (return-from run-auth-identity-test t)))
 
   (let* ((ca-pem       (%read-fixture-pem "ca/ca-cert.pem"))
@@ -132,7 +131,7 @@
    Verifies dds.dare:sha-256 against the NIST FIPS 180-4 empty-string test vector. Both impls must pass."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [sha256-kat] SKIP: ~a~%" %dare-reason)
+      (note-dare-skip "sha256-kat" %dare-reason)
       (return-from run-auth-sha256-kat t)))
   (let* ((empty    (make-array 0 :element-type '(unsigned-byte 8)))
          (result   (dds.dare:sha-256 empty))
@@ -160,7 +159,7 @@
    Must pass on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [ecdsa-kat] SKIP: ~a~%" %dare-reason)
+      (note-dare-skip "ecdsa-kat" %dare-reason)
       (return-from run-auth-ecdsa-kat t)))
 
   ;;; --- RFC 5903 §8.1 ECDH KAT (Group 19, P-256) ---
@@ -314,7 +313,7 @@
    Must pass on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [rsa-pss-kat] SKIP: ~a~%" %dare-reason)
+      (note-dare-skip "rsa-pss-kat" %dare-reason)
       (return-from run-auth-rsa-pss-kat t)))
 
   ;; SubjectPublicKeyInfo DER for Wycheproof testGroups[0].key (RSA-2048, e=65537).
@@ -435,7 +434,7 @@
    and that SHA-256 of the shared secret is 32 bytes (DDS-Security §9.3.3). Must pass on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [ffdh-kat] SKIP: ~a~%" %dare-reason)
+      (note-dare-skip "ffdh-kat" %dare-reason)
       (return-from run-auth-ffdh-kat t)))
   (multiple-value-bind (pub-a priv-a)
       (dds.dare:ffdh-gen-keypair dds.security::+modp-2048-p+ dds.security::+modp-2048-g+)
@@ -510,7 +509,7 @@
    Negative: tampered reply -> requester :rejected. Must pass on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [auth-handshake-rsa] SKIP: ~a~%" %dare-reason)
+      (note-dare-skip "auth-handshake-rsa" %dare-reason)
       (return-from run-auth-handshake-rsa-test t)))
   (let* ((ca-pem     (%read-fixture-pem "ca/ca-cert.pem"))
          (rsa-cert-a (%read-fixture-pem "participant_rsa/identity_cert.pem"))
@@ -643,8 +642,7 @@
    Requires OpenSSL >= 3.5; skips gracefully if absent. Must pass on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [auth-negatives] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "auth-negatives" %dare-reason)
       (return-from run-auth-negatives-test t)))
 
   (let* ((ca-pem        (%read-fixture-pem "ca/ca-cert.pem"))
@@ -1011,8 +1009,7 @@
    Requires OpenSSL >= 3.5; skips gracefully if absent. Must pass on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [auth-challenge-binding] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "auth-challenge-binding" %dare-reason)
       (return-from run-auth-challenge-binding-test t)))
   (let* ((ca-pem    (%read-fixture-pem "ca/ca-cert.pem"))
          (ec-cert-a (%read-fixture-pem "participant_ec/identity_cert.pem"))
@@ -1152,8 +1149,7 @@
    takes. Requires OpenSSL >= 3.5; skips gracefully if absent. Must pass on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [auth-forged-request-hardening] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "auth-forged-request-hardening" %dare-reason)
       (return-from run-auth-forged-request-hardening-test t)))
   (let* ((ca-pem    (%read-fixture-pem "ca/ca-cert.pem"))
          (ec-cert-a (%read-fixture-pem "participant_ec/identity_cert.pem"))
@@ -1274,8 +1270,7 @@
    Must pass on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [auth-token-corpus] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "auth-token-corpus" %dare-reason)
       (return-from run-auth-token-corpus-test t)))
 
   (let* ((ca-pem    (%read-fixture-pem "ca/ca-cert.pem"))
@@ -1454,8 +1449,7 @@
    Requires OpenSSL >= 3.5; skips gracefully if absent. Must pass on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [auth-token-fuzz] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "auth-token-fuzz" %dare-reason)
       (return-from run-auth-token-fuzz-test t)))
 
   (let* ((ca-pem    (%read-fixture-pem "ca/ca-cert.pem"))
@@ -1566,7 +1560,7 @@
    Negative (b): tampered Final -> replier returns :rejected. Must pass on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [auth-handshake-ecdh] SKIP: ~a~%" %dare-reason)
+      (note-dare-skip "auth-handshake-ecdh" %dare-reason)
       (return-from run-auth-handshake-ecdh-test t)))
   (let* ((ca-pem    (%read-fixture-pem "ca/ca-cert.pem"))
          (ec-cert-a (%read-fixture-pem "participant_ec/identity_cert.pem"))
@@ -1681,8 +1675,7 @@
    Requires OpenSSL >= 3.5 for the fixture IdentityToken; skips gracefully if absent."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [auth-spdp-identity-token] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "auth-spdp-identity-token" %dare-reason)
       (return-from run-auth-spdp-identity-token-test t)))
 
   ;; Acquire a fixture IdentityToken from validate-local-identity on the EC fixture.
@@ -1810,8 +1803,7 @@
    Requires OpenSSL >= 3.5; skips gracefully if absent. Must pass on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [auth-wire-codec] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "auth-wire-codec" %dare-reason)
       (return-from run-auth-wire-codec-test t)))
 
   (let* ((ca-pem    (%read-fixture-pem "ca/ca-cert.pem"))
@@ -2206,8 +2198,7 @@
    Requires OpenSSL >= 3.5; skips gracefully if absent. Must pass on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [auth-handshake-over-wire] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "auth-handshake-over-wire" %dare-reason)
       (return-from run-auth-handshake-over-wire-test t)))
 
   (let* ((ca-pem    (%read-fixture-pem "ca/ca-cert.pem"))
@@ -2423,8 +2414,7 @@
    Requires OpenSSL >= 3.5; skips gracefully if absent. Must pass on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [auth-manager-handshake] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "auth-manager-handshake" %dare-reason)
       (return-from run-auth-manager-handshake-test t)))
 
   (let* ((ca-pem    (%read-fixture-pem "ca/ca-cert.pem"))
@@ -2516,8 +2506,7 @@
    Requires OpenSSL >= 3.5; skips gracefully if absent. Must pass on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [auth-encrypted-pubsub-keyx] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "auth-encrypted-pubsub-keyx" %dare-reason)
       (return-from run-auth-encrypted-pubsub-keyx-test t)))
 
   (let* ((ca-pem    (%read-fixture-pem "ca/ca-cert.pem"))
@@ -2694,8 +2683,7 @@
    Requires OpenSSL >= 3.5; skips gracefully if absent. Must pass on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [secure-discovery-keyed] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "secure-discovery-keyed" %dare-reason)
       (return-from run-secure-discovery-keyed-test t)))
   (let* ((ca-pem    (%read-fixture-pem "ca/ca-cert.pem"))
          (ec-cert-a (%read-fixture-pem "participant_ec/identity_cert.pem"))
@@ -2802,8 +2790,7 @@
    Requires OpenSSL >= 3.5; skips if absent. Must pass on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [kxkey-kat] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "kxkey-kat" %dare-reason)
       (return-from run-auth-kxkey-kat t)))
 
   ;;; --- (a) RFC 4231 §4.2 TC1: HMAC-SHA256 primitive KAT ---
@@ -2968,8 +2955,7 @@
    Requires OpenSSL >= 3.5; skips gracefully if absent. Must pass on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [auth-keymaterial-roundtrip] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "auth-keymaterial-roundtrip" %dare-reason)
       (return-from run-auth-keymaterial-roundtrip t)))
 
   (let* ((kx  (dds.security:derive-kx-key *kat-shared-secret* *kat-challenge1* *kat-challenge2*))
@@ -3153,8 +3139,7 @@
    Requires OpenSSL >= 3.5; skips gracefully if absent. Must pass on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [auth-cryptotoken-fuzz] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "auth-cryptotoken-fuzz" %dare-reason)
       (return-from run-auth-cryptotoken-fuzz t)))
 
   ;; A fixed but non-trivial KxKey for fuzz parsing (not used for anything real)
@@ -3236,8 +3221,7 @@
    Requires OpenSSL >= 3.5 (identity load); skips gracefully if absent. Must pass on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [auth-secured-refuses-plain] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "auth-secured-refuses-plain" %dare-reason)
       (return-from run-auth-secured-refuses-plain-test t)))
 
   (let* ((ca-pem    (%read-fixture-pem "ca/ca-cert.pem"))
@@ -3458,8 +3442,7 @@
    Requires OpenSSL >= 3.5; skips gracefully if absent. Must pass on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [secure-discovery-e2e ~a] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              gov-p7s-name %dare-reason)
+      (note-dare-skip (format nil "secure-discovery-e2e ~a" gov-p7s-name) %dare-reason)
       (return-from %run-secure-discovery-e2e t)))
   (let* ((ca-pem    (%read-fixture-pem "ca/ca-cert.pem"))
          (ec-cert-a (%read-fixture-pem "participant_ec/identity_cert.pem"))
@@ -3685,7 +3668,7 @@
    Must pass on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [cms-verify-kat] SKIP: ~a~%" %dare-reason)
+      (note-dare-skip "cms-verify-kat" %dare-reason)
       (return-from run-cms-verify-kat t)))
   (let* ((p7s-octets     (%read-ac-fixture-pem "governance.p7s"))
          (perm-ca-octets (%read-ac-fixture-pem "perm-ca-cert.pem"))
@@ -4000,8 +3983,7 @@
    Must pass identically on SBCL and AllegroCL."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [security-crypto-manager] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "security-crypto-manager" %dare-reason)
       (return-from run-security-crypto-manager-test t)))
   (%cm-generator-units)
   (%cm-participant-registry)

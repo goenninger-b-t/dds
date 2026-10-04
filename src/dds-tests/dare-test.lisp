@@ -11,8 +11,7 @@
    Must pass identically on SBCL and AllegroCL when OpenSSL 3.x is installed."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [dare-sha384-hkdf-kat] SKIP — OpenSSL >= 3.5 not available on this host: ~a~%"
-              %dare-reason)
+      (note-dare-skip "dare-sha384-hkdf-kat" %dare-reason)
       (return-from run-dare-sha384-hkdf-kat-test t)))
 
   ;; SHA-384("abc") — NIST FIPS 180-4 §B.2 example, 48-byte digest.
@@ -83,8 +82,7 @@
      T  = 76fc6ece0f4e1768cddf8853bb2d551b (16 bytes)"
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [dare-aes-gcm-kat] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "dare-aes-gcm-kat" %dare-reason)
       (return-from run-dare-aes-gcm-kat-test t)))
 
   ;; NIST SP 800-38D Appendix B TC16 key/IV/PT/AAD
@@ -276,8 +274,7 @@
    (a reference seal captured before nulling), so no KAT constant is duplicated. Requires OpenSSL >= 3.5."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [dare-image-restart-reresolve] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "dare-image-restart-reresolve" %dare-reason)
       (return-from run-dare-image-restart-reresolve-test t)))
   (let* ((key (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x2a))
          (nonce (make-array 12 :element-type '(unsigned-byte 8) :initial-element #x13))
@@ -342,8 +339,7 @@
    Requires OpenSSL >= 3.5 on the host; skips only if truly absent."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [dare-ml-kem-kat] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "dare-ml-kem-kat" %dare-reason)
       (return-from run-dare-ml-kem-kat-test t)))
 
   ;; (b) Byte-exact decaps KAT — deterministic pure function, no hook needed.
@@ -577,8 +573,7 @@
   "KEM-DEM envelope: derive-dek, seal-payload, open-payload, make-record-aad round-trips and rejection tests."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [dare-envelope] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "dare-envelope" %dare-reason)
       (return-from run-dare-envelope-test t)))
 
   ;; generate a real ML-KEM shared secret and derive the DEK from it
@@ -685,8 +680,7 @@
    Uses unwind-protect to clean up the temp dir."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [dare-key-provider] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "dare-key-provider" %dare-reason)
       (return-from run-dare-key-provider-test t)))
 
   (let* ((tmp-dir (uiop:merge-pathnames*
@@ -777,8 +771,7 @@
   "Encrypted durable-store decorator: put/get-range round-trip, sealed inner payloads, tamper drop."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [dare-encrypted-store] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "dare-encrypted-store" %dare-reason)
       (return-from run-dare-encrypted-store-test t)))
 
   (let* ((tmp-dir (uiop:merge-pathnames*
@@ -884,8 +877,7 @@
    foreign-backed static-vector zeroize+free + re-derive paths."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [dare-encrypted-store-lifecycle] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "dare-encrypted-store-lifecycle" %dare-reason)
       (return-from run-dare-encrypted-store-lifecycle-test t)))
   (let* ((tmp-dir (uiop:merge-pathnames*
                    (make-pathname :directory (list :relative
@@ -934,8 +926,7 @@
    Regression: v1 seal-payload/open-payload are deterministic (unchanged) + round-trip correctly."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [dare-envelope-v2] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "dare-envelope-v2" %dare-reason)
       (return-from run-dare-envelope-v2-test t)))
 
   (let* ((shared-secret (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x42))
@@ -1137,8 +1128,7 @@
    epoch only (per-epoch counter uniqueness — cross-epoch nonce values may coincide under distinct DEKs)."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [dare-persistent-store] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "dare-persistent-store" %dare-reason)
       (return-from run-dare-persistent-store-test t)))
 
   (let* ((d-dir (uiop:merge-pathnames*
@@ -1334,8 +1324,7 @@
    under the same topic-hash + surrogate guid' is DROPPED fail-closed (the GCM tag catches it)."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [dare-keyhash-aad] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "dare-keyhash-aad" %dare-reason)
       (return-from run-dare-keyhash-aad-test t)))
   (let* ((d-dir (uiop:merge-pathnames* (make-pathname :directory (list :relative (format nil "dds-khaad-d-~a" (get-universal-time)))) (uiop:temporary-directory)))
          (k-dir (uiop:merge-pathnames* (make-pathname :directory (list :relative (format nil "dds-khaad-k-~a" (get-universal-time)))) (uiop:temporary-directory)))
@@ -1479,8 +1468,7 @@
    order, idempotency, NO plaintext topic-name/guid/sn/key-hash on disk, and cross-restart recovery."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [dare-metadata-conf-3c] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "dare-metadata-conf-3c" %dare-reason)
       (return-from run-dare-metadata-conf-3c-test t)))
   (let* ((base (uiop:temporary-directory))
          (fd (uiop:merge-pathnames* (make-pathname :directory (list :relative (format nil "dds-m3c-fd-~a" (get-universal-time)))) base))

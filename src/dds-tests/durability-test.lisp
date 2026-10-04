@@ -864,8 +864,9 @@
    Runs on SBCL only: process mode launches a child Lisp only on SBCL (other implementations fall back to
    in-thread mode, runner.lisp), so on AllegroCL this test pass-skips."
   (unless (eq (dds.pal:pal-impl-name) :sbcl)
-    (format t "~&    [process-smoke] ~a: skipping (NFR-PORT gap — subprocess mode is SBCL-only)~%"
-            (dds.pal:pal-impl-name))
+    (note-skip "process-smoke" :subprocess-mode
+               (format nil "subprocess mode is SBCL-only; ~(~a~) falls back to in-thread mode (NFR-PORT gap)"
+                       (dds.pal:pal-impl-name)))
     (return-from run-durability-process-smoke-test t))
   (let* ((spec (dds.durability:make-service-spec
                 :domain (test-domain +td-writer-rep+)
@@ -1634,8 +1635,7 @@
    TL late-joiner receives all N byte-exact (DARE transparent to relay path). Domain 107, loopback unicast."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [dare-service-transparency] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "dare-service-transparency" %dare-reason)
       (return-from run-dare-service-transparency-test t)))
   (let* ((n 5)
          (tmp-dir (uiop:merge-pathnames*
@@ -1811,7 +1811,7 @@
   "PERSISTENT service tier: write N TL samples; service-stop (store persists); fresh service
    on same dirs simulates restart; TL late-joiner receives all N byte-exact. Domain 117."
   (unless (%dare-ok-p)
-    (format t "~&  [persistent-service] SKIP — OpenSSL >= 3.5 not available~%")
+    (note-dare-skip "persistent-service" (nth-value 1 (dds.dare:dare-available-p)))
     (return-from run-durability-persistent-service-test t))
   (let* ((n 4)
          (tmp-dir (uiop:merge-pathnames*
@@ -2088,8 +2088,7 @@
    get-range byte-exact (DARE transparent), and no plaintext sample appears in the DB file."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [sqlite-dare] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "sqlite-dare" %dare-reason)
       (return-from run-durability-sqlite-dare-test t)))
   (let* ((db-path (%sqlite-tmp-db-path "dare"))
          (tmp-dir (uiop:pathname-directory-pathname db-path))
@@ -2139,7 +2138,7 @@
   "PERSISTENT SQLite service tier: write N TL samples; service-stop (store persists to DB); fresh
    service on same dirs simulates restart (store-open replays); TL late-joiner receives all N byte-exact."
   (unless (%dare-ok-p)
-    (format t "~&  [sqlite-service] SKIP — OpenSSL >= 3.5 not available~%")
+    (note-dare-skip "sqlite-service" (nth-value 1 (dds.dare:dare-available-p)))
     (return-from run-durability-sqlite-service-test t))
   (let* ((n 4)
          (tmp-dir (uiop:merge-pathnames*
@@ -2508,8 +2507,7 @@
    regression: a dropped :sync delegation = the DARE PERSISTENT config never fsyncs = data loss)."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [sync-delegation] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "sync-delegation" %dare-reason)
       (return-from run-durability-sync-delegation-test t)))
   (let* ((k1 (uiop:merge-pathnames*
               (make-pathname :directory (list :relative (format nil "dds-syncdel-k1-~a" (get-universal-time))))
@@ -3657,7 +3655,7 @@
   "KEEP_LAST cross-restart: write M :data records; reopen with :keep-last D; assert
    exactly D records remain per instance; DARE envelope decrypts (ADR 0029)."
   (unless (%dare-ok-p)
-    (format t "~&  [keeplast-cross-restart] SKIP — OpenSSL >= 3.5 not available~%")
+    (note-dare-skip "keeplast-cross-restart" (nth-value 1 (dds.dare:dare-available-p)))
     (return-from run-durability-keeplast-cross-restart-test t))
   (let* ((m       6)
          (d       2)
@@ -4004,8 +4002,7 @@
        DOCUMENTED deferred-anchor residual (ADR 0045 §7) — asserted here to remain undetected."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [durability-mac-chain] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "durability-mac-chain" %dare-reason)
       (return-from run-durability-mac-chain-test t)))
   (let ((g0   (make-array 16 :element-type '(unsigned-byte 8) :initial-element 7))
         (dirs '())
@@ -4332,8 +4329,7 @@
        the first seal ⇒ no logmac.tail) reopens clean — the anchor only protects SEALED prefixes."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [durability-tail-anchor] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "durability-tail-anchor" %dare-reason)
       (return-from run-durability-tail-anchor-test t)))
   (let ((g0   (make-array 16 :element-type '(unsigned-byte 8) :initial-element 5))
         (dirs '())
@@ -4519,8 +4515,7 @@
    (e.g. the pre-existing mid-file-corruption signal)."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [durability-epochs-mac] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "durability-epochs-mac" %dare-reason)
       (return-from run-durability-epochs-mac-test t)))
   (let ((g0   (make-array 16 :element-type '(unsigned-byte 8) :initial-element 9))
         (dirs '())
@@ -4682,8 +4677,7 @@
    (6) NIL-oracle regression: a bare make-sqlite-store round-trips unchanged (NULL mac column)."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [durability-sqlite-mac-chain] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "durability-sqlite-mac-chain" %dare-reason)
       (return-from run-durability-sqlite-mac-chain-test t)))
   (let ((g0   (make-array 16 :element-type '(unsigned-byte 8) :initial-element 7))
         (kh0  (make-array 16 :element-type '(unsigned-byte 8) :initial-element 3))
@@ -4892,8 +4886,7 @@
        BRICKS (stale anchor N=5 vs the shrunk log -> :truncated), proving the invalidate is load-bearing for SQLite."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [durability-sqlite-tail-anchor] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "durability-sqlite-tail-anchor" %dare-reason)
       (return-from run-durability-sqlite-tail-anchor-test t)))
   (let ((g0   (make-array 16 :element-type '(unsigned-byte 8) :initial-element 9))
         (dirs '())
@@ -5450,7 +5443,7 @@
        encrypted tier's get-range compacts to newest-D exactly like SQLite (its own physical reclaim lands in
        Sliver 3b — run-durability-file-encrypted-physical-reclaim-test covers the file on-disk bound)."
   (unless (%dare-ok-p)
-    (format t "~&  [enc-physical-reclaim] SKIP — OpenSSL >= 3.5 not available~%")
+    (note-dare-skip "enc-physical-reclaim" (nth-value 1 (dds.dare:dare-available-p)))
     (return-from run-durability-encrypted-physical-reclaim-test t))
   (let* ((g0  (make-array 16 :element-type '(unsigned-byte 8) :initial-element 7))
          (kh1 (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xB1))
@@ -5765,7 +5758,7 @@
    (5) MULTI-WRITER + IDEMPOTENT parity — the decorator window is inherited by the file backend: a multi-writer
        instance drops by (guid,sn) not pure SN; an idempotent re-put of a live row loses nothing."
   (unless (%dare-ok-p)
-    (format t "~&  [file-enc-physical-reclaim] SKIP — OpenSSL >= 3.5 not available~%")
+    (note-dare-skip "file-enc-physical-reclaim" (nth-value 1 (dds.dare:dare-available-p)))
     (return-from run-durability-file-encrypted-physical-reclaim-test t))
   (let* ((g0  (make-array 16 :element-type '(unsigned-byte 8) :initial-element 7))
          (kh1 (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xB1))
@@ -5968,7 +5961,7 @@
    (5) IDEMPOTENT — reopening an already-swept store (no new writes) reclaims nothing (physical stays D).
    (6) KEEP_ALL — a KEEP_ALL reopen runs no sweep (retains all, physical == N)."
   (unless (%dare-ok-p)
-    (format t "~&  [enc-cross-restart-sweep] SKIP — OpenSSL >= 3.5 not available~%")
+    (note-dare-skip "enc-cross-restart-sweep" (nth-value 1 (dds.dare:dare-available-p)))
     (return-from run-durability-encrypted-cross-restart-sweep-test t))
   (let* ((g0  (make-array 16 :element-type '(unsigned-byte 8) :initial-element 7))
          (kh1 (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xB1))
@@ -6146,7 +6139,7 @@
    (4) NO-LOSS + CHAIN — get-range post-sweep = newest D byte-exact; reopen-after-sweep verifies the chain clean.
    (5) KEEP_ALL — a KEEP_ALL reopen runs no sweep (on-disk == N)."
   (unless (%dare-ok-p)
-    (format t "~&  [file-enc-cross-restart-sweep] SKIP — OpenSSL >= 3.5 not available~%")
+    (note-dare-skip "file-enc-cross-restart-sweep" (nth-value 1 (dds.dare:dare-available-p)))
     (return-from run-durability-file-encrypted-cross-restart-sweep-test t))
   (let* ((g0  (make-array 16 :element-type '(unsigned-byte 8) :initial-element 7))
          (kh1 (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xB1))
@@ -6889,10 +6882,14 @@
             "persistent :process store must NOT be conveyable (NIL) — the fail-fast target")
     ;; SBCL: the subprocess path returns a reject STATUS before launch; AllegroCL falls to in-thread mode
     ;; (honors the real store), so the refuse assertion is SBCL-only (NFR-PORT).
-    (when (eq (dds.pal:pal-impl-name) :sbcl)
-      (%check :b1-persistent-process-rejects
-              (and (nth-value 1 (dds.durability::%start-process-service persist-spec)) t)
-              "a :process PERSISTENT spec must RETURN a reject status (fail-fast), not launch a degraded subprocess"))
+    (if (eq (dds.pal:pal-impl-name) :sbcl)
+        (%check :b1-persistent-process-rejects
+                (and (nth-value 1 (dds.durability::%start-process-service persist-spec)) t)
+                "a :process PERSISTENT spec must RETURN a reject status (fail-fast), not launch a degraded subprocess")
+        ;; ADR 0122: this arm was a silent WHEN.
+        (note-skip "process-persistent-refuse/subprocess-reject" :subprocess-mode
+                   "the subprocess path exists only on SBCL; other implementations run :process specs in-thread"
+                   :scope :arm))
     t))
 
 (defun* run-durability-origins-cap-test ()
@@ -7339,8 +7336,7 @@
    re-put no-op; logical count. SKIPs if OpenSSL >= 3.5 is unavailable (the DARE-test pattern)."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [microservice-dare] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "microservice-dare" %dare-reason)
       (return-from run-durability-microservice-dare-test t)))
   ;; distinctive plaintext needles (multi-byte, collision-negligible)
   (let ((dguid (make-array 16 :element-type '(unsigned-byte 8)
@@ -7577,8 +7573,7 @@
    OpenSSL < 3.5 (the DARE-test pattern); the bare cross-restart runs regardless. Both impls."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [microservice-dare-cross-restart] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "microservice-dare-cross-restart" %dare-reason)
       (return-from run-durability-microservice-dare-cross-restart-test t)))
   (let* ((sdir  (%tms-tmp-dir "dxr-server"))   ; the SERVER's file inner dir D (opaque sealed frames on disk)
          (cbase (%tms-tmp-dir "dxr-client"))   ; the CLIENT-LOCAL DARE state (epochs.dat + ML-KEM key)
@@ -7672,8 +7667,7 @@
    (5) NIL-ORACLE regression: a bare microservice-store (no oracle) round-trips unchanged (Slice 1)."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [microservice-remote-chain] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "microservice-remote-chain" %dare-reason)
       (return-from run-durability-microservice-remote-chain-test t)))
   (let ((g0  (%tms-guid 5))
         (pay (lambda (i) (%tms-payload (+ 6 i) (logand (+ 1 i) 255)))))
@@ -7948,8 +7942,7 @@
    Completes the sealed high-water tail anchor across ALL 3 durability tiers (file + SQLite + microservice)."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [durability-microservice-tail-anchor] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "durability-microservice-tail-anchor" %dare-reason)
       (return-from run-durability-microservice-tail-anchor-test t)))
   (let ((g0  (%tms-guid 5))
         (g6  (%tms-guid 6))
@@ -8206,8 +8199,7 @@
    Both impls."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [durability-microservice-keep-last-reclaim] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "durability-microservice-keep-last-reclaim" %dare-reason)
       (return-from run-durability-microservice-keep-last-reclaim-test t)))
   (labels ((%keys (base) (uiop:merge-pathnames* (make-pathname :directory '(:relative "keys")) base))
            (%mk (port base) (funcall (dds.durability:make-microservice-store-factory
@@ -8735,7 +8727,11 @@
       (%check :bsel-usage-dir (search "--dir" u) "usage documents --dir")
       (%check :bsel-usage-server (search "--backend server" u) "usage still documents the reserved server MODE value")))
   ;; (7) DARE-gated round-trip — proves the SERVICE actually USES the selected backend (skips if OpenSSL<3.5)
-  (when (handler-case (dds.dare:dare-available-p) (error () nil))
+  (if (not (handler-case (dds.dare:dare-available-p) (error () nil)))
+    ;; ADR 0122: this arm was a silent WHEN.
+    (note-dare-skip "service-backend-select/dare-roundtrip"
+                    (or (nth-value 1 (ignore-errors (dds.dare:dare-available-p))) "DARE unavailable")
+                    :scope :arm)
     (let ((g1 (%tms-guid 1)) (g2 (%tms-guid 2)) (p1 (%tms-payload 24 1)) (p2 (%tms-payload 40 2)))
       ;; file backend -> the file-store on-disk layout (topics/), NOT a sqlite db
       (let* ((base  (%tms-tmp-dir "bsel-file"))
@@ -8824,8 +8820,7 @@
    SKIPs if OpenSSL < 3.5 (the DARE-test pattern)."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [microservice-reconnect] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "microservice-reconnect" %dare-reason)
       (return-from run-durability-microservice-reconnect-test t)))
   (let* ((sdir  (%tms-tmp-dir "recon-server"))
          (cbase (%tms-tmp-dir "recon-client"))
@@ -9030,8 +9025,7 @@
    (skip if OpenSSL < 3.5)."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [microservice-reconnect-exhausted] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "microservice-reconnect-exhausted" %dare-reason)
       (return-from run-durability-microservice-reconnect-exhausted-test t)))
   (labels ((%reopen-result (skip-resync)
              ;; drive the exhausted R1 + a following R2 (same topic) in one session, then reopen a fresh
@@ -9087,8 +9081,7 @@
        decorator's PRE-open tail-anchor probe dials (%ms-dial clears closed-p) so its %ms-call is not refused."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [microservice-reconnect-seal] SKIP — OpenSSL >= 3.5 not available: ~a~%"
-              %dare-reason)
+      (note-dare-skip "microservice-reconnect-seal" %dare-reason)
       (return-from run-durability-microservice-reconnect-seal-test t)))
   ;; ---- (A) apply-then-ack-lost PURGE + clean close: reopen must be CLEAN (GREEN) / BRICK (RED) ----
   (labels ((%reopen (skip-resync)
@@ -9247,11 +9240,14 @@
                     (eq :timeout (nth-value 1 (dds.durability::%ms-recv-message srv)))
                     "a huge (at-cap) declared body with NO data TIMES OUT via the incremental reader (no infinite block, no OOM)")
             (let ((delta (- (dds.pal:bytes-consed) consed0)))
-              (%check :ms-huge-bounded-alloc
-                      (or (zerop (dds.pal:bytes-consed))          ; AllegroCL: no consing counter -> behavioral proof only
-                          (< delta (floor dds.durability::+ms-max-message+ 4)))
-                      (format nil "the huge declared length did NOT force a full up-front allocation (incremental read; delta=~d << cap ~d)"
-                              delta dds.durability::+ms-max-message+)))))
+              (if (zerop (dds.pal:bytes-consed))
+                  ;; ADR 0122: this was (OR (ZEROP BYTES-CONSED) ...), an assertion that silently passed.
+                  (note-skip "microservice-huge-declared/bounded-alloc" :alloc-counter
+                             "dds.pal:bytes-consed does not move on this impl — behavioral proof only" :scope :arm)
+                  (%check :ms-huge-bounded-alloc
+                          (< delta (floor dds.durability::+ms-max-message+ 4))
+                          (format nil "the huge declared length did NOT force a full up-front allocation (incremental read; delta=~d << cap ~d)"
+                                  delta dds.durability::+ms-max-message+))))))
       (progn (ignore-errors (dds.pal:tcp-close cli)) (ignore-errors (dds.pal:tcp-close srv))
              (ignore-errors (dds.pal:tcp-close ln)))))
   t)

@@ -4167,7 +4167,7 @@
   ;; The pooled arm is reached on the RECEIVER THREAD, where a LET binding of the switch is invisible (special
   ;; bindings are per-thread) — so this test cannot force the pool on locally; it reports NOT-APPLICABLE instead.
   (when (null dds.disc:*rx-store-pool-enabled*)
-    (format t "  [rx-store-pool] SKIP: dds.disc:*rx-store-pool-enabled* is NIL (pool off; the copy path allocates)~%")
+    (note-skip "rx-store-pool" :rx-store-pool "dds.disc:*rx-store-pool-enabled* is NIL (pool off; the copy path allocates)")
     (return-from run-rx-store-pool-test t))
   (let* ((ts (dds.types:find-type-support "shape-type"))
          (p1 (dds.dcps:create-participant :domain (test-domain)))
@@ -8818,7 +8818,7 @@
    the writer's shmem-sends advanced (so SHMEM, not UDP, carried the user data). Skips cleanly where SHMEM
    is off (shm-attach-by-name-reliable-p is NIL, ADR 0013)."
   (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
-    (dds.pal:note-test-skip "run-shmem-end-to-end-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
+    (note-skip "run-shmem-end-to-end-test" :shm-attach-by-name "shm-attach-by-name unreliable on this platform (ADR 0013)")
     (return-from run-shmem-end-to-end-test t))
   (let* ((p1 (make-array 12 :element-type '(unsigned-byte 8) :initial-element 51))
          (p2 (make-array 12 :element-type '(unsigned-byte 8) :initial-element 52))
@@ -8889,7 +8889,7 @@
    The late-joiner prompt HEARTBEAT (%writer-durability-init) takes the identical two-line change and is NOT
    separately gated here. Skips cleanly where SHMEM is off (shm-attach-by-name-reliable-p is NIL, ADR 0013)."
   (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
-    (dds.pal:note-test-skip "run-shmem-control-lane-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
+    (note-skip "run-shmem-control-lane-test" :shm-attach-by-name "shm-attach-by-name unreliable on this platform (ADR 0013)")
     (return-from run-shmem-control-lane-test t))
   (let* ((p1 (make-array 12 :element-type '(unsigned-byte 8) :initial-element 61))
          (p2 (make-array 12 :element-type '(unsigned-byte 8) :initial-element 62))
@@ -8972,7 +8972,7 @@
    UDP fallback), disc-node-shmem-send-faults advanced (>=1), the hook fired with context :shmem-send-fault, and
    disc-node-shmem-sends did NOT advance (it went UDP, not SHMEM). Skips where SHMEM is off (ADR 0013)."
   (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
-    (dds.pal:note-test-skip "run-shmem-send-self-guard-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
+    (note-skip "run-shmem-send-self-guard-test" :shm-attach-by-name "shm-attach-by-name unreliable on this platform (ADR 0013)")
     (return-from run-shmem-send-self-guard-test t))
   (let* ((p1 (make-array 12 :element-type '(unsigned-byte 8) :initial-element 53))
          (p2 (make-array 12 :element-type '(unsigned-byte 8) :initial-element 54))
@@ -9043,7 +9043,10 @@
    pass-skips where SHMEM is off (ADR 0013). (2) A non-SHMEM (shmem-dest NIL) UDP send still delivers and is
    byte-unaffected — this leg runs on BOTH impls (it never touches the SHMEM transport)."
   ;; Leg 1 (SHMEM active only): no-fault SHMEM send -> SHMEM, counter 0, hook silent.
-  (when (dds.xport.shmem:shm-attach-by-name-reliable-p)
+  (if (not (dds.xport.shmem:shm-attach-by-name-reliable-p))
+      ;; ADR 0122: this arm was a silent WHEN.
+      (note-skip "shmem-send-self-guard-no-regression/shmem-leg" :shm-attach-by-name "SHMEM by-name attach unreliable on this platform (ADR 0013)" :scope :arm)
+      (progn
     (let* ((p1 (make-array 12 :element-type '(unsigned-byte 8) :initial-element 55))
            (p2 (make-array 12 :element-type '(unsigned-byte 8) :initial-element 56))
            (dds.disc:*shmem-enabled* t)
@@ -9090,7 +9093,7 @@
              (%check :shmem-noreg-hook-silent (null (dds.pal:with-lock (lock) (copy-list fired)))
                      "the *sender-emit-error-hook* must never fire on the no-fault SHMEM path"))
         (setf dds.disc:*sender-emit-error-hook* saved-hook)
-        (dds.disc:stop-node w) (dds.disc:stop-node r))))
+        (dds.disc:stop-node w) (dds.disc:stop-node r)))))
   ;; Leg 2 (both impls): a non-SHMEM UDP send (shmem-dest NIL) is unaffected by the guard.
   (let* ((p1 (make-array 12 :element-type '(unsigned-byte 8) :initial-element 57))
          (p2 (make-array 12 :element-type '(unsigned-byte 8) :initial-element 58))
@@ -9141,7 +9144,7 @@
    slots fully recover once the reader has resolved+released every reference (no slot leak). Skips cleanly
    where SHMEM is off (shm-attach-by-name-reliable-p is NIL, ADR 0013)."
   (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
-    (dds.pal:note-test-skip "run-zerocopy-end-to-end-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
+    (note-skip "run-zerocopy-end-to-end-test" :shm-attach-by-name "shm-attach-by-name unreliable on this platform (ADR 0013)")
     (return-from run-zerocopy-end-to-end-test t))
   (let* ((p1 (make-array 12 :element-type '(unsigned-byte 8) :initial-element 61))
          (p2 (make-array 12 :element-type '(unsigned-byte 8) :initial-element 62))
@@ -9270,7 +9273,7 @@
    Skips cleanly where SHMEM is off (shm-attach-by-name-reliable-p is NIL, ADR 0013); on SBCL bytes-consed is exact,
    on AllegroCL it reads 0 (NFR-PORT gap) so the RX assertion is smoked, not enforced."
   (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
-    (dds.pal:note-test-skip "run-flatdata-zerocopy-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
+    (note-skip "run-flatdata-zerocopy-test" :shm-attach-by-name "shm-attach-by-name unreliable on this platform (ADR 0013)")
     (return-from run-flatdata-zerocopy-test t))
   (let* ((p1 (make-array 12 :element-type '(unsigned-byte 8) :initial-element 63))
          (p2 (make-array 12 :element-type '(unsigned-byte 8) :initial-element 64))
@@ -9352,7 +9355,10 @@
                              new-bytes v1-bytes (if sbcl-p "SBCL exact" "AllegroCL bytes-consed=0 gap"))
                      (format t "  fd-zc-rx: RX win = one exact-length (~d-octet) owned vector, read in place; no 65536-byte sink, no 2nd copy. TX app->slot copy eliminated by loan-write (WP-FLATDATA-LOAN-WRITE, ADR 0042).~%"
                              (length payload))
-                     (when sbcl-p
+                     (if (not sbcl-p)
+                         ;; ADR 0122: this arm was a silent WHEN.
+                         (note-skip "flatdata-zerocopy/fd-zc-rx-alloc" :alloc-counter "allocation guards gated on pal-impl-name :SBCL (bytes-consed does not move elsewhere)" :scope :arm)
+                         (progn
                        (%check :fd-zc-rx-bounded
                                (< new-bytes v1-bytes)
                                (format nil "the new single-copy RX (~d) must allocate strictly less than the v1 sink+re-copy (~d)"
@@ -9360,7 +9366,7 @@
                        (%check :fd-zc-rx-no-sink
                                (< new-bytes dds.disc:+zerocopy-pool-slot-bytes+)
                                (format nil "the new RX (~d) must not allocate a slot-sized (~d) sink"
-                                       new-bytes dds.disc:+zerocopy-pool-slot-bytes+))))))))
+                                       new-bytes dds.disc:+zerocopy-pool-slot-bytes+)))))))))
         (dds.disc:stop-node w) (dds.disc:stop-node r)
         (dds.pal:free-static (dds.core.buffer:octet-buffer-vec fd)))))
   t)
@@ -9384,7 +9390,7 @@
          pool). The slot lifetime never lets the receiver thread free a slot under the app's read (no UAF) and
          never leaks a refcount (no wedge). Skips cleanly where SHMEM is off (shm-attach-by-name-reliable-p is NIL, ADR 0013)."
   (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
-    (dds.pal:note-test-skip "run-dcps-loan-roundtrip-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
+    (note-skip "run-dcps-loan-roundtrip-test" :shm-attach-by-name "shm-attach-by-name unreliable on this platform (ADR 0013)")
     (return-from run-dcps-loan-roundtrip-test t))
   (let* ((dds.disc:*shmem-enabled* t)
          (dds.disc:*zerocopy-enabled* t)
@@ -9500,7 +9506,7 @@
          the next loan-sample (freelist, no per-sample struct cons).
    Skips cleanly where SHMEM is off (shm-attach-by-name-reliable-p is NIL, ADR 0013)."
   (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
-    (dds.pal:note-test-skip "run-dcps-loan-write-e2e-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
+    (note-skip "run-dcps-loan-write-e2e-test" :shm-attach-by-name "shm-attach-by-name unreliable on this platform (ADR 0013)")
     (return-from run-dcps-loan-write-e2e-test t))
   (let* ((dds.disc:*shmem-enabled* t)
          (dds.disc:*zerocopy-enabled* t)
@@ -9604,7 +9610,7 @@
          restored to K) — no leak, no premature free / UAF.
    Skips cleanly where SHMEM is off (shm-attach-by-name-reliable-p is NIL, ADR 0013)."
   (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
-    (dds.pal:note-test-skip "run-multi-dest-zc-e2e-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
+    (note-skip "run-multi-dest-zc-e2e-test" :shm-attach-by-name "shm-attach-by-name unreliable on this platform (ADR 0013)")
     (return-from run-multi-dest-zc-e2e-test t))
   (let* ((dds.disc:*shmem-enabled* t)
          (dds.disc:*zerocopy-enabled* t)
@@ -9746,7 +9752,7 @@
          %loan-write-data-protected-p gate, ADR 0042 §6 — the slot would hold pre-transform plaintext).
    Skips cleanly where SHMEM is off (shm-attach-by-name-reliable-p is NIL, ADR 0013)."
   (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
-    (dds.pal:note-test-skip "run-loan-write-shmem-cleartext-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
+    (note-skip "run-loan-write-shmem-cleartext-test" :shm-attach-by-name "shm-attach-by-name unreliable on this platform (ADR 0013)")
     (return-from run-loan-write-shmem-cleartext-test t))
   (let* ((dds.disc:*shmem-enabled* t)
          (dds.disc:*zerocopy-enabled* t)
@@ -9799,7 +9805,7 @@
    Pre-fix this FAILS (take-loaned returns two samples, both the recycled V1, both reading sample 2). Skips
    cleanly where SHMEM is off (shm-attach-by-name-reliable-p is NIL, ADR 0013)."
   (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
-    (dds.pal:note-test-skip "run-loan-read-return-take-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
+    (note-skip "run-loan-read-return-take-test" :shm-attach-by-name "shm-attach-by-name unreliable on this platform (ADR 0013)")
     (return-from run-loan-read-return-take-test t))
   (let* ((dds.disc:*shmem-enabled* t)
          (dds.disc:*zerocopy-enabled* t)
@@ -9920,7 +9926,7 @@
          wire is byte-identical). Skips cleanly where SHMEM is off (shm-attach-by-name-reliable-p is NIL, ADR 0013); on SBCL
          bytes-consed is exact, on AllegroCL it reads 0 (NFR-PORT gap) so the headline assertion is smoked."
   (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
-    (dds.pal:note-test-skip "run-flatdata-zc-loan-e2e-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
+    (note-skip "run-flatdata-zc-loan-e2e-test" :shm-attach-by-name "shm-attach-by-name unreliable on this platform (ADR 0013)")
     (return-from run-flatdata-zc-loan-e2e-test t))
   (let* ((dds.disc:*shmem-enabled* t)
          (dds.disc:*zerocopy-enabled* t)
@@ -9988,7 +9994,10 @@
                            loan-bytes new-bytes v1-bytes (if sbcl-p "SBCL exact" "AllegroCL bytes-consed=0 gap"))
                    (format t "  fd-zc-loan-rx: the eliminated per-sample OWNED VECTOR is the win (~d -> ~d, payload-independent residue = the CFFI mutex lock the v1 path ALSO pays); the loan API's cost is the explicit acquire/release calls + the app's return-loan obligation (FR-LANG-7, no overclaim).~%"
                            new-bytes loan-bytes)
-                   (when sbcl-p
+                   (if (not sbcl-p)
+                       ;; ADR 0122: this arm was a silent WHEN.
+                       (note-skip "flatdata-zc-loan-e2e/loan-rx-alloc" :alloc-counter "allocation guards gated on pal-impl-name :SBCL (bytes-consed does not move elsewhere)" :scope :arm)
+                       (progn
                      ;; the literal-0-copy win: the per-sample OWNED VECTOR is gone (loan RX strictly below the v1 single-copy)
                      (%check :fdzc-e2e-loan-below-v1-single
                              (< loan-bytes new-bytes)
@@ -10001,7 +10010,7 @@
                      (%check :fdzc-e2e-loan-below-v1-sink
                              (< loan-bytes v1-bytes)
                              (format nil "the literal-0-copy loan RX (~d) must allocate far less than the WP-ZEROCOPY-v1 sink (~d)"
-                                     loan-bytes v1-bytes)))))))
+                                     loan-bytes v1-bytes))))))))
            (dds.pal:free-static (dds.core.buffer:octet-buffer-vec fd)))
       (dds.dcps:delete-participant p1)
       (when p2 (dds.dcps:delete-participant p2))))
@@ -10021,7 +10030,7 @@
    -fd are byte-correct off the slot. Skips cleanly where SHMEM is off (shm-attach-by-name-reliable-p is
    NIL, ADR 0013). NOT cleared for ship — pending counsel (R6)."
   (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
-    (dds.pal:note-test-skip "run-keyed-flatdata-loan-handle-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
+    (note-skip "run-keyed-flatdata-loan-handle-test" :shm-attach-by-name "shm-attach-by-name unreliable on this platform (ADR 0013)")
     (return-from run-keyed-flatdata-loan-handle-test t))
   (let* ((dds.disc:*shmem-enabled* t)
          (dds.disc:*zerocopy-enabled* t)
@@ -10114,7 +10123,7 @@
    instance, so the depth-2 cap never fires and all 3 loaned samples are retained. Skips cleanly where SHMEM is off
    (shm-attach-by-name-reliable-p is NIL, ADR 0013). NOT cleared for ship (R6)."
   (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
-    (dds.pal:note-test-skip "run-keyed-flatdata-loan-keeplast-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
+    (note-skip "run-keyed-flatdata-loan-keeplast-test" :shm-attach-by-name "shm-attach-by-name unreliable on this platform (ADR 0013)")
     (return-from run-keyed-flatdata-loan-keeplast-test t))
   (let* ((dds.disc:*shmem-enabled* t)
          (dds.disc:*zerocopy-enabled* t)
@@ -10570,7 +10579,7 @@
    <name>-<field>-fd Offset accessors (both a flatdata-view and an owned FlatData octet-buffer answer them).
    Bounded drive (no unbounded wait). Skips cleanly where SHMEM is off (shm-attach-by-name-reliable-p is NIL, ADR 0013)."
   (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
-    (dds.pal:note-test-skip "run-reliable-zc-retransmit-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
+    (note-skip "run-reliable-zc-retransmit-test" :shm-attach-by-name "shm-attach-by-name unreliable on this platform (ADR 0013)")
     (return-from run-reliable-zc-retransmit-test t))
   (let* ((dds.disc:*shmem-enabled* t)
          (dds.disc:*zerocopy-enabled* t)
@@ -10684,7 +10693,7 @@
    sample that is NOT a flatdata-view (a copy) with NIL in the loans list; (3) its a/b/c read byte-exact.
    Skips cleanly where SHMEM is off (shm-attach-by-name-reliable-p is NIL, ADR 0013)."
   (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
-    (dds.pal:note-test-skip "run-reliable-zc-poolfull-fallback-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
+    (note-skip "run-reliable-zc-poolfull-fallback-test" :shm-attach-by-name "shm-attach-by-name unreliable on this platform (ADR 0013)")
     (return-from run-reliable-zc-poolfull-fallback-test t))
   (let* ((dds.disc:*shmem-enabled* t)
          (dds.disc:*zerocopy-enabled* t)
@@ -10761,7 +10770,7 @@
    exact; (5) return-loan releases the view (registry empties) and is a no-op for the copy. Skips cleanly where
    SHMEM is off (shm-attach-by-name-reliable-p is NIL, ADR 0013)."
   (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
-    (dds.pal:note-test-skip "run-reliable-zc-mixed-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
+    (note-skip "run-reliable-zc-mixed-test" :shm-attach-by-name "shm-attach-by-name unreliable on this platform (ADR 0013)")
     (return-from run-reliable-zc-mixed-test t))
   (let* ((dds.disc:*shmem-enabled* t)
          (dds.disc:*zerocopy-enabled* t)
@@ -10853,7 +10862,7 @@
    refcount is 0 and a fresh %zc-loan succeeds (the slot is reclaimable). Skips cleanly where SHMEM is off
    (shm-attach-by-name-reliable-p is NIL, ADR 0013)."
   (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
-    (dds.pal:note-test-skip "run-reliable-zc-slot-outlives-purge-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
+    (note-skip "run-reliable-zc-slot-outlives-purge-test" :shm-attach-by-name "shm-attach-by-name unreliable on this platform (ADR 0013)")
     (return-from run-reliable-zc-slot-outlives-purge-test t))
   (let* ((dds.disc:*shmem-enabled* t)
          (dds.disc:*zerocopy-enabled* t)
@@ -10962,7 +10971,7 @@
    full-ACK purge drops the HC change AND releases the pin (live pin count back to 0), and after return-loan the
    slot frees (refcount 0, free-count restored). Skips cleanly where SHMEM is off (shm-attach-by-name-reliable-p is NIL, ADR 0013)."
   (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
-    (dds.pal:note-test-skip "run-acked-slot-pin-happy-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
+    (note-skip "run-acked-slot-pin-happy-test" :shm-attach-by-name "shm-attach-by-name unreliable on this platform (ADR 0013)")
     (return-from run-acked-slot-pin-happy-test t))
   (let* ((dds.disc:*shmem-enabled* t)
          (dds.disc:*zerocopy-enabled* t)
@@ -11056,7 +11065,7 @@
    ultimately received (reliable, no silent loss) and reads a/b/c byte-exact; (4) the retransmit materialised the
    payload from the slot (the change now carries a resolved serialized-payload). Skips where SHMEM is off."
   (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
-    (dds.pal:note-test-skip "run-acked-slot-pin-retransmit-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
+    (note-skip "run-acked-slot-pin-retransmit-test" :shm-attach-by-name "shm-attach-by-name unreliable on this platform (ADR 0013)")
     (return-from run-acked-slot-pin-retransmit-test t))
   (let* ((dds.disc:*shmem-enabled* t)
          (dds.disc:*zerocopy-enabled* t)
@@ -11121,7 +11130,7 @@
    retained payload on demand from the still-armed slot and publish as a NORMAL change (serialized-payload
    non-nil, NOT pinned, live pin count stays 0) — and still deliver byte-exact. Skips where SHMEM is off."
   (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
-    (dds.pal:note-test-skip "run-acked-slot-pin-budget-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
+    (note-skip "run-acked-slot-pin-budget-test" :shm-attach-by-name "shm-attach-by-name unreliable on this platform (ADR 0013)")
     (return-from run-acked-slot-pin-budget-test t))
   (let* ((dds.disc:*shmem-enabled* t)
          (dds.disc:*zerocopy-enabled* t)
@@ -11165,7 +11174,7 @@
    NOT pinned, carries a serialized-payload, and the live pin count stays 0 — and deliver byte-exact. Skips where
    SHMEM is off."
   (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
-    (dds.pal:note-test-skip "run-acked-slot-pin-ineligible-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
+    (note-skip "run-acked-slot-pin-ineligible-test" :shm-attach-by-name "shm-attach-by-name unreliable on this platform (ADR 0013)")
     (return-from run-acked-slot-pin-ineligible-test t))
   (let* ((dds.disc:*shmem-enabled* t)
          (dds.disc:*zerocopy-enabled* t)
@@ -11226,7 +11235,7 @@
    exactly once (no retransmit owed for a superseded sample). Asserts the pin count returns to 1 (SN 2's pin) after
    SN 1 is evicted, proving the eviction drop-site releases the pin. Skips where SHMEM is off."
   (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
-    (dds.pal:note-test-skip "run-acked-slot-pin-keeplast-evict-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
+    (note-skip "run-acked-slot-pin-keeplast-evict-test" :shm-attach-by-name "shm-attach-by-name unreliable on this platform (ADR 0013)")
     (return-from run-acked-slot-pin-keeplast-evict-test t))
   (let* ((dds.disc:*shmem-enabled* t)
          (dds.disc:*zerocopy-enabled* t)
@@ -11365,7 +11374,7 @@
    non-FlatData byte-identity regression is held by the existing suite (flow-off-byte-identical, the corpus,
    zerocopy-end-to-end). Skips cleanly where SHMEM is off (shm-attach-by-name-reliable-p is NIL, ADR 0013)."
   (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
-    (dds.pal:note-test-skip "run-reliable-zc-qos-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
+    (note-skip "run-reliable-zc-qos-test" :shm-attach-by-name "shm-attach-by-name unreliable on this platform (ADR 0013)")
     (return-from run-reliable-zc-qos-test t))
   (let ((dds.disc:*shmem-enabled* t)
         (dds.disc:*zerocopy-enabled* t)
@@ -11390,7 +11399,7 @@
    (ADR 0013); on AllegroCL it pass-skips (gated on pal-impl-name :sbcl, not yet re-evaluated against the
    AllegroCL PAL's load-sap-u8)."
   (if (not (eq (dds.pal:pal-impl-name) :sbcl))
-      (format t "~&  [skip] flatdata-zc-loan-stress: ZC pool + load-sap-u8 are SBCL-only (ADR 0013) — NFR-PORT gap~%")
+      (note-skip "flatdata-zc-loan-stress" :zc-sap-primitives "ZC pool + load-sap-u8 are SBCL-only (ADR 0013) — NFR-PORT gap")
       (let* ((k 4)
              (slot-bytes 64)
              (mem (dds.pal:alloc-static (dds.xport.zerocopy::%zc-bytes k slot-bytes)))

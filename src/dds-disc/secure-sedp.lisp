@@ -1018,7 +1018,7 @@
    Requires the AES-GCM primitive (like the other secure tests); skips gracefully if absent. Both impls."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [rtps-protection] SKIP — AES-GCM not available: ~a~%" %dare-reason)
+      (%note-dare-test-skip "rtps-protection" %dare-reason)
       (return-from run-rtps-protection-test t)))
   (let* ((pa (make-array 12 :element-type '(unsigned-byte 8) :initial-element 81))
          (pb (make-array 12 :element-type '(unsigned-byte 8) :initial-element 82))
@@ -1213,7 +1213,7 @@
        zc-sends advances (the overlay DID take ZC). Both impls (Part B skips cleanly where the pool is not carved)."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [zc-shmem-secured-overlay] SKIP — AES-GCM not available: ~a~%" %dare-reason)
+      (%note-dare-test-skip "zc-shmem-secured-overlay" %dare-reason)
       (return-from run-zc-shmem-secured-overlay-test t)))
   (let ((pa (make-array 12 :element-type '(unsigned-byte 8) :initial-element 93))
         (*zerocopy-min-payload-bytes* 8)
@@ -1419,7 +1419,7 @@
    Requires AES-GCM; skips gracefully if absent. Both impls (SBCL and AllegroCL)."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [rtps-protection-zeroalloc] SKIP — AES-GCM not available: ~a~%" %dare-reason)
+      (%note-dare-test-skip "rtps-protection-zeroalloc" %dare-reason)
       (return-from run-rtps-protection-zeroalloc-test t)))
   (let* ((pa (make-array 12 :element-type '(unsigned-byte 8) :initial-element 71))
          (pb (make-array 12 :element-type '(unsigned-byte 8) :initial-element 72))
@@ -1485,7 +1485,7 @@
                  (format t "~&  [rtps-protection-zeroalloc] SRTPS wrap bytes/datagram: before(subseq+encode-rtps-message)=~,2f  after(pooled -into)=~,2f (~d iters)~%"
                          old-per new-per iters)
                  (if (zerop (dds.pal:bytes-consed))
-                     (format t "  [skip] dds.pal:bytes-consed is 0 on this impl (AllegroCL NFR-PORT gap) — SRTPS wrap alloc not measurable~%")
+                     (dds.pal:note-test-skip "rtps-protection-zeroalloc/srtps-wrap-alloc" :alloc-counter "dds.pal:bytes-consed does not move on this impl — SRTPS wrap alloc not measurable" :arm)
                      (progn
                        (assert (< new-per 1.0) ()
                                "ZA-2: the pooled SRTPS wrap must cons ~~0 GC-heap B/datagram; got ~,2f (would FAIL on the pre-rewire subseq+encode-rtps-message path, ~,2f)" new-per old-per)
@@ -1555,7 +1555,7 @@
                  (let ((rx-per (/ (float rx-b) iters)))
                    (format t "~&  [rtps-protection-zeroalloc] SRTPS RX unwrap (pooled borrow + decode-rtps-message-into) bytes/datagram: ~,2f (~d iters)~%" rx-per iters)
                    (if (zerop (dds.pal:bytes-consed))
-                       (format t "  [skip] dds.pal:bytes-consed is 0 on this impl (AllegroCL NFR-PORT gap) — SRTPS RX alloc not measurable~%")
+                       (dds.pal:note-test-skip "rtps-protection-zeroalloc/srtps-rx-alloc" :alloc-counter "dds.pal:bytes-consed does not move on this impl — SRTPS RX alloc not measurable" :arm)
                        (assert (< rx-per 1.0) ()
                                "ZA-2: the pooled SRTPS RX unwrap must cons ~~0 GC-heap B/datagram; got ~,2f" rx-per))))))
            t)
@@ -1581,7 +1581,7 @@
    Requires the AES-GCM primitive; skips gracefully if absent. Both impls."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [user-submsg] SKIP — AES-GCM not available: ~a~%" %dare-reason)
+      (%note-dare-test-skip "user-submsg" %dare-reason)
       (return-from run-user-submessage-protection-test t)))
   (let* ((pa (make-array 12 :element-type '(unsigned-byte 8) :initial-element 91))
          (pb (make-array 12 :element-type '(unsigned-byte 8) :initial-element 92))
@@ -1650,7 +1650,7 @@
    varies, exactly as the crypto-manager resolver would supply it. Requires AES-GCM; skips gracefully if absent."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [secure-builtin-xcheck] SKIP — AES-GCM not available: ~a~%" %dare-reason)
+      (%note-dare-test-skip "secure-builtin-xcheck" %dare-reason)
       (return-from run-secure-builtin-sender-crosscheck-test t)))
   (let* ((pa   (make-array 12 :element-type '(unsigned-byte 8) :initial-element 71))
          (node (make-disc-node :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element 72)
@@ -1699,7 +1699,7 @@
    RESPONDS to reader state, not a fixed reply). Requires AES-GCM; skips gracefully if absent."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [secure-builtin-acknack] SKIP — AES-GCM not available: ~a~%" %dare-reason)
+      (%note-dare-test-skip "secure-builtin-acknack" %dare-reason)
       (return-from run-secure-builtin-acknack-count-test t)))
   (flet ((inner-acknack-numbits (dg km reid wid)   ; decode the protected bracket, assert it is the secure-SEDP ACKNACK, return numBits
            (let ((plain (dds.security:decode-datawriter-submessage km (subseq dg 20))))
@@ -1784,7 +1784,7 @@
    Requires the AES-GCM primitive; skips gracefully if absent. Both impls (SBCL and AllegroCL)."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [user-submsg-data-protection] SKIP — AES-GCM not available: ~a~%" %dare-reason)
+      (%note-dare-test-skip "user-submsg-data-protection" %dare-reason)
       (return-from run-user-submessage-data-protection-test t)))
   (let* ((pa (make-array 12 :element-type '(unsigned-byte 8) :initial-element 95))
          (pb (make-array 12 :element-type '(unsigned-byte 8) :initial-element 96))
@@ -1870,7 +1870,7 @@
    Requires the AES-GCM primitive; skips gracefully if absent."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [user-submsg-zeroalloc] SKIP — AES-GCM not available: ~a~%" %dare-reason)
+      (%note-dare-test-skip "user-submsg-zeroalloc" %dare-reason)
       (return-from run-user-submessage-protection-zeroalloc-test t)))
   (let* ((pa (make-array 12 :element-type '(unsigned-byte 8) :initial-element 87))
          (pb (make-array 12 :element-type '(unsigned-byte 8) :initial-element 88))
@@ -1963,7 +1963,7 @@
                    (format t "~&  [user-submsg-zeroalloc] SEND wrap bytes/datagram: before(subseq+encode-datawriter-submessage)=~,2f  after(pooled -into)=~,2f (~d iters)~%" so sn iters)
                    (format t "  [user-submsg-zeroalloc] RX decode bytes/bracket: before(decode-datawriter-submessage)=~,2f  after(pooled decode-into)=~,2f~%" ro rn)
                    (if (zerop (dds.pal:bytes-consed))
-                       (format t "  [skip] dds.pal:bytes-consed is 0 on this impl (AllegroCL NFR-PORT gap) — metadata_protection alloc not measurable~%")
+                       (dds.pal:note-test-skip "user-submsg-zeroalloc/metadata-alloc" :alloc-counter "dds.pal:bytes-consed does not move on this impl — metadata_protection alloc not measurable" :arm)
                        (progn
                          (assert (< sn 1.0) ()
                                  "ZA-2: the pooled metadata_protection SEND wrap must cons ~~0 GC-heap B/datagram; got ~,2f (would FAIL on the pre-rewire +8192/subseq path, ~,2f)" sn so)
@@ -2022,7 +2022,7 @@
    no auth handshake (manual KMs). Requires the AES-GCM primitive; skips gracefully if absent. Wired into make mem."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [secured-dataplane-mem] SKIP — AES-GCM not available: ~a~%" %dare-reason)
+      (%note-dare-test-skip "secured-dataplane-mem" %dare-reason)
       (return-from run-secured-dataplane-mem-test t)))
   (let* ((pa (make-array 12 :element-type '(unsigned-byte 8) :initial-element 71))
          (pb (make-array 12 :element-type '(unsigned-byte 8) :initial-element 72))
@@ -2043,10 +2043,13 @@
              (report-arm (label plain secured)
                (format t "~&  mem[~a]: plain=~,4f secured=~,4f -> delta=~,4f B/sample (~a)~%"
                        label plain secured (- secured plain) (dds.pal:pal-impl-name))
-               (when sbcl
-                 (assert (< (abs (- secured plain)) 1.0) ()
-                         "ZA-2 T5 ~a: enabling the tier must add ~~0 GC-heap B/sample over the non-secured baseline; got delta ~,4f (plain ~,4f, secured ~,4f)"
-                         label (- secured plain) plain secured))))
+               (if sbcl
+                   (assert (< (abs (- secured plain)) 1.0) ()
+                           "ZA-2 T5 ~a: enabling the tier must add ~~0 GC-heap B/sample over the non-secured baseline; got delta ~,4f (plain ~,4f, secured ~,4f)"
+                           label (- secured plain) plain secured)
+                   ;; ADR 0122: the arm ran (smoke) but its assertion did not — say so, per arm.
+                   (dds.pal:note-test-skip (format nil "secured-dataplane-mem/~a" label) :alloc-counter
+                                           "alloc assertion gated on pal-impl-name :SBCL (bytes-consed does not move elsewhere)" :arm))))
       (unwind-protect
            (progn
              ;; ---- (a) metadata_protection SEND: resolver OFF (no-op) vs ON (pooled wrap), over the reused tx buffer ----
@@ -2378,7 +2381,7 @@
    Requires the AES-GCM primitive; skips gracefully if absent. Both impls (SBCL and AllegroCL)."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [rtps-enforce-user-bracket] SKIP — AES-GCM not available: ~a~%" %dare-reason)
+      (%note-dare-test-skip "rtps-enforce-user-bracket" %dare-reason)
       (return-from run-rtps-protection-enforce-user-bracket-test t)))
   (let* ((pa (make-array 12 :element-type '(unsigned-byte 8) :initial-element 97))   ; the :keyed peer A
          (pb (make-array 12 :element-type '(unsigned-byte 8) :initial-element 98))   ; node-b: receiver under enforcement
@@ -2567,7 +2570,7 @@
    Bounded; requires the AES-GCM primitive (skips gracefully if absent). Both impls."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [secure-pm] SKIP — AES-GCM not available: ~a~%" %dare-reason)
+      (%note-dare-test-skip "secure-pm" %dare-reason)
       (return-from %run-secure-pm t)))
   (let* ((pa (make-array 12 :element-type '(unsigned-byte 8) :initial-element 61))
          (pb (make-array 12 :element-type '(unsigned-byte 8) :initial-element 62))
@@ -2670,7 +2673,7 @@
    MAC and is DROPPED (no stamp). Requires the AES-GCM primitive (skips gracefully if absent). Both impls."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [secure-pm-tamper] SKIP — AES-GCM not available: ~a~%" %dare-reason)
+      (%note-dare-test-skip "secure-pm-tamper" %dare-reason)
       (return-from run-secure-participant-message-tamper-test t)))
   (let* ((pa (make-array 12 :element-type '(unsigned-byte 8) :initial-element 63))
          (pb (make-array 12 :element-type '(unsigned-byte 8) :initial-element 64))
@@ -2743,7 +2746,7 @@
    Requires the AES-GCM primitive (skips gracefully if absent). Both impls."
   (multiple-value-bind (%dare-ok %dare-reason) (dds.dare:dare-available-p)
     (unless %dare-ok
-      (format t "~&  [secure-spdp] SKIP — AES-GCM not available: ~a~%" %dare-reason)
+      (%note-dare-test-skip "secure-spdp" %dare-reason)
       (return-from run-secure-spdp-reannounce-test t)))
   (let* ((pa (make-array 12 :element-type '(unsigned-byte 8) :initial-element 65))
          (pb (make-array 12 :element-type '(unsigned-byte 8) :initial-element 66))
