@@ -298,6 +298,22 @@
                                       (declare (ignore ignored))
                                       (funcall callback)))))))
 
+(defun* %hard-exit (code)
+    (function ((integer 0 255)) nil)
+  "End the process NOW with exit status CODE: (EXCL:EXIT CODE :NO-UNWIND T :QUIET T). The lambda list was
+   read from this host's image, not recalled: (EXCL:ARGLIST 'EXCL:EXIT) answers
+   (&OPTIONAL CODE &KEY NO-UNWIND QUIET) on Allegro CL 11.0 [64-bit Linux (x86-64) *SMP*]. :NO-UNWIND T
+   skips the unwind of every Lisp process; :QUIET T suppresses the exit banner. The ONLY caller is
+   EXIT-PROCESS (pal-exit.lisp), which has already run the shutdown-hook chain and flushed the standard
+   streams.
+
+   Why :NO-UNWIND. UIOP:QUIT calls EXCL:EXIT without it, and that exit waits for every other Lisp process to
+   unwind. A process parked in a foreign call never returns to Lisp to do so. Measured on this host
+   (2026-10-04): with one thread blocked in read(2) on a pipe nobody writes, UIOP:QUIT 7 was still running
+   when `timeout 40` killed it (rc 124), while (EXCL:EXIT 7 :NO-UNWIND T :QUIET T) returned rc 7 in 2.8 s.
+   The full test suite's 'hang at exit' with 10 live threads is that case."
+  (excl:exit code :no-unwind t :quiet t))
+
 (defun* register-image-restart-hook (hook)
     (function ((or symbol function)) (eql t))
   "Arrange for HOOK to run when a dumped image restarts — the point at which every cached foreign pointer
@@ -379,10 +395,10 @@
    ⛔ THE FLAGS ARE NOT COSMETIC. A child handed another implementation's flags does not report an error —
    it treats them as garbage and the parent waits forever for a service that never started.
 
-   ⚠️ NO LIVE CONSUMER TODAY. dds-durability/runner.lisp gates :process mode on
-   (eq (pal-impl-name) :sbcl), and both the LISP-EVAL-COMMAND call and the :NO-ARGV0 bail sit inside that
-   branch — on AllegroCL control reaches the fallback that prints \":process mode not available\" and starts
-   in-thread. This arm is preventive PAL-contract completion, NOT the fix for any observed stall."
+   CONSUMERS. dds-durability/runner.lisp gates :process mode on (eq (pal-impl-name) :sbcl), so on AllegroCL
+   control reaches the fallback that prints \":process mode not available\" and starts in-thread. The
+   exit-process test (src/dds-tests/exit-test.lisp, ADR 0121) does launch AllegroCL children through this
+   arm: three of them per suite run."
   ;; UIOP:ARGV0 is NIL on AllegroCL (measured), so this falls back to SYS:COMMAND-LINE-ARGUMENT 0, which
   ;; answers "alisp" — LAUNCH-PROGRAM resolves that through the inherited PATH.
   (let ((bin (or (uiop:argv0)

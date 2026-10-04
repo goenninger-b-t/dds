@@ -131,8 +131,8 @@
    uiop:command-line-arguments. Parses config (parse-log-service-config), builds the collector + sink
    (make-service-collector), and drains received LogEvents into the sink.
    BLOCK T (the daemon/subprocess body): installs a SIGTERM/SIGINT handler that requests shutdown, runs
-   the drain loop until the signal (or SECONDS, when > 0), tears the collector down, and uiop:quit 0 —
-   or, on a config error, prints usage to *error-output* and uiop:quit 1 (the exit code IS the
+   the drain loop until the signal (or SECONDS, when > 0), tears the collector down, and dds.pal:exit-process 0 —
+   or, on a config error, prints usage to *error-output* and dds.pal:exit-process 1 (the exit code IS the
    ReturnCode_t; ADR 0064, nothing unwinds to the Lisp toplevel).
    BLOCK NIL (in-process callers/tests): returns (values collector NIL) — the built collector, which the
    caller drains (collector-run / collector-drain) and closes — or (values NIL status) on a config
@@ -143,7 +143,7 @@
       ((%log-service-help-requested-p effective-argv)
        (write-string (log-service-usage) *standard-output*)
        (finish-output *standard-output*)
-       (if block (uiop:quit 0) :help))
+       (if block (dds.pal:exit-process 0) :help))
       (t
        (multiple-value-bind (config status)
            (parse-log-service-config :argv effective-argv :env env)
@@ -152,7 +152,7 @@
                (format *error-output* "log-service: bad configuration (~a)~%~a"
                        status (log-service-usage))
                (finish-output *error-output*)
-               (if block (uiop:quit 1) (values nil status)))
+               (if block (dds.pal:exit-process 1) (values nil status)))
              (let ((collector (make-service-collector config)))
                (if block
                    (progn
@@ -161,5 +161,5 @@
                       '(:term :int) (lambda () (setf *log-service-shutdown-requested* t)))
                      (%log-service-run-until-shutdown collector seconds)
                      (close-log-collector collector)
-                     (uiop:quit 0))
+                     (dds.pal:exit-process 0))
                    (values collector nil)))))))))

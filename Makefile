@@ -13,7 +13,21 @@ SBCL  := ./scripts/with-sbcl.sh
 ALLEGRO := ./scripts/with-allegro.sh
 LISP  ?= $(SBCL)
 
-.PHONY: all build test build-sbcl build-allegro test-sbcl test-allegro gate-build gate-mem gate-pal gate-nocond gate-quickload gate-verification gate-drivers \
+# ADR 0121: EVERY Lisp run below is bounded. At the limit `timeout` sends TERM to the whole process group it
+# started, then KILL 60 s later (--kill-after=60) if anything is still alive, so neither a wedged test nor an
+# exit that hangs (AllegroCL's UIOP:QUIT did, with a thread parked in a foreign call) can hold a shell or a CI
+# job forever. A timeout exits 124 (137 after the KILL), never 0. Override per run: make test TEST_TIMEOUT=7200.
+# The interactive participants (square-pub & co., which run until Ctrl-C) get --foreground so Ctrl-C still
+# reaches them, and a one-day default bound.
+TIMEOUT       := timeout --kill-after=60
+BUILD_TIMEOUT ?= 3600
+TEST_TIMEOUT  ?= 3600
+GATE_TIMEOUT  ?= 3600
+BENCH_TIMEOUT ?= 7200
+RUN_TIMEOUT   ?= 24h
+RUN           := $(TIMEOUT) --foreground $(RUN_TIMEOUT)
+
+.PHONY: all build test build-sbcl build-allegro test-sbcl test-allegro gate-build gate-mem gate-pal gate-quit-lint gate-nocond gate-quickload gate-verification gate-drivers \
         build-all test-all gate-hotpath gate-types corpus fuzz wire interop \
         square-pub square-sub square-spy large-pub large-sub gated-sub corpus-capture \
         nokey-pub nokey-sub keyed-flat-pub keyed-flat-sub \
@@ -95,11 +109,11 @@ hooks:
 # *compile-file-failure-behaviour* (:error), builds the Quicklisp-provided dependencies on demand
 # exactly as before, and FAILS on a full WARNING in our own code. Proven to fail: scripts/gate-build.sh.
 build:
-	$(LISP) --eval '(asdf:load-system :dds)' --eval '(uiop:quit 0)'
+	$(TIMEOUT) $(BUILD_TIMEOUT) $(LISP) --eval '(asdf:load-system :dds)' --eval '(dds.pal:exit-process 0)'
 
 test:
-	$(LISP) --eval '(asdf:load-system :dds-tests)' \
-	        --eval '(handler-case (progn (asdf:test-system :dds-tests) (uiop:quit 0)) (error (e) (format t "~&~a~%" e) (uiop:quit 1)))'
+	$(TIMEOUT) $(TEST_TIMEOUT) $(LISP) --eval '(asdf:load-system :dds-tests)' \
+	        --eval '(handler-case (progn (asdf:test-system :dds-tests) (dds.pal:exit-process 0)) (error (e) (format t "~&~a~%" e) (dds.pal:exit-process 1)))'
 
 build-sbcl:    ; $(MAKE) build LISP=$(SBCL)
 build-allegro: ; $(MAKE) build LISP=$(ALLEGRO)
@@ -116,6 +130,12 @@ gate-types: ; ./scripts/gate-types.sh
 # No reader conditionals outside dds-pal/ (contract §10, NFR-PORT). The contract claimed "CI lint enforces
 # this" — no such lint existed, and there was no CI to run it in. This is that lint; it falsifies itself.
 gate-pal: ; ./scripts/gate-pal.sh
+
+# ADR 0121: Lisp code in src/ ends the process ONLY through dds.pal:exit-process, which runs the shutdown-hook
+# chain (key wipe, store fsync, log flush, shm unlink) and then a hard exit that cannot hang. A bare
+# uiop:quit skips all four and, on AllegroCL, waits forever for a thread parked in a foreign call. This lint
+# bans uiop:quit and the implementations' own exit/quit outside src/dds-pal/; it falsifies itself.
+gate-quit-lint: ; ./scripts/gate-quit-lint.sh
 
 # Quicklisp may PROVIDE our dependencies; it must never GATE our own code. ql:quickload muffles every
 # compile warning, so a system loaded through it cannot fail on one. The Makefile was swept long ago;
@@ -144,20 +164,20 @@ gate-drivers: ; ./scripts/gate-drivers.sh
 
 # The REAL build gate (operating contract §6): clean-cache rebuild + a falsification self-test.
 # `build` above is the incremental convenience load; THIS is the one that can actually fail.
-gate-build: ; ./scripts/gate-build.sh $(LISP)
+gate-build: ; $(TIMEOUT) $(GATE_TIMEOUT) ./scripts/gate-build.sh $(LISP)
 
 # NFR-MEM ALLOCATION RATCHET (ADR 0062). `mem` above measures the CODEC in isolation (~0 B/iter) — a real
 # assertion, but NOT the per-sample budget it is credited with, which is why it stayed green while the live
 # DCPS path allocated ~3.9 KB/sample. gate-mem measures the END-TO-END path and ratchets it DOWN toward 0.
 # Fails on regression AND on an un-lowered ceiling after an improvement. A canary first proves the allocation
 # counter moves (ADR 0118), so it FAILS on AllegroCL, whose dds.pal:bytes-consed is the constant 0.
-gate-mem: ; ./scripts/gate-mem.sh
+gate-mem: ; $(TIMEOUT) $(GATE_TIMEOUT) ./scripts/gate-mem.sh
 
 # FR-PF-7 STATIC-MEMORY PROPERTY (ADR 0095). Asserts what `make mem` was credited with and does not check:
 # that ONE process arena sized by *static-arena-bytes* actually bounds hot-path static memory, that a live
 # participant charges it, that a create/delete cycle RETURNS the charge (option (a) — the leak this design
 # exists to prevent), and that high-water < budget. FALSIFIES ITSELF on every run before asserting anything.
-gate-arena: ; ./scripts/gate-arena.sh
+gate-arena: ; $(TIMEOUT) $(GATE_TIMEOUT) ./scripts/gate-arena.sh
 
 # THE CI PLATFORM, REACHABLE FROM THE DEV BOX. macOS/arm64 cannot see a whole class of defect this
 # stack has: uninitialized memory that only shows on the wire, a stack that only deadlocks under Linux
@@ -168,8 +188,8 @@ gate-arena: ; ./scripts/gate-arena.sh
 #   make test-linux                                 the whole suite on Linux x86_64
 #   make linux-run FORM='(dds.tests::run-x-test)'   one form, loaded and run in ONE process
 #   make linux-shell / linux-image / linux-clean-cache
-test-linux:   ; ./scripts/linux-repro.sh
-linux-run:    ; ./scripts/linux-repro.sh --eval '(handler-case (progn $(FORM) (format t "~&LINUX: ok~%") (uiop:quit 0)) (error (e) (format t "~&LINUX: FAILED ~a~%" e) (uiop:quit 1)))'
+test-linux:   ; $(TIMEOUT) $(TEST_TIMEOUT) ./scripts/linux-repro.sh
+linux-run:    ; $(TIMEOUT) $(TEST_TIMEOUT) ./scripts/linux-repro.sh --eval '(handler-case (progn $(FORM) (format t "~&LINUX: ok~%") (dds.pal:exit-process 0)) (error (e) (format t "~&LINUX: FAILED ~a~%" e) (dds.pal:exit-process 1)))'
 linux-shell:  ; ./scripts/linux-repro.sh --shell
 linux-image:  ; ./scripts/linux-repro.sh --build-only
 linux-clean-cache: ; docker volume rm -f neodds-linux-fasl-cache
@@ -178,112 +198,112 @@ linux-clean-cache: ; docker volume rm -f neodds-linux-fasl-cache
 # The vectors in corpus/xcdr2/ are captured from a live Connext writer (scripts/capture-corpus.sh); this
 # target only VERIFIES them, so it needs no Connext install and runs anywhere.
 corpus:
-	$(LISP) --eval '(asdf:load-system :dds-bench)' \
-	        --eval '(uiop:quit (if (zerop (dds.bench:corpus-verify)) 0 1))'
+	$(TIMEOUT) $(GATE_TIMEOUT) $(LISP) --eval '(asdf:load-system :dds-bench)' \
+	        --eval '(dds.pal:exit-process (if (zerop (dds.bench:corpus-verify)) 0 1))'
 
 fuzz:
-	$(LISP) --eval '(asdf:load-system :dds-tests)' \
-	        --eval '(handler-case (progn (dds.tests:run-pbt-tests) (uiop:quit 0)) (error (e) (format t "~&~a~%" e) (uiop:quit 1)))'
+	$(TIMEOUT) $(GATE_TIMEOUT) $(LISP) --eval '(asdf:load-system :dds-tests)' \
+	        --eval '(handler-case (progn (dds.tests:run-pbt-tests) (dds.pal:exit-process 0)) (error (e) (format t "~&~a~%" e) (dds.pal:exit-process 1)))'
 
 wire:
-	./scripts/wire-check.sh
+	$(TIMEOUT) $(GATE_TIMEOUT) ./scripts/wire-check.sh
 
 # Standalone Shapes interop participants (docs/interop-shapes.md). Run forever;
 # Ctrl-C to stop. Override DOMAIN=.. COLOR=.. ; LISP=$(SBCL) used (CFFI multicast).
 square-pub:
-	$(SBCL) --eval '(asdf:load-system :dds-shapes)' \
+	$(RUN) $(SBCL) --eval '(asdf:load-system :dds-shapes)' \
 	        --eval '(uiop:symbol-call :dds.shapes :run-publisher :domain $(DOMAIN) :color "$(COLOR)" :advertise-address "$(ADVERTISE)" :type :$(TYPE) :count $(COUNT) :peers "$(PEERS)" :port $(PORT) $(LIVELINESS_ARGS) $(PERF_ARGS) $(FAULT_ARGS) $(HISTORY_ARGS) $(REP_ARGS) $(DURABILITY_ARGS))' \
-	        --eval '(uiop:quit 0)'
+	        --eval '(dds.pal:exit-process 0)'
 
 # SECONDS bounds the run (default 20; SECONDS=0 runs until Ctrl-C, run-subscriber's :seconds 0
 # contract). Previously omitted, so the target silently ran forever and a backgrounded subscriber
 # outlived its capture, holding the DDS sockets and hanging the next suite.
 square-sub:
-	$(SBCL) --eval '(asdf:load-system :dds-shapes)' \
+	$(RUN) $(SBCL) --eval '(asdf:load-system :dds-shapes)' \
 	        --eval '(uiop:symbol-call :dds.shapes :run-subscriber :domain $(DOMAIN) :seconds $(SECONDS) :advertise-address "$(ADVERTISE)" :type :$(TYPE) :peers "$(PEERS)" :port $(PORT) $(DURABILITY_ARGS))' \
-	        --eval '(uiop:quit 0)'
+	        --eval '(dds.pal:exit-process 0)'
 
 # Discovery diagnostic: print each discovered participant's locators + resolved dest.
 square-spy:
-	$(SBCL) --eval '(asdf:load-system :dds-shapes)' \
+	$(RUN) $(SBCL) --eval '(asdf:load-system :dds-shapes)' \
 	        --eval '(uiop:symbol-call :dds.shapes :run-spy :domain $(DOMAIN) :advertise-address "$(ADVERTISE)")' \
-	        --eval '(uiop:quit 0)'
+	        --eval '(dds.pal:exit-process 0)'
 
 # LargeData DATA_FRAG harness; SIZE=payload octets, DROP=3 injects fragment loss for NACK_FRAG recovery
 large-pub:
-	$(SBCL) --eval '(asdf:load-system :dds-shapes)' \
+	$(RUN) $(SBCL) --eval '(asdf:load-system :dds-shapes)' \
 	        --eval '(uiop:symbol-call :dds.shapes :run-large-publisher :domain $(DOMAIN) :size $(SIZE) :advertise-address "$(ADVERTISE)" :drop-fragments (quote ($(DROP))))' \
-	        --eval '(uiop:quit 0)'
+	        --eval '(dds.pal:exit-process 0)'
 
 large-sub:
-	$(SBCL) --eval '(asdf:load-system :dds-shapes)' \
+	$(RUN) $(SBCL) --eval '(asdf:load-system :dds-shapes)' \
 	        --eval '(uiop:symbol-call :dds.shapes :run-large-subscriber :domain $(DOMAIN) :advertise-address "$(ADVERTISE)")' \
-	        --eval '(uiop:quit 0)'
+	        --eval '(dds.pal:exit-process 0)'
 
 # DCPS-level gated live subscriber (FR-TYPE-4, ADR 0010 live DoD): the type-gate fires on a
 # stock Connext peer's PID_TYPE_OBJECT_LB. LOCALTYPE=shape-type (compatible) | shape-mismatch.
 gated-sub:
-	$(SBCL) --eval '(asdf:load-system :dds-shapes)' \
+	$(RUN) $(SBCL) --eval '(asdf:load-system :dds-shapes)' \
 	        --eval '(uiop:symbol-call :dds.shapes :run-gated-subscriber :domain $(DOMAIN) :topic "$(TOPIC)" :type-name "$(TYPENAME)" :local-type "$(LOCALTYPE)" :seconds $(SECONDS) :advertise-address "$(ADVERTISE)" $(OWNERSHIP_ARGS))' \
-	        --eval '(uiop:quit 0)'
+	        --eval '(dds.pal:exit-process 0)'
 
 # WP-DCPS-API-COMPLETION S4 live DEADLINE interop (DDS 1.4 §2.2.3.7; interop/deadline). DEADLINE_MS sets
 # the offered (pub) / requested (sub) period; COUNT = samples before the pub stops. The peer is the stock
 # Connext/Fast DDS shapes_sub (for deadline-pub) or a finite-offered-deadline shapes_pub (for deadline-sub).
 deadline-pub:
-	$(SBCL) --eval '(asdf:load-system :dds-shapes)' \
+	$(RUN) $(SBCL) --eval '(asdf:load-system :dds-shapes)' \
 	        --eval '(uiop:symbol-call :dds.shapes :run-deadline-publisher :domain $(DOMAIN) :deadline-ms $(DEADLINE_MS) :count $(COUNT) :seconds $(SECONDS) :advertise-address "$(ADVERTISE)")' \
-	        --eval '(uiop:quit 0)'
+	        --eval '(dds.pal:exit-process 0)'
 
 deadline-sub:
-	$(SBCL) --eval '(asdf:load-system :dds-shapes)' \
+	$(RUN) $(SBCL) --eval '(asdf:load-system :dds-shapes)' \
 	        --eval '(uiop:symbol-call :dds.shapes :run-deadline-subscriber :domain $(DOMAIN) :deadline-ms $(DEADLINE_MS) :seconds $(SECONDS) :advertise-address "$(ADVERTISE)")' \
-	        --eval '(uiop:quit 0)'
+	        --eval '(dds.pal:exit-process 0)'
 
 # WP-DCPS-API-COMPLETION S7 live AUTONOMOUS-DISCOVERY interop (ADR 0056; interop/autodiscovery). The same
 # DCPS runners in AUTONOMOUS mode: the loop calls NO spin — a background announcer thread drives SPDP/SEDP
 # on the ANNOUNCE_MS cadence and announces a LEASE_SECONDS leaseDuration. DEADLINE_MS=0 = no finite
 # deadline, so the stock Connext/Fast DDS shapes peer matches with no QoS tweak.
 autodisc-pub:
-	$(SBCL) --eval '(asdf:load-system :dds-shapes)' \
+	$(RUN) $(SBCL) --eval '(asdf:load-system :dds-shapes)' \
 	        --eval '(uiop:symbol-call :dds.shapes :run-deadline-publisher :domain $(DOMAIN) :deadline-ms 0 :count $(COUNT) :seconds $(SECONDS) :advertise-address "$(ADVERTISE)" :peers "$(PEERS)" :autonomous t :announce-ms $(ANNOUNCE_MS) :lease-seconds $(LEASE_SECONDS) $(REP_ARGS))' \
-	        --eval '(uiop:quit 0)'
+	        --eval '(dds.pal:exit-process 0)'
 
 autodisc-sub:
-	$(SBCL) --eval '(asdf:load-system :dds-shapes)' \
+	$(RUN) $(SBCL) --eval '(asdf:load-system :dds-shapes)' \
 	        --eval '(uiop:symbol-call :dds.shapes :run-deadline-subscriber :domain $(DOMAIN) :deadline-ms 0 :seconds $(SECONDS) :advertise-address "$(ADVERTISE)" :peers "$(PEERS)" :autonomous t :announce-ms $(ANNOUNCE_MS) :lease-seconds $(LEASE_SECONDS))' \
-	        --eval '(uiop:quit 0)'
+	        --eval '(dds.pal:exit-process 0)'
 
 # Clean-room legacy-TypeObject capture: dump a peer's PID_TYPE_OBJECT_LB as a Lisp byte vector.
 corpus-capture:
-	$(SBCL) --eval '(asdf:load-system :dds-shapes)' \
+	$(RUN) $(SBCL) --eval '(asdf:load-system :dds-shapes)' \
 	        --eval '(uiop:symbol-call :dds.shapes :run-corpus-capture-subscriber :domain $(DOMAIN) :topic "$(TOPIC)" :type "$(TYPE)" :seconds $(SECONDS))' \
-	        --eval '(uiop:quit 0)'
+	        --eval '(dds.pal:exit-process 0)'
 
 # No-key endpoint-kinds live harness (keyed/no-key feature). The DCPS path threads the
 # topic type's keyed-ness (NIL) so the endpoints come up NO_KEY (writer 0x03 / reader 0x04).
 nokey-pub:
-	$(SBCL) --eval '(asdf:load-system :dds-shapes)' \
+	$(RUN) $(SBCL) --eval '(asdf:load-system :dds-shapes)' \
 	        --eval '(uiop:symbol-call :dds.shapes :run-nokey-publisher :domain $(DOMAIN) :count $(COUNT) :advertise-address "$(ADVERTISE)" :peers "$(PEERS)")' \
-	        --eval '(uiop:quit 0)'
+	        --eval '(dds.pal:exit-process 0)'
 
 nokey-sub:
-	$(SBCL) --eval '(asdf:load-system :dds-shapes)' \
+	$(RUN) $(SBCL) --eval '(asdf:load-system :dds-shapes)' \
 	        --eval '(uiop:symbol-call :dds.shapes :run-nokey-subscriber :domain $(DOMAIN) :seconds $(SECONDS) :advertise-address "$(ADVERTISE)" :peers "$(PEERS)")' \
-	        --eval '(uiop:quit 0)'
+	        --eval '(dds.pal:exit-process 0)'
 
 # WP-KEYED-FLATDATA cross-DDS interop live harness (FR-PF-4, RTPS 2.5 §9.6.4.8; interop/keyed-flatdata).
 # DCPS COPY/UDP path (NO ZeroCopy) of the keyed FlatData type keyed-flat (i32 @key id; i32 x; i32 y); the
 # foreign peers are interop/keyed-flatdata/{connext,fastdds}. KEYS=N keys, DISPOSE_AFTER=N dispose-by-key.
 keyed-flat-pub:
-	$(SBCL) --eval '(asdf:load-system :dds-shapes)' \
+	$(RUN) $(SBCL) --eval '(asdf:load-system :dds-shapes)' \
 	        --eval '(uiop:symbol-call :dds.shapes :run-keyed-flat-publisher :domain $(DOMAIN) :count $(COUNT) :keys $(KEYS) :dispose-after $(DISPOSE_AFTER) :advertise-address "$(ADVERTISE)" :peers "$(PEERS)")' \
-	        --eval '(uiop:quit 0)'
+	        --eval '(dds.pal:exit-process 0)'
 
 keyed-flat-sub:
-	$(SBCL) --eval '(asdf:load-system :dds-shapes)' \
+	$(RUN) $(SBCL) --eval '(asdf:load-system :dds-shapes)' \
 	        --eval '(uiop:symbol-call :dds.shapes :run-keyed-flat-subscriber :domain $(DOMAIN) :seconds $(SECONDS) :advertise-address "$(ADVERTISE)" :peers "$(PEERS)")' \
-	        --eval '(uiop:quit 0)'
+	        --eval '(dds.pal:exit-process 0)'
 
 # Fast DDS interop peers (interop/fastdds/README.md). FASTDDS_PREFIX via with-fastdds.sh;
 # the apps read profiles.xml from their cwd. COUNT=0 / SECONDS=0 = run forever.
@@ -301,9 +321,9 @@ fastdds-type-probe:
 # TypeLookup live leg A (FR-IO-2 S4): our getTypes client queries a peer's TypeLookup
 # server (e.g. `make fastdds-pub`) for its SEDP-announced EK_MINIMAL hash. PASS/FAIL on stdout.
 fastdds-tl-probe:
-	$(SBCL) --eval '(asdf:load-system :dds-shapes)' \
+	$(RUN) $(SBCL) --eval '(asdf:load-system :dds-shapes)' \
 	        --eval '(uiop:symbol-call :dds.shapes :run-typelookup-probe :domain $(DOMAIN) :seconds $(SECONDS) :advertise-address "$(ADVERTISE)")' \
-	        --eval '(uiop:quit 0)'
+	        --eval '(dds.pal:exit-process 0)'
 
 # WP-KEYED-FLATDATA Fast DDS interop peers (interop/keyed-flatdata/fastdds; FR-PF-4). FASTDDS_PREFIX via
 # with-fastdds.sh; the apps read profiles.xml from their cwd. Owner-run leg. KEYS=N keys, COUNT=0/SECONDS=0
@@ -319,7 +339,7 @@ fastdds-keyed-flat-sub:
 # A gate that cannot run must not report success: gate-interop.sh FAILS on a missing vendor unless
 # excused via INTEROP_ALLOW_MISSING=connext|fastdds|both.
 interop: wire
-	./scripts/gate-interop.sh
+	$(TIMEOUT) $(GATE_TIMEOUT) ./scripts/gate-interop.sh
 
 # ⚠️ `bench` IS A REPORT, NOT A GATE. It prints latency/throughput and exits 0 whatever the numbers say —
 # it has NO pass/fail criterion and CANNOT go red, despite the operating contract §6 listing it among the
@@ -329,30 +349,30 @@ interop: wire
 # latency tail (the ~10 ms p99.99 is a GC pause in the PEER — ADR 0062), so that is the number under guard.
 # A latency ratchet is NOT viable on this hardware: the box measures 16-32 us for identical code.
 bench:
-	$(SBCL) --eval '(asdf:load-system :dds-bench)' \
+	$(TIMEOUT) $(BENCH_TIMEOUT) $(SBCL) --eval '(asdf:load-system :dds-bench)' \
 	        --eval '(uiop:symbol-call :dds.bench :run-bench :latency-samples $(LATSAMPLES) :throughput-samples $(THRUSAMPLES))' \
-	        --eval '(uiop:quit 0)'
+	        --eval '(dds.pal:exit-process 0)'
 
 bench-shmem:
-	$(SBCL) --eval '(asdf:load-system :dds-bench)' \
+	$(TIMEOUT) $(BENCH_TIMEOUT) $(SBCL) --eval '(asdf:load-system :dds-bench)' \
 	        --eval '(uiop:symbol-call :dds.bench :run-bench-shmem :latency-samples $(LATSAMPLES) :throughput-samples $(THRUSAMPLES))' \
-	        --eval '(uiop:quit 0)'
+	        --eval '(dds.pal:exit-process 0)'
 
 # WP-ZEROCOPY (FR-PF-3): large-sample ZC vs SHMEM vs UDP comparison (default sizes 4/16/64 KiB,
 # above *zerocopy-min-payload-bytes*). Each ZEROCOPY run asserts disc-node-zc-sends advanced (a
 # 16-byte reference crossed, not the payload). NOT cleared for ship — pending counsel (R6).
 bench-zerocopy:
-	$(SBCL) --eval '(asdf:load-system :dds-bench)' \
+	$(TIMEOUT) $(BENCH_TIMEOUT) $(SBCL) --eval '(asdf:load-system :dds-bench)' \
 	        --eval '(uiop:symbol-call :dds.bench :run-bench-zerocopy)' \
-	        --eval '(uiop:quit 0)'
+	        --eval '(dds.pal:exit-process 0)'
 
 # WP-FLATDATA Phase E1a (FR-PF-4, NFR-PERF-7, FR-LANG-7): HONEST ser/deser/accessor cost of a FINAL
 # fixed-size FlatData type vs the classic per-field codec, plus the FlatData-over-ZC RX (safe single
 # copy out of SHMEM, ~830x less than WP-ZEROCOPY-v1 — NOT literal-0-copy). Lives in dds-tests (needs
 # the dds-gen FlatData type); writes bench/report/2026-06-14-wp-flatdata.md. NOT cleared for ship (R6).
 bench-flatdata:
-	$(SBCL) --eval '(asdf:load-system :dds-tests)' \
-	        --eval '(handler-case (progn (uiop:symbol-call :dds.tests :run-bench-flatdata :file "bench/report/2026-06-14-wp-flatdata.md") (uiop:quit 0)) (error (e) (format t "~&~a~%" e) (uiop:quit 1)))'
+	$(TIMEOUT) $(BENCH_TIMEOUT) $(SBCL) --eval '(asdf:load-system :dds-tests)' \
+	        --eval '(handler-case (progn (uiop:symbol-call :dds.tests :run-bench-flatdata :file "bench/report/2026-06-14-wp-flatdata.md") (dds.pal:exit-process 0)) (error (e) (format t "~&~a~%" e) (dds.pal:exit-process 1)))'
 
 # WP-FLATDATA-ZC-LOAN Phase F2 (FR-PF-3/4, NFR-PERF-7, FR-LANG-7): the literal-0-copy RX headline — the RX GC
 # bytes/sample PROGRESSION (literal-0-copy loan via take-loaned/return-loan -> FlatData+ZC v1 single-copy ->
@@ -361,8 +381,8 @@ bench-flatdata:
 # dds-gen FlatData type); writes bench/report/2026-06-16-wp-flatdata-zc-loan.md. SBCL only (ZC, ADR 0013).
 # NOT cleared for ship — pending counsel (R6); see ADR 0017.
 bench-flatdata-zc-loan:
-	$(SBCL) --eval '(asdf:load-system :dds-tests)' \
-	        --eval '(handler-case (progn (uiop:symbol-call :dds.tests :run-bench-flatdata-zc-loan :file "bench/report/2026-06-16-wp-flatdata-zc-loan.md") (uiop:quit 0)) (error (e) (format t "~&~a~%" e) (uiop:quit 1)))'
+	$(TIMEOUT) $(BENCH_TIMEOUT) $(SBCL) --eval '(asdf:load-system :dds-tests)' \
+	        --eval '(handler-case (progn (uiop:symbol-call :dds.tests :run-bench-flatdata-zc-loan :file "bench/report/2026-06-16-wp-flatdata-zc-loan.md") (dds.pal:exit-process 0)) (error (e) (format t "~&~a~%" e) (dds.pal:exit-process 1)))'
 
 # WP-FLATDATA-LOAN-WRITE (FR-PF-4, FR-LANG-7): the 0-copy TX headline — the writer writes a FlatData sample
 # straight into the SHMEM pool slot via the SAP-mode Offset setters, eliminating BOTH intra-host TX copies
@@ -370,8 +390,8 @@ bench-flatdata-zc-loan:
 # (zero copies), GC bytes/sample + ns/sample. Writes bench/report/2026-07-03-wp-flatdata-loan-write.md. SBCL only
 # (ZC + foreign-SAP writes, ADR 0013). NOT cleared for ship — pending counsel (R6); see ADR 0042.
 bench-flatdata-loan-write:
-	$(SBCL) --eval '(asdf:load-system :dds-tests)' \
-	        --eval '(handler-case (progn (uiop:symbol-call :dds.tests :run-bench-flatdata-loan-write :file "bench/report/2026-07-03-wp-flatdata-loan-write.md") (uiop:quit 0)) (error (e) (format t "~&~a~%" e) (uiop:quit 1)))'
+	$(TIMEOUT) $(BENCH_TIMEOUT) $(SBCL) --eval '(asdf:load-system :dds-tests)' \
+	        --eval '(handler-case (progn (uiop:symbol-call :dds.tests :run-bench-flatdata-loan-write :file "bench/report/2026-07-03-wp-flatdata-loan-write.md") (dds.pal:exit-process 0)) (error (e) (format t "~&~a~%" e) (dds.pal:exit-process 1)))'
 
 # WP-ZC-LOAN-LOCKFREE Phase C (FR-PF-3/4, NFR-PERF-7, FR-LANG-7): the lock-free 0-alloc loaned RX headline —
 # the loaned RX GC bytes/sample now LITERAL 0 (the lock-free %zc-acquire-for-read + cas-sap-u32 %zc-release),
@@ -381,14 +401,14 @@ bench-flatdata-loan-write:
 # bench/report/2026-06-16-wp-zc-loan-lockfree.md. SBCL only (ZC + foreign-SAP atomics, ADR 0013).
 # NOT cleared for ship — pending counsel (R6); see ADR 0018.
 bench-zc-loan-lockfree:
-	$(SBCL) --eval '(asdf:load-system :dds-tests)' \
-	        --eval '(handler-case (progn (uiop:symbol-call :dds.tests :run-bench-zc-loan-lockfree :file "bench/report/2026-06-16-wp-zc-loan-lockfree.md") (uiop:quit 0)) (error (e) (format t "~&~a~%" e) (uiop:quit 1)))'
+	$(TIMEOUT) $(BENCH_TIMEOUT) $(SBCL) --eval '(asdf:load-system :dds-tests)' \
+	        --eval '(handler-case (progn (uiop:symbol-call :dds.tests :run-bench-zc-loan-lockfree :file "bench/report/2026-06-16-wp-zc-loan-lockfree.md") (dds.pal:exit-process 0)) (error (e) (format t "~&~a~%" e) (dds.pal:exit-process 1)))'
 
 # WP-ZC-MULTI-DEST-REFCOUNT (FR-PF-4, FR-LANG-7; R6, ADR 0047): one shared Zero-Copy slot across N co-resident
 # ZC destinations — slots + app->slot copies drop from N to 1 at fan-out. SBCL only (the bench convention).
 bench-multi-dest-zc:
-	$(SBCL) --eval '(asdf:load-system :dds-tests)' \
-	        --eval '(handler-case (progn (uiop:symbol-call :dds.tests :run-bench-multi-dest-zc :file "bench/report/2026-07-05-wp-zc-multi-dest.md") (uiop:quit 0)) (error (e) (format t "~&~a~%" e) (uiop:quit 1)))'
+	$(TIMEOUT) $(BENCH_TIMEOUT) $(SBCL) --eval '(asdf:load-system :dds-tests)' \
+	        --eval '(handler-case (progn (uiop:symbol-call :dds.tests :run-bench-multi-dest-zc :file "bench/report/2026-07-05-wp-zc-multi-dest.md") (dds.pal:exit-process 0)) (error (e) (format t "~&~a~%" e) (dds.pal:exit-process 1)))'
 
 # WP-ASYNC-FLOW Phase F1 (FR-PF-2, FR-LANG-7): HONEST rate-shaping report — achieved-vs-configured rate,
 # single-writer paced vs the enable-async UNPACED baseline (pacing ADDS latency by design — no 0-cost claim),
@@ -396,8 +416,8 @@ bench-multi-dest-zc:
 # FR-PF-2 headline). Standard DDS, NOT R6 (ADR 0016). Writes bench/report/2026-06-15-wp-async-flow.md. SBCL
 # only (real threads + timing; the bench convention).
 bench-async-flow:
-	$(SBCL) --eval '(asdf:load-system :dds-tests)' \
-	        --eval '(handler-case (progn (uiop:symbol-call :dds.tests :run-bench-async-flow :file "bench/report/2026-06-15-wp-async-flow.md") (uiop:quit 0)) (error (e) (format t "~&~a~%" e) (uiop:quit 1)))'
+	$(TIMEOUT) $(BENCH_TIMEOUT) $(SBCL) --eval '(asdf:load-system :dds-tests)' \
+	        --eval '(handler-case (progn (uiop:symbol-call :dds.tests :run-bench-async-flow :file "bench/report/2026-06-15-wp-async-flow.md") (dds.pal:exit-process 0)) (error (e) (format t "~&~a~%" e) (dds.pal:exit-process 1)))'
 
 # WP-FLOW-EDF-PRIORITY (ADR 0016; FR-QOS-1, FR-LANG-7): deterministic ordering-quality report for the :edf +
 # :priority scheduling policies vs round-robin — EDF deadline-miss count for mixed LATENCY_BUDGET streams, and
@@ -405,8 +425,8 @@ bench-async-flow:
 # sim over the SHIPPED %flow-policy-* selectors (injected clock). Standard DDS, NOT R6 (ADR 0016). Writes
 # bench/report/2026-07-04-wp-flow-edf-priority.md. SBCL (bench convention; the sim is threadless/impl-agnostic).
 bench-flow-edf-priority:
-	$(SBCL) --eval '(asdf:load-system :dds-tests)' \
-	        --eval '(handler-case (progn (uiop:symbol-call :dds.tests :run-bench-flow-edf-priority :file "bench/report/2026-07-04-wp-flow-edf-priority.md") (uiop:quit 0)) (error (e) (format t "~&~a~%" e) (uiop:quit 1)))'
+	$(TIMEOUT) $(BENCH_TIMEOUT) $(SBCL) --eval '(asdf:load-system :dds-tests)' \
+	        --eval '(handler-case (progn (uiop:symbol-call :dds.tests :run-bench-flow-edf-priority :file "bench/report/2026-07-04-wp-flow-edf-priority.md") (dds.pal:exit-process 0)) (error (e) (format t "~&~a~%" e) (dds.pal:exit-process 1)))'
 
 # WP-KEEPLAST Task E1 (DDS 1.4 §2.2.3.18, FR-LANG-7): HONEST writer-side cost of per-instance
 # KEEP_LAST. Drives dds.rtps.history:hc-add-change directly so the KEEP_LAST-vs-KEEP_ALL delta
@@ -414,30 +434,30 @@ bench-flow-edf-priority:
 # bytes/sample for KEEP_ALL/KEEP_LAST x keyed/unkeyed + the keyhash-derivation line; SBCL is the
 # record (AllegroCL bytes-consed=0, NFR-PORT gap). Writes bench/report/2026-06-16-wp-keeplast.md.
 bench-keeplast:
-	$(SBCL) --eval '(asdf:load-system :dds-bench)' \
+	$(TIMEOUT) $(BENCH_TIMEOUT) $(SBCL) --eval '(asdf:load-system :dds-bench)' \
 	        --eval '(with-open-file (s "bench/report/2026-06-16-wp-keeplast.md" :direction :output :if-exists :supersede :if-does-not-exist :create) (uiop:symbol-call :dds.bench :run-keeplast-bench :samples $(KLSAMPLES) :instances $(KLINSTANCES) :depth $(KLDEPTH) :stream s))' \
-	        --eval '(uiop:quit 0)'
+	        --eval '(dds.pal:exit-process 0)'
 
 # WP-DDS-SECURITY-SECURE-DISCOVERY T4 (§8.5.1.10-.12): whole-RTPS-message protection (SRTPS) encode+decode
 # micro-bench of a representative datagram submessage stream (SIGN + ENCRYPT); ns/op + GC bytes/op. T4
 # BASELINE (T10 re-measures the integrated path). SBCL is the record (AllegroCL bytes-consed=0, NFR-PORT).
 # Writes bench/report/2026-06-27-wp-secure-discovery-t4.md.
 bench-rtps-message:
-	$(SBCL) --eval '(asdf:load-system :dds-tests)' \
+	$(TIMEOUT) $(BENCH_TIMEOUT) $(SBCL) --eval '(asdf:load-system :dds-tests)' \
 	        --eval '(with-open-file (s "bench/report/2026-06-27-wp-secure-discovery-t4.md" :direction :output :if-exists :supersede :if-does-not-exist :create) (uiop:symbol-call :dds.tests :run-rtps-message-bench :iters $(RTPSITERS) :size $(RTPSSIZE) :stream s))' \
-	        --eval '(uiop:quit 0)'
+	        --eval '(dds.pal:exit-process 0)'
 
 bench-rtps-protection:
-	$(SBCL) --eval '(asdf:load-system :dds-tests)' \
+	$(TIMEOUT) $(BENCH_TIMEOUT) $(SBCL) --eval '(asdf:load-system :dds-tests)' \
 	        --eval '(with-open-file (s "bench/report/2026-06-28-wp-secure-discovery-t10.md" :direction :output :if-exists :supersede :if-does-not-exist :create) (uiop:symbol-call :dds.tests :run-rtps-protection-bench :iters $(RTPSITERS) :size $(RTPSSIZE) :stream s))' \
-	        --eval '(uiop:quit 0)'
+	        --eval '(dds.pal:exit-process 0)'
 
 # WP-SHMEM Task F1 (FR-XPORT-2): REAL two-OS-process cross-process SHMEM round-trip.
 # Two SEPARATE SBCL processes discover over loopback UDP (:peers, no multicast) and the
 # pub routes user DATA over SHARED MEMORY; PASS iff the sub received the samples AND the
 # pub's shmem-sends > 0. SBCL only — the harness launches two SBCL processes.
 shmem-xproc:
-	./scripts/shmem-roundtrip.sh
+	$(TIMEOUT) $(GATE_TIMEOUT) ./scripts/shmem-roundtrip.sh
 
 # WP-ZEROCOPY Phase E2 (FR-PF-3): REAL two-OS-process cross-process Zero-Copy round-trip.
 # Two SEPARATE SBCL processes discover over loopback UDP (:peers, no multicast) and the pub
@@ -445,11 +465,11 @@ shmem-xproc:
 # sub resolves it CROSS-PROCESS + verifies byte-exact. PASS iff the sub received >= threshold
 # AND the pub's zc-sends > 0. SBCL only. NOT cleared for ship — pending counsel (R6); ADR 0014.
 zc-xproc:
-	./scripts/zerocopy-roundtrip.sh
+	$(TIMEOUT) $(GATE_TIMEOUT) ./scripts/zerocopy-roundtrip.sh
 
 mem:
-	$(SBCL) --eval '(asdf:load-system :dds-tests)' \
-	        --eval '(handler-case (progn (dds.tests:run-mem-test) (uiop:quit 0)) (error (e) (format t "~&~a~%" e) (uiop:quit 1)))'
+	$(TIMEOUT) $(BENCH_TIMEOUT) $(SBCL) --eval '(asdf:load-system :dds-tests)' \
+	        --eval '(handler-case (progn (dds.tests:run-mem-test) (dds.pal:exit-process 0)) (error (e) (format t "~&~a~%" e) (dds.pal:exit-process 1)))'
 
 clean:
 	find . -name '*.fasl' -o -name '*.fasp' -o -name '*.faso' -o -name '*.fasc' | xargs -r rm -f

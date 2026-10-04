@@ -115,7 +115,15 @@ result; plan `docs/plans/2026-10-03-sbcl-allegro-full-ok.md`):
   `FLOW-TD-NO-WEDGE`, `LEASE-MATCHED`, `OFF-DEADLINE-FIRES`, `ONENODE-WRITER-A-DRAINED`, `RUNNER-C1-GOT-OWN`,
   `SCHED-A-DELIVERED`, `shmem-ring-drain-fuzz`, `SUP-REVIVED`, `TG4-TIMEOUT-MATCH`, `TLE-TIMEOUT`,
   `TLS-INDEX-HIT`, the `rti-shmem-recognition` test (`:SHMAT-FAILED`) and the `pvms-reliable-bootstrap` test) —
-  and the process **hangs at exit** (WP-0.11).
+  and the process **hung at exit**. **Since WP-0.11 (ADR 0121, uncommitted working tree, measured 2026-10-04)**
+  the suite **exits by itself** in about 3 minutes (188 s; it was killed at 1654 s before): every Lisp exit in
+  `src/` and in the `Makefile` now goes through `dds.pal:exit-process`, which runs a bounded shutdown-hook
+  chain (log-sink flush, durability store fsync, DARE secret wipe, `shm_unlink`) and then a hard exit that
+  waits for no thread. That run: 631/650 (the suite grew by the two exit-process tests, which pass);
+  `shmem-ring-drain-fuzz` now passes (WP-0.7); `dcps-read-status-reset` failed once, a pre-existing AllegroCL
+  timing flake measured at about 9-10 % per run with or without this change; and the new leaked-thread check
+  lists 8 `dds-*` threads left by two tests that already fail. SBCL in the same tree: 650/650, 0 leaked
+  threads.
 - **CI:** the hosted workflow (`.github/workflows/gates.yml`) runs **SBCL only** and prints the AllegroCL legs
   as NOT COVERED; AllegroCL is a local step until the CI licence question is settled.
 - **Allocation:** `make mem` measures the **CDR codec only** (0 bytes/iteration serialize/deserialize on SBCL);

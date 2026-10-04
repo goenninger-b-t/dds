@@ -31,18 +31,61 @@
   "Release SINK via its close closure."
   (funcall (log-sink-close sink)))
 
+;; ADR 0121: the output streams of every live stream/file sink, so the exit chain can flush what an orderly
+;; close-sink never reached. Control plane: sinks are made and closed at collector setup/teardown.
+(defvar *live-sink-streams* (make-hash-table :test 'eq)
+  "Set (EQ hash table) of the character streams written by a live MAKE-STREAM-SINK / MAKE-FILE-SINK sink.
+   An entry is added when the sink is made and removed by CLOSE-SINK. Guarded by *LIVE-SINK-STREAMS-LOCK*.
+   Read by the :LOG-SINK-FLUSH shutdown hook (ADR 0121). Not exported.")
+
+(defvar *live-sink-streams-lock* (dds.pal:make-lock "dds-log-sink-streams")
+  "Guards *LIVE-SINK-STREAMS*.")
+
+(defun* %note-sink-stream (stream live)
+    (function (t t) (eql t))
+  "Add STREAM to *LIVE-SINK-STREAMS* when LIVE is true, else remove it (ADR 0121)."
+  (dds.pal:with-lock (*live-sink-streams-lock*)
+    (if live
+        (setf (gethash stream *live-sink-streams*) t)
+        (remhash stream *live-sink-streams*)))
+  t)
+
+(defun* %flush-live-sink-streams ()
+    (function () (values (integer 0) (or null keyword)))
+  "Shutdown hook :LOG-SINK-FLUSH (ADR 0121): FINISH-OUTPUT every stream of a live stream/file sink, so log
+   records already handed to a sink reach the file or console before the hard exit, which flushes nothing.
+   FLUSH, NOT CLOSE: the collector thread may still be writing. A stream that is no longer open is skipped.
+   Each stream is guarded on its own. Returns
+   (VALUES FLUSHED STATUS): STATUS is NIL, or :FLUSH-FAILED when at least one stream signalled.
+   NOT COVERED: events still queued in an ASYNC logger's ring (emit.lisp) have not reached any sink and
+   would need a DDS write to leave the process; only CLOSE-LOGGER drains them."
+  (let ((streams (dds.pal:with-lock (*live-sink-streams-lock*)
+                   (loop for k being the hash-keys of *live-sink-streams* collect k)))
+        (n 0) (bad nil))
+    (dolist (s streams)
+      ;; A stream its owner already closed (a borrowed string stream whose WITH-OUTPUT-TO-STRING ended) has
+      ;; nothing left to flush and is not a failure.
+      (handler-case (when (open-stream-p s) (finish-output s) (incf n))
+        (error () (setf bad t))))
+    (values n (when bad :flush-failed))))
+
+(dds.pal:register-shutdown-hook :log-sink-flush '%flush-live-sink-streams)
+
 (defun* make-stream-sink (stream &key (formatter #'format-log-event-text))
     (function (t &key (:formatter function)) log-sink)
   "A sink that writes each event to the character STREAM as one FORMATTER-rendered record per line
    (newline-delimited), force-output after each so nothing lingers unflushed. The stream is BORROWED —
    close-sink finish-outputs but does NOT close it (unlike make-file-sink, which owns its file). Use for
-   *standard-output*/*error-output* or any already-open stream (the log service's default console sink)."
+   *standard-output*/*error-output* or any already-open stream (the log service's default console sink).
+   The stream is flushed by the :LOG-SINK-FLUSH shutdown hook if the process exits before close-sink
+   (ADR 0121)."
+  (%note-sink-stream stream t)
   (%make-log-sink
    :write (lambda (event)
             (write-string (funcall formatter event) stream)
             (write-char #\Newline stream)
             (force-output stream))
-   :close (lambda () (finish-output stream))))
+   :close (lambda () (%note-sink-stream stream nil) (finish-output stream))))
 
 (defun* make-file-sink (path &key (formatter #'format-log-event-text) (if-exists :append))
     (function (t &key (:formatter function) (:if-exists keyword)) log-sink)
@@ -57,7 +100,7 @@
                             :element-type 'character :external-format :utf-8))
          (inner (make-stream-sink stream :formatter formatter)))
     (%make-log-sink :write (log-sink-write inner)
-                    :close (lambda () (close stream)))))
+                    :close (lambda () (%note-sink-stream stream nil) (close stream)))))
 
 (defun* make-udp-syslog-sink (host port &key (facility 1))
     (function (string (integer 0 65535) &key (:facility (integer 0 23))) log-sink)

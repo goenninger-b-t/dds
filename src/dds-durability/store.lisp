@@ -78,6 +78,29 @@
 
 ;;; durable-store vtable: function slots mirror the transport pattern (FR-XPORT-5 analogue).
 
+;; ADR 0121: every store opened through STORE-OPEN and not yet closed through STORE-CLOSE, so the exit chain
+;; can flush+fsync what an orderly teardown never closed. Control plane: open/close happen at service
+;; start/stop, never per sample.
+(defvar *open-stores* (make-hash-table :test 'eq)
+  "Set (EQ hash table) of the DURABLE-STOREs opened by STORE-OPEN and not yet closed by STORE-CLOSE. Guarded
+   by *OPEN-STORES-LOCK*. Read by the :DURABILITY-STORE-SYNC shutdown hook (ADR 0121). Not exported.")
+
+(defvar *open-stores-lock* (dds.pal:make-lock "dds-durability-open-stores")
+  "Guards *OPEN-STORES*.")
+
+(defun* %note-store-opened (store)
+    (function (t) (eql t))
+  "Record STORE as open (ADR 0121). Called by STORE-OPEN on a clean open only."
+  (dds.pal:with-lock (*open-stores-lock*) (setf (gethash store *open-stores*) t))
+  t)
+
+(defun* %note-store-closed (store)
+    (function (t) (eql t))
+  "Forget STORE (ADR 0121). Called by STORE-CLOSE; forgetting a store never recorded is a no-op (a store
+   whose open failed is still closed by its owner)."
+  (dds.pal:with-lock (*open-stores-lock*) (remhash store *open-stores*))
+  t)
+
 (defstruct* (durable-store (:constructor %make-durable-store))
   "Pluggable persistence vtable (ADR 0021): every operation is a function slot so the
    caller is decoupled from the backing implementation (memory, file, or db)."
@@ -179,7 +202,9 @@
   (declare (type durable-store store)
            (type (or null (member :keep-all :keep-last)) history-kind)
            (type (or null (integer 1)) history-depth))
-  (funcall (durable-store-open store) history-kind history-depth))
+  (multiple-value-bind (ok status) (funcall (durable-store-open store) history-kind history-depth)
+    (when (and ok (null status)) (%note-store-opened store))   ; ADR 0121: the exit chain syncs it
+    (values ok status)))
 
 (defun* store-close (store)
     (function (durable-store) (values (eql t) (or null keyword)))
@@ -187,6 +212,7 @@
    (VALUES T STATUS): STATUS is NIL on a clean close, or :FSYNC-FAILED when a backend's close-time persist
    flush (e.g. the file store's topics.map dirent) failed (ADR 0064 — a status value, never an unwind; the
    in-memory / SQLite / microservice / encrypted backends return (VALUES T NIL))."
+  (%note-store-closed store)   ; ADR 0121: forget it BEFORE closing, so the exit chain never syncs a closed store
   (funcall (durable-store-close store)))
 
 (defun* store-count (store &optional topic)
@@ -204,6 +230,36 @@
    value, never an unwind; the collect-loop group-commit tick surfaces it via *durability-error-hook*)."
   (let ((f (durable-store-sync store)))
     (if f (values t (nth-value 1 (funcall f))) (values t nil))))
+
+(defun* %sync-open-stores ()
+    (function () (values (integer 0) (or null keyword)))
+  "Shutdown hook :DURABILITY-STORE-SYNC (ADR 0121): STORE-SYNC every store that is still open
+   (*OPEN-STORES*), so records a service accepted are flushed and fsynced before the process ends even when
+   its orderly teardown (service-stop, which closes the store) never ran. SYNC, NOT CLOSE: another thread
+   (a collect loop) may still be using the store, and the file backend's sync takes the store lock, so it
+   cannot interleave with a put. Each store is guarded on its own; a failed flush is reported on
+   *ERROR-OUTPUT* and the remaining stores are still synced. Returns (VALUES SYNCED STATUS): the number
+   synced without error, and NIL or :FSYNC-FAILED when at least one did not, which the exit chain counts as
+   a failed hook (a requested exit status 0 becomes 70, so an unsynced store cannot report success)."
+  (let ((stores (dds.pal:with-lock (*open-stores-lock*)
+                  (loop for k being the hash-keys of *open-stores* collect k)))
+        (n 0) (bad nil))
+    (dolist (st stores)
+      (handler-case
+          (multiple-value-bind (ok status) (store-sync st)
+            (declare (ignore ok))
+            (if status
+                (progn (setf bad t)
+                       (format *error-output* "~&dds.durability: exit sync of a ~(~a~) store failed: ~a~%"
+                               (durable-store-name st) status))
+                (incf n)))
+        (error (c)
+          (setf bad t)
+          (ignore-errors
+           (format *error-output* "~&dds.durability: exit sync of a store signalled: ~a~%" c)))))
+    (values n (when bad :fsync-failed))))
+
+(dds.pal:register-shutdown-hook :durability-store-sync '%sync-open-stores)
 
 (defun* store-set-chain-mac-fn (store fn &optional required grandfather-set)
     (function (durable-store (or null function) &optional t (or null hash-table)) (eql t))

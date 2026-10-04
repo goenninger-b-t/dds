@@ -9,5 +9,8 @@
   :components ((:file "pal-contract")
                (:file "pal-sbcl"    :if-feature :sbcl)
                (:file "pal-allegro" :if-feature :allegro)
-               (:file "pal-net"))
+               (:file "pal-net")
+               ;; ADR 0121: EXIT-PROCESS and the shutdown-hook chain. Last, because it registers the PAL's own
+               ;; hook over the shm registry in pal-net and calls each backend's %HARD-EXIT.
+               (:file "pal-exit"))
   :in-order-to ((test-op (test-op "dds-tests"))))

@@ -22,6 +22,7 @@ make test-all      # test on both — where an impl is absent, use the per-impl 
 make gate-build    # THE build gate: clean-cache rebuild + a falsification self-test (see below)
 make gate-types    # every defun has a single-line ftype declaim (FR-LANG-8)
 make gate-pal      # no reader conditionals outside dds-pal/ (contract §10, NFR-PORT); no Clasp token anywhere (ADR 0118)
+make gate-quit-lint # src/ exits only via dds.pal:exit-process — no uiop:quit / sb-ext:exit / excl:exit (ADR 0121)
 make gate-hotpath  # no CLOS dispatch (NFR-CLOS) + no UNJUSTIFIED allocation (NFR-MEM) in hot-path files
 make mem           # CODEC-only: 0 bytes/sample serialize + deserialize (NFR-PERF-8) — see the caveat below
 make gate-mem      # NFR-MEM RATCHET: END-TO-END bytes/sample, must not regress (ADR 0062). SBCL only:
@@ -30,6 +31,16 @@ make gate-arena    # FR-PF-7: the process static-memory budget is real, charged 
 make wire          # validate emitted RTPS against the tshark RTPS dissector (FR-TOOL-3)
 make interop       # LIVE cross-vendor interop: Connext 7.3.1 + Fast DDS (FR-IO)
 ```
+
+**Every Lisp run the Makefile starts is bounded** (ADR 0121): it runs under `timeout --kill-after=60 N`,
+which sends TERM to the run's whole process group at N seconds and KILL 60 s later, and exits 124 (137 after
+the KILL), never 0. Defaults: `BUILD_TIMEOUT`, `TEST_TIMEOUT` and `GATE_TIMEOUT` 3600 s, `BENCH_TIMEOUT`
+7200 s; the interactive participants (`square-pub` & co.) run under `--foreground` with `RUN_TIMEOUT=24h` so
+Ctrl-C still reaches them. Override per run, e.g. `make test LISP=./scripts/with-allegro.sh TEST_TIMEOUT=5400`.
+Every Lisp form in the Makefile ends the process with `(dds.pal:exit-process CODE)`, which cannot hang on a
+thread parked in a foreign call (the AllegroCL suite used to, after printing its summary). `make test` also
+**fails on a leaked `dds-*` thread**: `run-all-tests` lists every thread it started that is still alive after
+the last test and a 5 s grace period.
 
 ### `make mem` vs `make gate-mem` — read this before trusting either
 

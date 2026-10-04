@@ -427,6 +427,81 @@ The `teardown-deadline` test (`make test-sbcl`) is the falsifier: it asserts a c
 a wedged thread reports `:timeout` **under its own site keyword**, and the emit barrier *terminates* —
 asserted on elapsed time, not merely on the return value.
 
+### Process exit — `dds.pal:exit-process` and the shutdown-hook chain (ADR 0121)
+
+**The rule: code in `src/` ends the process only through `dds.pal:exit-process`.** `make gate-quit-lint` bans
+`uiop:quit`, `sb-ext:exit`/`quit` and `excl:exit` everywhere in `src/` outside `src/dds-pal/`, in code,
+strings and comments, plus the indirect forms `uiop:symbol-call` of `quit`/`exit` and a CFFI
+`foreign-funcall` of `"exit"`/`"_exit"`, and proves on every run that it catches all twelve canary lines.
+
+Why. `uiop:quit` on AllegroCL calls `excl:exit` without `:no-unwind`, which waits for every Lisp process to
+unwind, and a process parked in a foreign call never does. Measured on this host: with one thread blocked in
+`read(2)` on a pipe, `(uiop:quit 7)` was still running when `timeout 40` killed it, while
+`(excl:exit 7 :no-unwind t :quiet t)` exited 7 in 2.8 s. That is how the full AllegroCL suite hung at exit.
+A plain hard exit is not the answer either: it would skip the cleanup an orderly teardown does (key wipe,
+store fsync, `shm_unlink`). `exit-process` keeps the cleanup and bounds it.
+
+| Symbol | Kind | Description |
+|---|---|---|
+| `dds.pal:exit-process` | function | `(&optional (code 0))`, never returns. On the first thread to call it: start a watchdog, run every registered shutdown hook newest-first (each guarded, so one failure does not skip the rest), `finish-output` the standard streams, then hard-exit: SBCL `(sb-ext:exit :code code :abort t)` (`_exit(2)`), AllegroCL `(excl:exit code :no-unwind t :quiet t)` (lambda list read from the image: `(&optional code &key no-unwind quiet)`). Neither waits for another thread. If `code` is 0 but a hook failed or the watchdog fired, the status is `+exit-shutdown-incomplete+` instead. A second caller on another thread parks (the first ends the process); a recursive call from a hook hard-exits at once with its own code, except that 0 becomes `+exit-shutdown-incomplete+` (the chain was truncated). |
+| `dds.pal:register-shutdown-hook` | function | `(name function) → name`. Registers a 0-argument function (or a symbol naming one) under the keyword `name`. LIFO: the newest runs first. Re-registering a name replaces its function in place, keeping its position. A hook runs **while other threads may still be running**: it may wipe, flush, sync and unlink names, never free or close something another thread may be using. It fails by returning a non-NIL second value (a status keyword) or by signalling; both are caught and reported on `*error-output*`. |
+| `dds.pal:unregister-shutdown-hook` | function | `(name) → boolean` — `t` if a hook was removed. |
+| `dds.pal:shutdown-hook-names` | function | `() → list` — the registered names in run order. |
+| `dds.pal:*shutdown-hook-timeout-seconds*` | special | Default `10`. Upper bound on the hook chain plus the stream flush. When it expires a watchdog thread writes one line to fd 2 with `write(2)` (no Lisp stream, so a wedged stream lock cannot stop it) and hard-exits. Read once per `exit-process` call. |
+| `dds.pal:+exit-shutdown-incomplete+` | constant | `70`, `EX_SOFTWARE` (`/usr/include/sysexits.h:102`). The exit status used when the caller asked for 0 but the cleanup did not complete. A caller's non-zero code is never replaced. |
+
+**The built-in hooks**, in the order they run when the whole stack is loaded (the reverse of load order):
+
+| Hook | Registered by | What it does at exit | What it deliberately does not do |
+|---|---|---|---|
+| `:log-sink-flush` | `dds-log` (`sink.lisp`) | `finish-output` on every live stream/file sink's stream | close it (the collector thread may still write); drain an async logger's ring (that needs a DDS write) |
+| `:durability-store-sync` | `dds-durability` (`store.lisp`) | `store-sync` (flush + fsync) every store opened by `store-open` and not yet closed; a failed sync is `:fsync-failed` | close it (a collect loop may still use it; the file backend's sync takes the store lock) |
+| `:dare-secret-wipe` | `dds-dare` (`primitives.lisp`) | zero every secret buffer made by `%make-secret-octets` and not yet released by `free-secret-octets`, and pass each to `*secret-wipe-readback-hook*` when set | release it: a thread mid-AEAD would read freed memory; with a zeroed key it fails closed instead |
+| `:pal-shm-unlink` | `dds-pal` (`pal-exit.lisp`) | `shm_unlink` every POSIX shm object created by `shm-create` and not yet unlinked by `shm-destroy` | unmap it (the kernel frees it with the last mapping, i.e. the exit itself) |
+
+Without the last one, a process that exits without its orderly teardown leaves its segments in `/dev/shm`
+until reboot. Not covered: DDS-Security KxKey buffers (`dds.security` allocates them with `alloc-static`
+directly, not through `dds-dare`), System V segments created for RTI Connext shared-memory interop, and an
+async logger's queued events.
+
+**Example — a service entry point.**
+
+```lisp
+(defun* run-my-service (&key (block t))
+    (function (&key (:block t)) t)
+  "Run until SIGTERM/SIGINT, tear down in order, then end the process through the hook chain."
+  (let ((svc (start-my-service)) (stop (list nil)))
+    (if (not block)
+        svc
+        (progn
+          (dds.pal:install-signal-handler '(:term :int) (lambda () (setf (car stop) t)))
+          (format t "~&MY-SERVICE-READY~%") (finish-output)   ; readiness AFTER the handler exists
+          (loop until (car stop) do (sleep 0.2))
+          (stop-my-service svc)            ; the orderly path does the real teardown ...
+          (dds.pal:exit-process 0)))))     ; ... the hooks clean up whatever it did not reach
+```
+
+A subsystem that owns a resource type registers one hook at load time, over a registry it maintains itself:
+
+```lisp
+(dds.pal:register-shutdown-hook :my-thing-flush
+  (lambda ()
+    (let ((bad nil))
+      (dolist (x (live-things))                     ; a snapshot taken under the registry's lock
+        (unless (flush-thing x) (setf bad t)))
+      (values t (when bad :flush-failed)))))        ; a status, never a signal (ADR 0064)
+```
+
+The falsifiers are `run-exit-hook-chain-test` (the chain on synthetic hooks, plus the four registries) and
+`run-exit-process-subprocess-test`, which starts three children of the running Lisp and checks, on SBCL and on
+AllegroCL: a child with a thread parked in `read(2)` exits with its code within 30 s, its planted secret read
+back as zeros and its planted segment gone; a child whose hook never returns is ended by the watchdog with 70;
+and a real `durability-service-main`, sent SIGTERM after it prints `DURABILITY-SERVICE-READY`, exits 0 with
+its planted secret wiped and both its planted segment and its participant's segment unlinked.
+
+`run-all-tests` also lists every thread the suite started that is still alive at the end and **fails the run
+on any `dds-*` thread** (after a 5 s grace period); other threads are listed but do not fail it.
+
 ## Examples
 
 Each block below is adapted from a passing test in `src/dds-tests/`.

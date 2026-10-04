@@ -1057,6 +1057,38 @@
   "A mapped POSIX shared-memory object: NAME (e.g. \"/dds...\"), FD, foreign SAP, byte SIZE."
   (name "" :type string) (fd -1 :type fixnum) (sap nil :type t) (size 0 :type (integer 0)))
 
+;; ADR 0121: the names of the POSIX shm objects THIS process created and has not yet unlinked. SHM-CREATE adds
+;; on success, SHM-DESTROY removes, and the :PAL-SHM-UNLINK shutdown hook (pal-exit.lisp) unlinks whatever is
+;; left when the process ends through EXIT-PROCESS. Control plane only: segment create/destroy happen at
+;; participant and pool setup/teardown, never per sample.
+(defvar *owned-shm-names* (make-hash-table :test 'equal)
+  "Set (hash table, EQUAL on the name string) of the POSIX shm object names this process created via
+   SHM-CREATE and has not unlinked via SHM-DESTROY. Guarded by *OWNED-SHM-LOCK*. Read by the
+   :PAL-SHM-UNLINK shutdown hook (ADR 0121). Not exported.")
+
+(defvar *owned-shm-lock* (make-lock "dds-shm-registry")
+  "Guards *OWNED-SHM-NAMES*.")
+
+(defun* %note-shm-created (name)
+    (function (string) (eql t))
+  "Record NAME as a shm object this process owns (ADR 0121). Called by SHM-CREATE on success only."
+  (with-lock (*owned-shm-lock*) (setf (gethash name *owned-shm-names*) t))
+  t)
+
+(defun* %note-shm-destroyed (name)
+    (function (string) (eql t))
+  "Forget NAME (ADR 0121). Called by SHM-DESTROY; forgetting a name never recorded is a no-op, because
+   SHM-DESTROY is also used to clear a stale leftover before a create."
+  (with-lock (*owned-shm-lock*) (remhash name *owned-shm-names*))
+  t)
+
+(defun* %owned-shm-names ()
+    (function () list)
+  "A fresh list of the shm object names this process currently owns (ADR 0121). For the shutdown hook and
+   for tests; the order is unspecified."
+  (with-lock (*owned-shm-lock*)
+    (loop for k being the hash-keys of *owned-shm-names* collect k)))
+
 (defun* %mmap-shared (fd size)
     (function (fixnum (integer 1)) (values t (or null keyword)))
   "mmap SIZE bytes of FD shared R/W. Returns (values sap NIL), or (values NIL :MMAP-FAILED) on
@@ -1129,6 +1161,7 @@
       (bail :ftruncate-failed))
     (multiple-value-bind (sap status) (%mmap-shared fd size)
       (when status (cffi:foreign-funcall "close" :int fd :int) (bail status))
+      (%note-shm-created name)   ; ADR 0121: the exit chain unlinks whatever this process still owns
       (values (make-shm-segment :name name :fd fd :sap sap :size size) nil))))
 
 (defun* shm-attach (name size)
@@ -1152,7 +1185,13 @@
   (cffi:foreign-funcall "munmap" :pointer (shm-segment-sap segment) :unsigned-long (shm-segment-size segment) :int)
   (cffi:foreign-funcall "close" :int (shm-segment-fd segment) :int))
 
-(defun* shm-destroy (name) (function (string) t) "shm_unlink NAME." (cffi:foreign-funcall "shm_unlink" :string name :int))
+(defun* shm-destroy (name)
+    (function (string) t)
+  "shm_unlink NAME, and drop NAME from this process's owned-segment registry (ADR 0121), so the
+   :PAL-SHM-UNLINK shutdown hook does not unlink it a second time. Unlinking only removes the name; a
+   mapping that is still live stays valid until SHM-DETACH."
+  (%note-shm-destroyed name)
+  (cffi:foreign-funcall "shm_unlink" :string name :int))
 
 ;; System V shared-memory primitives (FR-XPORT-2, ADR 0081). A SECOND, distinct mechanism from the
 ;; POSIX shm_open/mmap objects above, needed because RTI Connext's shared-memory transport uses SysV

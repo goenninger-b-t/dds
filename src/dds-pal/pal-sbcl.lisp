@@ -298,6 +298,23 @@
          (funcall callback)))))
   t)
 
+(defun* %hard-exit (code)
+    (function ((integer 0 255)) nil)
+  "End the process NOW with exit status CODE: SB-EXT:EXIT :ABORT T, which calls _exit(2) without unwinding
+   any stack, without running SB-EXT:*EXIT-HOOKS*, without terminating or joining other threads and without
+   flushing Lisp streams (sb-ext:exit docstring, SBCL 2.2.9). The ONLY caller is EXIT-PROCESS (pal-exit.lisp),
+   which has already run the shutdown-hook chain and flushed the standard streams, so nothing it needs is
+   skipped.
+
+   Why :ABORT T and not the :TIMEOUT protocol. A non-abort exit unwinds this thread, runs *EXIT-HOOKS*, then
+   TERMINATE-THREADs every other thread and joins them for at most :TIMEOUT seconds (default
+   SB-EXT:*EXIT-TIMEOUT*, 60). The docstring is explicit that TIMEOUT 'applies only to JOIN-THREAD, not
+   *EXIT-HOOKS*', and the unwind itself runs arbitrary UNWIND-PROTECT cleanups, so neither phase is bounded.
+   A thread parked in a foreign call does not see TERMINATE-THREAD until it returns to Lisp, so the 60 s join
+   is the BEST case. EXIT-PROCESS owns the bounded cleanup itself (the hook chain plus its watchdog); what it
+   needs from the implementation is the one primitive that cannot wait, and that is _exit(2)."
+  (sb-ext:exit :code code :abort t))
+
 (defun* register-image-restart-hook (hook)
     (function ((or symbol function)) (eql t))
   "Register HOOK (a 0-arg function or fbound symbol) to run at IMAGE STARTUP — after a save-lisp-and-die dump
@@ -365,8 +382,27 @@
 
    ⛔ THE FLAGS ARE NOT COSMETIC. A child handed another implementation's flags does not report an error —
    it treats them as garbage and the parent waits forever for a service that never started, which is how
-   the durability runner's SBCL-only argv stalled the whole suite on AllegroCL."
-  (let ((bin (uiop:argv0)))
-    (when (and bin (plusp (length bin)))          ; no argv0 => the caller cannot launch a child at all
-      (append (list bin) (list "--dynamic-space-size" "512")
+   the durability runner's SBCL-only argv stalled the whole suite on AllegroCL.
+
+   THE BINARY (ADR 0121). UIOP:ARGV0 is NIL in an SBCL that was not dumped as an executable, unless a wrapper
+   exports __CL_ARGV0 (uiop/image ARGV0) — measured NIL under scripts/with-sbcl.sh on SBCL 2.2.9, so this
+   function used to answer NIL there and every caller bailed (the durability runner's :NO-ARGV0). The
+   fallback is this image's own runtime and core, SB-EXT:*RUNTIME-PATHNAME* and SB-EXT:*CORE-PATHNAME*
+   (measured: /usr/bin/sbcl and /usr/bin/../lib/sbcl/sbcl.core), passed as `--core`, a runtime option that
+   precedes --dynamic-space-size. The child is then the same SBCL as its parent by construction.
+
+   QUICKLISP. Like the AllegroCL arm, the child loads Quicklisp itself when it is not already present (a
+   user init file that loads it sets :QUICKLISP first, so the probe-guarded load does not run twice), so the
+   child does not depend on ~/.sbclrc existing to find this system's dependencies."
+  (let* ((argv0 (uiop:argv0))
+         (bin (if (and argv0 (plusp (length argv0)))
+                  argv0
+                  (and sb-ext:*runtime-pathname* (namestring sb-ext:*runtime-pathname*))))
+         (core (and (not (and argv0 (plusp (length argv0)))) sb-ext:*core-pathname*
+                    (namestring sb-ext:*core-pathname*))))
+    (when (and bin (plusp (length bin)))          ; no binary => the caller cannot launch a child at all
+      (append (list bin)
+              (when core (list "--core" core))
+              (list "--dynamic-space-size" "512")
+              (list "--eval" "(unless (find-package \"QL\") (let ((p (or (probe-file (merge-pathnames \"quicklisp/setup.lisp\" (user-homedir-pathname))) (probe-file \"/opt/common-lisp/quicklisp/setup.lisp\")))) (when p (load p))))")
               (loop for f in forms append (list "--eval" f))))))

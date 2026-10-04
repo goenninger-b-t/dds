@@ -4214,12 +4214,16 @@
 
 (defun* run-all-tests ()
     (function () t)
-  "Run every landed test; signal on first failure, else report and return T."
+  "Run every landed test (a failure is recorded and the run continues), report skips, stuck teardown joins
+   and leaked dds-* threads (ADR 0121), then signal TEST-FAILURE if any test failed or any dds-* thread the
+   suite started is still alive; else return T."
   (let ((tests '(("md5-rfc1321"               . run-md5-test)
                  ("endpoint-registry"        . run-endpoint-registry-test)
                  ("echo-over-mock-transport" . run-echo-test)
                  ("pal-fence"                . run-pal-fence-test)
                  ("pal-signal-handler"       . run-pal-signal-handler-test)
+                 ("pal-exit-hook-chain"      . run-exit-hook-chain-test)          ; ADR 0121
+                 ("pal-exit-process-subprocess" . run-exit-process-subprocess-test) ; ADR 0121: 3 child Lisps, SIGTERM
                  ("pal-sap-atomics"          . run-pal-sap-atomics-test)
                  ("pal-atomics"              . run-pal-atomics-test)
                  ("pal-sap-ref"              . run-sap-ref-test)
@@ -4881,14 +4885,22 @@
     ;; ⚠️ A failure can CASCADE: a test that dies mid-way may leave participants, threads or sockets behind
     ;; and break its successors. Read the FIRST failure as the real one and treat the rest as suspect until
     ;; re-run in isolation. That is still strictly better than learning nothing about them.
-    (let ((failures '()) (passed 0))
+    (let ((failures '()) (passed 0)
+          ;; ADR 0121: the threads alive BEFORE the first test. Anything else still alive after the last one
+          ;; (and a short grace period) was started by a test and never stopped.
+          (threads-before (dds.pal:live-threads))
+          ;; thread -> the test after which it was FIRST seen alive, so a leak names its likely source
+          (started-by (make-hash-table :test 'eq)))
       (dolist (test tests)
         (format t "~&  [test] ~a ... " (car test))
         (finish-output)
         (handler-case (progn (funcall (cdr test)) (incf passed) (format t "ok~%"))   ; HOTPATH-COND(TEST): the run-every-test harness — a failure is recorded, never allowed to end the run
           (error (e)
             (push (cons (car test) (princ-to-string e)) failures)
-            (format t "FAIL~%           ~a~%" e))))
+            (format t "FAIL~%           ~a~%" e)))
+        (dolist (th (dds.pal:live-threads))
+          (unless (or (member th threads-before :test #'eq) (gethash th started-by))
+            (setf (gethash th started-by) (car test)))))
       (format t "~&tests: ~d passed, ~d FAILED, ~d total.~%" passed (length failures) (length tests))
       ;; ADR 0092 built a report of every teardown wait that hit its deadline, and NOTHING EVER READ IT in a
       ;; suite run. A stuck teardown is invisible on its own — dds.pal:join-bounded returns :TIMEOUT and the
@@ -4930,9 +4942,57 @@
           (when fixtures
             (format t "~&teardown: ~{~a~^, ~} — deliberate TEST fixtures (ADR 0092 bounded-wait gates), expected.~%"
                     (mapcar (lambda (s) (format nil "~a x~a" (car s) (cdr s))) fixtures)))))
+      ;; ADR 0121: A LEAKED THREAD IS A FAILURE. The exit that follows a suite run no longer waits for any
+      ;; thread (dds.pal:exit-process hard-exits), so a test that leaves its participant's receiver or a
+      ;; service loop running would otherwise pass silently, and only the exit used to notice (AllegroCL hung
+      ;; at exit with 10 live threads). Every thread this stack starts is named dds-* (dds.pal:spawn's
+      ;; default and every named call site); one of those still alive here, after a grace period for
+      ;; asynchronous teardown, fails the run. A non-dds thread (an implementation's own finalizer, say) is
+      ;; listed but does not fail it.
+      (multiple-value-bind (leaked foreign) (%leaked-threads threads-before 5 started-by)
+        (if (or leaked foreign)
+            (progn
+              (when leaked
+                (format t "~&⚠️ LEAKED THREADS: ~d dds-* thread(s) started by the suite are still alive:~%"
+                        (length leaked))
+                (dolist (n leaked) (format t "     ~a~%" n)))
+              (when foreign
+                (format t "~&threads: ~d non-dds thread(s) also still alive (listed, not a failure): ~{~a~^, ~}~%"
+                        (length foreign) foreign)))
+            (format t "~&threads: 0 leaked — every thread the suite started has ended.~%"))
+        (when leaked
+          (push (cons "thread-leak-check"
+                      (format nil "~d dds-* thread(s) still alive after the last test: ~{~a~^, ~}"
+                              (length leaked) leaked))
+                failures)))
       (when failures
         (format t "~&FAILURES (the FIRST is the real one; later ones may be cascades):~%")
         (dolist (f (reverse failures)) (format t "  ~a~%    ~a~%" (car f) (cdr f)))
         (error 'test-failure :name :run-all-tests
-                             :detail (format nil "~d of ~d tests failed" (length failures) (length tests))))
+                             :detail (format nil "~d failure(s) across ~d tests (a thread-leak-check entry is not a test)"
+                                             (length failures) (length tests))))
       t)))
+
+(defun* %leaked-threads (before grace-seconds started-by)
+    (function (list real hash-table) (values list list))
+  "Threads alive now that were not in BEFORE (a DDS.PAL:LIVE-THREADS snapshot), after waiting up to
+   GRACE-SECONDS for the dds-* ones among them to end (teardown joins are bounded and some threads exit a
+   poll period after their stop flag). Returns (VALUES DDS-ENTRIES OTHER-ENTRIES): one string per remaining
+   thread, 'NAME (first seen after TEST)' using STARTED-BY (thread -> test name, filled by RUN-ALL-TESTS
+   after each test), split by whether NAME starts with \"dds\" (case-insensitive). ADR 0121."
+  (flet ((snapshot ()
+           (let ((dds '()) (other '()))
+             (dolist (th (dds.pal:live-threads))
+               (unless (member th before :test #'eq)
+                 (let* ((n (or (ignore-errors (dds.pal:thread-name th)) ""))
+                        (entry (format nil "~a (first seen after ~a)" n (gethash th started-by "the last test"))))
+                   (if (and (>= (length n) 3) (string-equal "dds" n :end2 3))
+                       (push entry dds)
+                       (push entry other)))))
+             (values (nreverse dds) (nreverse other)))))
+    (let ((deadline (+ (get-internal-real-time) (* grace-seconds internal-time-units-per-second))))
+      (loop
+        (multiple-value-bind (dds other) (snapshot)
+          (when (or (null dds) (> (get-internal-real-time) deadline))
+            (return (values dds other))))
+        (sleep 0.1)))))

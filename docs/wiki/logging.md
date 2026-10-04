@@ -159,6 +159,8 @@ The ring is **lock-based** — and stays that way: a micro-bench (`bench/report/
 
 The sink is chosen from `--file`: a `make-file-sink` (owns the file) when a path is given, else a `make-stream-sink` over `*standard-output*` (the console sink — a new sink that *borrows* a stream, flushing but not closing it).
 
+Every exit of `log-service-main` in `:block t` mode (`--help`, a bad configuration, the end of a signalled run) goes through `dds.pal:exit-process` (ADR 0121; [Transports — process exit](transports.md#process-exit--ddspalexit-process-and-the-shutdown-hook-chain-adr-0121)), never `uiop:quit`. Its `:log-sink-flush` hook runs `finish-output` on the stream of every stream or file sink that has not been closed with `close-sink`, so records already handed to a sink reach the file or console even when the process ends without the orderly `close-log-collector`; a stream its owner already closed is skipped. It flushes and never closes (the collector thread may still be writing). Events still queued in an async logger's ring (`make-logger :async t`) are **not** covered: they have not reached any sink, and only `close-logger` drains them.
+
 For running **several collectors under one process**, `dds.log:make-log-service-runner` takes a list of collectors it will own; `log-runner-start` spawns one drain thread per collector, and `log-runner-stop` joins them all and closes every collector. Each collector's participant is touched only by its own drain thread, so N collectors run without cross-thread races.
 
 ```lisp

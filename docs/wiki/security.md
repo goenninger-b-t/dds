@@ -155,6 +155,13 @@ ADR 0032 `free-secret-octets` secret discipline.  `make-key-material` hardens th
 at construction.  A moving GC can no longer copy the master secrets, freed heap cannot linger with
 them, and they can be reliably wiped (operating contract NFR-MEM / CNSA-2.0 data-at-rest).
 
+**At process exit (ADR 0121).** A master slot that no teardown released is still zeroed when the process
+ends through `dds.pal:exit-process`: `octets->secret` records every buffer in `dds-dare`'s live-secret
+registry, and the `:dare-secret-wipe` shutdown hook fills each remaining one with zeros (without releasing
+it, since a receiver thread may still be decoding with it). The KxKey/KxSalt buffers of the §9.5.3
+handshake (`derive-kx-key`) are allocated with `dds.pal:alloc-static` directly, are not in that registry and
+are not wiped at exit; `free-kx-key` remains their only wipe.
+
 The derived §9.5.3.3.4.2/.4.3 session-key caches (`cached-session-key`, `cached-recv-session-key`,
 `cached-recv-master-key`) are **ephemeral plain GC-heap** vectors — re-derivable per `session_id`
 from the master secrets, short-lived, GC-reclaimed; they are **not** long-lived secrets-at-rest.

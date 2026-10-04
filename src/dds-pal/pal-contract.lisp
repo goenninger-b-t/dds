@@ -62,6 +62,11 @@
    #:live-threads #:thread-name
    ;; process signal handling (SIGTERM/SIGINT -> 0-arg callback; ADR 0026 §10 graceful teardown)
    #:install-signal-handler
+   ;; process exit (ADR 0121): the ONE way our code ends the process — a bounded, LIFO, per-hook-guarded
+   ;; shutdown-hook chain, then a hard exit that waits for no other thread (AllegroCL's UIOP:QUIT hung on a
+   ;; thread parked in a foreign call)
+   #:exit-process #:register-shutdown-hook #:unregister-shutdown-hook #:shutdown-hook-names
+   #:*shutdown-hook-timeout-seconds* #:+exit-shutdown-incomplete+
    ;; image lifecycle: run a 0-arg hook at startup after a save-lisp-and-die restart, so a dumped core
    ;; can re-resolve state it cannot carry live across restart, e.g. foreign-symbol pointers / re-mapped
    ;; libraries (dds.dare EVP re-resolution; ADR 0038/0039 saved-image residual)

@@ -547,7 +547,7 @@
    line that is ALSO the interop-harness readiness marker).
    When BLOCK is T (operator / driver): installs a SIGTERM/SIGINT handler (dds.pal:install-signal-handler),
    BLOCKS until a signal, then microservice-server-stop (the clean §4.8 tcp-shutdown wake — no hang, no
-   leak), logs 'MS-SERVER-STOPPED port=P ... stopped cleanly', and calls UIOP:QUIT 0. When NIL (in-process /
+   leak), logs 'MS-SERVER-STOPPED port=P ... stopped cleanly', and calls DDS.PAL:EXIT-PROCESS 0. When NIL (in-process /
    testing): returns the running MICROSERVICE-SERVER for the caller to microservice-server-stop itself."
   (let ((srv (handler-case
                  (let ((inner (%make-server-inner inner-backend inner-dir)))
@@ -559,7 +559,7 @@
                  ;; then fail closed (exit non-zero in operator/driver mode, NIL in-process). It never
                  ;; unwinds to the Lisp toplevel. Only STARTUP is wrapped; the serve loop is unchanged.
                  (ignore-errors (funcall *durability-error-hook* c :server-start-failed 1))
-                 (if block (uiop:quit 1) (return-from %run-microservice-server nil))))))
+                 (if block (dds.pal:exit-process 1) (return-from %run-microservice-server nil))))))
     (let ((bound (microservice-server-port srv)))
       (format stream "~&MS-SERVER-LISTENING port=~d — durability microservice server listening (inner: ~(~a~) ~a, host ~a)~%"
               bound inner-backend (uiop:ensure-directory-pathname inner-dir) host)
@@ -571,7 +571,7 @@
             (microservice-server-stop srv)
             (format stream "~&MS-SERVER-STOPPED port=~d — durability microservice server stopped cleanly~%" bound)
             (finish-output stream)
-            (uiop:quit 0))
+            (dds.pal:exit-process 0))
           srv))))
 
 ;;; --- main entrypoint ---
@@ -579,24 +579,26 @@
 (defun* %durability-config-fail (status block)
     (function (durability-config-status t) t)
   "Report a config STATUS at the toplevel (ADR 0064: this is where a malformed CLI/env surfaces as an exit
-   code, never an unwind): print its MESSAGE + the usage to *error-output*, then UIOP:QUIT 1 when BLOCK (an
+   code, never an unwind): print its MESSAGE + the usage to *error-output*, then DDS.PAL:EXIT-PROCESS 1 when BLOCK (an
    operator run) or RETURN the STATUS when NIL (an in-process caller / test inspects it)."
   (format *error-output* "~&dds.durability: ~a~%~%~a"
           (durability-config-status-message status) (durability-usage))
   (finish-output *error-output*)
-  (if block (uiop:quit 1) status))
+  (if block (dds.pal:exit-process 1) status))
 
 (defun* durability-service-main (&key (argv nil) (env '()) (block t))
     (function (&key (:argv (or null list)) (:env (or list function)) (:block t)) t)
   "CLI/env entrypoint for the durability service.
    ARGV defaults to UIOP:COMMAND-LINE-ARGUMENTS when NIL. ENV is an alist or 1-arg fn.
    Parses config (including supervisor opts max-restarts/window-seconds), builds runner+supervisor.
-   When BLOCK is T (subprocess body), installs a SIGTERM/SIGINT handler, polls a shutdown flag,
-   then tears down in order (supervisor-stop -> runner-stop) and calls UIOP:QUIT 0.
+   When BLOCK is T (subprocess body), installs a SIGTERM/SIGINT handler, prints the readiness line
+   'DURABILITY-SERVICE-READY services=N ...' to *STANDARD-OUTPUT*, polls a shutdown flag, then tears down in
+   order (supervisor-stop -> runner-stop) and calls DDS.PAL:EXIT-PROCESS 0, whose shutdown-hook chain wipes
+   any secret, syncs any store and unlinks any shm segment the teardown did not reach (ADR 0121).
    When NIL, returns (CONS runner sup).
    FAIL-CLOSED START (ADR 0045/0064): if a spec fails to start — a tampered/corrupt store refusing to open
    is the security case — RUNNER-START sheds that spec and returns :SERVICE-START-FAILED; the started specs
-   are then torn down (zeroizing their DEKs) and the process fails closed: UIOP:QUIT 1 (BLOCK T, the exit
+   are then torn down (zeroizing their DEKs) and the process fails closed: DDS.PAL:EXIT-PROCESS 1 (BLOCK T, the exit
    code is the ReturnCode_t) or (VALUES (CONS runner sup) status) (BLOCK NIL).
 
    SERVICE PERSISTENCE BACKEND (semantics A, ADR 0050 §4.9): in the default SERVICE mode,
@@ -619,7 +621,7 @@
       ((%durability-help-requested-p effective-argv)
        (write-string (durability-usage) *standard-output*)
        (finish-output *standard-output*)
-       (if block (uiop:quit 0) :help))
+       (if block (dds.pal:exit-process 0) :help))
       ((%durability-server-mode-p effective-argv env)
        (multiple-value-bind (cfg status)
            (parse-durability-server-config :argv (or effective-argv '()) :env env)
@@ -649,7 +651,7 @@
                    ;; %durability-config-fail); nothing unwinds to the Lisp toplevel.
                    (ignore-errors (runner-stop runner))
                    (if block
-                       (uiop:quit 1)
+                       (dds.pal:exit-process 1)
                        (return-from durability-service-main (values (cons runner sup) start-status)))))
                (supervisor-start sup)
                (if block
@@ -658,7 +660,13 @@
                      (dds.pal:install-signal-handler
                       '(:term :int)
                       (lambda () (setf *durability-shutdown-requested* t)))
+                     ;; Operator line AND readiness marker (ADR 0121): printed only once the SIGTERM/SIGINT
+                     ;; handler is installed, so a supervisor that waits for it knows a TERM from then on
+                     ;; takes the orderly path below, not the implementation's default action.
+                     (format t "~&DURABILITY-SERVICE-READY services=~d — durability service running; SIGTERM/SIGINT stops it~%"
+                             (length specs))
+                     (finish-output)
                      (loop until *durability-shutdown-requested* do (sleep 0.2))
                      (%graceful-shutdown runner sup)
-                     (uiop:quit 0))
+                     (dds.pal:exit-process 0))
                    (cons runner sup)))))))))

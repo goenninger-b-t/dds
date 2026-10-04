@@ -386,17 +386,30 @@ sbcl --eval '(require :asdf)' \
 ### 5.1 Signal-driven graceful shutdown (WP-GRACEFUL-FFI-TEARDOWN, ADR 0030)
 
 When `:block t` (the default), `durability-service-main` installs a **SIGTERM/SIGINT handler**
-via `dds.pal:install-signal-handler` and blocks until the handler fires.  On receipt:
+via `dds.pal:install-signal-handler`, prints the readiness line
+`DURABILITY-SERVICE-READY services=N — …` to standard output, and blocks until the handler fires. A supervisor
+that waits for that line before it may send SIGTERM knows the orderly path below will run; a TERM that
+arrives earlier gets the implementation's default action. On receipt:
 
 ```
-supervisor-stop   ; no more restarts
-runner-stop       ; service-stop each service = join collect threads THEN store-close
-                  ; store-close:  fsync + free DARE DEKs + free static arena
-uiop:quit 0       ; no live foreign pointer at this point
+supervisor-stop          ; no more restarts
+runner-stop              ; service-stop each service = join collect threads THEN store-close
+                         ; store-close:  fsync + free DARE DEKs + free static arena
+dds.pal:exit-process 0   ; shutdown-hook chain, then a hard exit that waits for no thread (ADR 0121)
 ```
 
 The handler sets a flag (`*durability-shutdown-requested*`); all teardown runs in the blocking
 Lisp thread, never in the signal context.
+
+`dds.pal:exit-process` replaced `uiop:quit` here (ADR 0121; [Transports — process exit](transports.md#process-exit--ddspalexit-process-and-the-shutdown-hook-chain-adr-0121)).
+Its hook chain is the safety net under the orderly path: `:durability-store-sync` flushes and fsyncs every
+store still open, `:dare-secret-wipe` zeroes every secret buffer not yet released (`free-secret-octets`), and
+`:pal-shm-unlink` unlinks every shm object the process still owns. After a clean `runner-stop` they find
+nothing to do. Every other exit of `durability-service-main` (`--help`, a bad configuration, a refused store
+open, the microservice server's stop) goes through `exit-process` too. The exit status is the requested one,
+except that a requested 0 becomes 70 (`dds.pal:+exit-shutdown-incomplete+`) when a hook failed, so an unsynced
+store or an unwiped key cannot exit 0. `run-exit-process-subprocess-test` SIGTERMs a real service in a child
+Lisp on SBCL and AllegroCL and checks the exit status, the wipe read-back and the unlinked segments.
 
 **PAL primitive:** `dds.pal:install-signal-handler signals callback → t`
 
@@ -699,7 +712,12 @@ wrap the inner store in the decorator backed by a file key-provider:
   `v`; release `v` (under `unwind-protect`, so a hook that exits non-locally cannot leak it). The hook
   is a verification seam, NIL in production: it is the only point at which a test can read the wipe
   back on both SBCL and AllegroCL, because after the release the storage is gone. See
-  [Security §2.4](security.md) for a worked example.
+  [Security §2.4](security.md) for a worked example. Every secret buffer is also recorded, from its
+  allocation until this release, in a process-wide registry, and the `:dare-secret-wipe` shutdown hook
+  zeroes whatever is still in it when the process ends through `dds.pal:exit-process` (ADR 0121). The hook
+  wipes but does not release (another thread may still hold the key mid-AEAD; a zeroed key makes that call
+  fail closed), and it calls `*secret-wipe-readback-hook*` on each buffer it wipes, which is how the
+  exit-process test reads the wipe back from a child process.
 - `dds.dare:make-file-key-provider :dir DIR` — an ML-KEM-1024 keypair in `DIR/ml-kem-1024.{pub,key}`,
   generated on first open (perms enforced **0600 file / 0700 dir** and checked at open — a
   group/other-readable or unverifiable key **refuses to load**, fail-closed) and loaded thereafter.

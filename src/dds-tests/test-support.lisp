@@ -277,3 +277,8 @@
   "ADR 0106 review finding 1 isolation offset: CONCURRENT writes on one DataWriter. The arm asserts that
    every instance's key holder matches its own key after N threads write M instances each, so a foreign
    participant's traffic would add instances the per-instance assertions do not expect.")
+
+(defconstant +td-exit-process+ 65
+  "ADR 0121 isolation offset: the durability-service SUBPROCESS that the exit-process test SIGTERMs. The
+   child runs a real participant, so a foreign participant on the domain would only add discovery traffic,
+   but a sibling test's participant on the same domain could match its endpoints and delay its teardown.")

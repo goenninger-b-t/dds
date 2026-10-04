@@ -7,6 +7,9 @@
   :components ((:file "packages")
                (:file "test-support")
                (:file "echo-test")
+               ;; ADR 0121: exit-process + the shutdown-hook chain. exit-child.lisp is NOT a component: it is
+               ;; LOADed by the child processes this file starts.
+               (:file "exit-test")
                (:file "gen-test")
                (:file "rtps-test")
                (:file "pbt-test")

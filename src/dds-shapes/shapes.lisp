@@ -161,13 +161,13 @@
    expects. Delegates to DDS.DISC:PARSE-PEERS — the layer that owns the peer-list contract — so the shapes
    CLI, the perf/interop harness and any future caller convert a peers string the ONE way (DRY).
    A malformed spec is a HARD STOP at the shapes CLI: the reason is printed to *error-output* and the
-   process exits non-zero via uiop:quit — no signal, no silent multicast fallback (ADR 0064)."
+   process exits non-zero via dds.pal:exit-process — no signal, no silent multicast fallback (ADR 0064)."
   (multiple-value-bind (plist pstatus) (dds.disc:parse-peers peers)
     (when pstatus
       (format *error-output* "~&shapes: malformed --peers ~s (~a) — aborting (want host:port[,host:port]...).~%"
               peers pstatus)
       (finish-output *error-output*)
-      (uiop:quit 1))
+      (dds.pal:exit-process 1))
     plist))
 
 (defun* run-publisher (&key (domain 0) (color "BLUE") (shapesize 30) (rate 30) (count 0)
@@ -529,7 +529,7 @@
    reliable Square/ShapeType reader, bound to the deterministic loopback port for participant 0 and
    pointing :peers at the publisher (participant 1). Loopback-only (no multicast) sidesteps the macOS
    app-firewall LAN-UDP drop. Spins to the SECONDS deadline collecting samples, then prints
-   SHMEM-SUB-RECEIVED: <n> and uiop:quit 0 iff n >= THRESHOLD else 1. Same host as the pub => same
+   SHMEM-SUB-RECEIVED: <n> and dds.pal:exit-process 0 iff n >= THRESHOLD else 1. Same host as the pub => same
    host-uuid => the pub's user DATA arrives over shared memory, which this node's SHMEM receiver feeds
    into the identical engine path. Intended to be launched by scripts/shmem-roundtrip.sh."
   (let ((node (dds.disc:make-disc-node :guid-prefix (%make-prefix #x53) :domain domain
@@ -567,7 +567,7 @@
         (dds.disc:stop-node node))
       (format t "~&SHMEM-SUB-RECEIVED: ~d~%" seen)
       (force-output)
-      (uiop:quit (if (>= seen threshold) 0 1)))))
+      (dds.pal:exit-process (if (>= seen threshold) 0 1)))))
 
 (defun* run-shmem-xproc-pub (&key (domain 0) (color "BLUE") (count 60) (rate 30)
                                   (match-timeout 15) (advertise-address "127.0.0.1"))
@@ -578,7 +578,7 @@
    pointing :peers at the subscriber (participant 0). Loopback-only (no multicast). Waits up to
    MATCH-TIMEOUT s for the subscriber's reader to match, then publish-sample COUNT times at RATE/s (the
    pacing lets the reliable handshake keep up), then prints SHMEM-PUB-SENDS: <shmem-sends> / <COUNT> and
-   uiop:quit (0 iff shmem-sends > 0, i.e. SHMEM actually carried user DATA, else 2). Same host as the sub
+   dds.pal:exit-process (0 iff shmem-sends > 0, i.e. SHMEM actually carried user DATA, else 2). Same host as the sub
    => same host-uuid => the writer routes user DATA over shared memory and disc-node-shmem-sends counts
    each such datagram. Intended to be launched by scripts/shmem-roundtrip.sh after the sub binds."
   (let ((node (dds.disc:make-disc-node :guid-prefix (%make-prefix #x50) :domain domain
@@ -628,7 +628,7 @@
           (dds.disc:stop-node node)
           (format t "~&SHMEM-PUB-SENDS: ~d / ~d~%" sends count)
           (force-output)
-          (uiop:quit (if (plusp sends) 0 2)))))))
+          (dds.pal:exit-process (if (plusp sends) 0 2)))))))
 
 ;;; LargeData type: keyed (id) + unbounded octet sequence payload for DATA_FRAG testing.
 ;;; payload is :byte (TK_BYTE) to mirror Connext's `sequence<octet>` (interop/connext/large-data).
@@ -762,7 +762,7 @@
    loopback port for participant 0 and pointing :peers at the publisher (participant 1). Loopback-only (no
    multicast) sidesteps the macOS app-firewall LAN-UDP drop. Spins to the SECONDS deadline collecting
    samples, verifying each SIZE-octet payload is byte-exact (proving the cross-process pool resolve), then
-   prints ZC-SUB-RECEIVED: <n> and uiop:quit 0 iff n >= THRESHOLD else 1. Same host as the pub => same
+   prints ZC-SUB-RECEIVED: <n> and dds.pal:exit-process 0 iff n >= THRESHOLD else 1. Same host as the pub => same
    host-uuid => the pub's reference resolves against the writer's SHMEM pool, which this node maps + reads
    directly. Intended to be launched by scripts/zerocopy-roundtrip.sh."
   (let* ((dds.disc:*shmem-enabled* t)
@@ -806,7 +806,7 @@
       (format t "~&ZC-SUB-RECEIVED: ~d~%" seen)
       (when (plusp bad) (format t "~&[zc-sub] WARNING: ~d sample(s) had a payload mismatch (resolve corruption)~%" bad))
       (force-output)
-      (uiop:quit (if (and (>= seen threshold) (zerop bad)) 0 1)))))
+      (dds.pal:exit-process (if (and (>= seen threshold) (zerop bad)) 0 1)))))
 
 (defun* run-zc-xproc-pub (&key (domain 0) (count 24) (rate 20) (size 4000)
                                (match-timeout 15) (advertise-address "127.0.0.1"))
@@ -817,7 +817,7 @@
    loopback port for participant 1 and pointing :peers at the subscriber (participant 0). Loopback-only (no
    multicast). Waits up to MATCH-TIMEOUT s for the subscriber's reader to match AND advertise
    PID_ZEROCOPY_CAPABLE, then publish-sample COUNT SIZE-octet LargeData samples (SIZE > the ZC threshold) at
-   RATE/s, then prints ZC-PUB-SENDS: <zc-sends> / <COUNT> and uiop:quit (0 iff zc-sends > 0, i.e. at least
+   RATE/s, then prints ZC-PUB-SENDS: <zc-sends> / <COUNT> and dds.pal:exit-process (0 iff zc-sends > 0, i.e. at least
    one large sample crossed as a reference, else 2). Same host as the sub => same host-uuid => the writer
    stores the payload in its SHMEM pool and sends only a 16-byte reference; disc-node-zc-sends counts each.
    Intended to be launched by scripts/zerocopy-roundtrip.sh after the sub binds."
@@ -869,7 +869,7 @@
           (dds.disc:stop-node node)
           (format t "~&ZC-PUB-SENDS: ~d / ~d~%" sends count)
           (force-output)
-          (uiop:quit (if (plusp sends) 0 2)))))))
+          (dds.pal:exit-process (if (plusp sends) 0 2)))))))
 
 (defun* run-gated-subscriber (&key (domain 0) (topic "Square") (type-name "C_Shape")
                                    (local-type "shape-type") (seconds 25)

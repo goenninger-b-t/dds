@@ -808,13 +808,27 @@
   (dotimes (i n t)
     (setf (cffi:mem-aref ptr :uint8 i) 0)))
 
+;; ADR 0121: every secret buffer this process holds, so the exit chain can wipe what an orderly teardown
+;; never reached. Keyed by the vector itself (EQ); the buffer is foreign-static, so holding a reference here
+;; changes nothing about its lifetime (it is released only by FREE-SECRET-OCTETS, never by the GC).
+(defvar *live-secrets* (make-hash-table :test 'eq)
+  "Set (EQ hash table) of the secret buffers allocated by %MAKE-SECRET-OCTETS and not yet released by
+   FREE-SECRET-OCTETS. Guarded by *LIVE-SECRETS-LOCK*. Read by the :DARE-SECRET-WIPE shutdown hook
+   (ADR 0121). Not exported.")
+
+(defvar *live-secrets-lock* (dds.pal:make-lock "dds-dare-live-secrets")
+  "Guards *LIVE-SECRETS*.")
+
 (defun* %make-secret-octets (n)
     (function (fixnum) (simple-array (unsigned-byte 8) (*)))
   "Allocate an N-byte foreign-backed secret buffer, zero-initialised, via the PAL (impl-agnostic).
    The backing memory is pinned/foreign so it can be reliably wiped (design spec §6 — a
-   GC-moved heap array cannot). Caller MUST release it via FREE-SECRET-OCTETS at end-of-life."
+   GC-moved heap array cannot). Caller MUST release it via FREE-SECRET-OCTETS at end-of-life.
+   The buffer is recorded in *LIVE-SECRETS* until then, so EXIT-PROCESS can wipe it if the release never
+   happens (ADR 0121). Control plane: secrets are created at key setup, never per sample."
   (let ((v (dds.pal:alloc-static n)))
     (fill v 0)
+    (dds.pal:with-lock (*live-secrets-lock*) (setf (gethash v *live-secrets*) t))
     v))
 
 (defun* %foreign->secret (ptr n)
@@ -855,12 +869,35 @@
    non-locally cannot leak the buffer. Returns NIL so callers can write (setf slot (free-secret-octets
    slot)). Idempotent: a NIL argument is a no-op."
   (when v
+    (dds.pal:with-lock (*live-secrets-lock*) (remhash v *live-secrets*))
     (unwind-protect
          (let ((hook *secret-wipe-readback-hook*))
            (%wipe-secret-octets v)
            (when hook (funcall hook v)))
       (dds.pal:free-static v)))
   nil)
+
+(defun* %wipe-live-secrets ()
+    (function () (values (integer 0) (or null keyword)))
+  "Shutdown hook :DARE-SECRET-WIPE (ADR 0121): fill every still-live secret buffer (*LIVE-SECRETS*) with
+   zeros and, when *SECRET-WIPE-READBACK-HOOK* is set, hand each wiped buffer to it. It WIPES BUT DOES NOT RELEASE: it runs while other threads may still be running, and a thread in
+   the middle of an AEAD call holding one of these keys would read freed memory if it were released. A
+   wiped key makes that call fail closed (wrong key, GCM tag mismatch) instead. The memory itself goes back
+   to the OS with the process. Each buffer is guarded on its own, so one failure does not leave the rest
+   unwiped. Returns (VALUES WIPED STATUS): STATUS is NIL, or :WIPE-FAILED when any buffer's wipe or
+   read-back signalled, which the exit chain counts as a failed hook."
+  (let ((secrets (dds.pal:with-lock (*live-secrets-lock*)
+                   (loop for k being the hash-keys of *live-secrets* collect k)))
+        (hook *secret-wipe-readback-hook*)
+        (n 0) (bad nil))
+    (dolist (v secrets)
+      (handler-case (progn (%wipe-secret-octets v)
+                           (when hook (funcall hook v))
+                           (incf n))
+        (error () (setf bad t))))
+    (values n (when bad :wipe-failed))))
+
+(dds.pal:register-shutdown-hook :dare-secret-wipe '%wipe-live-secrets)
 
 (defun* octets->secret (vec)
     (function ((simple-array (unsigned-byte 8) (*))) (simple-array (unsigned-byte 8) (*)))
