@@ -764,33 +764,65 @@
     (unwind-protect
          (let ((sap (dds.pal:static-pointer m)))
            (dds.xport.shmem::%ring-init sap 2 4096)
-           (let ((a (dds.xport.shmem::%claim-lane sap 111))
-                 (b (dds.xport.shmem::%claim-lane sap 222)))
+           (let ((a (dds.xport.shmem::%claim-lane sap 2 111))
+                 (b (dds.xport.shmem::%claim-lane sap 2 222)))
              (%check :shmem-claim-a a "first token must get a lane")
              (%check :shmem-claim-b b "second token must get a lane")
              (%check :shmem-claim-distinct (/= a b) "two tokens must get distinct lanes")
-             (%check :shmem-claim-reuse (= a (dds.xport.shmem::%claim-lane sap 111)) "re-claim returns same lane")
-             (%check :shmem-claim-full (null (dds.xport.shmem::%claim-lane sap 333)) "third token must get NIL (full)"))
+             (%check :shmem-claim-reuse (= a (dds.xport.shmem::%claim-lane sap 2 111)) "re-claim returns same lane")
+             (%check :shmem-claim-full (null (dds.xport.shmem::%claim-lane sap 2 333)) "third token must get NIL (full)"))
            (dds.pal:pshared-destroy sap dds.xport.shmem::+mutex-off+ dds.xport.shmem::+cond-off+)
            t)
       (dds.pal:free-static m))))
 
 (defun* run-shmem-enqueue-test ()
     (function () (eql t))
-  "SHMEM SPSC enqueue: a 5-byte record advances the write-cursor to round8(4+5)=16; an oversize record rejects."
+  "SHMEM SPSC enqueue: a 5-byte record advances the write-cursor to round8(4+5)=16; an oversize record rejects.
+   Then the ADR 0119 §3 shared record bound: on an empty 64-octet lane, len 58 (cap-6) is refused and leaves
+   the lane healthy, len 56 (cap-8) is accepted and drains cleanly."
   (let ((m (dds.pal:alloc-static (dds.xport.shmem::%segment-bytes 1 64))))
     (unwind-protect
          (let ((sap (dds.pal:static-pointer m))
                (p (octets 1 2 3 4 5))
                (big (make-array 60 :element-type '(unsigned-byte 8) :initial-element 0)))
            (dds.xport.shmem::%ring-init sap 1 64)
-           (%check :shmem-enq-ok (dds.xport.shmem::%lane-enqueue sap 0 64 p 0 5) "enqueue of 5 bytes must succeed")
+           (%check :shmem-enq-ok (dds.xport.shmem::%lane-enqueue sap 1 0 64 p 0 5) "enqueue of 5 bytes must succeed")
            (%check :shmem-enq-cursor
                    (= 16 (dds.pal:load-sap-u64 sap (+ (dds.xport.shmem::%lane-desc-off 0)
                                                       dds.xport.shmem::+lane-off-write+)))
                    "write-cursor must be round8(4+5)=16")
-           (%check :shmem-enq-reject (null (dds.xport.shmem::%lane-enqueue sap 0 64 big 0 60))
+           (%check :shmem-enq-reject (null (dds.xport.shmem::%lane-enqueue sap 1 0 64 big 0 60))
                    "a record of len cap-4 must be rejected (does not fit)")
+           (dds.pal:pshared-destroy sap dds.xport.shmem::+mutex-off+ dds.xport.shmem::+cond-off+)
+           t)
+      (dds.pal:free-static m)))
+  ;; ADR 0119 §3: enqueue and drain share ONE record bound, LEN <= CAPACITY - 8. On an EMPTY lane a record
+  ;; of CAPACITY - 6 used to be accepted by the enqueue and then read by the drain as :BAD-RECORD-LENGTH,
+  ;; which poisons the lane — a conforming producer quarantining itself. It must now be refused (UDP
+  ;; fallback) and leave the lane healthy; a record exactly AT the bound must round-trip.
+  (let ((m (dds.pal:alloc-static (dds.xport.shmem::%segment-bytes 1 64))) (got '()))
+    (unwind-protect
+         (let ((sap (dds.pal:static-pointer m))
+               (p (make-array 64 :element-type '(unsigned-byte 8) :initial-element 42))
+               (sink (dds.core.buffer:make-octet-buffer 64)))
+           (dds.xport.shmem::%ring-init sap 1 64)
+           (%check :shmem-enq-bound-reject (null (dds.xport.shmem::%lane-enqueue sap 1 0 64 p 0 58))
+                   "a record of len cap-6 must be refused on an EMPTY lane (above the drain's cap-8 bound)")
+           (%check :shmem-enq-bound-untouched
+                   (zerop (dds.pal:load-sap-u64 sap (+ (dds.xport.shmem::%lane-desc-off 0)
+                                                       dds.xport.shmem::+lane-off-write+)))
+                   "a refused record must not move the write-cursor")
+           (let ((st (dds.xport.shmem::%lane-drain sap 1 0 64 sink
+                                                   (lambda (s n) (declare (ignore s)) (push n got)))))
+             (%check :shmem-enq-bound-healthy (eq st t)
+                     (format nil "the lane must stay healthy after a refused record, drain got ~s" st)))
+           (%check :shmem-enq-bound-accept (dds.xport.shmem::%lane-enqueue sap 1 0 64 p 0 56)
+                   "a record of len cap-8 (the shared bound) must be accepted")
+           (let ((st (dds.xport.shmem::%lane-drain sap 1 0 64 sink
+                                                   (lambda (s n) (declare (ignore s)) (push n got)))))
+             (%check :shmem-enq-bound-drained (and (eq st t) (equal got '(56)))
+                     (format nil "a cap-8 record must drain cleanly, got status ~s sizes ~s" st got)))
+           (dds.pal:free-static (dds.core.buffer:octet-buffer-vec sink))
            (dds.pal:pshared-destroy sap dds.xport.shmem::+mutex-off+ dds.xport.shmem::+cond-off+)
            t)
       (dds.pal:free-static m))))
@@ -806,10 +838,10 @@
                (sink (dds.core.buffer:make-octet-buffer 64))
                (got '()))
            (dds.xport.shmem::%ring-init sap 1 64)
-           (dds.xport.shmem::%lane-enqueue sap 0 64 a 0 3)
-           (dds.xport.shmem::%lane-enqueue sap 0 64 b 0 2)
+           (dds.xport.shmem::%lane-enqueue sap 1 0 64 a 0 3)
+           (dds.xport.shmem::%lane-enqueue sap 1 0 64 b 0 2)
            (dds.xport.shmem::%lane-drain
-            sap 0 64 sink
+            sap 1 0 64 sink
             (lambda (s size)
               (push (cons size (aref (dds.core.buffer:octet-buffer-vec s) 0)) got)))
            (setf got (nreverse got))
@@ -829,12 +861,200 @@
            (dds.xport.shmem::%ring-init sap lanes cap)
            ;; forge a write-cursor 10*capacity ahead with no real records written
            (dds.pal:store-sap-u64 sap (+ (dds.xport.shmem::%lane-desc-off 0) dds.xport.shmem::+lane-off-write+) (* 10 cap))
-           (let ((sink (dds.core.buffer:make-octet-buffer cap)))
-             (dds.xport.shmem::%lane-drain sap 0 cap sink (lambda (buf size) (declare (ignore buf size)) (incf n))))
+           (let* ((sink (dds.core.buffer:make-octet-buffer cap))
+                  (status (dds.xport.shmem::%lane-drain sap lanes 0 cap sink
+                                                        (lambda (buf size) (declare (ignore buf size)) (incf n)))))
+             ;; ADR 0119: the bail-out is no longer silent — it reports the reason the caller poisons the lane for
+             (%check :overrun-reported (eq status :cursor-overrun)
+                     (format nil "a w-r > capacity cursor must report :CURSOR-OVERRUN, got ~s" status)))
            (%check :no-flood (zerop n) "drain must deliver 0 records for a w-r > capacity garbage cursor")
            (dds.pal:pshared-destroy sap dds.xport.shmem::+mutex-off+ dds.xport.shmem::+cond-off+)
            t)
       (dds.pal:free-static m))))
+
+;;; ---- WP-0.7 / ADR 0119: SHMEM lane poisoning (NFR-SEC-POSTURE, NFR-OBS) ----
+
+(defun* %os-page-size ()
+    (function () (integer 1))
+  "The OS page size in octets, from getpagesize(3), so no page-size constant is typed from memory (test
+   fixture)."
+  (cffi:foreign-funcall "getpagesize" :int))
+
+(defun* run-shmem-lane-poison-page-end-test ()
+    (function () (eql t))
+  "ADR 0119 regression: a corrupt read cursor must be REJECTED BEFORE the 4-octet length read, never used to
+   address memory, AT THE ONE PLACE WHERE AN OVER-READ IS GUARANTEED TO FAULT.
+
+   Fixture: a one-lane ring whose lane ends EXACTLY at the end of a page-aligned SHM-CREATE object (capacity
+   = page - header - one descriptor, so %SEGMENT-BYTES = one page). The drain runs on a SECOND mapping of
+   that object, SHM-ATTACHed at TWO pages. The second page lies beyond the object's end-of-file, so any
+   access to it raises SIGBUS. This holds on both implementations and does not depend on what mmap happens
+   to place after the object.
+
+   Before ADR 0119, a read cursor of capacity-1/-2/-3 made %LANE-DRAIN read its :uint32 length at
+   data+(MOD R CAPACITY), which straddles the end of the file: a fault. Now each such cursor returns
+   :MISALIGNED-CURSOR, delivers nothing, and leaves the read cursor where it was. Positive control first: a
+   VALID record occupying the lane's last 8 octets, ending exactly at end-of-file, is still delivered. The
+   check is not merely refusing everything near the boundary. Then every corrupt-cursor reason that a
+   synthetic lane can produce is driven and asserted by name."
+  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
+    (dds.pal:note-test-skip "run-shmem-lane-poison-page-end-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
+    (return-from run-shmem-lane-poison-page-end-test t))
+  (let* ((page (%os-page-size))
+         (cap (- page (- (dds.xport.shmem::%segment-bytes 1 8) 8)))   ; header + 1 descriptor + cap = page
+         (name (format nil "/ddsp07~x" (random #xFFFFFFFF))))
+    (%check :page-geometry (and (>= cap 64) (zerop (mod cap 8)) (= page (dds.xport.shmem::%segment-bytes 1 cap)))
+            (format nil "fixture: page ~d gives capacity ~d, segment ~d" page cap (dds.xport.shmem::%segment-bytes 1 cap)))
+    (multiple-value-bind (own cstatus) (dds.pal:shm-create name page)
+      (%check :shm-create (null cstatus) (format nil "shm-create failed: ~s" cstatus))
+      (multiple-value-bind (view astatus) (dds.pal:shm-attach name (* 2 page))
+        (unless (null astatus) (dds.pal:shm-detach own) (dds.pal:shm-destroy name))
+        (%check :shm-attach-2-pages (null astatus) (format nil "shm-attach at two pages failed: ~s" astatus))
+        (let* ((sap (dds.pal:shm-sap view))
+               (sink (dds.core.buffer:make-octet-buffer cap))
+               (data (dds.xport.shmem::%lane-data-off 1 0 cap))
+               (wo (+ (dds.xport.shmem::%lane-desc-off 0) dds.xport.shmem::+lane-off-write+))
+               (ro (+ (dds.xport.shmem::%lane-desc-off 0) dds.xport.shmem::+lane-off-read+))
+               (n 0)
+               (fn (lambda (b size) (declare (ignore b size)) (incf n))))
+          (unwind-protect
+               (progn
+                 (%check :lane-ends-at-eof (= (+ data cap) page)
+                         (format nil "lane data [~d,~d) must end at the object's end ~d" data (+ data cap) page))
+                 (dds.xport.shmem::%ring-init sap 1 cap)
+                 (flet ((drain (r w)
+                          (dds.pal:store-sap-u64 sap ro r)
+                          (dds.pal:store-sap-u64 sap wo w)
+                          (setf n 0)
+                          (dds.xport.shmem::%lane-drain sap 1 0 cap sink fn))
+                        (len-at (pos v) (setf (cffi:mem-ref sap :uint32 (+ data pos)) v)))
+                   ;; positive control: a valid 4-octet record in the lane's LAST 8 octets, ending exactly at EOF
+                   (len-at (- cap 8) 4)
+                   (let ((st (drain (- cap 8) cap)))
+                     (%check :boundary-record-delivered (and (eq st t) (= n 1))
+                             (format nil "a valid record ending exactly at EOF must be delivered: status ~s, ~d delivered" st n))
+                     (%check :boundary-cursor-advanced (= cap (dds.pal:load-sap-u64 sap ro))
+                             "the read cursor must advance past the delivered record"))
+                   ;; misaligned read cursors whose 4-octet length read would cross EOF (the pre-ADR-0119 fault),
+                   ;; plus a misaligned one that would not, and one 1000 laps around the ring
+                   (dolist (r (list (- cap 1) (- cap 2) (- cap 3) (- cap 4) 5 (+ (* 1000 cap) (- cap 1))))
+                     (let ((st (drain r (+ r 8))))
+                       (%check :misaligned-rejected (and (eq st :misaligned-cursor) (zerop n))
+                               (format nil "read cursor ~d (pos ~d): want :MISALIGNED-CURSOR and 0 delivered, got ~s and ~d"
+                                       r (mod r cap) st n))
+                       (%check :misaligned-cursor-untouched (= r (dds.pal:load-sap-u64 sap ro))
+                               (format nil "a rejected cursor must be left where it was (~d)" r))))
+                   ;; cursor-level reasons
+                   (let ((st (drain 64 16)))
+                     (%check :regressed (eq st :cursor-regressed) (format nil "w < r: want :CURSOR-REGRESSED, got ~s" st)))
+                   (let ((st (drain 0 (+ cap 8))))
+                     (%check :overrun (eq st :cursor-overrun) (format nil "w - r > capacity: want :CURSOR-OVERRUN, got ~s" st)))
+                   ;; record-level reasons, at the last aligned slot
+                   (len-at (- cap 8) 5)              ; 4 + 5 = 9 octets cannot fit in the 8 left before the lane end
+                   (let ((st (drain (- cap 8) cap)))
+                     (%check :bad-len (and (eq st :bad-record-length) (zerop n))
+                             (format nil "a record overrunning the lane end: want :BAD-RECORD-LENGTH, got ~s" st)))
+                   (len-at 0 #x7FFFFFF0)              ; larger than any record the ring can hold
+                   (let ((st (drain 0 64)))
+                     (%check :huge-len (eq st :bad-record-length) (format nil "a huge length: want :BAD-RECORD-LENGTH, got ~s" st)))
+                   (len-at 0 40)                       ; span 48 > the 16 octets committed
+                   (let ((st (drain 0 16)))
+                     (%check :overruns-commit (eq st :record-overruns-commit)
+                             (format nil "a record beyond the committed extent: want :RECORD-OVERRUNS-COMMIT, got ~s" st)))
+                   (len-at (- cap 16) dds.xport.shmem::+skip-marker+)  ; pad to the lane end = 16, but only 8 committed
+                   (let ((st (drain (- cap 16) (- cap 8))))
+                     (%check :skip-overruns (eq st :skip-overruns-commit)
+                             (format nil "a skip pad beyond the committed extent: want :SKIP-OVERRUNS-COMMIT, got ~s" st))))
+                 (dds.pal:pshared-destroy sap dds.xport.shmem::+mutex-off+ dds.xport.shmem::+cond-off+)
+                 t)
+            (dds.pal:free-static (dds.core.buffer:octet-buffer-vec sink))
+            (dds.pal:shm-detach view)
+            (dds.pal:shm-detach own)
+            (dds.pal:shm-destroy name)))))))
+
+(defun* run-shmem-lane-poison-observable-test ()
+    (function () (eql t))
+  "ADR 0119: a poisoned lane is OBSERVABLE, not merely harmless. Two senders hold the two lanes of one
+   receiver. One lane's record header is corrupted (a length no ring can hold). One drain must then:
+     - deliver nothing from that lane, and POISON it: SHMEM-LANE-POISONED-P = :BAD-RECORD-LENGTH,
+       SHMEM-LANE-CORRUPT-CURSORS = 1, SHMEM-TRANSPORT-POISONED-LANES = 1 and ((lane :BAD-RECORD-LENGTH 1));
+     - emit EXACTLY ONE log event through *SHMEM-LANE-POISONED-HOOK*, naming the segment, lane and reason;
+   and afterwards:
+     - further drains add NO event and do not move the counter (the lane is quarantined, not re-detected);
+     - the receiver's work predicate ignores the lane although its cursors still differ, so the receiver
+       thread can park instead of spinning on a lane it will never read;
+     - the OTHER lane still delivers;
+     - the poisoned lane's sender gets the UDP-fallback answer (send returns 0) once its ring fills, because
+       its read cursor no longer moves."
+  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
+    (dds.pal:note-test-skip "run-shmem-lane-poison-observable-test" "shm-attach-by-name unreliable on this platform (ADR 0013)")
+    (return-from run-shmem-lane-poison-observable-test t))
+  (let* ((cap 4096)
+         (rx (dds.xport.shmem:make-shmem-transport :participant-guid (dds.xport.shmem::%test-guid #x71)
+                                                   :host-uuid 7 :lane-count 2 :capacity cap))
+         (tx (dds.xport.shmem:make-shmem-transport :participant-guid (dds.xport.shmem::%test-guid #x72) :host-uuid 7))
+         (tx2 (dds.xport.shmem:make-shmem-transport :participant-guid (dds.xport.shmem::%test-guid #x73) :host-uuid 7))
+         (loc (dds.xport.shmem:shmem-transport-locator rx))
+         (buf (dds.core.buffer:make-octet-buffer 16))
+         (events '())
+         (got '()))
+    (unwind-protect
+         (let ((dds.xport.shmem:*shmem-lane-poisoned-hook*
+                 (lambda (seg lane reason count) (push (list seg lane reason count) events)))
+               (sap (dds.pal:shm-sap (dds.xport.shmem::shmem-transport-segment rx))))
+           (flet ((send (st tag)
+                    (let ((c (dds.core.buffer:cursor buf)))
+                      (dotimes (i 4) (dds.core.buffer:put-u8 c tag)))
+                    (dds.xport:send (dds.xport.shmem:shmem-transport-transport st) loc buf 0 4))
+                  (drain ()
+                    (dds.xport.shmem:shmem-receive-drain
+                     rx (lambda (s size) (push (cons size (aref (dds.core.buffer:octet-buffer-vec s) 0)) got)))))
+             (%check :tx-sent (= 4 (send tx #xA1)) "first sender must enqueue over SHMEM")
+             (let* ((bad (dds.xport.shmem::%claim-lane sap 2 (dds.xport.shmem::shmem-transport-token tx)))
+                    (good (- 1 bad))
+                    (desc (dds.xport.shmem::%lane-desc-off bad))
+                    (r (dds.pal:load-sap-u64 sap (+ desc dds.xport.shmem::+lane-off-read+)))
+                    (data (dds.xport.shmem::%lane-data-off 2 bad cap)))
+               ;; corrupt the committed record's length word: no ring of this capacity can hold it
+               (setf (cffi:mem-ref sap :uint32 (+ data (mod r cap))) #x7FFFFFF0)
+               (drain)
+               (%check :nothing-delivered (null got) (format nil "a corrupt lane must deliver nothing, got ~s" got))
+               (%check :poisoned-flag (eq :bad-record-length (dds.xport.shmem:shmem-lane-poisoned-p rx bad))
+                       (format nil "lane ~d must read as poisoned for :BAD-RECORD-LENGTH, got ~s"
+                               bad (dds.xport.shmem:shmem-lane-poisoned-p rx bad)))
+               (%check :healthy-flag (null (dds.xport.shmem:shmem-lane-poisoned-p rx good)) "the other lane must stay healthy")
+               (%check :counter (= 1 (dds.xport.shmem:shmem-lane-corrupt-cursors rx bad))
+                       (format nil "corrupt-cursor counter must be 1, got ~d" (dds.xport.shmem:shmem-lane-corrupt-cursors rx bad)))
+               (multiple-value-bind (total lanes) (dds.xport.shmem:shmem-transport-poisoned-lanes rx)
+                 (%check :report (and (= total 1) (equal lanes (list (list bad :bad-record-length 1))))
+                         (format nil "status snapshot must be 1 / ((~d :BAD-RECORD-LENGTH 1)), got ~s / ~s" bad total lanes)))
+               (%check :one-event (and (= 1 (length events))
+                                       (equal (first events)
+                                              (list (dds.xport.shmem::shmem-transport-name rx) bad :bad-record-length 1)))
+                       (format nil "exactly one log event naming segment, lane, reason must fire, got ~s" events))
+               ;; quarantined: more traffic and more drains add no event and no count
+               (send tx #xA1)
+               (drain) (drain)
+               (%check :still-one-event (= 1 (length events)) (format nil "a quarantined lane must not log again, got ~s" events))
+               (%check :counter-stable (= 1 (dds.xport.shmem:shmem-lane-corrupt-cursors rx bad)) "the counter must not move after quarantine")
+               (%check :cursors-differ (/= (dds.pal:load-sap-u64 sap (+ desc dds.xport.shmem::+lane-off-write+))
+                                           (dds.pal:load-sap-u64 sap (+ desc dds.xport.shmem::+lane-off-read+)))
+                       "fixture: the poisoned lane must still hold unread data")
+               (%check :predicate-ignores (not (dds.xport.shmem::%any-data-p sap 2 (dds.xport.shmem::shmem-transport-lane-poison rx)))
+                       "the receiver's work predicate must ignore a poisoned lane (else the receiver never parks)")
+               ;; the healthy lane is unaffected
+               (%check :tx2-sent (= 4 (send tx2 #xB2)) "second sender must enqueue over SHMEM")
+               (drain)
+               (%check :healthy-delivers (equal got '((4 . #xB2))) (format nil "the healthy lane must deliver, got ~s" got))
+               ;; the poisoned lane's sender falls back: its ring fills because nobody reads it any more
+               (let ((zero-at (loop for i from 0 below (+ 2 (truncate cap 8))
+                                    when (zerop (send tx #xA1)) return i)))
+                 (%check :sender-falls-back zero-at
+                         "the poisoned lane's sender must get 0 (the UDP-fallback answer) once its ring is full"))
+               t)))
+      (dds.xport.shmem:shmem-transport-close tx2)
+      (dds.xport.shmem:shmem-transport-close tx)
+      (dds.xport.shmem:shmem-transport-close rx))))
 
 (defun* run-zc-pool-init-test ()
     (function () (eql t))
@@ -4377,6 +4597,8 @@
                  ("shmem-enqueue"            . run-shmem-enqueue-test)
                  ("shmem-drain"              . run-shmem-drain-test)
                  ("shmem-drain-resource-guard" . run-shmem-drain-resource-guard-test)
+                 ("shmem-lane-poison-page-end" . run-shmem-lane-poison-page-end-test)
+                 ("shmem-lane-poison-observable" . run-shmem-lane-poison-observable-test)
                  ("zc-pool-init"             . run-zc-pool-init-test)
                  ("zc-pool-loan"             . run-zc-pool-loan-test)
                  ("zc-pool-resolve"          . run-zc-pool-resolve-test)

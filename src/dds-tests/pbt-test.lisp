@@ -155,7 +155,7 @@
              ;; the drain is synchronous and non-blocking; no timeout guard needed
              (handler-case
                  (dds.xport.shmem::%lane-drain
-                  sap 0 +fuzz-ring-cap+ sink
+                  sap +fuzz-ring-lanes+ 0 +fuzz-ring-cap+ sink
                   (lambda (buf size) (declare (ignore buf size)) (incf cbs)))
                (error (e)
                  (error 'test-failure :name "shmem-ring-drain-fuzz"

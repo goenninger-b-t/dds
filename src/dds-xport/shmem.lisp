@@ -80,15 +80,20 @@
   (and (= +shm-magic+ (cffi:mem-ref sap :uint32 +off-magic+))
        (= +shm-version+ (cffi:mem-ref sap :uint32 +off-version+))))
 
-(defun* %claim-lane (sap token)
-    (function (t (unsigned-byte 64)) (or null (integer 0)))
+(defun* %claim-lane (sap lane-count token)
+    (function (t (integer 1) (unsigned-byte 64)) (or null (integer 0)))
   "Claim a lane for TOKEN (a nonzero per-sender id) under the segment's pshared mutex: return TOKEN's
    existing lane (reuse), else the first free lane (owner=0) after claiming it, else NIL (all taken).
    One-time, off the hot path — the mutex (not a CAS) serializes concurrent claimers. TOKEN must be
-   nonzero (0 marks a free lane)."
+   nonzero (0 marks a free lane).
+
+   LANE-COUNT is the TRUSTED lane count the caller mapped the segment with (the locator's, which sized the
+   mapping). The scan covers at most (MIN LANE-COUNT header-lane-count): the header is cross-process
+   memory, and scanning a header-supplied count of descriptors would read — and on a claim WRITE — past
+   the end of this process's mapping (NFR-SEC-POSTURE, ADR 0119 §3)."
   (dds.pal:pshared-lock sap +mutex-off+)
   (unwind-protect
-       (let ((n (%ring-lane-count sap)) (free nil))
+       (let ((n (min lane-count (%ring-lane-count sap))) (free nil))
          (dotimes (i n)
            (let ((o (dds.pal:load-sap-u64 sap (+ (%lane-desc-off i) +lane-off-owner+))))
              (when (= o token) (return-from %claim-lane i))
@@ -103,25 +108,37 @@
   "Bytes a [len][payload] record occupies (4-byte header included), rounded up to 8."
   (logand (+ 4 len 7) (lognot 7)))
 
-(defun* %lane-enqueue (sap lane capacity payload off len)
-    (function (t (integer 0) (integer 8) (simple-array (unsigned-byte 8) (*)) (integer 0) (integer 0)) t)
+(defun* %lane-enqueue (sap lane-count lane capacity payload off len)
+    (function (t (integer 1) (integer 0) (integer 8) (simple-array (unsigned-byte 8) (*)) (integer 0) (integer 0)) t)
   "Single-producer enqueue of PAYLOAD[off,off+len) as one ring record into LANE. T on success, NIL if it
    does not fit (caller maps NIL to RESOURCE_LIMITS / UDP fallback). Publishes the advanced write-cursor
    with a RELEASE fence so the consumer's ACQUIRE load sees the payload.
+
+   LANE-COUNT and CAPACITY are the TRUSTED geometry the caller mapped the destination segment with (the
+   locator's). The lane's data offset is derived from them, never from the segment header, which another
+   process can rewrite (ADR 0119 §3). The write cursor W lives in that shared segment too: a conforming
+   producer only ever advances it by whole 8-aligned spans, so a W that is not a multiple of 8 is corrupt,
+   and writing a record header at (MOD W CAPACITY) could then cross the lane's end. Such a W returns NIL —
+   the same 'does not fit' answer, so the caller falls back to UDP — and nothing is written.
 
    ⛔ SINGLE-PRODUCER IS A PRECONDITION THE CALLER MUST ENFORCE, not a property of the deployment (ADR
    0109). Read-cursor, memcpy and cursor-publish are three separate steps with no atomicity between them,
    so two threads on ONE lane resolve the same position and the second overwrites the first. %SHMEM-SEND
    holds SHMEM-DEST-SEND-LOCK across this call for exactly that reason. Cross-PROCESS single-producer is
    structural — a lane is owned by one sender token (%claim-lane) — but a sender is many THREADS."
-  (when (> (+ 4 len) capacity) (return-from %lane-enqueue nil))
+  ;; The record bound is the SAME one %lane-drain enforces: LEN <= CAPACITY - 8 (the max-record %ring-init
+  ;; writes). The old bound (> (+ 4 LEN) CAPACITY) accepted LEN up to CAPACITY - 4, which the drain then
+  ;; read as :BAD-RECORD-LENGTH and quarantined — a conforming producer poisoning its own lane (ADR 0119
+  ;; §3). A record above the bound answers 'does not fit', so the caller falls back to UDP.
+  (when (> len (- capacity 8)) (return-from %lane-enqueue nil))
   (let* ((base (%lane-desc-off lane))
-         (data (%lane-data-off (%ring-lane-count sap) lane capacity))
+         (data (%lane-data-off lane-count lane capacity))
          (w (dds.pal:load-sap-u64 sap (+ base +lane-off-write+)))
          (r (dds.pal:load-sap-u64 sap (+ base +lane-off-read+)))
          (span (%record-span len))
          (pos (mod w capacity))
          (tail (- capacity pos)))
+    (when (logtest w 7) (return-from %lane-enqueue nil))   ; corrupt (non-8-aligned) write cursor: refuse, write nothing
     (let ((need (if (< tail span) (+ tail span) span)))
       (when (> (+ (- w r) need) capacity) (return-from %lane-enqueue nil)))
     (when (< tail span)
@@ -133,33 +150,75 @@
     (dds.pal:store-sap-u64 sap (+ base +lane-off-write+) (+ w span))
     t))
 
-(defun* %lane-drain (sap lane capacity sink on-datagram)
-    (function (t (integer 0) (integer 8) dds.core.buffer:octet-buffer function) t)
+(defun* %lane-drain (sap lane-count lane capacity sink on-datagram)
+    (function (t (integer 1) (integer 0) (integer 8) dds.core.buffer:octet-buffer function) (or (eql t) keyword))
   "Single-consumer drain of LANE: ACQUIRE-load the producer's write-cursor, read every committed record up
-   to it, copy each into SINK and call (ON-DATAGRAM SINK size), advance read-cursor. Bounds-check every
-   len against max-record + the committed extent before trusting it (untrusted cross-process input).
-   SINK capacity must be >= the ring max-record (caller contract; allocated once, off the hot path)."
+   to it, copy each into SINK and call (ON-DATAGRAM SINK size), advance read-cursor. Returns T when every
+   committed record was consumed cleanly, or a CORRUPT-CURSOR REASON keyword (below) when the lane's
+   shared state is impossible for a conforming producer. The caller POISONS the lane on a keyword
+   (SHMEM-RECEIVE-DRAIN, ADR 0119); this function only detects and reports.
+
+   UNTRUSTED INPUT (NFR-SEC-POSTURE). Both cursors and every record header live in memory another process
+   can write. Everything that can address memory is validated BEFORE it is used:
+     - geometry: LANE-COUNT and CAPACITY are the caller's TRUSTED values (the receive segment's own creation
+       parameters). The header's lane count and max-record are never consulted — a forged header would
+       otherwise move the data window past the end of the mapping. The record bound is (- CAPACITY 8), the
+       value %RING-INIT writes as max-record.
+     - cursors: W < R              -> :CURSOR-REGRESSED
+                W - R > CAPACITY   -> :CURSOR-OVERRUN
+     - per record, at pos = (MOD R CAPACITY), BEFORE the 4-octet length read:
+                (LOGTEST POS 7)        -> :MISALIGNED-CURSOR   (every valid record starts 8-aligned:
+                                          spans are rounded to 8, %record-span, and CAPACITY is a multiple
+                                          of 8, %ring-init)
+                (> (+ POS 4) CAPACITY) -> :CURSOR-OUT-OF-RANGE (the length word would cross the lane end)
+     - per record, the length LEN:
+                skip marker whose pad (CAPACITY - POS) exceeds W - R -> :SKIP-OVERRUNS-COMMIT
+                LEN > CAPACITY - 8, or 4 + LEN > CAPACITY - POS     -> :BAD-RECORD-LENGTH
+                span(LEN) > W - R                                   -> :RECORD-OVERRUNS-COMMIT
+   Before this check a corrupt R was reduced (MOD R CAPACITY) and read as a :uint32 at data+pos with no
+   alignment or extent test: R = CAPACITY - 1 read three octets past the lane, which on the LAST lane is past
+   the end of the mapping (ADR 0119 §1).
+
+   THE READ CURSOR IS STORED ON EVERY EXIT (UNWIND-PROTECT), advanced past each record BEFORE ON-DATAGRAM
+   runs. A record is copied into SINK first, so its ring slot is free to reuse by then. On a corrupt cursor
+   R is left at the last good record boundary. If ON-DATAGRAM unwinds (a malformed datagram signalling in
+   the parser, caught by the receiver thread's boundary handler), the offending record is already
+   consumed. Before, R was stored only on the normal exit, so an unwinding datagram was redelivered on
+   every drain, indefinitely.
+
+   SINK capacity must be >= CAPACITY - 8 (caller contract; allocated once, off the hot path)."
   (let* ((base (%lane-desc-off lane))
-         (data (%lane-data-off (%ring-lane-count sap) lane capacity))
-         (maxr (%ring-max-record sap))
+         (data (%lane-data-off lane-count lane capacity))
+         (maxr (- capacity 8))
          (w (dds.pal:load-sap-u64 sap (+ base +lane-off-write+))))
     (dds.pal:fence :acquire)
     (let ((r (dds.pal:load-sap-u64 sap (+ base +lane-off-read+)))
-          (vec (dds.core.buffer:octet-buffer-vec sink)))
-      ;; w is cross-process/untrusted; a conforming producer never has w-r > capacity (NFR-SEC-POSTURE).
-      (when (> (- w r) capacity) (return-from %lane-drain t))
-      (loop while (< r w) do
-        (let* ((pos (mod r capacity))
-               (len (cffi:mem-ref sap :uint32 (+ data pos))))
-          (cond
-            ((= len +skip-marker+) (incf r (- capacity pos)))
-            ((or (> len maxr) (> (+ 4 len) (- capacity pos)) (> (%record-span len) (- w r)))
-             (return-from %lane-drain t))
-            (t (dds.pal:sap-copy-out sap (+ data pos 4) vec 0 len)   ; BULK memcpy, was one mem-ref per OCTET
-               (funcall on-datagram sink len)
-               (incf r (%record-span len))))))
-      (dds.pal:store-sap-u64 sap (+ base +lane-off-read+) r)
-      t)))
+          (vec (dds.core.buffer:octet-buffer-vec sink))
+          (status t))
+      ;; w and r are cross-process/untrusted; a conforming producer keeps 0 <= w - r <= capacity.
+      (when (< w r) (return-from %lane-drain :cursor-regressed))
+      (when (> (- w r) capacity) (return-from %lane-drain :cursor-overrun))
+      (unwind-protect
+           (loop while (< r w) do
+             (let ((pos (mod r capacity)))
+               ;; Validate the position BEFORE the length read — this is the read that went out of bounds.
+               (cond ((logtest pos 7) (setf status :misaligned-cursor) (return))
+                     ((> (+ pos 4) capacity) (setf status :cursor-out-of-range) (return)))
+               (let ((len (cffi:mem-ref sap :uint32 (+ data pos))))
+                 (cond
+                   ((= len +skip-marker+)
+                    (let ((pad (- capacity pos)))
+                      (when (> pad (- w r)) (setf status :skip-overruns-commit) (return))
+                      (incf r pad)))
+                   ((or (> len maxr) (> (+ 4 len) (- capacity pos)))
+                    (setf status :bad-record-length) (return))
+                   ((> (%record-span len) (- w r))
+                    (setf status :record-overruns-commit) (return))
+                   (t (dds.pal:sap-copy-out sap (+ data pos 4) vec 0 len)   ; BULK memcpy, was one mem-ref per OCTET
+                      (incf r (%record-span len))                          ; consumed BEFORE the handler runs
+                      (funcall on-datagram sink len))))))
+        (dds.pal:store-sap-u64 sap (+ base +lane-off-read+) r))
+      status)))
 
 ;;;; D1 — make-shmem-transport: the frozen DDS.XPORT transport record wrapped around a
 ;;;; per-participant receive segment. SEND attaches (once, cached) to the destination
@@ -181,7 +240,14 @@
   ;; ACKNACK repair, the flow scheduler) on EVERY %shmem-send. Every access — read AND write — is taken under
   ;; this lock. An unsynchronised (setf gethash) corrupted the table, which SBCL reported as
   ;; `failed AVER: (= HWM (HASH-TABLE-PAIRS-CAPACITY ...))`.
-  (attach-lock (dds.pal:make-lock "shmem-attach-cache") :type t))   ; HOTPATH-ALLOC(COLD): defstruct initform — one lock per transport
+  (attach-lock (dds.pal:make-lock "shmem-attach-cache") :type t)   ; HOTPATH-ALLOC(COLD): defstruct initform — one lock per transport
+  ;; ADR 0119 lane poisoning — RECEIVER-LOCAL, deliberately NOT in the shared segment: a flag another
+  ;; process could clear would be no quarantine at all. One entry per lane of this transport's OWN receive
+  ;; segment, sized at creation (%make-shmem-transport-record). Written only by the single drain thread.
+  ;; LANE-POISON: NIL = healthy, else the corrupt-cursor REASON keyword %lane-drain returned (the flag).
+  ;; LANE-CORRUPT-CURSORS: per-lane count of corrupt-cursor detections (the NFR-OBS counter).
+  (lane-poison #() :type simple-vector)
+  (lane-corrupt-cursors #() :type simple-vector))
 
 (defun* %guid-token (guid)
     (function ((simple-array (unsigned-byte 8) (12))) (unsigned-byte 64))
@@ -234,7 +300,10 @@
    so it composes with the status-threading convention."
   (let ((st (%make-shmem-transport :segment seg :name name :host-uuid host-uuid :lane-count lane-count
                                    :capacity capacity :token token
-                                   :sink (dds.core.buffer:make-octet-buffer capacity))))
+                                   :sink (dds.core.buffer:make-octet-buffer capacity)
+                                   ;; ADR 0119: per-lane poison flag + corrupt-cursor counter, sized once here
+                                   :lane-poison (make-array lane-count :initial-element nil)   ; HOTPATH-ALLOC(COLD): once per transport create
+                                   :lane-corrupt-cursors (make-array lane-count :initial-element 0))))   ; HOTPATH-ALLOC(COLD): once per transport create
     (setf (shmem-transport-transport st)
           (dds.xport:make-transport
            :kind :shmem :locator-kind :shmem :max-message-size (- capacity 8)
@@ -325,7 +394,8 @@
                  (sap (dds.pal:shm-sap seg)))
             (values (setf (gethash (shmem-locator-name locator) (shmem-transport-attach-cache st))
                           (%make-shmem-dest :segment seg :sap sap
-                                            :lane (%claim-lane sap (shmem-transport-token st))))
+                                            :lane (%claim-lane sap (shmem-locator-lane-count locator)
+                                                               (shmem-transport-token st))))
                     nil))))))
 
 (defun* %shmem-send (st locator buffer len)
@@ -347,8 +417,9 @@
     (let* ((sap (if *shmem-dest-cache* (shmem-dest-sap dest) (dds.pal:shm-sap (shmem-dest-segment dest))))
            (lane (if *shmem-dest-cache*
                      (or (shmem-dest-lane dest)
-                         (setf (shmem-dest-lane dest) (%claim-lane sap (shmem-transport-token st))))
-                     (%claim-lane sap (shmem-transport-token st)))))
+                         (setf (shmem-dest-lane dest) (%claim-lane sap (shmem-locator-lane-count locator)
+                                                                   (shmem-transport-token st))))
+                     (%claim-lane sap (shmem-locator-lane-count locator) (shmem-transport-token st)))))
       (if (and lane
                ;; ADR 0109: SERIALISE THE ENQUEUE. %lane-enqueue is a single-producer ring — it loads the
                ;; write cursor, writes the record at that position and publishes cursor+span — and this
@@ -361,7 +432,7 @@
                ;; DESTINATION, so it costs one uncontended acquire per datagram and never serialises
                ;; sends to different peers. It is NOT held across the futex wake below.
                (dds.pal:with-lock ((shmem-dest-send-lock dest))
-                 (%lane-enqueue sap lane (shmem-locator-capacity locator)
+                 (%lane-enqueue sap (shmem-locator-lane-count locator) lane (shmem-locator-capacity locator)
                                 (dds.core.buffer:octet-buffer-vec buffer) 0 len)))
           (progn
             (dds.pal:fence :full)                          ; order the enqueue's cursor store before the parked load (StoreLoad)
@@ -372,12 +443,96 @@
             len)
           0))))
 
+(defun* %default-shmem-lane-poisoned-hook (segment-name lane reason count)
+    (function (string (integer 0) keyword (integer 1)) t)
+  "Default *SHMEM-LANE-POISONED-HOOK*: ONE line on *ERROR-OUTPUT* naming the segment, the lane and the
+   corrupt-cursor REASON. Writes to a stream and returns; it signals nothing (gate-nocond). COUNT is unused
+   because each poisoning event invokes the hook exactly once."
+  (declare (ignore count))
+  (format *error-output* "~&dds shmem: lane ~d of receive segment ~a POISONED (~(~a~)); quarantined until ~
+                          the transport is closed, its sender falls back to UDP (ADR 0119)~%"
+          lane segment-name reason)
+  (force-output *error-output*)
+  t)
+
+(defparameter *shmem-lane-poisoned-hook* #'%default-shmem-lane-poisoned-hook
+  "Funcallable (SEGMENT-NAME LANE REASON COUNT), the LOG EVENT of a SHMEM lane poisoning (ADR 0119,
+   NFR-OBS). Called EXACTLY ONCE per poisoning: when the receiver detects a corrupt cursor or record header in
+   lane LANE of its own receive segment SEGMENT-NAME. REASON is the corrupt-cursor keyword %LANE-DRAIN
+   returned (:CURSOR-REGRESSED :CURSOR-OVERRUN :MISALIGNED-CURSOR :CURSOR-OUT-OF-RANGE :SKIP-OVERRUNS-COMMIT
+   :BAD-RECORD-LENGTH :RECORD-OVERRUNS-COMMIT). COUNT is the lane's corrupt-cursor counter after the
+   increment.
+   A poisoned lane is quarantined and never drained again, so it produces no further events. Runs ON the
+   SHMEM receiver thread: it MUST NOT block. A signalling hook is swallowed (IGNORE-ERRORS at the call site)
+   so it cannot kill the receiver. Default = %DEFAULT-SHMEM-LANE-POISONED-HOOK, one line on *ERROR-OUTPUT*.
+   Rebind it to route the event into a logging service.")
+
+(defun* %poison-lane (st lane reason)
+    (function (shmem-transport (integer 0) keyword) (integer 1))
+  "ADR 0119: quarantine LANE of ST's own receive segment after %LANE-DRAIN reported REASON. Set the
+   receiver-local poison flag, bump the lane's corrupt-cursor counter, and emit the ONE log event through
+   *SHMEM-LANE-POISONED-HOOK*. Returns the new counter value. Cold: runs at most once per lane per
+   transport lifetime, because a poisoned lane is never drained again."
+  (setf (svref (shmem-transport-lane-poison st) lane) reason)
+  (let ((n (incf (svref (shmem-transport-lane-corrupt-cursors st) lane))))
+    (ignore-errors (funcall *shmem-lane-poisoned-hook* (shmem-transport-name st) lane reason n))
+    n))
+
 (defun* shmem-receive-drain (st on-datagram)
     (function (shmem-transport function) t)
-  "Drain ALL lanes of ST's OWN receive segment once, calling ON-DATAGRAM per record."
-  (let ((sap (dds.pal:shm-sap (shmem-transport-segment st))))
-    (dotimes (i (shmem-transport-lane-count st) t)
-      (%lane-drain sap i (shmem-transport-capacity st) (shmem-transport-sink st) on-datagram))))
+  "Drain every HEALTHY lane of ST's OWN receive segment once, calling ON-DATAGRAM per record.
+
+   LANE POISONING (ADR 0119, NFR-SEC-POSTURE). A lane whose shared cursors or record headers are impossible
+   for a conforming producer (%LANE-DRAIN returns a reason keyword) is POISONED. It is quarantined: never
+   drained again for this transport's lifetime, and ignored by the receiver's work predicate, so the
+   receiver can still park. The event is counted per lane and logged once
+   (*SHMEM-LANE-POISONED-HOOK*). The other lanes are unaffected. The poisoned lane's sender is not told
+   directly. Its read cursor stops moving, so its ring fills, %LANE-ENQUEUE answers 'does not fit', and its
+   %SHMEM-SEND returns 0, which is the ordinary UDP-fallback signal. Delivery continues over UDP.
+   Observe the state with SHMEM-LANE-POISONED-P, SHMEM-LANE-CORRUPT-CURSORS and
+   SHMEM-TRANSPORT-POISONED-LANES.
+
+   Geometry (lane count, capacity) is ST's own, the values the segment was created with. It is never read
+   back from the shared header."
+  (let ((sap (dds.pal:shm-sap (shmem-transport-segment st)))
+        (n (shmem-transport-lane-count st))
+        (cap (shmem-transport-capacity st))
+        (sink (shmem-transport-sink st))
+        (poison (shmem-transport-lane-poison st)))
+    (dotimes (i n t)
+      (unless (svref poison i)                       ; quarantined lanes are never read again
+        (let ((status (%lane-drain sap n i cap sink on-datagram)))
+          (unless (eq status t) (%poison-lane st i status)))))))
+
+(defun* shmem-lane-poisoned-p (st lane)
+    (function (shmem-transport (integer 0)) (or null keyword))
+  "NIL if LANE of ST's receive segment is healthy, else the corrupt-cursor REASON keyword it was poisoned
+   for (ADR 0119). A queryable status (NFR-OBS); lock-free read of a word the single drain thread writes."
+  (svref (shmem-transport-lane-poison st) lane))
+
+(defun* shmem-lane-corrupt-cursors (st lane)
+    (function (shmem-transport (integer 0)) (integer 0))
+  "Number of corrupt-cursor detections on LANE of ST's receive segment (ADR 0119, NFR-OBS). 0 in a healthy
+   run. Under the quarantine policy a poisoned lane is never read again, so this is 0 or 1 per lane per
+   transport lifetime. It is a counter rather than a flag so that a future re-arm policy needs no API
+   change."
+  (svref (shmem-transport-lane-corrupt-cursors st) lane))
+
+(defun* shmem-transport-poisoned-lanes (st)
+    (function (shmem-transport) (values (integer 0) list))
+  "SNAPSHOT of ST's lane-poisoning report (ADR 0119, NFR-OBS): (VALUES TOTAL LIST). TOTAL is the sum of
+   every lane's corrupt-cursor counter. LIST is a FRESH list of (LANE REASON COUNT), one per poisoned lane,
+   in lane order. A healthy transport returns 0 and NIL. MUST be 0/NIL after a healthy run. Non-zero means a
+   peer, or a local defect, wrote a lane state no conforming producer writes, and that lane is now
+   quarantined (its sender is on UDP). Cold: allocates the fresh list, so do not call it per datagram."
+  (let ((poison (shmem-transport-lane-poison st))
+        (counts (shmem-transport-lane-corrupt-cursors st))
+        (total 0) (out '()))
+    (dotimes (i (length poison))
+      (incf total (svref counts i))
+      (when (svref poison i)
+        (push (list i (svref poison i) (svref counts i)) out)))   ; HOTPATH-ALLOC(COLD): status snapshot, never per datagram
+    (values total (nreverse out))))
 
 (defun* shmem-transport-close (st)
     (function (shmem-transport) (values t (or null keyword)))
@@ -559,7 +714,7 @@
              (let ((sap (dds.pal:shm-sap (shmem-dest-segment
                                           (gethash (shmem-locator-name loc)
                                                    (shmem-transport-attach-cache a))))))
-               (assert (eql lane-a (%claim-lane sap (shmem-transport-token a))) ()   ; HOTPATH-COND(TEST): in-file self-test
+               (assert (eql lane-a (%claim-lane sap (shmem-locator-lane-count loc) (shmem-transport-token a))) ()   ; HOTPATH-COND(TEST): in-file self-test
                        "the cached lane must equal a fresh %claim-lane for the same token"))
              (shmem-receive-drain
               rx (lambda (s size)
@@ -578,33 +733,41 @@
 ;;;; receiver holding the mutex sees the data. Shutdown sets stop + broadcasts, then JOINs the
 ;;;; thread BEFORE any segment teardown (no use-after-free).
 
-(defun* %any-data-p (sap)
-    (function (t) t)
-  "T iff any lane has unread data (write-cursor != read-cursor). Checked under the pshared mutex."
-  (let ((n (%ring-lane-count sap)))
-    (dotimes (i n nil)
+(defun* %any-data-p (sap lane-count poison)
+    (function (t (integer 1) simple-vector) t)
+  "T iff any HEALTHY lane has unread data (write-cursor != read-cursor). Checked under the pshared mutex
+   (and, unlocked, by the spin).
+
+   LANE-COUNT is the receiver's own trusted lane count, never the header's: a forged header count would walk
+   descriptors past the end of the mapping. POISON is the transport's per-lane quarantine vector (ADR 0119):
+   a poisoned lane is skipped. Before poisoning existed, a wedged lane kept w != r forever, so this
+   predicate stayed true and the receiver never parked. It spun at full CPU, re-draining a lane that could
+   never advance."
+  (dotimes (i lane-count nil)
+    (unless (svref poison i)
       (let ((b (%lane-desc-off i)))
         (when (/= (dds.pal:load-sap-u64 sap (+ b +lane-off-write+))
                   (dds.pal:load-sap-u64 sap (+ b +lane-off-read+)))
           (return t))))))
 
-(defun* %rx-wait-for-work (sap)
-    (function (t) t)
+(defun* %rx-wait-for-work (sap lane-count poison)
+    (function (t (integer 1) simple-vector) t)
   "Receiver inner wait (CALLER HOLDS the mutex): block on the pshared cond until a lane has data or stop,
    using the parked flag for the conditional-wakeup handshake. Sets parked=1 + a FULL fence + RE-CHECKS
    the predicate BEFORE waiting (the Dekker StoreLoad pair with %shmem-send's full-fenced parked load):
    if a producer enqueued (or stop was set) between the first predicate check and publishing parked, the
    re-check observes it and returns WITHOUT waiting, so the sender's skipped signal is never lost. parked
-   is cleared to 0 on every exit (raced-out OR woken) so a later send re-arms it. Returns T iff stop is set."
+   is cleared to 0 on every exit (raced-out OR woken) so a later send re-arms it. Returns T iff stop is set.
+   LANE-COUNT and POISON are passed through to %ANY-DATA-P (trusted geometry, quarantined lanes skipped)."
   (loop
     (when (= 1 (dds.pal:load-sap-u64 sap +stop-off+)) (return t))
-    (when (%any-data-p sap) (return nil))
+    (when (%any-data-p sap lane-count poison) (return nil))
     (dds.pal:store-sap-u64 sap +parked-off+ 1)
     (dds.pal:fence :full)                                ; order parked=1 store before the data/stop re-load (StoreLoad)
     (cond
       ((= 1 (dds.pal:load-sap-u64 sap +stop-off+))       ; stop raced in after we armed parked
        (dds.pal:store-sap-u64 sap +parked-off+ 0) (return t))
-      ((%any-data-p sap)                                 ; a producer enqueued after we armed parked: drain, don't wait
+      ((%any-data-p sap lane-count poison)               ; a producer enqueued after we armed parked: drain, don't wait
        (dds.pal:store-sap-u64 sap +parked-off+ 0) (return nil))
       (t (dds.pal:pshared-cond-wait sap +cond-off+ +mutex-off+)   ; truly idle: block (parked stays 1)
          (dds.pal:store-sap-u64 sap +parked-off+ 0)))))   ; woken (signal/broadcast/spurious): unpark, loop re-checks
@@ -655,11 +818,12 @@
    MONOTONIC-NS cost ~633 ns per read on the since-withdrawn Clasp target (libffi) — on any FFI where a clock
    read is not nearly free it would dominate the spin itself.")
 
-(defun* %rx-spin-for-work (sap)
-    (function (t) t)
+(defun* %rx-spin-for-work (sap lane-count poison)
+    (function (t (integer 1) simple-vector) t)
   "Spin up to *SHMEM-RX-SPIN-ITERATIONS* times waiting for a lane to fill, WITHOUT holding the pshared mutex
    and WITHOUT arming the parked flag. Returns :DATA if a lane filled, :STOP if teardown was signalled, or
-   NIL if the spin budget ran out (the caller then takes the mutex and parks).
+   NIL if the spin budget ran out (the caller then takes the mutex and parks). LANE-COUNT and POISON are
+   passed through to %ANY-DATA-P (trusted geometry; a poisoned lane is not work, ADR 0119).
 
    OUTSIDE THE MUTEX — that placement is the whole point, and getting it wrong is what sank the first
    attempt. Spinning INSIDE %rx-wait-for-work (which runs with the mutex HELD) starves stop-shmem-receiver,
@@ -672,7 +836,7 @@
    miss a datagram (it polls the lanes directly) and cannot block a sender."
   (loop repeat *shmem-rx-spin-iterations*
         do (when (= 1 (dds.pal:load-sap-u64 sap +stop-off+)) (return-from %rx-spin-for-work :stop))
-           (when (%any-data-p sap) (return-from %rx-spin-for-work :data)))
+           (when (%any-data-p sap lane-count poison) (return-from %rx-spin-for-work :data)))
   nil)
 
 (defun* start-shmem-receiver (st on-datagram)
@@ -685,18 +849,20 @@
    Optionally SPINS first (%rx-spin-for-work, *shmem-rx-spin-iterations*, default 0 = off) — outside the
    mutex, so a spinning receiver never blocks teardown. A spin that finds data skips the park entirely, and
    with it the cross-process wake that is our whole remaining distance to Connext on this transport."
-  (let ((sap (dds.pal:shm-sap (shmem-transport-segment st))))
+  (let ((sap (dds.pal:shm-sap (shmem-transport-segment st)))
+        (n (shmem-transport-lane-count st))              ; trusted geometry (ADR 0119)
+        (poison (shmem-transport-lane-poison st)))       ; quarantined lanes do not count as work (ADR 0119)
     (dds.pal:store-sap-u64 sap +stop-off+ 0)
     (dds.pal:store-sap-u64 sap +parked-off+ 0)
     (setf (shmem-transport-rx-thread st)
           (dds.pal:spawn
            (lambda ()
              (loop
-               (let ((spun (%rx-spin-for-work sap)))          ; NO mutex held here
+               (let ((spun (%rx-spin-for-work sap n poison)))   ; NO mutex held here
                  (when (eq spun :stop) (return))
                  (unless (eq spun :data)                      ; spin budget exhausted (or 0): park
                    (dds.pal:pshared-lock sap +mutex-off+)
-                   (let ((stop (%rx-wait-for-work sap)))
+                   (let ((stop (%rx-wait-for-work sap n poison)))
                      (dds.pal:pshared-unlock sap +mutex-off+)
                      (when stop (return)))))
                (handler-case (shmem-receive-drain st on-datagram) (error () nil))))

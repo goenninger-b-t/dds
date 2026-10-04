@@ -162,14 +162,30 @@
    physically hold — a buffer cannot be larger than the segment containing it — and never against an
    invented ceiling. That is deliberate: a peer may legitimately be configured with any
    `message_size_max` its segment accommodates, and REJECTING A CONFORMANT PEER is the worst failure class
-   this project recognises. A physical bound cannot false-reject a real segment; a guessed policy bound can."
+   this project recognises. A physical bound cannot false-reject a real segment; a guessed policy bound can.
+
+   THE RING MUST FIT TOO (ADR 0119 §4, the RTI-SHMEM audit). The record ring these properties describe
+   starts at `+rti-shmem-ring-start-base+ + 8 * count` and is `rbs + msm + 8 * count - 64` long
+   (RTI-SHMEM-RING-START / RTI-SHMEM-RING-MODULUS, ADR 0081 §5.0). Each field passing on its own does not
+   make that ring physical. rbs = msm = count = 1 gives a NEGATIVE modulus, and a zero modulus is reachable
+   as well. RTI-SHMEM-RECORD-OFFSET then either divides by zero or reduces the cursor to a negative offset
+   that points BELOW the ring start, into the control block that RTI-SHMEM-WRITE-RECORD writes. So a
+   plausible block also needs a positive modulus, a ring that STARTS inside the segment, and a modulus no
+   larger than the segment. All three are physical bounds again: a ring cannot have no length, cannot begin
+   outside the segment holding it, and cannot be longer than that segment. That check is
+   %RTI-SHMEM-RING-FITS-P, defined after the ring constants it uses. It deliberately does NOT require the
+   ring to END inside the segment: under the measured formulas (ADR 0081 §5.0) ring end is
+   `rbs + msm + 176 + 16 * count` against a segment of `rbs + msm + align8(240 + 15 * count)`, so for
+   count >= 72 the formulas put the ring end past the segment, and that bound could reject a conformant
+   peer. The record-level extent checks in RTI-SHMEM-READ-RECORD still guard every individual read."
   (let ((size (rti-shmem-properties-segment-size props)))
     (and (plusp (rti-shmem-properties-message-size-max props))
          (plusp (rti-shmem-properties-received-message-count-max props))
          (plusp (rti-shmem-properties-receive-buffer-size props))
          (<= (rti-shmem-properties-receive-buffer-size props) size)
          (<= (rti-shmem-properties-message-size-max props) size)
-         (<= (rti-shmem-properties-received-message-count-max props) size))))
+         (<= (rti-shmem-properties-received-message-count-max props) size)
+         (%rti-shmem-ring-fits-p props))))
 
 (defun* rti-shmem-segment-properties (port)
     (function ((unsigned-byte 16)) (values (or null rti-shmem-properties) (or null keyword)))
@@ -242,6 +258,33 @@
 (defconstant +rti-shmem-cursor-bias+ 68
   "Subtracted from a control-block cursor before reducing it modulo the ring length. Invariant across all
    four measured configurations. ADR 0081 §5.0.")
+
+(defun* %rti-shmem-ring-fits-p (props)
+    (function (rti-shmem-properties) t)
+  "T iff the record ring PROPS describe is PHYSICAL (ADR 0119 §4): its length is POSITIVE, it STARTS inside
+   the segment, it is no LONGER than the segment, and ring start + length stays below 2^32. Ring start is
+   `+rti-shmem-ring-start-base+ + 8 * count`, length `rbs + msm + 8 * count - 64` (ADR 0081 §5.0).
+
+   Computed on plain integers rather than through RTI-SHMEM-RING-START / RTI-SHMEM-RING-MODULUS, because
+   those declare (unsigned-byte 32) results, which a hostile property block can violate (a modulus of -54
+   at rbs = msm = count = 1). Once this holds, both helpers and RTI-SHMEM-RECORD-OFFSET (at most
+   ring start + length - 1) stay inside their declared (unsigned-byte 32) types.
+
+   NOT checked: that the ring ENDS inside the segment. The measured formulas put the ring end 8 octets past
+   the segment at count = 72 and further beyond above it (ADR 0081 §5.0 measured only count 8, 16, 37, 64),
+   so that bound could false-reject a conformant Connext peer. It may be added only once a live capture at
+   count >= 72 settles the geometry (ADR 0081). RTI-SHMEM-READ-RECORD bounds every record it reads."
+  (let* ((size (rti-shmem-properties-segment-size props))
+         (cnt (rti-shmem-properties-received-message-count-max props))
+         (ring-start (+ +rti-shmem-ring-start-base+ (* +rti-shmem-ring-entry-stride+ cnt)))
+         (modulus (+ (rti-shmem-properties-receive-buffer-size props)
+                     (rti-shmem-properties-message-size-max props)
+                     (* +rti-shmem-ring-entry-stride+ cnt)
+                     +rti-shmem-ring-modulus-bias+)))
+    (and (plusp modulus)
+         (< ring-start size)
+         (<= modulus size)
+         (< (+ ring-start modulus) (expt 2 32)))))
 
 (defun* rti-shmem-ring-start (count)
     (function ((unsigned-byte 32)) (unsigned-byte 32))
@@ -558,7 +601,15 @@
      3. a segment CLAIMING to be larger than it is        -> :IMPLAUSIBLE-SEGMENT-PROPERTIES (the kernel
         refuses the oversized re-attach, so a lie about extent cannot become a trusted bound);
      4. receive_buffer_size larger than the whole segment -> :IMPLAUSIBLE-SEGMENT-PROPERTIES;
-     5. message_size_max of zero                          -> :IMPLAUSIBLE-SEGMENT-PROPERTIES.
+     5. message_size_max of zero                          -> :IMPLAUSIBLE-SEGMENT-PROPERTIES;
+     6. rbs = msm = count = 1 (each field plausible alone, ring modulus -54) -> :IMPLAUSIBLE-SEGMENT-PROPERTIES;
+     7. a ring that STARTS at the segment end (rbs = msm = 1, count 482 in 4096 octets; its modulus 3794
+        fits, so only the ring-start bound refuses it)                       -> :IMPLAUSIBLE-SEGMENT-PROPERTIES;
+     8. the count = 72 geometry the measured formulas predict (ADR 0081 §5.0): segment 4096 =
+        rbs + msm + align8(240 + 15 * 72), whose ring formally ENDS 8 octets past the segment -> ACCEPTED.
+        A ring-end bound would refuse it and could so reject a conformant peer.
+   Cases 6 to 8 are the RTI-SHMEM reader audit of ADR 0119 §4. Before it, case 6 was accepted, and
+   RTI-SHMEM-RECORD-OFFSET then pointed below the ring start, into the control block.
 
    Case 3 is the one worth having: it is the difference between reading a length and trusting it. The
    plausibility bounds are PHYSICAL (a buffer cannot exceed the segment holding it), never an invented
@@ -605,6 +656,24 @@
                (multiple-value-bind (p st) (rti-shmem-segment-properties port)
                  (assert (and (null p) (eq st :implausible-segment-properties)) ()   ; HOTPATH-COND(TEST): in-file self-test
                          "a zero message_size_max must be refused, got ~s/~s" p st))
+               ;; 6. ADR 0119 §4: every field plausible alone, but the ring they describe has a NEGATIVE length.
+               (lay-out size 1 1 1)
+               (multiple-value-bind (p st) (rti-shmem-segment-properties port)
+                 (assert (and (null p) (eq st :implausible-segment-properties)) ()   ; HOTPATH-COND(TEST): in-file self-test
+                         "a ring of non-positive length (rbs=msm=count=1) must be refused, got ~s/~s" p st))
+               ;; 7. ADR 0119 §4: a ring that starts AT the segment end (240 + 8*482 = 4096); modulus
+               ;;    1+1+3856-64 = 3794 <= 4096, so only the ring-start bound refuses it.
+               (lay-out size 1 1 482)
+               (multiple-value-bind (p st) (rti-shmem-segment-properties port)
+                 (assert (and (null p) (eq st :implausible-segment-properties)) ()   ; HOTPATH-COND(TEST): in-file self-test
+                         "a ring starting at the segment end must be refused, got ~s/~s" p st))
+               ;; 8. ADR 0119 §4 / ADR 0081 §5.0: count 72, rbs + msm = 4096 - align8(240 + 15*72) = 2776.
+               ;;    Ring end 240+576 + 2776+576-64 = 4104 > 4096 by the formulas, yet this is what a
+               ;;    conformant peer's segment looks like by the same formulas: it must be ACCEPTED.
+               (lay-out size 2264 512 72)
+               (multiple-value-bind (p st) (rti-shmem-segment-properties port)
+                 (assert (and p (null st)) ()   ; HOTPATH-COND(TEST): in-file self-test
+                         "the count=72 formula geometry must be accepted (no ring-end bound), got ~s/~s" p st))
                t))
         (dds.pal:sysv-shm-destroy seg)
         (dds.pal:sysv-shm-detach seg)))

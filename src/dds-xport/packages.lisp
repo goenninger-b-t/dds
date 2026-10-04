@@ -46,6 +46,9 @@
            #:shmem-locator-lane-count #:shmem-locator-capacity
            #:seg-name-for-guid
            #:shmem-receive-drain #:shmem-transport-close
+           ;; ADR 0119 lane poisoning: the log-event hook + the queryable per-lane status (NFR-OBS)
+           #:*shmem-lane-poisoned-hook* #:shmem-lane-poisoned-p #:shmem-lane-corrupt-cursors
+           #:shmem-transport-poisoned-lanes
            #:*shmem-rx-spin-iterations* #:start-shmem-receiver #:stop-shmem-receiver
            #:shm-attach-by-name-reliable-p
            #:*debug-shmem-send-fault* #:shmem-send-test-fault

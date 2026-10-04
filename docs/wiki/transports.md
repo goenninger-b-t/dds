@@ -82,7 +82,11 @@ machinery. See [When SHMEM engages](#when-shmem-engages-and-what-stays-on-udp) a
 | `dds.xport.shmem:start-shmem-receiver` | function | `(st on-datagram)` — spawn the receive thread: it blocks on the segment's pshared cond until a lane has data (or stop), then drains **all** lanes and calls `(on-datagram sink size)` per record. Uses the conditional-wakeup parked flag so a busy sender skips the futex wake while the thread is draining. |
 | `dds.xport.shmem:stop-shmem-receiver` | function | `(st)` — signal the receive thread to exit (set stop + broadcast) and **join it before** any segment teardown (no use-after-free). |
 | `dds.xport.shmem:shmem-locator` — **a lane has ONE producer at a time (ADR 0109)** | contract | A lane's ring enqueue reads the write cursor, memcpys the record at that position and publishes cursor+span: **three non-atomic steps**. Cross-*process* single-producer is structural (a lane is owned by one sender token), but a sender is many **threads** — the publisher, the async sender, the receiver thread's ACKNACK repair, the flow scheduler, and every application thread calling `write` (DDS 1.4 §2.2.2.4.2.11 permits concurrent writes on one `DataWriter`). Unsynchronised, two producers resolve the **same** ring position, the second memcpy destroys the first record, and the cursor advances by one span for two writes — a datagram lost outright, and a consumer that resumes mid-record decoding a datagram header as a payload. The send path therefore holds a **per-destination lock** across the enqueue (per lane, so sends to different peers stay concurrent); it is not held across the futex wake. |
-| `dds.xport.shmem:shmem-receive-drain` | function | `(st on-datagram)` — drain all lanes of `st`'s own receive segment once, calling `on-datagram` per record (the single-shot drain the threaded receiver wraps). |
+| `dds.xport.shmem:shmem-receive-drain` | function | `(st on-datagram)` — drain every **healthy** lane of `st`'s own receive segment once, calling `on-datagram` per record (the single-shot drain the threaded receiver wraps). A lane whose shared cursors or record headers are impossible for a conforming producer is **poisoned** and quarantined (ADR 0119, see [Lane poisoning](#lane-poisoning--a-corrupt-cursor-is-hostile-input-adr-0119)). The read cursor is advanced past each record *before* `on-datagram` runs and is stored on every exit, so a datagram whose handler unwinds is not redelivered. |
+| `dds.xport.shmem:*shmem-lane-poisoned-hook*` | special variable | Funcallable `(segment-name lane reason count)`: the **log event** of a lane poisoning, called **exactly once** per poisoned lane on the receiver thread. Must not block; a signalling hook is swallowed. Default: one line on `*error-output*`. Rebind it to route the event into a logging service. |
+| `dds.xport.shmem:shmem-lane-poisoned-p` | function | `(st lane)` → `NIL` if healthy, else the corrupt-cursor **reason** keyword (`:cursor-regressed` `:cursor-overrun` `:misaligned-cursor` `:cursor-out-of-range` `:skip-overruns-commit` `:bad-record-length` `:record-overruns-commit`). |
+| `dds.xport.shmem:shmem-lane-corrupt-cursors` | function | `(st lane)` → the lane's corrupt-cursor counter (NFR-OBS). 0 in a healthy run; at most 1 per lane per transport lifetime under the quarantine policy. |
+| `dds.xport.shmem:shmem-transport-poisoned-lanes` | function | `(st)` → `(values total list)`: the summed counter and a fresh `((lane reason count) …)` for every poisoned lane. **Must be `0` / `NIL` after a healthy run.** Allocates; do not call it per datagram. |
 | `dds.xport.shmem:*shmem-dest-cache*` | special variable | Default `T`: the sender resolves a destination **once** — attached segment, mapped SAP and claimed ring lane together in one `shmem-dest`, cached beside the attach (ADR 0067). `NIL`: re-derive both on every datagram, which means `shm-sap` boxing a pointer and `%claim-lane` taking the segment's pshared mutex, scanning every lane descriptor and running an `unwind-protect` — per send, for a value that cannot have changed. **The ring bytes are identical either way**; only how the sender finds its lane differs. A/B lever and escape hatch: a wrong cached lane is *silent mis-delivery* into another sender's ring, so `run-shmem-dest-cache-test` asserts lanes are claimed, stable, distinct and in agreement with a fresh `%claim-lane`. |
 | `dds.xport.shmem:shmem-transport-close` | function | `(st)` — stop the receiver, destroy the pshared objects, detach all attached + own segments, and unlink the own segment. |
 | `dds.xport.shmem:shm-attach-by-name-reliable-p` | function | `()` — `T` iff a segment this process creates is re-openable **by name**, which the transport requires because the sender opens the receiver's named segment. Delegates to `dds.pal:shm-create-mode-reliable-p`: it asks for the **capability**, never the platform (ADR 0064), and dds-xport is outside dds-pal where reader conditionals are banned. **`T` on SBCL everywhere and on AllegroCL on Linux**; `NIL` for a non-SBCL image on macOS, a platform not admitted (ADR 0118 §4, owner decision D1). Where it is `NIL` the transport's tests pass-skip. |
@@ -109,7 +113,7 @@ from the RTPS port. This package answers one question — **is that RTI peer on 
 | `rti-shmem-same-host-p` *host-id* *port* → `(values same-host status)` | Attaches read-only to that key and compares the segment's `shmemUUID` against the 12-octet `host-id` from the peer's advertised `Locator_t`. |
 | `+rti-shmem-segment-key-base+` `#x400000` | Segment key offset. Semaphore `#x800000` and mutex `#xB00000` bases are exported alongside it. |
 | `+rti-shmem-protocol-major-validated+` `2` | The one shared-memory protocol version the layout was measured against. |
-| `rti-shmem-segment-properties` *port* → `(values props status)` | The receiver's embedded transport properties: `segment-size`, `receive-buffer-size`, `message-size-max`, `received-message-count-max`. |
+| `rti-shmem-segment-properties` *port* → `(values props status)` | The receiver's embedded transport properties: `segment-size`, `receive-buffer-size`, `message-size-max`, `received-message-count-max`. Refused as `:implausible-segment-properties` unless every field is physically possible **and** the record ring they describe is physical: a positive length, a start inside the segment, a length no larger than the segment (ADR 0119 §4). Without the ring check, `rbs = msm = count = 1` (modulus −54) passed and made `rti-shmem-record-offset` point below the ring, into the control block. The ring is deliberately **not** required to end inside the segment: the measured formulas (ADR 0081 §5.0) put the ring end past the segment for `received_message_count_max >= 72`, so that bound could reject a conformant peer; `rti-shmem-read-record` still bounds every record it reads. |
 | `rti-shmem-datagram-fits-p` *props* *bytes* → *boolean* | Whether a `bytes`-octet datagram is within what that receiver carries in one message. |
 | `rti-shmem-ring-start` *count* → *offset* | Where the record ring begins: `240 + 8*count`. |
 | `rti-shmem-ring-modulus` *props* → *length* | Ring length: `receive_buffer_size + message_size_max + 8*count - 64`. |
@@ -835,6 +839,61 @@ wire: every `len`/offset is bounds-checked against the lane extents before it is
 (NFR-SEC-POSTURE). A lane/ring-full enqueue returns a reject sentinel, which the discovery layer maps to a UDP
 fallback for that datagram (the reliable sample stays in the HistoryCache and repairs via HEARTBEAT/ACKNACK) —
 **never** a GC-heap fallback.
+
+### Lane poisoning — a corrupt cursor is hostile input (ADR 0119)
+
+Both cursors of a lane and every record header live in memory that another process can write. A
+conforming producer keeps `0 <= w - r <= capacity`, starts every record on an 8-octet boundary (spans are
+rounded to 8 and the capacity is a multiple of 8), and never commits a record past `w`. `%lane-drain` checks
+each of those facts **before** the value is used to address memory. The 4-octet length read at
+`data + (mod r capacity)` is guarded by `(logtest pos 7)` and `(> (+ pos 4) capacity)`. Before ADR 0119
+that read was unguarded, and `r = capacity - 1` read three octets past the lane, which on the last lane is
+past the end of the mapping. The lane geometry (lane count, capacity, record bound `capacity - 8`) always
+comes from the receiver's own creation parameters, never from the shared header.
+
+A lane that fails any check is **poisoned**, and the response is fixed:
+
+1. a receiver-local flag records the reason (`shmem-lane-poisoned-p`). It is kept in the receiver's process,
+   not in the segment, because a peer could clear a flag stored there;
+2. the lane's corrupt-cursor counter is incremented (`shmem-lane-corrupt-cursors`,
+   `shmem-transport-poisoned-lanes`, NFR-OBS);
+3. **one** log event is emitted through `*shmem-lane-poisoned-hook*`;
+4. the lane is **quarantined** (detached, not reset) for the transport's lifetime. It is never drained
+   again, and the receiver's work predicate ignores it, so the receiver can still park. Before poisoning
+   existed, a wedged lane kept `w ≠ r` forever and the receiver spun at full CPU.
+
+The lane's sender is not told anything explicitly. Its read cursor stops moving, so its ring fills, the
+enqueue answers "does not fit", and `%shmem-send` returns 0, which is the existing UDP-fallback signal.
+Delivery therefore continues over UDP, and a reliable writer repairs the records stranded in the ring
+through HEARTBEAT/ACKNACK. ADR 0119 explains why quarantine was chosen over resetting `r := w`: a reset
+trusts the same untrusted `w` that was just found inconsistent, re-poisons on every pass while a buggy
+producer keeps writing, and so turns one log event into a log flood.
+
+The sender side has the same class of bug and gets the same fix. `%lane-enqueue` and `%claim-lane` take the
+lane count from the locator the mapping was sized by (`%claim-lane` scans `(min locator-count
+header-count)`), and a non-8-aligned write cursor is refused before anything is written. Enqueue and drain
+share **one** record bound, `len <= capacity - 8` (the max-record `%ring-init` writes). A datagram above it
+is refused at the enqueue (`NIL`, so the send falls back to UDP) rather than written and then read back as
+`:bad-record-length`, which would make a conforming sender poison its own lane.
+
+```lisp
+;; Operator view: is any SHMEM lane of this participant quarantined?
+(multiple-value-bind (total lanes)
+    (dds.xport.shmem:shmem-transport-poisoned-lanes (dds.disc:disc-node-shmem node))
+  (when (plusp total)
+    (format t "~d corrupt-cursor event(s): ~s~%" total lanes)))   ; e.g. 1 ((3 :MISALIGNED-CURSOR 1))
+
+;; Route the one-per-lane event into your own log instead of *error-output*:
+(setf dds.xport.shmem:*shmem-lane-poisoned-hook*
+      (lambda (segment lane reason count)
+        (my-log :warn "shmem lane ~d of ~a poisoned: ~a (#~d)" lane segment reason count)))
+```
+
+Regression tests: `shmem-lane-poison-page-end` puts a one-lane ring whose lane ends **exactly** at the end of
+a one-page `shm-create` object and maps it at two pages, so any over-read past end-of-file raises SIGBUS.
+The pre-ADR-0119 drain was measured to fault there on SBCL and AllegroCL. `shmem-lane-poison-observable`
+asserts the flag, the counter, the snapshot, exactly one hook event, the quarantine, the healthy neighbour
+lane, and the poisoned sender's UDP fallback.
 
 **A signalled SHMEM-send hard fault also degrades to UDP** (WP-SHMEM-SEND-SELF-GUARD, FR-XPORT-2). The lane-full
 reject above is a benign *return-0*; a **signalled** `%shmem-send` error (segment detached / pshared error /

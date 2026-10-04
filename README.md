@@ -185,6 +185,16 @@ CPU. **A timed-out wait is never treated as success:** these joins exist so a su
 leaks* rather than risking a use-after-free on a live thread. `dds.pal:stuck-teardown-joins` must read 0
 after a healthy run.
 
+**A corrupt shared-memory cursor is hostile input** ([ADR 0119](docs/adr/0119-shmem-lane-poisoning.md)).
+SHMEM ring cursors and record headers live in memory that another process can write. The receiver checks
+every one before using it to address memory: alignment and extent first, then the length, all against
+the ring geometry the receiver itself created, never against the shared header. A lane that fails a check
+is **poisoned**: it gets a receiver-local flag, a per-lane counter and exactly one log event
+(`dds.xport.shmem:*shmem-lane-poisoned-hook*`), and is then quarantined. Its sender falls back to UDP
+through the existing ring-full path. Before this, a corrupt read cursor could read past the mapping (SIGBUS,
+measured on SBCL and AllegroCL), and a detected corruption wedged the lane silently while the receiver
+spun at full CPU. `dds.xport.shmem:shmem-transport-poisoned-lanes` must read 0 after a healthy run.
+
 **Allocation: `take` is a loan** ([ADR 0093](docs/adr/0093-the-copy-path-becomes-a-loan.md)). NFR-MEM's
 target is **zero bytes per sample**, and the FlatData/Zero-Copy read path already reaches it literally. The
 ordinary *copy* path could not, for a semantic reason rather than a missing optimisation: it hands the
