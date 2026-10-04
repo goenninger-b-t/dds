@@ -127,8 +127,8 @@ result; plan `docs/plans/2026-10-03-sbcl-allegro-full-ok.md`):
   `:openssl-pqc`; AllegroCL **504 FULL, 10 PARTIAL, 118 SKIPPED, 18 FAILED**, 142 events (`:openssl-pqc` 106,
   `:zc-sap-primitives` 18, `:static-vector-p` 11, `:alloc-counter` 5, `:subprocess-mode` 2). `make fuzz`,
   `make mem` and `make corpus` print the same accounting (`make corpus` counts its deferred vector as a
-  `:verified-elsewhere` skip). The step is report-only: exit codes are unchanged. Failing a run on an unbaselined skip (WP-0.10 step 2)
-  is Phase 0 work.
+  `:verified-elsewhere` skip). Step 1 was report-only; step 2 (ADR 0128) makes `make test` exit with the
+  ADR 0120 baseline verdict and judges `make fuzz` / `make mem` / `make corpus` on the same accounting.
 - **With the pinned OpenSSL 3.5.9 (WP-0.8/0.9, ADR 0123; measured 2026-10-04):** `scripts/build-openssl.sh`
   builds the verified release into a user prefix and `. scripts/openssl-env.sh` exports only
   `DDS_DARE_LIBCRYPTO`. The loader is fail-closed: the pinned file is the only candidate, its symbols are
@@ -158,8 +158,10 @@ result; plan `docs/plans/2026-10-03-sbcl-allegro-full-ok.md`):
   at `767c335` with the pinned OpenSSL: SBCL **654/654, 654 FULL, 0 skip events** (both SBCL baselines empty);
   AllegroCL **636/654**, the 18 known failures plus `thread-leak-check` and two known intermittents in the
   failure baseline (21 entries, each owned by a Phase 1 WP), and 51 skip events in the skip baseline
-  (`alloc-counter` 20, `zc-sap-primitives` 18, `static-vector-p` 11, `subprocess-mode` 2). `make test-ratchet
-  LISP=…` runs the suite and applies the rule. A run the baseline accepts is "no new failure", not "green".
+  (`alloc-counter` 20, `zc-sap-primitives` 18, `static-vector-p` 11, `subprocess-mode` 2). Since ADR 0128
+  `make test LISP=…` applies the rule itself: it exits 0 when nothing falls outside the baselines (printing
+  every baselined failure and skip as KNOWN, with its owner), 1 on a new failure or skip, and 3 (NOT A GATE
+  RUN) when `DDS_TEST_ALLOW_SKIP` allowed one. A run the baseline accepts is "no new failure", not "green".
 - **Milestones (ADR 0126, ADR 0127):** the M0→M8 sequence was not followed (M2–M7 work began before M1's exit
   passed), so **no milestone M1–M7 counts as passed**; the profile states above are progress, not exits.
   M2–M7 re-verification may run in parallel with M1 completion (owner decision D9), and exits are declared in
@@ -167,7 +169,9 @@ result; plan `docs/plans/2026-10-03-sbcl-allegro-full-ok.md`):
   clause mapping, the 96 cells of [`interop/matrix.csv`](interop/matrix.csv) (all NOT-RUN today: the Linux lab
   does not exist yet), REQUIREMENTS §6 as the only performance gate, and FR-CDR-8 big-endian conditional on the
   Connext probe (WP-4.11).
-- **CI:** the hosted workflow (`.github/workflows/gates.yml`) runs **SBCL only** and prints the AllegroCL legs
+- **CI:** the hosted workflow (`.github/workflows/gates.yml`) runs **SBCL only**, with the suite against the
+  pinned OpenSSL 3.5.9 and judged against the empty SBCL baselines (ADR 0128; `make corpus` and `make fuzz`
+  are judged on their skip accounting too, ADR 0128 §3), and prints the AllegroCL legs
   as NOT COVERED; AllegroCL is a local step until the CI licence question is settled.
 - **Allocation:** `make mem` measures the **CDR codec only** (0 bytes/iteration serialize/deserialize on SBCL);
   it is **not** a per-sample claim. The measured DCPS path still allocates (see *Allocation* under
@@ -296,7 +300,7 @@ commercially licensed; where one implementation is unavailable, use the per-impl
 
 ```sh
 make build         # load all systems (LISP=./scripts/with-sbcl.sh by default; or with-allegro.sh)
-make test          # run the unit/integration suite
+make test          # run the suite; exit = the ADR 0120 baseline verdict (0 / 1 / 3 NOT A GATE RUN; ADR 0128)
 make build-allegro # build on AllegroCL (ALISP_BIN / ALLEGRO_BIN override the binary)
 make test-allegro  # test on AllegroCL
 make build-all     # build on both targets (SBCL + AllegroCL)
@@ -306,7 +310,8 @@ make gate-hotpath  # no CLOS dispatch / per-sample alloc in hot-path files (NFR-
 make gate-nocond   # NO Lisp conditions in our code — failures are returned, never signalled (ADR 0064)
 make gate-skip-lint # a test skip goes through note-skip with a known capability, never a bare SKIP print (ADR 0122)
 make gate-verification # verification.csv well-formed; ADR 0120 baselines only shrink; interop/matrix.csv complete
-make test-ratchet LISP=./scripts/with-allegro.sh  # make test + no failure/skip outside test/*baseline-<lisp>.txt (ADR 0120)
+make test-ratchet LISP=./scripts/with-allegro.sh  # alias of make test since ADR 0128 (no failure/skip outside test/*baseline-<lisp>.txt)
+make clean         # remove every compiled file in the tree; gate-build fails while any src/**/*.fasl exists
 make mem           # measured 0 bytes/sample serialize/deserialize (NFR-PERF-8)
 make wire          # validate emitted RTPS against the tshark RTPS dissector (FR-TOOL-3)
 make all           # build-all + test-all + gates + mem

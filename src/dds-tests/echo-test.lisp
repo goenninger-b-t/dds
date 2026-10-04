@@ -4225,7 +4225,9 @@
    NOTE-SKIP is charged to it. Afterwards it prints the pass/fail line, the ADR 0122 coverage line (FULL /
    PARTIAL / SKIPPED / FAILED per test) and per-capability skip table, stuck teardown joins and leaked dds-*
    threads (ADR 0121), then signals TEST-FAILURE if any test failed or any dds-* thread the suite started is
-   still alive; else returns T. Skips do not change the outcome (ADR 0122 step 1 is report-only)."
+   still alive; else returns T. Skips do not change THIS function's outcome; `make test` judges the run's
+   log against the ADR 0120 baselines (scripts/test-baseline.py gate, ADR 0128: an unlisted skip or failure
+   fails it, a listed one is reported as KNOWN), so the exit status of `make test` is that verdict."
   (let ((tests '(("md5-rfc1321"               . run-md5-test)
                  ("endpoint-registry"        . run-endpoint-registry-test)
                  ("echo-over-mock-transport" . run-echo-test)
@@ -4940,7 +4942,8 @@
       ;; coverage — exactly how the DDS-Security suite sat entirely un-run on Linux behind an OpenSSL
       ;; pass-skip, and how about 100 tests printed "ok" on this host while the old registry printed
       ;; "skipped: 0" (ADR 0122). Every skip now arrives through NOTE-SKIP, so this report is complete by
-      ;; construction. Step 1 is REPORT-ONLY: nothing here changes the exit code.
+      ;; construction. Nothing HERE changes the exit code; ADR 0128 (step 2) enforces the skip baseline in
+      ;; `make test`, which reads this report from the log (scripts/test-baseline.py gate).
       (print-skip-report (reverse results) (skip-events))
       (multiple-value-bind (stuck sites) (dds.pal:stuck-teardown-joins)
         (declare (ignorable stuck))

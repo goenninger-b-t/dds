@@ -35,6 +35,30 @@ trap 'rm -rf "$TMP"' EXIT
 
 fail() { echo "gate-build: FAIL — $*" >&2; exit 1; }
 
+# ---- 0. NO COMPILED FILE IN THE SOURCE TREE (WP-0.16). ----
+# ASDF writes its output to the private cache (scripts/lisp-cache-env.sh), never beside the source. A fasl
+# under src/ therefore comes from a bare COMPILE-FILE and is stale by construction: nothing rebuilds it, a
+# (load "src/.../x") without a type can pick it up instead of the source, and it lives in a synced folder.
+# Three such files from 2026-06-30 sat in src/dds-dare/ for three months. `make clean` removes them.
+stray_fasls() { find "$1/src" -type f -name '*.fasl' 2>/dev/null | sort; }
+# Self-falsifier: one planted fasl under src/ must be found, and the near misses (a .lisp file, a name that
+# only contains "fasl", a fasl OUTSIDE src/) must not.
+mkdir -p "$TMP/tree/src/dds-x/sub" "$TMP/tree/other"
+: > "$TMP/tree/src/dds-x/sub/planted.fasl"
+: > "$TMP/tree/src/dds-x/planted.lisp"
+: > "$TMP/tree/src/dds-x/fasl-notes.txt"
+: > "$TMP/tree/other/outside.fasl"
+planted="$(stray_fasls "$TMP/tree")"
+[ "$planted" = "$TMP/tree/src/dds-x/sub/planted.fasl" ] ||
+  fail "the stray-fasl check is blind: it found [${planted}] where exactly one planted src/ fasl was expected."
+rm -rf "$TMP/tree"
+stray="$(stray_fasls "$REPO")"
+if [ -n "$stray" ]; then
+  echo "$stray" >&2
+  fail "compiled files in the source tree (above). Run 'make clean'; ASDF's output belongs in the private cache."
+fi
+echo "gate-build: no fasl under src/ (and the check is proven able to find one)."
+
 # ---- 1. FALSIFICATION: the gate must REJECT a known-bad compile. ----
 # A wrong-arity call against a declaimed ftype — the exact defect class that slipped through.
 mkdir -p "$TMP/canary"

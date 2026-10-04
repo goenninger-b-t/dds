@@ -284,7 +284,7 @@
    but a sibling test's participant on the same domain could match its endpoints and delay its teardown.")
 
 ;;; ================================================================================================
-;;; ONE SKIP CHANNEL (ADR 0122, WP-0.10 step 1: report-only)
+;;; ONE SKIP CHANNEL (ADR 0122, WP-0.10 step 1; step 2 enforcement: ADR 0128)
 ;;;
 ;;; A test that returns early, or skips one arm, because the host lacks a capability reports it HERE and
 ;;; nowhere else: (note-skip SITE CAPABILITY REASON). Every event is recorded against the test that is
@@ -293,8 +293,12 @@
 ;;; classification and a per-capability table. A bare "[skip]" or "SKIP" print in a test is banned by
 ;;; `make gate-skip-lint`; it is how about 100 tests reported "ok" on this host while doing nothing.
 ;;;
-;;; Step 1 changes NO exit code: the accounting is printed and the run ends as before. Step 2 (enforce,
-;;; with the ADR 0120 skip baseline) is a later work package.
+;;; Nothing in this file changes an exit code: the accounting is printed and the run ends as before. Step 2
+;;; (ADR 0128) enforces OUTSIDE the Lisp: `make test` hands the run's log to scripts/test-baseline.py gate,
+;;; which fails on any skip event (any capability) the ADR 0120 skip baseline does not list, unless
+;;; DDS_TEST_ALLOW_SKIP names its capability (then exit 3, NOT A GATE RUN). `make fuzz`, `make mem` and
+;;; `make corpus` (RUN-WITH-SKIP-REPORT) are judged by scripts/test-baseline.py entry (ADR 0128 section 3):
+;;; a skip of a capability the Lisp's skip baseline excuses for no test fails them.
 ;;; ================================================================================================
 
 (defparameter *skip-capabilities*
@@ -403,7 +407,8 @@
   "Print the ADR 0122 accounting to STREAM. RESULTS is a list of (NAME . FAILED-P), one per test run, in run
    order; EVENTS is the SKIP-EVENTS list. Prints the FULL / PARTIAL / SKIPPED / FAILED counts, then one row
    per capability of *SKIP-CAPABILITIES* (events, distinct tests, and the tests by name), then any event noted
-   outside a test. Report-only: it returns T and decides nothing (step 2 enforces)."
+   outside a test. Report-only: it returns T and decides nothing; `make test` judges this report from the
+   run's log against the ADR 0120 skip baseline (scripts/test-baseline.py gate, ADR 0128)."
   (let ((counts (list :full 0 :partial 0 :skipped 0 :failed 0)))
     (dolist (r results)
       (incf (getf counts (classify-test (car r) (cdr r) events))))
@@ -559,7 +564,9 @@
    ADR 0123), charge every NOTE-SKIP to NAME, and print the FULL / PARTIAL / SKIPPED / FAILED line
    and the per-capability table afterwards, whether THUNK returns or signals. Returns THUNK's values; a
    condition THUNK signals propagates unchanged after the report, so the caller's exit code is exactly what it
-   was without the report (step 1 is report-only). Used by `make fuzz`, `make mem` and `make corpus`."
+   was without the report. Used by `make fuzz`, `make mem` and `make corpus`, whose make targets then judge
+   the printed accounting with scripts/test-baseline.py entry (ADR 0128 section 3); the Lisp never consults
+   a baseline."
   (capability-preflight)
   (assert-libcrypto-preflight)
   (reset-skip-events)

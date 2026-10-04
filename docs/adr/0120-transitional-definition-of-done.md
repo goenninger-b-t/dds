@@ -2,6 +2,7 @@
 
 - **Status:** **Accepted** (2026-10-04). Approved in advance by owner decision **D31** (ADR 0124 §2: "approved,
   in the form plan WP-0.3(b) specifies"); this text is the ADR that approval was given for.
+- **Enforced by `make test`:** since ADR 0128 (rules 1 and 2; `make test-ratchet` is an alias).
 - **Date:** 2026-10-04
 - **Requirement:** the operating contract §5 (Definition of Done: "code compiles and unit tests pass on SBCL and
   AllegroCL"; "never mark work done with a red gate"), §7 (per-task loop); NFR-TEST; NFR-PORT (SBCL and

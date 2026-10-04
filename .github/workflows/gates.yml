@@ -35,26 +35,26 @@ name: Gates
 # failure injected into the FIRST test, 590 tests still ran, the summary read "622 passed, 1 FAILED,
 # 623 total", and make exited 2.
 #
-# OPENSSL 3.5 (WP-0.8, ADR 0123) — OFF BY DEFAULT, BY NAME. The DARE / DDS-Security arms need OpenSSL >= 3.5
-# and ubuntu-latest ships 3.0, so without it about a hundred of them record an ADR 0122 skip. The step below
-# builds the pinned release with scripts/build-openssl.sh (SHA-256 + OpenPGP verified), caches the install
-# keyed on the pinned version AND hash read out of that script, and exports ONLY DDS_DARE_LIBCRYPTO through
-# $GITHUB_ENV. It is gated by the switch NEODDS_CI_OPENSSL35 (repository variable = 'on', or the
-# `openssl35` input of a manual run). It is OFF by default for one reason: the governing plan
-# (docs/plans/2026-10-03-sbcl-allegro-full-ok.md, WP-0.10) enables OpenSSL 3.5 in hosted CI in the same commit
-# as ADR 0122 step 2, and this path has not yet run on a hosted runner. Locally (2026-10-04, SBCL 2.2.9,
-# OpenSSL 3.5.9) the suite was 652/652 with 0 skips and fuzz/corpus/mem passed, so turning it on is not
-# expected to go red. While it is off, the coverage step at the bottom prints "NOT COVERED: openssl35@sbcl".
+# OPENSSL 3.5 (WP-0.8, ADR 0123) — ON (WP-0.10 step 2, ADR 0128). The DARE / DDS-Security arms need
+# OpenSSL >= 3.5 and ubuntu-latest ships 3.0. The steps below build the pinned release with
+# scripts/build-openssl.sh (SHA-256 + OpenPGP verified), cache the install keyed on the pinned version AND hash
+# read out of that script, and export ONLY DDS_DARE_LIBCRYPTO through $GITHUB_ENV. The switch
+# NEODDS_CI_OPENSSL35 is set 'on' below (workflow-level env): the governing plan
+# (docs/plans/2026-10-03-sbcl-allegro-full-ok.md, WP-0.10) turns it on in the same commit as ADR 0122 step 2.
+# Do not turn it off: under step 2 a run against the system OpenSSL 3.0 FAILS `make test` (about 106
+# :openssl-pqc skip events, none of them in the empty SBCL skip baseline), which is the point.
+#
+# `make test` EXITS WITH THE ADR 0120 RATCHET'S VERDICT (ADR 0128): a failure or a skip event not listed in
+# test/baseline-sbcl.txt / test/skip-baseline-sbcl.txt fails the step; a listed one is printed as KNOWN. Both
+# SBCL baselines are empty, so for SBCL this is "0 FAILED, 0 skip events, 0 leaked threads".
 on:
   push:
     branches: [main]
   pull_request:
   workflow_dispatch:
-    inputs:
-      openssl35:
-        description: "Build/cache the pinned OpenSSL 3.5 and run the suite against it (NEODDS_CI_OPENSSL35)"
-        type: boolean
-        default: false
+
+env:
+  NEODDS_CI_OPENSSL35: 'on'
 
 jobs:
   gates:
@@ -92,7 +92,7 @@ jobs:
 
       - name: OpenSSL 3.5 pin (read from scripts/build-openssl.sh)
         id: osslpin
-        if: ${{ vars.NEODDS_CI_OPENSSL35 == 'on' || inputs.openssl35 }}
+        if: ${{ env.NEODDS_CI_OPENSSL35 == 'on' }}
         run: |
           set -euo pipefail
           ver="$(sed -n 's/^OPENSSL_VERSION="\(.*\)"$/\1/p' scripts/build-openssl.sh)"
@@ -103,14 +103,14 @@ jobs:
           echo "prefix=$HOME/.local/opt/openssl-3.5" >> "$GITHUB_OUTPUT"
 
       - name: Cache OpenSSL 3.5 install
-        if: ${{ vars.NEODDS_CI_OPENSSL35 == 'on' || inputs.openssl35 }}
+        if: ${{ env.NEODDS_CI_OPENSSL35 == 'on' }}
         uses: actions/cache@v4
         with:
           path: ${{ steps.osslpin.outputs.prefix }}
           key: openssl-${{ runner.os }}-${{ runner.arch }}-${{ steps.osslpin.outputs.version }}-${{ steps.osslpin.outputs.sha256 }}
 
       - name: Build OpenSSL 3.5 (no-op on a cache hit) and export DDS_DARE_LIBCRYPTO only
-        if: ${{ vars.NEODDS_CI_OPENSSL35 == 'on' || inputs.openssl35 }}
+        if: ${{ env.NEODDS_CI_OPENSSL35 == 'on' }}
         run: |
           set -euo pipefail
           # Cache miss: a full verified build (SHA-256 mandatory; OpenPGP required here). Cache hit: the
@@ -128,16 +128,18 @@ jobs:
           echo "gate-build" >> "$RUNNER_TEMP/ci-covered"
           echo "build@sbcl" >> "$RUNNER_TEMP/ci-covered"
 
-      # Bounded so a hang gives a FAST RED instead of burning the 60-minute job timeout.
-      - name: test (SBCL)
-        timeout-minutes: 12
+      # Bounded so a hang gives a FAST RED instead of burning the 60-minute job timeout. With OpenSSL 3.5 the
+      # ~100 DARE / DDS-Security arms that used to skip now run, so the bound is wider than before.
+      # The verdict is the ADR 0120 ratchet's (ADR 0128); the log is kept as an artifact when the job fails.
+      - name: test (SBCL, ADR 0120 ratchet, OpenSSL 3.5)
+        timeout-minutes: 25
         run: |
-          make test LISP=./scripts/with-sbcl.sh
+          make test LISP=./scripts/with-sbcl.sh TEST_LOG_DIR="$RUNNER_TEMP"
           echo "test@sbcl" >> "$RUNNER_TEMP/ci-covered"
 
       - name: corpus (XCDR byte-exact vs Connext's WIRE bytes)
         run: |
-          make corpus LISP=./scripts/with-sbcl.sh
+          make corpus LISP=./scripts/with-sbcl.sh TEST_LOG_DIR="$RUNNER_TEMP"
           echo "corpus@sbcl" >> "$RUNNER_TEMP/ci-covered"
 
       - name: gate-hotpath (CLOS purity + allocation purity; prints the NFR-MEM debt)
@@ -178,13 +180,23 @@ jobs:
 
       - name: fuzz (CDR/RTPS parser fuzzers, prod + safety-0)
         run: |
-          make fuzz LISP=./scripts/with-sbcl.sh
+          make fuzz LISP=./scripts/with-sbcl.sh TEST_LOG_DIR="$RUNNER_TEMP"
           echo "fuzz@sbcl" >> "$RUNNER_TEMP/ci-covered"
 
       - name: wire (validate emitted RTPS against the tshark RTPS dissector)
         run: |
           make wire
           echo "wire" >> "$RUNNER_TEMP/ci-covered"
+
+      # test, corpus and fuzz each write a fresh mktemp log, neodds-<stem>.XXXXXX.log (scripts/judged-run.sh,
+      # ADR 0128); when any step failed, all of them are kept.
+      - name: keep the judged-run logs (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: neodds-test-sbcl-log
+          path: ${{ runner.temp }}/neodds-*.log
+          if-no-files-found: ignore
 
       - name: Declare what CI did NOT cover (computed)
         if: always()
@@ -210,7 +222,7 @@ jobs:
             echo "::warning::ALLEGROCL NOT RUN — CI cannot run AllegroCL yet (licensed). Human step: make gate-build LISP=./scripts/with-allegro.sh && make test LISP=./scripts/with-allegro.sh"
           fi
           if printf '%s\n' "${missing[@]}" | grep -qx 'openssl35@sbcl'; then
-            echo "::warning::OPENSSL 3.5 NOT PROVISIONED — the DARE / DDS-Security arms recorded skips. Switch: repository variable NEODDS_CI_OPENSSL35=on (off by default until ADR 0122 step 2; ADR 0123)"
+            echo "::warning::OPENSSL 3.5 NOT PROVISIONED — the pinned build step did not complete (ADR 0123); the DARE / DDS-Security arms did not run against it"
           fi
           if printf '%s\n' "${missing[@]}" | grep -qx 'interop'; then
             echo "::warning::INTEROP NOT RUN — needs licensed RTI Connext + Fast DDS. Human step: make interop"

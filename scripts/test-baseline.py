@@ -26,6 +26,34 @@ of the closed ADR 0122 vocabulary, dds.tests:*skip-capabilities* (read from src/
 without the colon). <test-name> is the run-all-tests registry name, or `thread-leak-check` for the ADR 0121
 leaked-thread entry, or `<no test>` for a skip event noted outside a running test.
 
+  test-baseline.py gate LISP LOG RC      ADR 0128 (WP-0.10 step 2): the verdict `make test` exits with. RC is
+                                          the Lisp process's own exit status for the run that wrote LOG. Exit 0:
+                                          no failure and no skip event outside the baselines (a baselined
+                                          failure is printed as KNOWN and does not change the exit status);
+                                          1: a new failure or skip, a run that did not finish (RC other than 0
+                                          or 1: a timeout, a crash), an RC the log contradicts, or a log of the
+                                          wrong Lisp; 3: as 0, but DDS_TEST_ALLOW_SKIP was set (NOT A GATE RUN).
+
+  test-baseline.py entry LISP NAME LOG RC
+                                          ADR 0128 section 3: the verdict of `make corpus` / `make fuzz` /
+                                          `make mem` (NAME corpus, pbt-fuzz, mem), entry points that run outside
+                                          the suite and so have no per-test baseline entries. Exit 1 when RC is
+                                          not 0 (the entry point itself failed or did not finish), when the log
+                                          is of the other Lisp or has no skip accounting, or when it records a
+                                          skip event of a capability LISP's skip baseline does not already
+                                          excuse for some test (with an empty baseline, as on SBCL: any skip
+                                          event). The one exception is NAME corpus with :verified-elsewhere,
+                                          the vectors *corpus-verified-elsewhere* defers to another gate by
+                                          name. 3 under DDS_TEST_ALLOW_SKIP; else 0. No baseline entry is read
+                                          or needed per entry point, so nothing grows (ADR 0120 rule 4).
+
+DDS_TEST_ALLOW_SKIP=<cap>[,<cap>...] (ADR 0128; governing plan section 2, "one environment variable,
+fail-closed by default") lets `check-run` and `gate` accept skip events of the named capabilities beyond
+the skip baseline. It never excuses a failure. A run judged with it set prints NOT A GATE RUN and exits 3
+(ALLOW_SKIP_RC), never 0, so it cannot be mistaken for a gate pass; the governing plan uses it only for the
+Phase 1A exit check. Unset or empty: no capability is allowed beyond the baseline. A name outside the
+vocabulary is an error.
+
 The shrink-only rule compares the CURRENT file (working tree) against the running intersection of every
 committed version, not only against HEAD: re-adding an entry that an earlier commit removed is growth, and so
 is re-creating a baseline after a commit deleted it. A shallow clone cannot be checked and FAILS (a gate that
@@ -42,6 +70,10 @@ LISPS = ('sbcl', 'allegro')
 WP_RE = re.compile(r'WP-\d+\.\d+[a-z]?\Z')
 TEST_RE = re.compile(r'[^\s#]+\Z')
 NO_TEST = '<no test>'
+ALLOW_SKIP_ENV = 'DDS_TEST_ALLOW_SKIP'
+ALLOW_SKIP_RC = 3           # a run judged with DDS_TEST_ALLOW_SKIP set: never 0, never a failure code
+# The preflight's "on <IMPL>" token (dds.pal:pal-impl-name, ADR 0122 section 2.4) for each baseline name.
+IMPL_TOKEN = {'sbcl': 'SBCL', 'allegro': 'ALLEGRO'}
 
 
 class BaselineError(Exception):
@@ -347,8 +379,42 @@ def _parse_skips_block(lines, vocab):
     return skips
 
 
-def check_run(repo, lisp, log_text, vocab):
-    problems = []
+def parse_allow_skip(value, vocab):
+    """The capabilities DDS_TEST_ALLOW_SKIP names (ADR 0128), as a frozenset of vocabulary names. VALUE None or
+    blank = none. Names are comma-separated, case-insensitive, with or without the leading colon. A name
+    outside the closed ADR 0122 vocabulary raises BaselineError: a typo must not silently allow nothing."""
+    if value is None or not value.strip():
+        return frozenset()
+    out = set()
+    for item in value.split(','):
+        cap = item.strip().lstrip(':').lower()
+        if not cap:
+            continue
+        if cap not in vocab:
+            raise BaselineError(f'{ALLOW_SKIP_ENV}: {item.strip()!r} is not in *skip-capabilities* (ADR 0122); '
+                                f'known: {", ".join(sorted(vocab))}')
+        out.add(cap)
+    return frozenset(out)
+
+
+def check_impl(log_text, lisp):
+    """Problems (list of str) if the log is not a run of LISP: every ADR 0122 preflight line ends in "on <IMPL>"
+    (dds.pal:pal-impl-name), and judging an AllegroCL log against the SBCL baselines, or the reverse, would
+    pass or fail for the wrong reason. A log without a preflight line cannot be attributed and is rejected."""
+    impls = re.findall(r'^preflight \(ADR 0122\): .* on (\S+)\s*$', log_text, re.M)
+    if not impls:
+        return ['no "preflight (ADR 0122): ... on <IMPL>" line: the log cannot be attributed to a Lisp']
+    want = IMPL_TOKEN[lisp]
+    wrong = sorted({i for i in impls if i != want})
+    return [f'WRONG LISP: the log is a run on {", ".join(wrong)}, judged against the {lisp} baselines '
+            f'(preflight must say "on {want}")'] if wrong else []
+
+
+def check_run(repo, lisp, log_text, vocab, allow=frozenset()):
+    """Rules 1 and 2 of ADR 0120 for one run log. ALLOW (ADR 0128, DDS_TEST_ALLOW_SKIP): capabilities whose
+    skip events are accepted beyond the skip baseline; failures are never excused. Returns (problems,
+    failures, skips, fixed, unskipped, leaked, known_failures, known_skips, allowed_skips)."""
+    problems = check_impl(log_text, lisp)
     fb = os.path.join(repo, failure_path(lisp))
     sb = os.path.join(repo, skip_path(lisp))
     allowed_f = parse_failures(open(fb, encoding='utf-8').read(), failure_path(lisp)) if os.path.exists(fb) else {}
@@ -359,15 +425,87 @@ def check_run(repo, lisp, log_text, vocab):
     if LEAK in failures and LEAK in allowed_f and leaked > allowed_f[LEAK][0]:
         problems.append(f'MORE LEAKED THREADS: {leaked} dds-* thread(s), {failure_path(lisp)} allows '
                         f'{allowed_f[LEAK][0]}')
+    known_s, allowed_by_env = [], []
     for (cap, name), n in sorted(skips.items()):
-        if (cap, name) not in allowed_s:
+        within = (cap, name) in allowed_s and n <= allowed_s[(cap, name)][0]
+        if within:
+            known_s.append(((cap, name), n, allowed_s[(cap, name)][1]))
+        elif cap in allow:
+            allowed_by_env.append(((cap, name), n))
+        elif (cap, name) not in allowed_s:
             problems.append(f'NEW SKIP: {cap} in {name} ({n} event(s)) is not in {skip_path(lisp)}')
-        elif n > allowed_s[(cap, name)][0]:
+        else:
             problems.append(f'MORE SKIPS: {cap} in {name}: {n} event(s), {skip_path(lisp)} allows '
                             f'{allowed_s[(cap, name)][0]}')
+    known_f = [(name, allowed_f[name][1] if name == LEAK else allowed_f[name])
+               for name in sorted(failures & set(allowed_f))]
     fixed = sorted(set(allowed_f) - failures)
     unskipped = sorted(k for k in allowed_s if k not in skips)
-    return problems, failures, skips, fixed, unskipped, leaked
+    return problems, failures, skips, fixed, unskipped, leaked, known_f, known_s, allowed_by_env
+
+
+# ADR 0128 section 3: the judged entry points and, per entry point, the capabilities its own source declares as
+# a deliberate deferral. corpus: *corpus-verified-elsewhere* (src/dds-bench/corpus.lisp) names each vector another
+# gate verifies; corpus-verify itself fails on any vector neither verified nor listed there.
+ENTRIES = ('corpus', 'pbt-fuzz', 'mem')
+ENTRY_DECLARED = {'corpus': frozenset({'verified-elsewhere'})}
+
+
+def check_entry(repo, lisp, name, log_text, lisp_rc, vocab, allow=frozenset()):
+    """ADR 0128 section 3 for one entry-point log. Returns (problems, known, allowed_by_env, skips): KNOWN is
+    [((cap, test), n, why)] for accepted events, WHY naming the owning WPs of the baseline entries that already
+    excuse CAP or the source declaration. A skip of a capability the Lisp's skip baseline excuses nowhere is a
+    problem: the entry point is a second way to exercise code the suite covers, so a capability the suite may
+    not skip on this Lisp it may not skip either. Bounding per entry point would need baseline entries under
+    the entry-point name, which ADR 0120 rule 4 forbids adding; the capability rule needs none."""
+    problems = check_impl(log_text, lisp)
+    if name not in ENTRIES:
+        raise BaselineError(f'entry point {name!r} is not one of {", ".join(ENTRIES)}')
+    if lisp_rc != 0:
+        what = {124: 'the timeout fired', 137: 'the timeout killed it'}.get(lisp_rc, 'it failed')
+        problems.append(f'the entry point exited {lisp_rc} ({what}): see the log')
+    sb = os.path.join(repo, skip_path(lisp))
+    allowed_s = parse_skips(open(sb, encoding='utf-8').read(), skip_path(lisp), vocab) if os.path.exists(sb) else {}
+    owners = {}
+    for (cap, _), (_, wp) in allowed_s.items():
+        owners.setdefault(cap, set()).add(wp)
+    skips = _parse_skips_block(log_text.splitlines(), vocab)
+    known, by_env = [], []
+    for (cap, test), n in sorted(skips.items()):
+        if cap in ENTRY_DECLARED.get(name, ()):
+            known.append(((cap, test), n, f'declared by the {name} entry point itself'))
+        elif cap in owners:
+            known.append(((cap, test), n, f'{skip_path(lisp)} excuses {cap}, owner {", ".join(sorted(owners[cap]))}'))
+        elif cap in allow:
+            by_env.append(((cap, test), n))
+        else:
+            problems.append(f'NEW SKIP: {cap} in {name} ({n} event(s)): {skip_path(lisp)} excuses {cap} for no test')
+    return problems, known, by_env, skips
+
+
+def gate_rc_problems(lisp_rc, failures):
+    """ADR 0128: problems with the Lisp process's own exit status RC for a run whose log names FAILURES. The
+    suite exits 0 when nothing failed and 1 when something did (run-all-tests signals TEST-FAILURE, the
+    Makefile's handler exits 1). Anything else (124/137: the timeout fired; another code: a crash) is a run
+    that did not finish, whatever its log says; and an RC the log contradicts means the log is not the whole
+    story. Either way the verdict is FAIL, never "no new failure"."""
+    if lisp_rc not in (0, 1):
+        what = {124: 'the timeout fired', 137: 'the timeout killed it'}.get(lisp_rc, 'it did not finish normally')
+        return [f'the Lisp exited {lisp_rc} ({what}): the run is not judged']
+    if lisp_rc == 0 and failures:
+        return [f'the Lisp exited 0 but the log names {len(failures)} failure(s): the log and the exit disagree']
+    if lisp_rc == 1 and not failures:
+        return ['the Lisp exited 1 but the log names no failure: the run failed for a reason the log does not '
+                'attribute to a test (see the end of the log)']
+    return []
+
+
+def verdict_rc(problems, allow):
+    """ADR 0128: 1 on any problem; else ALLOW_SKIP_RC (3) when DDS_TEST_ALLOW_SKIP was set, so a run that
+    needed an allowance is never reported as 0; else 0."""
+    if problems:
+        return 1
+    return ALLOW_SKIP_RC if allow else 0
 
 
 # ---------------------------------------------------------------- self-test
@@ -527,6 +665,104 @@ def self_test():
         put(skip_path('sbcl'), 'alloc-counter alpha 1 WP-1.13\nalloc-counter beta 3 WP-1.13\n')
         p, *_ = check_run(d, 'sbcl', SAMPLE_LOG, vocab)
         expect('check-run: a NEW skip was ACCEPTED', any('NEW SKIP: alloc-counter in gamma' in x for x in p))
+        # ADR 0128 (WP-0.10 step 2): the Lisp named by the log, KNOWN failures, DDS_TEST_ALLOW_SKIP, the Lisp's
+        # own exit status and the verdict code.
+        put(failure_path('sbcl'), 'beta WP-1.1\ndelta WP-1.5\n')
+        put(skip_path('sbcl'), base_s)
+        p, *rest = check_run(d, 'sbcl', SAMPLE_LOG, vocab)
+        expect(f'check-run: KNOWN failures not reported: {rest}',
+               p == [] and rest[5] == [('beta', 'WP-1.1'), ('delta', 'WP-1.5')] and len(rest[6]) == 3)
+        p, *_ = check_run(d, 'allegro', SAMPLE_LOG, vocab)
+        expect('check-run: an SBCL log judged against the allegro baselines was ACCEPTED',
+               any('WRONG LISP' in x for x in p))
+        p, *_ = check_run(d, 'sbcl', SAMPLE_LOG.replace('preflight (ADR 0122): SBCL 2.2.9.debian on SBCL\n', ''),
+                          vocab)
+        expect('check-run: a log with no preflight line (no Lisp named) was ACCEPTED',
+               any('cannot be attributed' in x for x in p))
+        put(skip_path('sbcl'), 'alloc-counter alpha 1 WP-1.13\nalloc-counter beta 3 WP-1.13\n')   # gamma unlisted
+        p, *rest = check_run(d, 'sbcl', SAMPLE_LOG, vocab, allow=frozenset({'alloc-counter'}))
+        expect(f'check-run: DDS_TEST_ALLOW_SKIP=alloc-counter did not accept an unlisted alloc-counter skip: {p}',
+               p == [] and rest[7] == [(('alloc-counter', 'gamma'), 1)])
+        expect('verdict: a run that needed DDS_TEST_ALLOW_SKIP exited 0 (it must be ALLOW_SKIP_RC)',
+               verdict_rc(p, frozenset({'alloc-counter'})) == ALLOW_SKIP_RC)
+        p, *_ = check_run(d, 'sbcl', SAMPLE_LOG, vocab, allow=frozenset({'openssl-pqc'}))
+        expect('check-run: DDS_TEST_ALLOW_SKIP for ANOTHER capability accepted an unlisted skip',
+               any('NEW SKIP: alloc-counter in gamma' in x for x in p))
+        expect('verdict: a problem with DDS_TEST_ALLOW_SKIP set did not exit 1',
+               verdict_rc(p, frozenset({'openssl-pqc'})) == 1)
+        put(failure_path('sbcl'), 'beta WP-1.1\n')
+        p, *_ = check_run(d, 'sbcl', SAMPLE_LOG, vocab, allow=frozenset(vocab))
+        expect('check-run: DDS_TEST_ALLOW_SKIP excused a NEW FAILURE', any('NEW FAILURE: delta' in x for x in p))
+        expect('verdict: a clean run did not exit 0', verdict_rc([], frozenset()) == 0)
+        expect('allow-skip: names, case, colon', parse_allow_skip(' alloc-counter, :OPENSSL-PQC ,', vocab)
+               == {'alloc-counter', 'openssl-pqc'})
+        expect('allow-skip: unset/blank is not empty-allowed', parse_allow_skip(None, vocab) == frozenset()
+               and parse_allow_skip('  ', vocab) == frozenset())
+        try:
+            parse_allow_skip('alloc-counter,alloc-countr', vocab)
+            bad.append('allow-skip: a capability outside the vocabulary was ACCEPTED')
+        except BaselineError:
+            pass
+        expect('gate: a timed-out Lisp (124) was judged', gate_rc_problems(124, set()) != [])
+        expect('gate: a killed Lisp (137) was judged', gate_rc_problems(137, {'beta'}) != [])
+        expect('gate: a crashed Lisp (2) was judged', gate_rc_problems(2, set()) != [])
+        expect('gate: exit 0 with failures in the log was ACCEPTED', gate_rc_problems(0, {'beta'}) != [])
+        expect('gate: exit 1 with no failure in the log was ACCEPTED', gate_rc_problems(1, set()) != [])
+        expect('gate: a consistent exit status was REJECTED',
+               gate_rc_problems(1, {'beta'}) == [] and gate_rc_problems(0, set()) == [])
+        # ADR 0128 section 3: the entry points (corpus, pbt-fuzz, mem).
+        entry_log = (SAMPLE_LOG.split('  [test] alpha')[0]
+                     + 'coverage: 0 FULL, 1 PARTIAL, 0 SKIPPED, 0 FAILED of 1 test(s); 2 skip event(s).\n'
+                       'skips by capability (ADR 0122; every event counted, no dedup):\n'
+                       '  capability            events  tests  arms\n'
+                       '  openssl-pqc                0      0     0\n'
+                       '  alloc-counter              2      1     2\n'
+                       '  alloc-counter: pbt-fuzz x2\n')
+        clean_entry = (entry_log.replace('2 skip event(s)', '0 skip event(s)')
+                       .replace('  alloc-counter              2      1     2\n  alloc-counter: pbt-fuzz x2\n',
+                                '  alloc-counter              0      0     0\n'))
+        put(skip_path('sbcl'), '')
+        p, *_ = check_entry(d, 'sbcl', 'pbt-fuzz', clean_entry, 0, vocab)
+        expect(f'entry: a clean run was REJECTED: {p}', p == [])
+        p, *_ = check_entry(d, 'sbcl', 'pbt-fuzz', entry_log, 0, vocab)
+        expect('entry: a skip against an EMPTY skip baseline was ACCEPTED',
+               any('NEW SKIP: alloc-counter in pbt-fuzz' in x for x in p))
+        put(skip_path('sbcl'), 'openssl-pqc alpha 1 WP-1.13\n')
+        p, *_ = check_entry(d, 'sbcl', 'pbt-fuzz', entry_log, 0, vocab)
+        expect('entry: a skip of a capability the baseline excuses for NO test was ACCEPTED',
+               any('NEW SKIP: alloc-counter' in x for x in p))
+        put(skip_path('sbcl'), 'alloc-counter alpha 1 WP-1.13\n')
+        p, known, *_ = check_entry(d, 'sbcl', 'pbt-fuzz', entry_log, 0, vocab)
+        expect(f'entry: a skip of a capability the baseline excuses was REJECTED: {p}',
+               p == [] and len(known) == 1 and 'WP-1.13' in known[0][2])
+        p, *_ = check_entry(d, 'sbcl', 'pbt-fuzz', clean_entry, 1, vocab)
+        expect('entry: an entry point that exited 1 was ACCEPTED', any('exited 1' in x for x in p))
+        p, *_ = check_entry(d, 'sbcl', 'pbt-fuzz', clean_entry, 124, vocab)
+        expect('entry: an entry point that timed out was ACCEPTED', any('exited 124' in x for x in p))
+        p, *_ = check_entry(d, 'allegro', 'pbt-fuzz', clean_entry, 0, vocab)
+        expect('entry: an SBCL log judged as allegro was ACCEPTED', any('WRONG LISP' in x for x in p))
+        put(skip_path('sbcl'), '')
+        p, _, env, _ = check_entry(d, 'sbcl', 'pbt-fuzz', entry_log, 0, vocab, allow=frozenset({'alloc-counter'}))
+        expect(f'entry: DDS_TEST_ALLOW_SKIP did not accept its capability: {p}', p == [] and len(env) == 1)
+        try:
+            check_entry(d, 'sbcl', 'pbt-fuzz', entry_log.split('skips by capability')[0], 0, vocab)
+            bad.append('entry: a log without the skip accounting was ACCEPTED')
+        except BaselineError:
+            pass
+        try:
+            check_entry(d, 'sbcl', 'fuzzz', clean_entry, 0, vocab)
+            bad.append('entry: an unknown entry-point name was ACCEPTED')
+        except BaselineError:
+            pass
+        ve_vocab = vocab | {'verified-elsewhere'}
+        ve_log = (clean_entry.replace('0 skip event(s)', '1 skip event(s)')
+                  + '  verified-elsewhere         1      1     1\n  verified-elsewhere: corpus\n')
+        p, *_ = check_entry(d, 'sbcl', 'corpus', ve_log, 0, ve_vocab)
+        expect(f'entry: the corpus-declared :verified-elsewhere deferral was REJECTED: {p}', p == [])
+        p, *_ = check_entry(d, 'sbcl', 'pbt-fuzz', ve_log.replace('verified-elsewhere: corpus',
+                                                                   'verified-elsewhere: pbt-fuzz'), 0, ve_vocab)
+        expect('entry: :verified-elsewhere outside corpus was ACCEPTED',
+               any('NEW SKIP: verified-elsewhere' in x for x in p))
         for text, what in (('beta\n', 'missing WP'), ('beta WP1.1\n', 'malformed WP'),
                            ('beta WP-1.1\nbeta WP-1.2\n', 'duplicate'),
                            (f'{LEAK} WP-1.1\n', 'thread-leak-check without max-threads'),
@@ -657,7 +893,7 @@ def main(argv):
     staged = '--staged' in argv[2:] and argv[1] == 'shrink-only'
     if staged:
         argv = [a for a in argv if a != '--staged']
-    if len(argv) < 2 or argv[1] not in ('shrink-only', 'check-run', 'self-test'):
+    if len(argv) < 2 or argv[1] not in ('shrink-only', 'check-run', 'gate', 'entry', 'self-test'):
         print(__doc__)
         return 2
     try:
@@ -670,7 +906,7 @@ def main(argv):
         print('test-baseline: FAIL — the checker is not proven able to fail; its verdict would mean nothing.')
         return 1
     if argv[1] == 'self-test':
-        print('test-baseline: self-test PASS (shrink-only and check-run both proven able to fail).')
+        print('test-baseline: self-test PASS (shrink-only, check-run, gate and entry all proven able to fail).')
         return 0
     try:
         vocab = read_vocabulary(REPO)
@@ -695,24 +931,78 @@ def main(argv):
             print(f'test-baseline: PASS — every ADR 0120 baseline ({"staged" if staged else "working tree"}) is '
                   f'within every committed version ({"; ".join(counts)}).')
             return 0
-        if len(argv) != 4 or argv[2] not in LISPS:
-            print('usage: test-baseline.py check-run sbcl|allegro LOG')
+        if argv[1] == 'entry':
+            if len(argv) != 6 or argv[2] not in LISPS or not argv[5].lstrip('-').isdigit():
+                print('usage: test-baseline.py entry sbcl|allegro corpus|pbt-fuzz|mem LOG EXIT-STATUS')
+                return 2
+            lisp, name = argv[2], argv[3]
+            allow = parse_allow_skip(os.environ.get(ALLOW_SKIP_ENV), vocab)
+            log = open(argv[4], encoding='utf-8', errors='replace').read()
+            problems, known, by_env, skips = check_entry(REPO, lisp, name, log, int(argv[5]), vocab, allow)
+            print(f'test-baseline: {lisp} {name} run has {sum(skips.values())} skip event(s) in {len(skips)} '
+                  f'(capability, test) pair(s).')
+            for (cap, test), n, why in known:
+                print(f'  KNOWN skip ({why}): {cap} in {test} x{n}')
+            for (cap, test), n in by_env:
+                print(f'  ALLOWED skip ({ALLOW_SKIP_ENV}, not excused by the baseline): {cap} in {test} x{n}')
+            for p in problems:
+                print(f'  {p}')
+            rc = verdict_rc(problems, allow)
+            if rc == 1:
+                print(f'test-baseline: FAIL — {name} failed, or skipped what {skip_path(lisp)} does not excuse (ADR 0128 section 3).')
+            elif rc == ALLOW_SKIP_RC:
+                print(f'test-baseline: NOT A GATE RUN — {ALLOW_SKIP_ENV}={",".join(sorted(allow))} was set; exit {ALLOW_SKIP_RC} (ADR 0128).')
+            else:
+                print(f'test-baseline: PASS — {name} exited 0 and skipped nothing {skip_path(lisp)} does not excuse.')
+            return rc
+        gate = argv[1] == 'gate'
+        if len(argv) != (5 if gate else 4) or argv[2] not in LISPS or (gate and not argv[4].lstrip('-').isdigit()):
+            print('usage: test-baseline.py check-run sbcl|allegro LOG\n'
+                  '       test-baseline.py gate sbcl|allegro LOG LISP-EXIT-STATUS')
             return 2
+        lisp = argv[2]
+        allow = parse_allow_skip(os.environ.get(ALLOW_SKIP_ENV), vocab)
         log = open(argv[3], encoding='utf-8', errors='replace').read()
-        problems, failures, skips, fixed, unskipped, leaked = check_run(REPO, argv[2], log, vocab)
-        print(f'test-baseline: {argv[2]} run has {len(failures)} failure(s) ({leaked} leaked dds-* thread(s)), '
+        rc_problems = []
+        try:
+            problems, failures, skips, fixed, unskipped, leaked, known_f, known_s, by_env = \
+                check_run(REPO, lisp, log, vocab, allow)
+        except BaselineError as e:
+            if gate and int(argv[4]) not in (0, 1):
+                # The run did not finish: say so first; the unparseable log is the consequence, not the cause.
+                rc_problems = gate_rc_problems(int(argv[4]), set())
+                for p in rc_problems:
+                    print(f'  {p}')
+            raise e
+        if gate:
+            rc_problems = gate_rc_problems(int(argv[4]), failures)
+        print(f'test-baseline: {lisp} run has {len(failures)} failure(s) ({leaked} leaked dds-* thread(s)), '
               f'{sum(skips.values())} skip event(s) in {len(skips)} (capability, test) pair(s).')
+        for name, wp in known_f:
+            extra = f', {leaked} thread(s)' if name == LEAK else ''
+            print(f'  KNOWN failure (ADR 0120 baseline, owner {wp}{extra}): {name}')
+        for (cap, name), n, wp in known_s:
+            print(f'  KNOWN skip (ADR 0120 baseline, owner {wp}): {cap} in {name} x{n}')
+        for (cap, name), n in by_env:
+            print(f'  ALLOWED skip ({ALLOW_SKIP_ENV}, not in the baseline): {cap} in {name} x{n}')
         for name in fixed:
-            print(f'  did not fail in this run (remove it from {failure_path(argv[2])} in the commit that fixes it): {name}')
+            print(f'  did not fail in this run (remove it from {failure_path(lisp)} in the commit that fixes it): {name}')
         for cap, name in unskipped:
-            print(f'  not skipped in this run (remove it from {skip_path(argv[2])} in the commit that fixes it): {cap} {name}')
+            print(f'  not skipped in this run (remove it from {skip_path(lisp)} in the commit that fixes it): {cap} {name}')
+        problems = rc_problems + problems
         for p in problems:
             print(f'  {p}')
-        if problems:
-            print('test-baseline: FAIL — the run is worse than its ADR 0120 baseline.')
-            return 1
-        print('test-baseline: PASS — no failure or skip event outside the ADR 0120 baseline.')
-        return 0
+        rc = verdict_rc(problems, allow)
+        if rc == 1:
+            print('test-baseline: FAIL — a new failure or skip, or a run that cannot be judged (see above; ADR 0120, ADR 0128).')
+        elif rc == ALLOW_SKIP_RC:
+            print(f'test-baseline: NOT A GATE RUN — {ALLOW_SKIP_ENV}={",".join(sorted(allow))} was set; no failure '
+                  f'or skip outside the baseline and that allowance; exit {ALLOW_SKIP_RC} (ADR 0128).')
+        else:
+            print(f'test-baseline: PASS — no failure or skip event outside the ADR 0120 baseline '
+                  f'({len(known_f)} KNOWN failure entr(y/ies), {sum(n for _, n, _ in known_s)} KNOWN skip event(s)); '
+                  f'this is "no new failure under the ADR 0120 baseline", not "all tests pass".')
+        return rc
     except BaselineError as e:
         print(f'test-baseline: FAIL — {e}')
         return 1

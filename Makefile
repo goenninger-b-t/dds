@@ -111,9 +111,28 @@ hooks:
 build:
 	$(TIMEOUT) $(BUILD_TIMEOUT) $(LISP) --eval '(asdf:load-system :dds)' --eval '(dds.pal:exit-process 0)'
 
+# ADR 0128 (WP-0.10 step 2): `make test` exits with the ADR 0120 ratchet's verdict, not the Lisp's own status.
+# The suite runs (bounded, ADR 0121) with its output tee'd to TEST_LOG, then scripts/test-baseline.py gate
+# judges that log against test/baseline-<lisp>.txt and test/skip-baseline-<lisp>.txt:
+#   exit 0  no failure and no skip event outside the baselines; every baselined one is printed as KNOWN;
+#   exit 1  (make: Error 1) a new failure, a new or extra skip event (any capability), more leaked threads,
+#           a log of the other Lisp, or a run that did not finish (timeout, crash, an exit status its log
+#           contradicts);
+#   exit 3  (make: Error 3) as 0, but DDS_TEST_ALLOW_SKIP=<cap,...> let skips of those capabilities past the
+#           baseline: NOT A GATE RUN (the governing plan's Phase 1A exit check uses it; nothing else should).
+# GNU make itself exits 2 for both failing codes; the recipe's own code is in make's "Error N" line.
+# The baseline is chosen from LISP's name (sbcl or allegro) and cross-checked against the preflight line.
+TEST_FORMS := --eval '(asdf:load-system :dds-tests)' \
+        --eval '(handler-case (progn (asdf:test-system :dds-tests) (dds.pal:exit-process 0)) (error (e) (format t "~&~a~%" e) (dds.pal:exit-process 1)))'
+TEST_LOG_DIR ?= $(or $(TMPDIR),/tmp)
+# The ADR 0120 baseline a LISP launcher uses, from its name: allegro, sbcl, or empty (refused).
+lisp-key = $(if $(findstring allegro,$(1)),allegro,$(if $(findstring sbcl,$(1)),sbcl,))
+# Each judged run writes a FRESH log (mktemp in TEST_LOG_DIR: neodds-<stem>.XXXXXX.log) and fails if it cannot
+# be written, so a verdict is never about an older run's log (scripts/judged-run.sh).
 test:
-	$(TIMEOUT) $(TEST_TIMEOUT) $(LISP) --eval '(asdf:load-system :dds-tests)' \
-	        --eval '(handler-case (progn (asdf:test-system :dds-tests) (dds.pal:exit-process 0)) (error (e) (format t "~&~a~%" e) (dds.pal:exit-process 1)))'
+	@l=$(call lisp-key,$(LISP)); [ -n "$$l" ] || { echo "make test: cannot tell which ADR 0120 baseline LISP=$(LISP) uses (sbcl or allegro)" >&2; exit 2; }; \
+	echo "make test: $(LISP), judged against test/baseline-$$l.txt + test/skip-baseline-$$l.txt (ADR 0128)"; \
+	./scripts/judged-run.sh "$(TEST_LOG_DIR)" test-$$l gate $$l -- $(TIMEOUT) $(TEST_TIMEOUT) $(LISP) $(TEST_FORMS)
 
 build-sbcl:    ; $(MAKE) build LISP=$(SBCL)
 build-allegro: ; $(MAKE) build LISP=$(ALLEGRO)
@@ -155,13 +174,9 @@ gate-verification: ; ./scripts/gate-verification.sh
 
 # ADR 0120, the transitional Definition of Done (until the Phase 1 exit of the governing plan): a run may
 # fail only tests listed in test/baseline-<lisp>.txt and skip only what test/skip-baseline-<lisp>.txt lists.
-# test-ratchet runs the suite for LISP and checks its log; baseline-check checks an existing LOG.
-RATCHET_LOG ?= $(or $(TMPDIR),/tmp)/neodds-test-ratchet.log
-test-ratchet:
-	@case "$(LISP)" in *allegro*) l=allegro;; *sbcl*) l=sbcl;; \
-	  *) echo "test-ratchet: cannot tell which baseline LISP=$(LISP) uses (sbcl or allegro)" >&2; exit 2;; esac; \
-	$(MAKE) --no-print-directory test LISP=$(LISP) 2>&1 | tee $(RATCHET_LOG); \
-	python3 scripts/test-baseline.py check-run $$l $(RATCHET_LOG)
+# Since ADR 0128 `make test` itself applies that rule; test-ratchet is kept as its alias. baseline-check
+# checks an existing LOG (it honours DDS_TEST_ALLOW_SKIP the same way, exit 3).
+test-ratchet: test
 baseline-check: ; python3 scripts/test-baseline.py check-run $(BASELINE_LISP) $(LOG)
 
 # Owner directive 2026-07-14 (NON-NEGOTIABLE): no Lisp conditions in the hot path; every condition handled
@@ -218,13 +233,20 @@ linux-clean-cache: ; docker volume rm -f neodds-linux-fasl-cache
 # target only VERIFIES them, so it needs no Connext install and runs anywhere.
 # ADR 0122: run under the skip accounting (preflight + coverage line); a deferred vector is reported as a
 # :verified-elsewhere skip. A mismatch is signalled inside the accounted run (so the coverage line says
-# FAILED) and turned into exit 1; the exit code is unchanged: 0 iff corpus-verify found no mismatch.
+# FAILED) and turned into exit 1.
+# ADR 0128 §3: corpus, fuzz and mem exit with `scripts/test-baseline.py entry`'s verdict on a fresh log: 1 if
+# the Lisp exited non-zero (a mismatch, a fuzz finding, a timeout), or if the run recorded a skip event of a
+# capability the Lisp's skip baseline does not already excuse (SBCL: any, its baseline is empty); the corpus's
+# own :verified-elsewhere deferrals (*corpus-verified-elsewhere*) are accepted for `corpus` only; 3 under
+# DDS_TEST_ALLOW_SKIP (NOT A GATE RUN); else 0.
 corpus:
-	$(TIMEOUT) $(GATE_TIMEOUT) $(LISP) --eval '(asdf:load-system :dds-tests)' \
+	@l=$(call lisp-key,$(LISP)); [ -n "$$l" ] || { echo "make corpus: LISP=$(LISP) is neither sbcl nor allegro" >&2; exit 2; }; \
+	./scripts/judged-run.sh "$(TEST_LOG_DIR)" corpus-$$l entry $$l corpus -- $(TIMEOUT) $(GATE_TIMEOUT) $(LISP) --eval '(asdf:load-system :dds-tests)' \
 	        --eval '(handler-case (progn (dds.tests:run-with-skip-report "corpus" (lambda () (let ((bad (dds.bench:corpus-verify))) (unless (zerop bad) (error "corpus: ~d mismatch(es)" bad)) bad))) (dds.pal:exit-process 0)) (error (e) (format t "~&~a~%" e) (dds.pal:exit-process 1)))'
 
 fuzz:
-	$(TIMEOUT) $(GATE_TIMEOUT) $(LISP) --eval '(asdf:load-system :dds-tests)' \
+	@l=$(call lisp-key,$(LISP)); [ -n "$$l" ] || { echo "make fuzz: LISP=$(LISP) is neither sbcl nor allegro" >&2; exit 2; }; \
+	./scripts/judged-run.sh "$(TEST_LOG_DIR)" fuzz-$$l entry $$l pbt-fuzz -- $(TIMEOUT) $(GATE_TIMEOUT) $(LISP) --eval '(asdf:load-system :dds-tests)' \
 	        --eval '(handler-case (progn (dds.tests:run-with-skip-report "pbt-fuzz" (function dds.tests:run-pbt-tests)) (dds.pal:exit-process 0)) (error (e) (format t "~&~a~%" e) (dds.pal:exit-process 1)))'
 
 wire:
@@ -376,7 +398,7 @@ bench:
 	        --eval '(dds.pal:exit-process 0)'
 
 bench-shmem:
-	$(TIMEOUT) $(BENCH_TIMEOUT) $(SBCL) --eval '(asdf:load-system :dds-bench)' \
+	@./scripts/judged-run.sh "$(TEST_LOG_DIR)" mem-sbcl entry sbcl mem -- $(TIMEOUT) $(BENCH_TIMEOUT) $(SBCL) --eval '(asdf:load-system :dds-bench)' \
 	        --eval '(uiop:symbol-call :dds.bench :run-bench-shmem :latency-samples $(LATSAMPLES) :throughput-samples $(THRUSAMPLES))' \
 	        --eval '(dds.pal:exit-process 0)'
 
@@ -489,9 +511,13 @@ shmem-xproc:
 zc-xproc:
 	$(TIMEOUT) $(GATE_TIMEOUT) ./scripts/zerocopy-roundtrip.sh
 
+# CODEC-ONLY 0 bytes/iter (ADR 0095 §1.6), SBCL only; judged like corpus/fuzz (ADR 0128 §3).
 mem:
-	$(TIMEOUT) $(BENCH_TIMEOUT) $(SBCL) --eval '(asdf:load-system :dds-tests)' \
+	@./scripts/judged-run.sh "$(TEST_LOG_DIR)" mem-sbcl entry sbcl mem -- $(TIMEOUT) $(BENCH_TIMEOUT) $(SBCL) --eval '(asdf:load-system :dds-tests)' \
 	        --eval '(handler-case (progn (dds.tests:run-with-skip-report "mem" (function dds.tests:run-mem-test)) (dds.pal:exit-process 0)) (error (e) (format t "~&~a~%" e) (dds.pal:exit-process 1)))'
 
+# WP-0.16: removes every compiled file IN THE TREE (stray fasls from a bare compile-file; ASDF's own output
+# goes to the private cache of scripts/lisp-cache-env.sh, outside the repo). .git is never entered. gate-build
+# fails while any src/**/*.fasl exists.
 clean:
-	find . -name '*.fasl' -o -name '*.fasp' -o -name '*.faso' -o -name '*.fasc' | xargs -r rm -f
+	find . -path ./.git -prune -o -type f \( -name '*.fasl' -o -name '*.fasp' -o -name '*.faso' -o -name '*.fasc' \) -print0 | xargs -0 -r rm -f

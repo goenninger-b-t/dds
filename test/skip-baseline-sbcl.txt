@@ -6,7 +6,7 @@
 # holds an entry, or a larger count, than ANY committed version of it held. Remove a line in the commit that
 # fixes it; never add one. Reassigning the owning WP is allowed.
 # Expires at the Phase 1 exit of docs/plans/2026-10-03-sbcl-allegro-full-ok.md: the file is then empty and
-# is deleted (ADR 0120 section 5). Check a run against it: make test-ratchet LISP=...
+# is deleted (ADR 0120 section 5). `make test LISP=...` applies it and exits with its verdict (ADR 0128).
 #
 # Measured 2026-10-04 at 767c335, SBCL 2.2.9.debian, . scripts/openssl-env.sh (OpenSSL 3.5.9):
 # coverage 654 FULL, 0 PARTIAL, 0 SKIPPED, 0 FAILED; 0 skip events. No entries.

@@ -14,7 +14,7 @@
 
 ```sh
 make build         # load all systems (default LISP = SBCL; override LISP=./scripts/with-allegro.sh)
-make test          # run the unit/integration suite once
+make test          # run the suite once; exits with the ADR 0120 baseline verdict (ADR 0128, see below)
 make build-allegro # build on AllegroCL (ALISP_BIN / ALLEGRO_BIN override the binary)
 make test-allegro  # test on AllegroCL
 make build-all     # build on both targets (SBCL + AllegroCL); each launcher exits 127 when absent
@@ -88,8 +88,22 @@ coverage: 547 FULL, 3 PARTIAL, 100 SKIPPED, 0 FAILED of 650 test(s); 106 skip ev
 ```
 
 FULL = ran with no skip; PARTIAL = passed but skipped at least one arm; SKIPPED = returned without running;
-FAILED = failed (whatever it skipped). **Step 1 is report-only: skips do not change the exit code.** Step 2
-(WP-0.10, with the ADR 0120 skip baseline) will fail a run on a skip that is not in the baseline.
+FAILED = failed (whatever it skipped). The Lisp run itself only reports; **`make test` enforces** (step 2,
+[ADR 0128](../adr/0128-make-test-enforces-the-baselines.md)): a skip event of **any** capability that the ADR
+0120 skip baseline below does not list, or more events than it allows, fails `make test`. `make fuzz`,
+`make mem` and `make corpus` are judged too (`scripts/test-baseline.py entry`, ADR 0128 §3): they fail when the
+Lisp exits non-zero or when the run records a skip of a capability the Lisp's skip baseline excuses for no
+test. On SBCL, whose skip baseline is empty, that means any skip, except the corpus's own
+`:verified-elsewhere` deferral (`*corpus-verified-elsewhere*`, `make corpus` only). On AllegroCL a skip of
+an already-excused capability (e.g. the `zc-sap-primitives` arm in `make fuzz`, owner WP-1.15) is printed as
+KNOWN; no per-entry-point baseline exists or is added.
+
+**`DDS_TEST_ALLOW_SKIP=<cap>[,<cap>…]`** is the only skip switch. It lets skip events of the named
+capabilities (closed vocabulary, case-insensitive, colon optional; an unknown name is an error) past the skip
+baseline, never a failure, and the verdict is then **exit 3, `NOT A GATE RUN`**, not 0 — even if nothing
+extra skipped. It exists for the governing plan's Phase 1A exit check
+(`DDS_TEST_ALLOW_SKIP=alloc-counter,zc-sap-primitives,subprocess-mode make test LISP=./scripts/with-allegro.sh`);
+a run made with it is not evidence for anything else.
 
 ### The transitional ratchet: known failures and skips, listed and owned (ADR 0120)
 
@@ -109,12 +123,28 @@ already zero/zero.
 
 ```sh
 . scripts/openssl-env.sh
-make test-ratchet LISP=./scripts/with-allegro.sh   # runs make test, then checks its log
-make baseline-check BASELINE_LISP=allegro LOG=/path/to/make-test.log   # check a log you already have
+make test LISP=./scripts/with-allegro.sh           # runs the suite, then judges its log (ADR 0128)
+make baseline-check BASELINE_LISP=allegro LOG=/path/to/make-test.log   # judge a log you already have
 make gate-verification                             # includes: no baseline grew against ANY committed version
 ```
 
-`test-ratchet` prints the entries that did **not** fire in this run; when you fix one, delete its line in
+`make test` writes the log to a fresh file `$(TEST_LOG_DIR)/neodds-test-<lisp>.XXXXXX.log` (mktemp; default
+`$TMPDIR` or `/tmp`; the path is printed first) and hands it to `scripts/test-baseline.py gate`, whose verdict
+is its exit status (`scripts/judged-run.sh`). If the log cannot be created or `tee` cannot write all of it
+(read-only directory, full disk), the run is not judged and `make test` fails: a verdict is never about a log
+an earlier run left behind.
+
+| exit | meaning |
+|---|---|
+| 0 | nothing outside the baselines. Each baselined failure that fired is printed as `KNOWN failure (ADR 0120 baseline, owner WP-…)`, each baselined skip as `KNOWN skip`; the last line says "no new failure under the ADR 0120 baseline", not "all tests pass" |
+| 1 | a new failure, a new or extra skip event, more leaked threads than the bound, a log of the other Lisp (the preflight line's `on SBCL` / `on ALLEGRO` must match `LISP`), or a run that cannot be judged: the Lisp timed out (124/137) or crashed, or exited 0 with failures in its log, or 1 with none |
+| 3 | as 0, but `DDS_TEST_ALLOW_SKIP` was set: **NOT A GATE RUN** |
+
+GNU make reports a failing recipe as its own exit 2; the recipe's code is in make's `Error N` line. On
+AllegroCL today `make test` exits 0 while printing its 19 KNOWN failure entries and 51 KNOWN skip events by
+name and owner. `make test-ratchet` is an alias of `make test`.
+
+The verdict also prints the entries that did **not** fire in this run; when you fix one, delete its line in
 the same commit. Adding a line is never the fix: `gate-verification` compares the file with every version
 ever committed (not only `HEAD`), so re-adding a removed entry, raising a skip count or the leaked-thread
 bound, or re-creating a deleted baseline all fail. The pre-commit hook (`make hooks`) runs the same check on
@@ -180,7 +210,10 @@ file was used and how many were mapped:
 ```
 
 Without `DDS_DARE_LIBCRYPTO` the loader searches (Homebrew paths, then `libcrypto.so.3`), verifies what it
-finds the same way, and on a 3.0 system the DARE and security tests record `:openssl-pqc` skips as before.
+finds the same way, and on a 3.0 system the DARE and security tests record `:openssl-pqc` skips as before;
+since ADR 0128 those skips are not in any baseline, so **`make test` fails without the pinned library**.
+Source `scripts/openssl-env.sh` for every run that is meant to count. Hosted CI builds and caches the same
+pin and runs the SBCL suite against it (`NEODDS_CI_OPENSSL35: 'on'` in `.github/workflows/gates.yml`).
 
 Measured on the reference host (Linux x86_64, 2026-10-04) with the pin: SBCL 2.2.9
 `tests: 652 passed, 0 FAILED` and `coverage: 652 FULL, 0 PARTIAL, 0 SKIPPED, 0 FAILED; 0 skip event(s)`;
@@ -246,6 +279,12 @@ The operating contract asserted CI enforcement that did not exist ("the **CI** h
 this"; "no reader conditionals outside `dds-pal/` — **CI lint** enforces this"). Both claims were false; the
 lint had never been written. `gates.yml` and `make gate-pal` make them true.
 
+**What CI runs for the suite:** `make test LISP=./scripts/with-sbcl.sh` against the pinned OpenSSL 3.5.9
+(built from the verified tarball and cached on its version and hash), judged against the empty SBCL baselines
+(ADR 0128): any failure, skip event or leaked `dds-*` thread turns the job red. `make corpus` and `make fuzz`
+are judged the same way (any skip but the corpus's declared `:verified-elsewhere` turns them red). When the
+job fails, the judged-run logs (`neodds-*.log`) are kept as the artifact `neodds-test-sbcl-log`.
+
 **What CI does NOT cover — stated loudly, never silently skipped:**
 
 - **AllegroCL.** It is commercially licensed and not on the hosted runner. The rule is that **SBCL AND
@@ -283,6 +322,13 @@ make gate-build LISP=./scripts/with-allegro.sh
 ⚠️ On AllegroCL the second line is expected to **fail its own falsification step** until the plan's Phase 2
 lands: ASDF's compile-failure behaviour there is `:warn`, so the wrong-arity canary is not rejected
 (`docs/plans/2026-10-03-sbcl-allegro-full-ok.md` §1). That red is the honest answer, not a flake.
+
+**No fasl in the source tree (WP-0.16).** Before building, `gate-build` fails if any `src/**/*.fasl` exists.
+ASDF writes its output to the private cache (below), so a fasl beside the source can only come from a bare
+`compile-file`; nothing rebuilds it, and a `(load "src/…/x")` without a type can load it instead of the
+source. The check proves itself on every run (one planted `src/` fasl must be found; a `.lisp` file, a name
+containing "fasl" and a fasl outside `src/` must not). `make clean` removes every compiled file in the tree
+(never entering `.git`).
 
 **The fasl cache is private to this project.** Every Lisp entry point (`scripts/with-sbcl.sh`,
 `scripts/with-allegro.sh`, `scripts/gate-build.sh`) sources `scripts/lisp-cache-env.sh`, which sets
