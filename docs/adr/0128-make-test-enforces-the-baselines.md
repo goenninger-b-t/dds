@@ -209,6 +209,10 @@ Hosted CI before this change (`workflow_dispatch` of `Gates` on `41082ef` with t
 passed the `OSSL_PARAM` probe; the SBCL 2.2.9.debian suite against it was 654 passed, 0 FAILED, 654 FULL,
 0 skip events, 0 leaked threads; every step green. That is the run this change makes the default.
 
+Hosted CI of this change (push of `59c2fd5`, `Gates` run 37190681940): green. `make test` (SBCL 2.2.9,
+pinned OpenSSL 3.5.9 by default) 654 passed, 654 FULL, 0 skip events, 0 leaked threads, verdict PASS;
+`make corpus` PASS with its one declared `verified-elsewhere` event; `make fuzz` PASS with 0 skip events.
+
 Not a hot-path change (no file `gate-hotpath` scans is touched; the Lisp edits are docstrings and comments in
 the test harness), so no bench report.
 
