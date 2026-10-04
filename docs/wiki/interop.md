@@ -7,6 +7,29 @@ under [`interop/connext/`](../../interop/connext/), the **Fast DDS peer harness*
 (`dds-shapes`, the `make square-*` targets). Wire correctness is judged with the Wireshark/
 tshark RTPS dissector — the same dissector `make wire` uses — not by eye.
 
+## The interop matrix (`interop/matrix.csv`, ADR 0127 §6)
+
+The interop **exit gate** is a checked-in file, not a list in someone's head. `interop/matrix.csv` has one
+row per cell: our Lisp (`sbcl`, `allegro`) × peer (`connext-7.3.1`, `fastdds-3.6.1`, and `neodds-allegro`
+for the cross-Lisp leg) × feature (`be` with its RxO-negative case, `reliable`, `cft`, `durability`,
+`evolution`, `frag`, `large-data`, `secure`, `flatdata`, plus `shmem` for Connext and the cross-Lisp leg) ×
+direction (`out`, `in`): **96 cells**, each `NOT-RUN`, `PASS`, `FAIL` or `EXCLUDED`.
+
+```
+Lisp,Peer,Feature,Direction,Status,Evidence,Notes
+sbcl,connext-7.3.1,be,out,NOT-RUN,,BEST_EFFORT ShapeType both ways; includes the RxO-negative case …
+```
+
+- **Every cell is `NOT-RUN` today.** The earlier live legs ran on a macOS host, which is not a target
+  (ADR 0124 D1); the Linux lab is plan Phase 4.
+- A `PASS`/`FAIL` cell names its evidence file, which must exist. An `EXCLUDED` cell names its ADR; only the
+  Connext `shmem` cells may be excluded, and only by the D20 scoping ADR. The check rejects `EXCLUDED` on
+  any other cell and an excluding ADR that does not exist under `docs/adr/`. A cell is never deleted.
+- `make gate-verification` checks the file is complete and well-formed (`scripts/interop-matrix.py check`,
+  self-falsifying). Making `make interop` fail on any cell that is not `PASS` or `EXCLUDED` is WP-4.12.
+- Which cells each milestone exit needs (M2: `be` + `reliable` with Connext; M3: `cft`; M4: `evolution`;
+  M5: `frag`, `large-data`, `flatdata`, `shmem`; M6: `durability`; M7: `secure`) is ADR 0127 §6.3.
+
 ## The interop gate (`make interop`)
 
 `make interop` runs `make wire` (our emitted RTPS validated against the tshark RTPS dissector) and then

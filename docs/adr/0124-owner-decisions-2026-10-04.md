@@ -14,6 +14,11 @@
   ADR 0118 §4's three OPEN rows (D1)
 - **Relates to:** ADR 0102 (chunked arena growth; D29), ADR 0120 (transitional DoD, reserved, not yet
   written; D31)
+- **Forward note (2026-10-04, same day):** the references below to ADR 0120 as "reserved" or "not yet
+  written" are superseded: ADR 0120 (transitional Definition of Done, D31) was written and accepted on
+  2026-10-04. D9 (§2) is recorded **here**; ADR 0126 records the milestone-sequence deviation that D9
+  answers and states the bounds of the parallel re-verification D9 approves. The body below is left as
+  written.
 
 ---
 

@@ -3468,3 +3468,20 @@ neither emitted nor interpreted. Naming a field we have not identified is what A
   `/proc/sys/kernel/version` in proc(5) on this host. Only the file names, the value `1` and the token
   `PREEMPT_RT` are used, as interface facts; no kernel code was copied.
 - No third-party code was copied into the repository.
+
+## 2026-10-04 — exit-gate wording (ADR 0127, WP-0.15)
+
+- **`tc-netem(8)`** as installed on the reference host (`/usr/share/man/man8/tc-netem.8.gz`, iproute2) was read
+  for the syntax of the soak's network profile (`delay TIME [JITTER]`, `loss random PERCENT`, `duplicate
+  PERCENT`, `reorder PERCENT`, and "to use reordering, a delay option must be specified"). Only the option
+  syntax is used, in the ADR's example command; nothing was copied into code. After review, the
+  `distribution { uniform | normal | pareto | paretonormal }` option and the man page's statement that the
+  default is Normal were read from the same page, and the location of the `normal` table
+  (`/usr/lib/x86_64-linux-gnu/tc/normal.dist`) from `dpkg -S normal.dist` (package `iproute2`, `tc -V`:
+  iproute2-6.1.0). The statements that netem's default queue reorders jittered packets, and that a kernel with
+  no table spreads uniformly, are general netem knowledge marked moderate confidence in ADR 0127 §4.2; they
+  were not verified on this host (no `CAP_NET_ADMIN`, D21) and no source was consulted for them.
+- The encapsulation identifiers of the committed `corpus/xcdr2/*.bin` vectors were read with `od` and compared
+  with `+representation-ids+` in `src/dds-cdr/cdr.lisp` (XTypes 1.3 §7.6 Table 60); no new constant was
+  introduced.
+- No third-party code was copied into the repository.

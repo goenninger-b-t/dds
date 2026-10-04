@@ -1,0 +1,97 @@
+Lisp,Peer,Feature,Direction,Status,Evidence,Notes
+sbcl,connext-7.3.1,be,out,NOT-RUN,,BEST_EFFORT ShapeType both ways; includes the RxO-negative case (an incompatible QoS must NOT match and must raise the incompatible-QoS statuses)
+sbcl,connext-7.3.1,be,in,NOT-RUN,,BEST_EFFORT ShapeType both ways; includes the RxO-negative case (an incompatible QoS must NOT match and must raise the incompatible-QoS statuses)
+sbcl,connext-7.3.1,reliable,out,NOT-RUN,,RELIABLE ShapeType; HEARTBEAT/ACKNACK/GAP repair observed on the wire
+sbcl,connext-7.3.1,reliable,in,NOT-RUN,,RELIABLE ShapeType; HEARTBEAT/ACKNACK/GAP repair observed on the wire
+sbcl,connext-7.3.1,cft,out,NOT-RUN,,"content-filtered topic, writer-side and reader-side filtering"
+sbcl,connext-7.3.1,cft,in,NOT-RUN,,"content-filtered topic, writer-side and reader-side filtering"
+sbcl,connext-7.3.1,durability,out,NOT-RUN,,TRANSIENT_LOCAL late joiner (and TRANSIENT/PERSISTENT where the peer supports them)
+sbcl,connext-7.3.1,durability,in,NOT-RUN,,TRANSIENT_LOCAL late joiner (and TRANSIENT/PERSISTENT where the peer supports them)
+sbcl,connext-7.3.1,evolution,out,NOT-RUN,,"XTypes appendable/mutable type evolution, assignability both ways"
+sbcl,connext-7.3.1,evolution,in,NOT-RUN,,"XTypes appendable/mutable type evolution, assignability both ways"
+sbcl,connext-7.3.1,frag,out,NOT-RUN,,DATA_FRAG / NACK_FRAG / HEARTBEAT_FRAG with a sample larger than the fragment size
+sbcl,connext-7.3.1,frag,in,NOT-RUN,,DATA_FRAG / NACK_FRAG / HEARTBEAT_FRAG with a sample larger than the fragment size
+sbcl,connext-7.3.1,large-data,out,NOT-RUN,,large samples (64 KB to 4 MB) end to end
+sbcl,connext-7.3.1,large-data,in,NOT-RUN,,large samples (64 KB to 4 MB) end to end
+sbcl,connext-7.3.1,secure,out,NOT-RUN,,"DDS-Security on a shared governance/permissions set: encrypt, sign and datasign variants"
+sbcl,connext-7.3.1,secure,in,NOT-RUN,,"DDS-Security on a shared governance/permissions set: encrypt, sign and datasign variants"
+sbcl,connext-7.3.1,flatdata,out,NOT-RUN,,"FlatData-equivalent binding on our side; the peer uses its FlatData or plain XCDR2 binding (M5 exit, where wire-compatible)"
+sbcl,connext-7.3.1,flatdata,in,NOT-RUN,,"FlatData-equivalent binding on our side; the peer uses its FlatData or plain XCDR2 binding (M5 exit, where wire-compatible)"
+sbcl,connext-7.3.1,shmem,out,NOT-RUN,,"same-host shared-memory transport incl. Zero-Copy (M5 exit, where wire-compatible); a Connext cell may be EXCLUDED only by the owner decision D20 scoping ADR (WP-5.9)"
+sbcl,connext-7.3.1,shmem,in,NOT-RUN,,"same-host shared-memory transport incl. Zero-Copy (M5 exit, where wire-compatible); a Connext cell may be EXCLUDED only by the owner decision D20 scoping ADR (WP-5.9)"
+sbcl,fastdds-3.6.1,be,out,NOT-RUN,,BEST_EFFORT ShapeType both ways; includes the RxO-negative case (an incompatible QoS must NOT match and must raise the incompatible-QoS statuses)
+sbcl,fastdds-3.6.1,be,in,NOT-RUN,,BEST_EFFORT ShapeType both ways; includes the RxO-negative case (an incompatible QoS must NOT match and must raise the incompatible-QoS statuses)
+sbcl,fastdds-3.6.1,reliable,out,NOT-RUN,,RELIABLE ShapeType; HEARTBEAT/ACKNACK/GAP repair observed on the wire
+sbcl,fastdds-3.6.1,reliable,in,NOT-RUN,,RELIABLE ShapeType; HEARTBEAT/ACKNACK/GAP repair observed on the wire
+sbcl,fastdds-3.6.1,cft,out,NOT-RUN,,"content-filtered topic, writer-side and reader-side filtering"
+sbcl,fastdds-3.6.1,cft,in,NOT-RUN,,"content-filtered topic, writer-side and reader-side filtering"
+sbcl,fastdds-3.6.1,durability,out,NOT-RUN,,TRANSIENT_LOCAL late joiner (and TRANSIENT/PERSISTENT where the peer supports them)
+sbcl,fastdds-3.6.1,durability,in,NOT-RUN,,TRANSIENT_LOCAL late joiner (and TRANSIENT/PERSISTENT where the peer supports them)
+sbcl,fastdds-3.6.1,evolution,out,NOT-RUN,,"XTypes appendable/mutable type evolution, assignability both ways"
+sbcl,fastdds-3.6.1,evolution,in,NOT-RUN,,"XTypes appendable/mutable type evolution, assignability both ways"
+sbcl,fastdds-3.6.1,frag,out,NOT-RUN,,DATA_FRAG / NACK_FRAG / HEARTBEAT_FRAG with a sample larger than the fragment size
+sbcl,fastdds-3.6.1,frag,in,NOT-RUN,,DATA_FRAG / NACK_FRAG / HEARTBEAT_FRAG with a sample larger than the fragment size
+sbcl,fastdds-3.6.1,large-data,out,NOT-RUN,,large samples (64 KB to 4 MB) end to end
+sbcl,fastdds-3.6.1,large-data,in,NOT-RUN,,large samples (64 KB to 4 MB) end to end
+sbcl,fastdds-3.6.1,secure,out,NOT-RUN,,"DDS-Security on a shared governance/permissions set: encrypt, sign and datasign variants"
+sbcl,fastdds-3.6.1,secure,in,NOT-RUN,,"DDS-Security on a shared governance/permissions set: encrypt, sign and datasign variants"
+sbcl,fastdds-3.6.1,flatdata,out,NOT-RUN,,"FlatData-equivalent binding on our side; the peer uses its FlatData or plain XCDR2 binding (M5 exit, where wire-compatible)"
+sbcl,fastdds-3.6.1,flatdata,in,NOT-RUN,,"FlatData-equivalent binding on our side; the peer uses its FlatData or plain XCDR2 binding (M5 exit, where wire-compatible)"
+allegro,connext-7.3.1,be,out,NOT-RUN,,BEST_EFFORT ShapeType both ways; includes the RxO-negative case (an incompatible QoS must NOT match and must raise the incompatible-QoS statuses)
+allegro,connext-7.3.1,be,in,NOT-RUN,,BEST_EFFORT ShapeType both ways; includes the RxO-negative case (an incompatible QoS must NOT match and must raise the incompatible-QoS statuses)
+allegro,connext-7.3.1,reliable,out,NOT-RUN,,RELIABLE ShapeType; HEARTBEAT/ACKNACK/GAP repair observed on the wire
+allegro,connext-7.3.1,reliable,in,NOT-RUN,,RELIABLE ShapeType; HEARTBEAT/ACKNACK/GAP repair observed on the wire
+allegro,connext-7.3.1,cft,out,NOT-RUN,,"content-filtered topic, writer-side and reader-side filtering"
+allegro,connext-7.3.1,cft,in,NOT-RUN,,"content-filtered topic, writer-side and reader-side filtering"
+allegro,connext-7.3.1,durability,out,NOT-RUN,,TRANSIENT_LOCAL late joiner (and TRANSIENT/PERSISTENT where the peer supports them)
+allegro,connext-7.3.1,durability,in,NOT-RUN,,TRANSIENT_LOCAL late joiner (and TRANSIENT/PERSISTENT where the peer supports them)
+allegro,connext-7.3.1,evolution,out,NOT-RUN,,"XTypes appendable/mutable type evolution, assignability both ways"
+allegro,connext-7.3.1,evolution,in,NOT-RUN,,"XTypes appendable/mutable type evolution, assignability both ways"
+allegro,connext-7.3.1,frag,out,NOT-RUN,,DATA_FRAG / NACK_FRAG / HEARTBEAT_FRAG with a sample larger than the fragment size
+allegro,connext-7.3.1,frag,in,NOT-RUN,,DATA_FRAG / NACK_FRAG / HEARTBEAT_FRAG with a sample larger than the fragment size
+allegro,connext-7.3.1,large-data,out,NOT-RUN,,large samples (64 KB to 4 MB) end to end
+allegro,connext-7.3.1,large-data,in,NOT-RUN,,large samples (64 KB to 4 MB) end to end
+allegro,connext-7.3.1,secure,out,NOT-RUN,,"DDS-Security on a shared governance/permissions set: encrypt, sign and datasign variants"
+allegro,connext-7.3.1,secure,in,NOT-RUN,,"DDS-Security on a shared governance/permissions set: encrypt, sign and datasign variants"
+allegro,connext-7.3.1,flatdata,out,NOT-RUN,,"FlatData-equivalent binding on our side; the peer uses its FlatData or plain XCDR2 binding (M5 exit, where wire-compatible)"
+allegro,connext-7.3.1,flatdata,in,NOT-RUN,,"FlatData-equivalent binding on our side; the peer uses its FlatData or plain XCDR2 binding (M5 exit, where wire-compatible)"
+allegro,connext-7.3.1,shmem,out,NOT-RUN,,"same-host shared-memory transport incl. Zero-Copy (M5 exit, where wire-compatible); a Connext cell may be EXCLUDED only by the owner decision D20 scoping ADR (WP-5.9)"
+allegro,connext-7.3.1,shmem,in,NOT-RUN,,"same-host shared-memory transport incl. Zero-Copy (M5 exit, where wire-compatible); a Connext cell may be EXCLUDED only by the owner decision D20 scoping ADR (WP-5.9)"
+allegro,fastdds-3.6.1,be,out,NOT-RUN,,BEST_EFFORT ShapeType both ways; includes the RxO-negative case (an incompatible QoS must NOT match and must raise the incompatible-QoS statuses)
+allegro,fastdds-3.6.1,be,in,NOT-RUN,,BEST_EFFORT ShapeType both ways; includes the RxO-negative case (an incompatible QoS must NOT match and must raise the incompatible-QoS statuses)
+allegro,fastdds-3.6.1,reliable,out,NOT-RUN,,RELIABLE ShapeType; HEARTBEAT/ACKNACK/GAP repair observed on the wire
+allegro,fastdds-3.6.1,reliable,in,NOT-RUN,,RELIABLE ShapeType; HEARTBEAT/ACKNACK/GAP repair observed on the wire
+allegro,fastdds-3.6.1,cft,out,NOT-RUN,,"content-filtered topic, writer-side and reader-side filtering"
+allegro,fastdds-3.6.1,cft,in,NOT-RUN,,"content-filtered topic, writer-side and reader-side filtering"
+allegro,fastdds-3.6.1,durability,out,NOT-RUN,,TRANSIENT_LOCAL late joiner (and TRANSIENT/PERSISTENT where the peer supports them)
+allegro,fastdds-3.6.1,durability,in,NOT-RUN,,TRANSIENT_LOCAL late joiner (and TRANSIENT/PERSISTENT where the peer supports them)
+allegro,fastdds-3.6.1,evolution,out,NOT-RUN,,"XTypes appendable/mutable type evolution, assignability both ways"
+allegro,fastdds-3.6.1,evolution,in,NOT-RUN,,"XTypes appendable/mutable type evolution, assignability both ways"
+allegro,fastdds-3.6.1,frag,out,NOT-RUN,,DATA_FRAG / NACK_FRAG / HEARTBEAT_FRAG with a sample larger than the fragment size
+allegro,fastdds-3.6.1,frag,in,NOT-RUN,,DATA_FRAG / NACK_FRAG / HEARTBEAT_FRAG with a sample larger than the fragment size
+allegro,fastdds-3.6.1,large-data,out,NOT-RUN,,large samples (64 KB to 4 MB) end to end
+allegro,fastdds-3.6.1,large-data,in,NOT-RUN,,large samples (64 KB to 4 MB) end to end
+allegro,fastdds-3.6.1,secure,out,NOT-RUN,,"DDS-Security on a shared governance/permissions set: encrypt, sign and datasign variants"
+allegro,fastdds-3.6.1,secure,in,NOT-RUN,,"DDS-Security on a shared governance/permissions set: encrypt, sign and datasign variants"
+allegro,fastdds-3.6.1,flatdata,out,NOT-RUN,,"FlatData-equivalent binding on our side; the peer uses its FlatData or plain XCDR2 binding (M5 exit, where wire-compatible)"
+allegro,fastdds-3.6.1,flatdata,in,NOT-RUN,,"FlatData-equivalent binding on our side; the peer uses its FlatData or plain XCDR2 binding (M5 exit, where wire-compatible)"
+sbcl,neodds-allegro,be,out,NOT-RUN,,BEST_EFFORT ShapeType both ways; includes the RxO-negative case (an incompatible QoS must NOT match and must raise the incompatible-QoS statuses)
+sbcl,neodds-allegro,be,in,NOT-RUN,,BEST_EFFORT ShapeType both ways; includes the RxO-negative case (an incompatible QoS must NOT match and must raise the incompatible-QoS statuses)
+sbcl,neodds-allegro,reliable,out,NOT-RUN,,RELIABLE ShapeType; HEARTBEAT/ACKNACK/GAP repair observed on the wire
+sbcl,neodds-allegro,reliable,in,NOT-RUN,,RELIABLE ShapeType; HEARTBEAT/ACKNACK/GAP repair observed on the wire
+sbcl,neodds-allegro,cft,out,NOT-RUN,,"content-filtered topic, writer-side and reader-side filtering"
+sbcl,neodds-allegro,cft,in,NOT-RUN,,"content-filtered topic, writer-side and reader-side filtering"
+sbcl,neodds-allegro,durability,out,NOT-RUN,,TRANSIENT_LOCAL late joiner (and TRANSIENT/PERSISTENT where the peer supports them)
+sbcl,neodds-allegro,durability,in,NOT-RUN,,TRANSIENT_LOCAL late joiner (and TRANSIENT/PERSISTENT where the peer supports them)
+sbcl,neodds-allegro,evolution,out,NOT-RUN,,"XTypes appendable/mutable type evolution, assignability both ways"
+sbcl,neodds-allegro,evolution,in,NOT-RUN,,"XTypes appendable/mutable type evolution, assignability both ways"
+sbcl,neodds-allegro,frag,out,NOT-RUN,,DATA_FRAG / NACK_FRAG / HEARTBEAT_FRAG with a sample larger than the fragment size
+sbcl,neodds-allegro,frag,in,NOT-RUN,,DATA_FRAG / NACK_FRAG / HEARTBEAT_FRAG with a sample larger than the fragment size
+sbcl,neodds-allegro,large-data,out,NOT-RUN,,large samples (64 KB to 4 MB) end to end
+sbcl,neodds-allegro,large-data,in,NOT-RUN,,large samples (64 KB to 4 MB) end to end
+sbcl,neodds-allegro,secure,out,NOT-RUN,,"DDS-Security on a shared governance/permissions set: encrypt, sign and datasign variants"
+sbcl,neodds-allegro,secure,in,NOT-RUN,,"DDS-Security on a shared governance/permissions set: encrypt, sign and datasign variants"
+sbcl,neodds-allegro,flatdata,out,NOT-RUN,,"FlatData-equivalent binding on our side; the peer uses its FlatData or plain XCDR2 binding (M5 exit, where wire-compatible)"
+sbcl,neodds-allegro,flatdata,in,NOT-RUN,,"FlatData-equivalent binding on our side; the peer uses its FlatData or plain XCDR2 binding (M5 exit, where wire-compatible)"
+sbcl,neodds-allegro,shmem,out,NOT-RUN,,"same-host shared-memory transport incl. Zero-Copy (M5 exit, where wire-compatible); a Connext cell may be EXCLUDED only by the owner decision D20 scoping ADR (WP-5.9)"
+sbcl,neodds-allegro,shmem,in,NOT-RUN,,"same-host shared-memory transport incl. Zero-Copy (M5 exit, where wire-compatible); a Connext cell may be EXCLUDED only by the owner decision D20 scoping ADR (WP-5.9)"

@@ -18,6 +18,14 @@
 #      shape after the 6-field repair; a field count alone accepted them.
 #   5. the file stays CRLF-terminated — git holds it as CRLF, and a line-ending flip turns a one-row
 #      addition into a whole-file diff that buries the real change
+#   6. ADR 0120: the transitional test baselines (test/baseline-<lisp>.txt, test/skip-baseline-<lisp>.txt)
+#      only SHRINK — the working-tree file is a subset of every version ever committed, with skip counts and
+#      the leaked-thread bound at or below the minimum (scripts/test-baseline.py shrink-only; self-falsifying;
+#      a shallow clone FAILS). The pre-commit hook runs the same check on the staged copy (--staged).
+#   7. ADR 0127 §6: interop/matrix.csv is complete and well-formed — every Lisp x peer x feature x direction
+#      cell present exactly once, Status in the closed set, PASS/FAIL cells point at existing evidence,
+#      EXCLUDED only on a Connext shmem cell and citing an ADR that exists (scripts/interop-matrix.py check;
+#      self-falsifying)
 #
 # --self-test falsifies it: builds a file carrying each defect and asserts the checker REJECTS it, and a
 # clean one and asserts it ACCEPTS. A gate never proven able to fail proves nothing.
@@ -85,4 +93,17 @@ if ! check "$CSV"; then
   exit 1
 fi
 n="$(python3 -c "import csv;print(len(list(csv.reader(open('$CSV',newline='',encoding='utf-8')))))")"
-echo "gate-verification: PASS — $n records, every one exactly 6 fields with a valid Gate token (and the gate is proven able to fail)."
+echo "gate-verification: $CSV — $n records, every one exactly 6 fields with a valid Gate token (and the check is proven able to fail)."
+
+# ---- 2. ADR 0120: the transitional baselines only shrink (each script runs its own self-test first) ----
+if ! python3 scripts/test-baseline.py shrink-only; then
+  echo "gate-verification: FAIL — an ADR 0120 test baseline is malformed or grew (see above). Baselines only shrink." >&2
+  exit 1
+fi
+
+# ---- 3. ADR 0127 §6: the interop matrix is complete and well-formed ----
+if ! python3 scripts/interop-matrix.py check; then
+  echo "gate-verification: FAIL — interop/matrix.csv is malformed or incomplete (see above)." >&2
+  exit 1
+fi
+echo "gate-verification: PASS — verification matrix, ADR 0120 baselines and interop matrix (every check proven able to fail)."

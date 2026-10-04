@@ -152,6 +152,21 @@ result; plan `docs/plans/2026-10-03-sbcl-allegro-full-ok.md`):
   timing flake measured at about 9-10 % per run with or without this change; and the new leaked-thread check
   lists 8 `dds-*` threads left by two tests that already fail. SBCL in the same tree: 650/650, 0 leaked
   threads.
+- **Transitional Definition of Done (ADR 0120, 2026-10-04):** until the Phase 1 exit of the governing plan, a
+  commit may not add a failure or a skip event to `test/baseline-<lisp>.txt` / `test/skip-baseline-<lisp>.txt`,
+  and those files only shrink (`make gate-verification` checks them against every committed version). Measured
+  at `767c335` with the pinned OpenSSL: SBCL **654/654, 654 FULL, 0 skip events** (both SBCL baselines empty);
+  AllegroCL **636/654**, the 18 known failures plus `thread-leak-check` and two known intermittents in the
+  failure baseline (21 entries, each owned by a Phase 1 WP), and 51 skip events in the skip baseline
+  (`alloc-counter` 20, `zc-sap-primitives` 18, `static-vector-p` 11, `subprocess-mode` 2). `make test-ratchet
+  LISP=…` runs the suite and applies the rule. A run the baseline accepts is "no new failure", not "green".
+- **Milestones (ADR 0126, ADR 0127):** the M0→M8 sequence was not followed (M2–M7 work began before M1's exit
+  passed), so **no milestone M1–M7 counts as passed**; the profile states above are progress, not exits.
+  M2–M7 re-verification may run in parallel with M1 completion (owner decision D9), and exits are declared in
+  order on fresh runs. ADR 0127 fixes what each exit means: fuzz 8 h per Lisp, a 24 h netem soak, the DCPS
+  clause mapping, the 96 cells of [`interop/matrix.csv`](interop/matrix.csv) (all NOT-RUN today: the Linux lab
+  does not exist yet), REQUIREMENTS §6 as the only performance gate, and FR-CDR-8 big-endian conditional on the
+  Connext probe (WP-4.11).
 - **CI:** the hosted workflow (`.github/workflows/gates.yml`) runs **SBCL only** and prints the AllegroCL legs
   as NOT COVERED; AllegroCL is a local step until the CI licence question is settled.
 - **Allocation:** `make mem` measures the **CDR codec only** (0 bytes/iteration serialize/deserialize on SBCL);
@@ -290,6 +305,8 @@ make gate-types    # every defun has a single-line ftype declaim (FR-LANG-8)
 make gate-hotpath  # no CLOS dispatch / per-sample alloc in hot-path files (NFR-CLOS)
 make gate-nocond   # NO Lisp conditions in our code — failures are returned, never signalled (ADR 0064)
 make gate-skip-lint # a test skip goes through note-skip with a known capability, never a bare SKIP print (ADR 0122)
+make gate-verification # verification.csv well-formed; ADR 0120 baselines only shrink; interop/matrix.csv complete
+make test-ratchet LISP=./scripts/with-allegro.sh  # make test + no failure/skip outside test/*baseline-<lisp>.txt (ADR 0120)
 make mem           # measured 0 bytes/sample serialize/deserialize (NFR-PERF-8)
 make wire          # validate emitted RTPS against the tshark RTPS dissector (FR-TOOL-3)
 make all           # build-all + test-all + gates + mem
