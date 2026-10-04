@@ -120,8 +120,9 @@ Effort is expressed in **sequence and dependency**, not calendar dates (calendar
 - A4 delivers XCDR1+XCDR2 byte-exact against the conformance corpus (both endiannesses, all extensibility kinds, optionals, DHEADER/EMHEADER).
 - A1/A2 deliver real buffers, atomics, sockets, GC hooks. PAL conformance tests pass on both.
 - A5 delivers the **s-expr type DSL → defstruct + monomorphic codec + key-hash + type-support**; round-trips through A4's codec.
+- A5 delivers the **IDL 4.2 front-end** (FR-TOOL-1, MUST; owner decision D27, ADR 0124; governing-plan WP-5.1b): a parser emitting `define-dds-type` forms (ADR 0111 §2.1), off the hot path.
 - A11 stands up the fuzzer against the CDR parser and the (stub) submessage parser.
-- **Exit (P0):** XCDR byte-exact vs. RTI-generated vectors; CDR fuzzer runs clean for N hours; generated `defstruct` types serialize/deserialize losslessly on SBCL and AllegroCL.
+- **Exit (P0):** XCDR byte-exact vs. RTI-generated vectors; CDR fuzzer runs clean for N hours; generated `defstruct` types serialize/deserialize losslessly on SBCL and AllegroCL. The IDL front-end accepts the four `.idl` files in `docs/specs/` and every committed interop IDL (the WP-5.1b acceptance), and the type definitions they contain emit `define-dds-type` forms whose types round-trip through the codec on both Lisps (D27).
 
 ### M2 — P1 Minimal RTPS interop (the credibility milestone)
 - A6 delivers submessage codec + stateful reliable writer/reader + best-effort path + HistoryCache (KEEP_LAST/KEEP_ALL) + HEARTBEAT/ACKNACK/GAP + SequenceNumberSet.
@@ -153,7 +154,8 @@ Effort is expressed in **sequence and dependency**, not calendar dates (calendar
 - **Exit (P6):** secure interop with a Connext Security-enabled participant on a shared governance/permissions set. `(High-risk, high-effort; schedule only if required.)`
 
 ### M8 — P7 Tooling / optional services
-- spy, gen polish (IDL parser), monitoring export. Services (Routing/Recording/Persistence) only if separately scoped (REQUIREMENTS §13).
+- spy, gen polish (beyond the M1 IDL front-end), monitoring export. Services (Routing/Recording/Persistence) only if separately scoped (REQUIREMENTS §13).
+- **Out of scope for this release (owner decision D26, 2026-10-04, ADR 0124).** The IDL parser is not M8 work: it is an M1 deliverable (FR-TOOL-1, MUST; D27; plan WP-5.1b). The spy (FR-TOOL-2) is in the SHOULD backlog (REQUIREMENTS §0, D28).
 
 ---
 

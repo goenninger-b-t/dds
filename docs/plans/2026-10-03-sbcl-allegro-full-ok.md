@@ -4,6 +4,8 @@
 
 **Sources:** a full test and gate run on this host on 2026-10-03 (SBCL 646/646 with ~106 in-test skips; AllegroCL 627/646, 19 failed, hang at exit), a read-only evidence review of milestones, defects, process, the verification matrix and performance, and targeted AllegroCL reproduction runs. Log citations of the form `test-*.log:N` and `probes/*` refer to that run's local logs, which are not committed.
 
+**Owner decisions, 2026-10-04:** D1–D34 are recorded in `docs/adr/0124-owner-decisions-2026-10-04.md`; §6 carries a *Decided 2026-10-04* column. Where an earlier line of this plan says "if D… decides", that column now answers it.
+
 **What changed since revision 1:**
 - The **work-package (WP) scope grew.** New WPs cover the IDL front-end, DynamicType/DynamicData, the security Logging and Data Tagging plugins, the full annotation set, NFR-PERF-9, the NFR-DET determinism soak, FR-LOG-3 source lines, the Allegro PAL gaps, NFR-MEM against ADR 0102, the hot-path gate scope, and the gaps the DCPS conformance mapping will expose.
 - **Phase 0 no longer leaves `main` red.** OpenSSL 3.5 provisioning and the fail-closed loader move into Phase 0. A transitional DoD ADR adds a ratchet mode.
@@ -102,11 +104,11 @@
 | **0.2** ADR 0118: Clasp withdrawn | Record the decision | Fully supersedes 0001 and 0103. Partly supersedes 0003, 0004 (M0 must be re-passed), 0013, 0104, NFR-PORT §7.2, §9 item 5, open decision 7, and IMPLEMENTATION-PLAN §3.1 A3, §6.3 and R5. Contents: evidence rebaseline (every "SBCL+Clasp" means SBCL-only); disposition list; platform and **image** matrix (D1); controlled Status vocabulary. `git tag clasp-last <sha>`. | 0.5–1 | H |
 | **0.3** ADR housekeeping | DoD requires accepted ADRs | (a) Accept, reject or supersede 0096 (§5 needs an owner decision), 0098, 0099, 0100 and 0111. Accepting 0111 is where Float128's deferral becomes an actual decision (D32). (b) **ADR 0120, transitional DoD:** until the Phase 1 exit, the per-commit rule is "no new failures against a committed `test/baseline-<lisp>.txt`, and no new skip events against `test/skip-baseline-<lisp>.txt`". Every baseline entry names its owning WP. Baselines may only shrink, enforced by gate-verification. The rule expires at the Phase 1 exit; from then on it is zero/zero. Allegro is checked locally per commit (WP-3.8 schema) until WP-3.2 is live. (c) ADR recording the past deviation from the M0→M8 sequence (audit). | 1.5–3 | H |
 | **0.4** Build and launcher | SBCL becomes the default | `LISP ?= $(SBCL)` (Makefile:15). `build-all`, `test-all` and `all` run SBCL and Allegro. Delete build-clasp, test-clasp and bench-rtps-message-clasp (Makefile:432-435). Fix the dds-pal.asd:10-12 comment. `git rm scripts/with-clasp.sh`. Fix comments in lisp-cache-env, with-sbcl and with-allegro. .gitignore:11. | 0.5 | H |
-| **0.5** PAL and source Clasp removal | Remove Clasp code and **all** comment hits | `git rm src/dds-pal/pal-clasp.lisp`. pal-contract.lisp:165-166 becomes `(cffi:foreign-symbol-pointer name)`. Delete `*native-shm-open*` (pal-net.lisp:1116-1124). `shm-create-mode-reliable-p` returns NIL for non-SBCL on Darwin arm64, or that platform is declared out (D1). Verify the `shm_open` prototype from `/usr/include/x86_64-linux-gnu/sys/mman.h`. **Also reword** the hits the original list missed: dds-dare/key-provider.lisp (4), dds-disc/disc.lisp:25, dds-durability/store-encrypted.lisp:654, dds-pal/pal-sbcl.lisp:18, for example "no reader conditionals (operating contract §4)". Keep the per-thread scratch machinery and reword its docstrings. | 1–1.5 | H |
+| **0.5** PAL and source Clasp removal | Remove Clasp code and **all** comment hits | `git rm src/dds-pal/pal-clasp.lisp`. pal-contract.lisp:165-166 becomes `(cffi:foreign-symbol-pointer name)`. Delete `*native-shm-open*` (pal-net.lisp:1116-1124). `shm-create-mode-reliable-p` returns NIL for non-SBCL on Darwin arm64, or that platform is declared out (D1). **D1 declared it out (ADR 0124):** reword the `shm-create-mode-reliable-p` docstring (pal-net.lisp:1139, "ADR 0118 §4 leaves macOS to owner decision D1") to "macOS is not a target (ADR 0124, D1)". Verify the `shm_open` prototype from `/usr/include/x86_64-linux-gnu/sys/mman.h`. **Also reword** the hits the original list missed: dds-dare/key-provider.lisp (4), dds-disc/disc.lisp:25, dds-durability/store-encrypted.lisp:654, dds-pal/pal-sbcl.lisp:18, for example "no reader conditionals (operating contract §4)". Keep the per-thread scratch machinery and reword its docstrings. | 1–1.5 | H |
 | **0.6** Tests | Delete the 13 `:clasp` branches, mechanically | Make the live arms unconditional. **No behavioural change on Allegro**: those arms already run and their failures are already in the baseline. Never rewrite as `(not :sbcl)`. **New coverage:** redesign the key-wipe proof (security-test.lisp:3029-3033, which today runs only on Clasp). Split zeroize into wipe-then-release, with a test-only read-back hook before release, on SBCL and Allegro. Rebase the cross-check at security-auth-test.lisp:2786-2844 to SBCL+Allegro. The ~250 docstring lines move to WP-0.13. | 1–1.5 | H |
 | **0.7** SHMEM `%lane-drain` OOB (security, both Lisps) | Close the NFR-SEC-POSTURE violation **and** make it visible | Before the `mem-ref` at shmem.lisp:152-153: if `(logtest pos 7)` or `(> (+ pos 4) capacity)`, **poison the lane**. That means setting a poisoned flag, incrementing a per-lane corrupt-cursor counter exposed as an NFR-OBS status, emitting one log event, and detaching or resetting per an ADR. Today's bail-outs at :148 and :155 leave `r` unchanged, which wedges the lane silently forever. Valid records are 8-aligned (shmem.lisp:101-104) and capacity is a multiple of 8 (:60). Regression tests: the lane ends exactly at the end of a page-aligned `shm-create` mapping, so the over-read faults on SBCL too; and the poisoned state is asserted to be **observable**, not merely "no crash". Audit the RTI-SHMEM reader the same way. Hot path, so a bench is required. | 1–1.5 | H |
-| **0.8** OpenSSL ≥ 3.5 (moved from 1.7) | Provision before the honesty switch | Build the latest 3.5.x LTS patch from the release tarball (verify SHA-256 and signature) into `/opt/openssl-3.5`. `scripts/openssl-env.sh` exports **only** `DDS_DARE_LIBCRYPTO`, **not** `LD_LIBRARY_PATH`, so peers, tshark and Allegro's `aclssl*.so` keep the system library. `offsetof` probe for the 40-byte OSSL_PARAM layout on x86_64 (openssl-ffi.lisp:43-48 was verified on arm64 only). Hosted CI: build once, cache with actions/cache keyed on version and SHA, export through `$GITHUB_ENV`. Bump docker/linux-amd64.Dockerfile:32-43 from 3.5.0 and add the checksum. Fix the SBOM's OpenSSL pin, which is the macOS 3.6.2 (generate-sbom.py:53). Provenance entry. | 1.5–2.5 | H |
-| **0.9** Fail-closed libcrypto loader (moved from 1.8; ADR) | A wrong library is an error | If `DDS_DARE_LIBCRYPTO` is set but cannot be loaded, return a hard error, never the 3.0 fallback (openssl-ffi.lisp:75-76, 93-96). Add a PAL `dlsym`-on-handle, because CFFI ignores `:library` on both Lisps (cffi-sbcl.lisp:399-403, cffi-allegro.lisp:407-410). Check with `dladdr` that `OpenSSL_version_num` resolves inside the realpath. The preflight reads `/proc/self/maps` and **fails if more than one libcrypto is mapped**. Reason: ELF lookup for a `dlopen`ed object searches the global scope first, so with two copies loaded, the /opt copy's internal references can bind to the system copy (moderate-high confidence; the check makes it moot). Falsifier: preload the system 3.0 library and require a rejection. | 1.5–2.5 | M |
+| **0.8** OpenSSL ≥ 3.5 (moved from 1.7) | Provision before the honesty switch | Build the latest 3.5.x LTS patch from the release tarball (verify SHA-256 and signature) into the user prefix `${DDS_OPENSSL_PREFIX:-$HOME/.local/opt/openssl-3.5}` (D23: accepted in place of `/opt/openssl-3.5`, which needs root on the reference host). `scripts/openssl-env.sh` exports **only** `DDS_DARE_LIBCRYPTO`, **not** `LD_LIBRARY_PATH`, so peers, tshark and Allegro's `aclssl*.so` keep the system library. `offsetof` probe for the 40-byte OSSL_PARAM layout on x86_64 (openssl-ffi.lisp:43-48 was verified on arm64 only). Hosted CI: build once, cache with actions/cache keyed on version and SHA, export through `$GITHUB_ENV`. Bump docker/linux-amd64.Dockerfile:32-43 from 3.5.0 and add the checksum. Fix the SBOM's OpenSSL pin, which is the macOS 3.6.2 (generate-sbom.py:53). Provenance entry. | 1.5–2.5 | H |
+| **0.9** Fail-closed libcrypto loader (moved from 1.8; ADR) | A wrong library is an error | If `DDS_DARE_LIBCRYPTO` is set but cannot be loaded, return a hard error, never the 3.0 fallback (openssl-ffi.lisp:75-76, 93-96). Add a PAL `dlsym`-on-handle, because CFFI ignores `:library` on both Lisps (cffi-sbcl.lisp:399-403, cffi-allegro.lisp:407-410). Check with `dladdr` that `OpenSSL_version_num` resolves inside the realpath. The preflight reads `/proc/self/maps` and **fails if more than one libcrypto is mapped**. Reason: ELF lookup for a `dlopen`ed object searches the global scope first, so with two copies loaded, the pinned copy's internal references can bind to the system copy (moderate-high confidence; the check makes it moot). Falsifier: preload the system 3.0 library and require a rejection. | 1.5–2.5 | M |
 | **0.10** Harness honesty: one skip channel (ADR) | No hidden skips, in two steps | Add `(note-skip SITE CAPABILITY REASON)` per `*current-test*`, with no dedup and a closed vocabulary: `:openssl-pqc :libcrypto :alloc-counter :zc-sap-primitives :shm-attach-by-name :subprocess-mode :rx-store-pool`. The registry moves out of `dds.pal` into test support; production-file test bodies reach it through a hook. Convert the ~105 bare `SKIP` prints and the silent `(when sbcl …)` arms (secure-sedp:2036-2048, gen-test:890/930/944/969, security-test:514/1570/1710/2973, durability-test:6910, dataplane:5379). The summary prints FULL/PARTIAL/SKIPPED/FAILED. A capability preflight prints the OpenSSL version and path, checks that bytes-consed moves and that shm attach works. Add **gate-skip-lint**. Apply the same accounting to fuzz, mem and corpus (deferred counts as a skip). **Step 1 (report-only):** accounting is printed and the exit code is unchanged. **Step 2 (enforce):** lands in the same commit that enables 0.8 in hosted CI. Required-capability skips fail **unless listed in the ADR 0120 skip baseline**, so CI stays green while every remaining skip is named and owned. | 4–6 | M |
 | **0.11** Exit that cannot hang, without losing cleanup (ADR) | Tests **and** production | `dds.pal:exit-process code` runs a registered **shutdown-hook chain** first: key wipe, SHMEM `shm_unlink`, store fsync, log flush, `finish-output`. Then a hard exit: Allegro `(excl:exit code :no-unwind t :quiet t)` (probes/exit2.log), SBCL the equivalent. Route **every** `uiop:quit` in `src/` through it (durability/main.lisp ×6, dds-log/service.lisp ×2, shapes.lisp ×3), plus the test-op, and lint against `uiop:quit` in src. `run-all-tests` lists live non-main threads and fails on any leaked `dds-*` thread. Wrap every Makefile Lisp call in `timeout --kill-after=60`. Test: SIGTERM a durability service, then assert the keys are wiped (via the 0.6 hook) and the segments unlinked, on both Lisps. | 2–3.5 | M |
 | **0.12** gate-mem falsifier | Close the vacuous pass | Replace the `*clasp*` name match (gate-mem.sh:96-103) with a canary: cons a known N bytes and FAIL if the delta is below N. gate-pal bans `#[+-]clasp\|:clasp` in code everywhere, including dds-pal/. | 0.5 | H |
@@ -134,7 +136,7 @@ git grep -n 'uiop:quit' -- src | grep -v dds-pal                  # → no outpu
 git tag -l clasp-last                                             # → clasp-last
 make gate-pal gate-verification gate-skip-lint gate-hotpath gate-nocond gate-types   # each PASS
 make test LISP=./scripts/with-sbcl.sh; echo rc=$?                 # rc=0 under ADR 0120 ratchet;
-      # preflight shows OpenSSL 3.5.x at /opt/openssl-3.5/…, "libcrypto mappings: 1"
+      # preflight shows OpenSSL 3.5.x at ~/.local/opt/openssl-3.5/…, "libcrypto mappings: 1"
 # falsifiers (each must exit non-zero):
 DDS_DARE_LIBCRYPTO=/nonexistent make test …                      # → hard error, rc≠0
 LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libcrypto.so.3 make test …   # → "2 libcrypto mappings", rc≠0
@@ -178,11 +180,11 @@ gh run list --branch main --workflow gates.yml --limit 1          # → success 
 | **1.14** Allegro direct-call FFI (ADR) | `ff:def-foreign-call :call-direct t` with an explicit `:release-heap` policy for recvfrom, sendto, clock_gettime, memcpy and `__atomic_*` (pal-allegro.lisp:149, 171). Route the 164 call sites outside the PAL through PAL entry points. **`with-pinned-octets`** (covering seal **and** open, sizes from dds-dare constants) replaces `with-pointer-to-vector-data` on heap AAD (primitives.lisp:462, 610), which does not pin on Allegro (cffi-allegro.lisp:128-138). A GC-stress KAT test must fail when pinning is removed. **atomic-cell:** probe `most-positive-fixnum`. Values at or above that box, and `excl::atomic-conditional-setf` compares with EQ, so the cell moves to foreign memory via `cas-sap-u64`, plus a large-value test. Bench before and after. | 8–15 | M |
 | **1.15** Un-gate the `:sbcl` skips | 15 registered skips plus about 4 unregistered (dataplane.lisp:5471, 5553; durability-test.lisp:874; flatdata-zc-loan-stress) plus about 39 `(eq … :sbcl)` gates become capability checks (ADR 0064). Expect real ZC/FlatData bugs under Allegro lock fairness. Bench. | 3–6 | L |
 | **1.16** Durability `:process` on Allegro | Prebuilt per-Lisp service image through a PAL entry point next to `lisp-eval-command` (ADR 0116). Remove the gate at runner.lisp:52. Licence: D13. | 3–5 | M |
-| **1.17** Non-BMP strings on Allegro (ADR amending 0115/0117) | Surrogate-pair decode and encode in `CDR-GET-STRING`/`%MS-CHAR`; bounds stay in UTF-8 octets; lone surrogates are rejected. Two-topic purge test. **Valid only for 16-bit images.** If an `*8` image is in scope (D1), it needs its own policy. Bench. | 2–4 | M |
+| **1.17** Non-BMP strings on Allegro (ADR amending 0115/0117) | Surrogate-pair decode and encode in `CDR-GET-STRING`/`%MS-CHAR`; bounds stay in UTF-8 octets; lone surrogates are rejected. Two-topic purge test. **Valid only for 16-bit images.** ~~If an `*8` image is in scope (D1), it needs its own policy.~~ D1 (2026-10-04) keeps only `alisp`, so no `*8` policy is needed. Bench. | 2–4 | M |
 | **1.18** First real security/DARE run on both Lisps | Full suite, `make fuzz` (4 security fuzzers, pbt-test.lisp:990-1366) and `make mem` secure arm (gen-test.lisp:909-916). SBCL first, then Allegro. Empty the 0120 security baseline. Fix security-test.lisp:669 "DEFERRED". | 6–12 | L |
 | **1.19** Allegro PAL "documented gaps" | Close each one, or downgrade its consumer by ADR, with a falsifier. **`static-vector-p`** cannot tell heap from foreign memory (pal-allegro.lisp:74-80), so the off-heap key proofs at security-test.lisp:2975-3013 are vacuous there; discriminate by address range or the static-vectors registry. **`internal-bug-p`** is NIL (:277-286), so the ADR 0100 latch at dataplane.lisp:502 is dead code. **`with-gc-inhibited`** is a `progn` (:265-270); prove no heap address crosses into C, or implement it. **TCP `recv`** cannot tell a reset from a timeout because errno is unreadable (pal-net.lisp:1016-1025); use `getsockopt(SO_ERROR)` or a return-code API. | 3–6 | M |
 | **1.20** FR-LOG-3 source line | PAL capture of the source line for SBCL (`sb-c` source path / form-number to line at macroexpansion) and Allegro (source-file recording), tested against the FR-LOG-9 golden lines. dds-log/macros.lisp:5-8 currently emits 0. | 1–2 | M |
-| **1.21** (conditional, D1) `mlisp` leg | Only if the owner puts modern-mode Allegro in scope: run the suite and gates under `mlisp`, and fix `intern`/`find-symbol`/`format ~A` case bugs. | 1–3 | L |
+| ~~**1.21** (conditional, D1) `mlisp` leg~~ | **Dropped 2026-10-04: D1 is `alisp` only (ADR 0124).** ~~Only if the owner puts modern-mode Allegro in scope: run the suite and gates under `mlisp`, and fix `intern`/`find-symbol`/`format ~A` case bugs.~~ | 0 | — |
 
 **Dependencies:**
 - 1.1 → 1.2, 1.6.
@@ -202,7 +204,7 @@ for L in ./scripts/with-sbcl.sh ./scripts/with-allegro.sh; do
   timeout --kill-after=60 3600 make test LISP=$L; echo rc=$?     # DDS_TEST_ALLOW_SKIP unset
 done
 # each: "N passed, 0 FAILED, 0 SKIPPED, 0 PARTIAL"; "leaked threads: 0"; rc=0
-# preflight: OpenSSL 3.5.x, path /opt/openssl-3.5/lib64/libcrypto.so.3, mappings 1, alloc-counter OK
+# preflight: OpenSSL 3.5.x, path ~/.local/opt/openssl-3.5/lib64/libcrypto.so.3, mappings 1, alloc-counter OK
 SBCL_BIN=<latest> make test …  and  SBCL_BIN=<prior> make test …    # both rc=0
 make gate-sleep-lint gate-ffi-sign-lint gate-quickload                # PASS (form-walker lint)
 ```
@@ -290,7 +292,7 @@ make interop-all   # every non-ADR-excluded cell of interop/matrix.csv PASS for 
 
 ### Phase 5: functional exit-gate gaps, M1 → M7
 
-Runs in parallel with M1 completion **only with D9**. Everything is done on both Lisps, with ADRs, docs and vectors.
+Runs in parallel with M1 completion **only with D9** (approved 2026-10-04, ADR 0124; no milestone counts as passed before its predecessor's exit gate). Everything is done on both Lisps, with ADRs, docs and vectors.
 
 | Milestone | WP | Work | ed | Conf |
 |---|---|---|---|---|
@@ -309,14 +311,14 @@ Runs in parallel with M1 completion **only with D9**. Everything is done on both
 | M5 | **5.10** LZ4 | Verify scope against FR-PF first; justify the dependency (§9); bench. | 4–8 | L |
 | **M6** | **5.11** Bug #15 (16 KB stall), `make soak`, then the soak | Reproduce on both Lisps with DATA_FRAG/NACK_FRAG/HEARTBEAT_FRAG instrumentation; fix. **Create the `make soak` target** (none exists): netns + veth + netem (D21), 64 KB–4 MB samples, late joiners, own peers and Connext. Assert no reliable loss, arena high-water below budget, no wedge. Duration per the ADR, per Lisp. | 8–18 + 2× soak time | L |
 | M6 | **5.12** Gate the manual durability scenarios | TRANSIENT and PERSISTENT against rtipersistenceservice and Fast DDS, data-representation, sender-resilience, log, typeobject-corpus, autodiscovery. Retire the Shapes-Demo GUI spikes. | 6–9 | L |
-| M6 | **5.12b** (conditional, D28) Multi-channel writers (FR-PF-6, SHOULD; M6 deliverable at IMPLEMENTATION-PLAN.md:149) | Partition traffic by filter across locators/channels; interop leg if Connext supports it. Otherwise an owner REQUIREMENTS/plan amendment drops it. | 6–12 | L |
+| M6 | **5.12b** (in scope: D28 keeps FR-PF-6 an M6 deliverable) Multi-channel writers (FR-PF-6, SHOULD; M6 deliverable at IMPLEMENTATION-PLAN.md:149) | Partition traffic by filter across locators/channels; interop leg if Connext supports it. Otherwise an owner REQUIREMENTS/plan amendment drops it. | 6–12 | L |
 | **M7** | **5.13** Secure interop with committed evidence | Leg 20 plus sign and datasign on both Lisps on Linux; commit logs and pcaps (`interop/security-connext/.gitignore:1`), test PKI only; measure AES-GCM per-call allocation on both Lisps. | 4–8 | M |
 | M7 | **5.13b** Security Logging and Data Tagging plugins (FR-SEC-1) | Builtin logging topic and data-tag PIDs from the DDS-Security spec tables; tests on both Lisps; a Connext leg if supported. Otherwise an owner amendment. | 6–12 | L |
 | **Acceptance** | **5.14** Release-candidate job | All gates, every matrix cell, fuzz soak, durability soak, determinism soak, perf (Phase 6), on both Lisps. Evidence index maps every §4 clause to a committed artifact (MILESTONES.md was deleted in 2160f22). Interop freshness fails here (3.4). | 3–5 + machine time | M |
 
 **Exit criterion:**
 - Every IMPLEMENTATION-PLAN §4 clause, M0–M7, as reworded by ADRs 0118 and 0.15, has committed evidence for **both** Lisps in the evidence index.
-- `make gate-verification` shows Status-SBCL = Status-Allegro = `verified` for every P0–P6 requirement row, and every SHOULD in scope per D28.
+- `make gate-verification` shows Status-SBCL = Status-Allegro = `verified` for every P0–P6 requirement row, and every SHOULD classified blocking per D28 (REQUIREMENTS §0).
 - `make corpus` has 0 deferred vectors.
 - `make soak` passes on both Lisps.
 
@@ -378,42 +380,42 @@ The total roughly doubles revision 1 (235–445), for three reasons: previously 
 
 ## 6. Owner actions and decisions
 
-| # | Decision / action | Recommendation | Blocks |
-|---|---|---|---|
-| D1 | Platform **and image** matrix: Linux x86_64 for both Lisps; macOS arm64 SBCL secondary? Allegro: `alisp` (ANSI, 16-bit) required; `mlisp` (operating contract §6 names it) required or out by ADR; `alisp8`/`mlisp8` out. What image runs in production (`REQUIREMENTS.md:283`)? | alisp required; mlisp per production use; `*8` out | 0.2, 0.5, 1.17, 1.21 |
-| D2 | Approve ADR 0118 and the REQUIREMENTS/IMPLEMENTATION-PLAN edits; apply the operating-contract edits (lines 9, 52, 58, 79, 96, 106, 116, 124, and the §6 Allegro invocation) | Approve | 0.2, 0.13 |
-| D3 | Fuzz N, soak duration, netem profile | 8 h per Lisp per release, 1 h nightly; 24 h soak | 0.15, 2.6, 5.11 |
-| D4 | FR-CDR-8 BE oracle: independent implementation plus foreign acceptance, **only if WP-4.11 shows Connext cannot emit BE** | Decide after 4.11 | 5.2 |
-| D5 | Confirm REQUIREMENTS.md:222-232 as the perf gate and retract ADR 0062's "5 %" | Confirm | 0.15, Phase 6 |
-| D6 | SBOM licence for AllegroCL | LicenseRef-Franz-proprietary | 0.13 |
-| D7 | Allegro perf and 0 B: keep the targets, or **amend REQUIREMENTS §6, §7.2, §9 and the M5 exit** (which means full OK is not met for M5 on Allegro) | Decide at 6.0 with data | Phase 6 |
-| D8 | Must DDS-Security refuse to run without PQC? | Split the probe; both capabilities stay required | 1.9 |
-| D9 | ADR allowing M2–M7 re-verification in parallel with M1 | Approve | Phase 5 |
-| D10 | bordeaux-threads: pin apiv1 or migrate to bt2 | bt2 | 1.10 |
-| D11 | Pinned dist vs vendored hot-path deps | Vendor static-vectors and cffi; pin the rest | 1.11 |
-| D12 | SBCL 2.2.9 floor | Non-blocking job only | 1.12 |
-| D13 | Franz: dumped durability/log service images (**runtime redistribution**, not only CI), extra processes, 100-participant runs | Ask Franz in writing | 1.16, 6.7 |
-| D14 | Non-BMP policy (ADR 0117) | Surrogate pairs (16-bit images) | 1.17 |
-| D15 | Our own style-warnings as build errors | Yes for "undeclared variable" | 2.2 |
-| D16 | Does devel.lic (expires 2027-06-15) permit unattended CI and containers? Host as CI for a public repo? | Get written terms; fallback 3.8 | 3.2, 3.7 |
-| D17 | Procure Connext 7.3.1 Linux x64: host, target, Security Plugins, **perftest**, a licence valid on this host and CI; stay on 7.3.1 | Buy | Phases 4 and 6 |
-| D18 | Interim Linux NeoDDS ↔ Mac Connext as Allegro evidence | Yes, interim only | 4.9 |
-| D19 | verification.csv split, 5-value enum, per-Lisp columns; are waivers allowed under full OK? | Approve; no waivers | 5.7 |
-| D20 | R6 counsel and deadline; ADR scoping Connext SHMEM out of "wire-compatible" | Assign now; scope it out | P4 ship, 5.9 |
-| D21 | CAP_NET_ADMIN for netns/netem | Grant | 5.11 |
-| D22 | Second GbE host. verification.csv (row ~197, not re-verified here) records Allegro on 192.168.2.113 and .180; confirm which host is used for PERF-5 and CI placement | Provide | 6.1 |
-| D23 | OpenSSL: vendored /opt build vs a trixie/Docker canonical platform | Vendored /opt | 0.8 |
-| D24 | Apply for a real OMG VendorId (`#x01FF` is provisional, message.lisp:21) | Apply now | — |
-| D25 | REQUIREMENTS §11 open items 1 (hot-path package list → D33), 3, 4, 6 (IDL → D27) | Decide explicitly | 0.13 |
-| D26 | M8 stays out of scope | Confirm | — |
-| **D27** | FR-TOOL-1 IDL front-end: build (5.1b) or amend REQUIREMENTS | Build | 5.1b |
-| **D28** | Do SHOULDs count? FR-PF-6, FR-XPORT-3/4/6, FR-API-2, FR-TOOL-2, FR-DCPS-7, MultiTopic. Same question for FR-SEC-1 Logging/Tagging (MUST-if-P6) and FR-TYPE-6 (MUST): build or amend | List explicitly; MUSTs built | 5.7b, 5.8b, 5.12b, 5.13b |
-| **D29** | NFR-MEM / FR-PF-7 ("allocated once at startup") vs ADR 0102 (chunked growth): amend REQUIREMENTS or revert the code | Amend REQUIREMENTS to "carved before first sample, bounded max, no steady-state growth", gated by 2.11 | 0.13, 2.11 |
-| **D30** | Fuzz method: coverage-guided CFFI harness (IMPLEMENTATION-PLAN §8) or an ADR accepting PBT plus replay; shrinking either way | PBT plus replay plus shrinking now; coverage-guided before P6 ship | 0.15, 2.6 |
-| **D31** | Approve the transitional DoD ADR 0120 (baseline ratchet, expiring at the Phase 1 exit) | Approve | 0.10 |
-| **D32** | Accept, reject or supersede ADRs 0096 (§5), 0098, 0099, 0100, 0111 (including the Float128 deferral) | Decide | 0.3, 5.1 |
-| **D33** | Hot-path package list (§11 item 1) | Include dataplane, reliable and the entities delivery path | 2.10 |
-| **D34** | Allegro merge gating: merge queue with a runner, or signed-record fallback | Merge queue | 3.7 |
+| # | Decision / action | Recommendation | Blocks | Decided 2026-10-04 (ADR 0124) |
+|---|---|---|---|---|
+| D1 | Platform **and image** matrix: Linux x86_64 for both Lisps; macOS arm64 SBCL secondary? Allegro: `alisp` (ANSI, 16-bit) required; `mlisp` (operating contract §6 names it) required or out by ADR; `alisp8`/`mlisp8` out. What image runs in production (`REQUIREMENTS.md:283`)? | alisp required; mlisp per production use; `*8` out | 0.2, 0.5, 1.17, 1.21 | **AllegroCL `alisp` only**; `mlisp`, `alisp8`, `mlisp8` out; macOS arm64 not a target; Linux x86_64 for both Lisps |
+| D2 | Approve ADR 0118 and the REQUIREMENTS/IMPLEMENTATION-PLAN edits; apply the operating-contract edits (lines 9, 52, 58, 79, 96, 106, 116, 124, and the §6 Allegro invocation) | Approve | 0.2, 0.13 | ADR 0118 **accepted**; REQUIREMENTS/IMPLEMENTATION-PLAN edits stand; operating-contract edits **pending owner application** (ADR 0124 §7) |
+| D3 | Fuzz N, soak duration, netem profile | 8 h per Lisp per release, 1 h nightly; 24 h soak | 0.15, 2.6, 5.11 | As recommended: fuzz 8 h per Lisp per release + 1 h nightly; 24 h soak; netem profile per WP-0.15 |
+| D4 | FR-CDR-8 BE oracle: independent implementation plus foreign acceptance, **only if WP-4.11 shows Connext cannot emit BE** | Decide after 4.11 | 5.2 | **Open**: decided after WP-4.11 |
+| D5 | Confirm REQUIREMENTS.md:222-232 as the perf gate and retract ADR 0062's "5 %" | Confirm | 0.15, Phase 6 | **Confirmed**: REQUIREMENTS §6 is the gate; ADR 0062 "5 %" retracted (forward note added) |
+| D6 | SBOM licence for AllegroCL | LicenseRef-Franz-proprietary | 0.13 | `LicenseRef-Franz-proprietary` (already in generate-sbom.py) |
+| D7 | Allegro perf and 0 B: keep the targets, or **amend REQUIREMENTS §6, §7.2, §9 and the M5 exit** (which means full OK is not met for M5 on Allegro) | Decide at 6.0 with data | Phase 6 | **Open**: decided at WP-6.0 with data |
+| D8 | Must DDS-Security refuse to run without PQC? | Split the probe; both capabilities stay required | 1.9 | Split the probe; both capabilities required |
+| D9 | ADR allowing M2–M7 re-verification in parallel with M1 | Approve | Phase 5 | **Approved** (ADR 0124 is the record) |
+| D10 | bordeaux-threads: pin apiv1 or migrate to bt2 | bt2 | 1.10 | bt2 |
+| D11 | Pinned dist vs vendored hot-path deps | Vendor static-vectors and cffi; pin the rest | 1.11 | Vendor static-vectors and cffi; pin the rest |
+| D12 | SBCL 2.2.9 floor | Non-blocking job only | 1.12 | Non-blocking job only |
+| D13 | Franz: dumped durability/log service images (**runtime redistribution**, not only CI), extra processes, 100-participant runs | Ask Franz in writing | 1.16, 6.7 | **Owner action** (written terms from Franz) |
+| D14 | Non-BMP policy (ADR 0117) | Surrogate pairs (16-bit images) | 1.17 | Surrogate pairs (only the 16-bit `alisp` image is in scope) |
+| D15 | Our own style-warnings as build errors | Yes for "undeclared variable" | 2.2 | Yes, for "undeclared variable" |
+| D16 | Does devel.lic (expires 2027-06-15) permit unattended CI and containers? Host as CI for a public repo? | Get written terms; fallback 3.8 | 3.2, 3.7 | **Owner action** (written terms); fallback 3.8 |
+| D17 | Procure Connext 7.3.1 Linux x64: host, target, Security Plugins, **perftest**, a licence valid on this host and CI; stay on 7.3.1 | Buy | Phases 4 and 6 | **Owner action** (buy Connext 7.3.1 Linux x64 + Security + perftest) |
+| D18 | Interim Linux NeoDDS ↔ Mac Connext as Allegro evidence | Yes, interim only | 4.9 | Allowed, interim evidence only |
+| D19 | verification.csv split, 5-value enum, per-Lisp columns; are waivers allowed under full OK? | Approve; no waivers | 5.7 | Approved: split, 5-value enum, per-Lisp columns, **no waivers** (WP-5.7) |
+| D20 | R6 counsel and deadline; ADR scoping Connext SHMEM out of "wire-compatible" | Assign now; scope it out | P4 ship, 5.9 | **Owner action** (counsel); Connext SHMEM scoped out by the WP-5.9 ADR |
+| D21 | CAP_NET_ADMIN for netns/netem | Grant | 5.11 | **Owner action** (grant) |
+| D22 | Second GbE host. verification.csv (row ~197, not re-verified here) records Allegro on 192.168.2.113 and .180; confirm which host is used for PERF-5 and CI placement | Provide | 6.1 | **Owner action** (provide host) |
+| D23 | OpenSSL: vendored build (user prefix `~/.local/opt/openssl-3.5`) vs a trixie/Docker canonical platform | Vendored build | 0.8 | Vendored build; **user prefix `~/.local/opt/openssl-3.5` accepted** in place of /opt |
+| D24 | Apply for a real OMG VendorId (`#x01FF` is provisional, message.lisp:21) | Apply now | — | **Owner action** (apply to OMG); `#x01FF` stays provisional |
+| D25 | REQUIREMENTS §11 open items 1 (hot-path package list → D33), 3, 4, 6 (IDL → D27) | Decide explicitly | 0.13 | Decided: §11 items 1 (D33), 4 (D24), 6 (D27). Item 3 **proposed, pending owner confirmation** (no hard-RT tail commitment; the owner did not state it) — ADR 0124 §4 |
+| D26 | M8 stays out of scope | Confirm | — | **Confirmed**: M8 out of scope |
+| **D27** | FR-TOOL-1 IDL front-end: build (5.1b) or amend REQUIREMENTS | Build | 5.1b | **Build** (WP-5.1b) |
+| **D28** | Do SHOULDs count? FR-PF-6, FR-XPORT-3/4/6, FR-API-2, FR-TOOL-2, FR-DCPS-7, MultiTopic. Same question for FR-SEC-1 Logging/Tagging (MUST-if-P6) and FR-TYPE-6 (MUST): build or amend | List explicitly; MUSTs built | 5.7b, 5.8b, 5.12b, 5.13b | MUSTs built; every tagged SHOULD classified blocking or backlog in REQUIREMENTS §0 (blocking: FR-CDR-7, FR-LANG-5, FR-DISC-4, FR-PF-5, FR-PF-6, FR-TOOL-3); FR-PF-6 stays an M6 deliverable |
+| **D29** | NFR-MEM / FR-PF-7 ("allocated once at startup") vs ADR 0102 (chunked growth): amend REQUIREMENTS or revert the code | Amend REQUIREMENTS to "carved before first sample, bounded max, no steady-state growth", gated by 2.11 | 0.13, 2.11 | Chunked growth to a configured max by default; **fixed arena on RTL** (interpretation in ADR 0124 §2.3; text and code in the next WP) |
+| **D30** | Fuzz method: coverage-guided CFFI harness (IMPLEMENTATION-PLAN §8) or an ADR accepting PBT plus replay; shrinking either way | PBT plus replay plus shrinking now; coverage-guided before P6 ship | 0.15, 2.6 | PBT + replay + shrinking now; coverage-guided before P6 ship |
+| **D31** | Approve the transitional DoD ADR 0120 (baseline ratchet, expiring at the Phase 1 exit) | Approve | 0.10 | **Approved**; ADR 0120 still to be written (WP-0.3(b)) |
+| **D32** | Accept, reject or supersede ADRs 0096 (§5), 0098, 0099, 0100, 0111 (including the Float128 deferral) | Decide | 0.3, 5.1 | All five **accepted**; 0096 §5 settled by ADR 0097, kept (ADR 0124 §5); 0111 with Float128 deferred |
+| **D33** | Hot-path package list (§11 item 1) | Include dataplane, reliable and the entities delivery path | 2.10 | Dataplane, reliable and the entities delivery path added (gate widening: WP-2.10) |
+| **D34** | Allegro merge gating: merge queue with a runner, or signed-record fallback | Merge queue | 3.7 | Merge queue |
 
 ---
 
@@ -422,7 +424,7 @@ The total roughly doubles revision 1 (235–445), for three reasons: previously 
 Setup, once per Lisp. For SBCL, run every block twice, once per matrix version.
 ```
 # SBCL:    export LISP=./scripts/with-sbcl.sh SBCL_BIN=<latest>   (repeat with <prior>)
-# Allegro: export LISP=./scripts/with-allegro.sh                  (+ mlisp if D1 says so)
+# Allegro: export LISP=./scripts/with-allegro.sh                  (alisp only, D1)
 # Both:    source scripts/openssl-env.sh ; unset DDS_TEST_ALLOW_SKIP ; no ADR 0120 baselines exist
 ```
 Static gates (run once):
@@ -465,7 +467,7 @@ Feature MUSTs are proven by the suites above: the IDL front-end accepts the docs
 
 ## 8. Do this week
 
-1. **Owner:** D1 (including the image), D2, D5, D9, D29, D31, D32, then D17 and D16 procurement and D23. These have the longest lead times.
+1. **Owner:** D1 (including the image), D2, D5, D9, D29, D31, D32, then D17 and D16 procurement and D23. These have the longest lead times. **Done 2026-10-04 (ADR 0124)** except the owner actions D13, D16, D17, D20, D21, D22, D24, which remain open (§6).
 2. **WP-0.1** (CSV only, revert gcm-scratch), **0.2** (ADR 0118), **0.7** (SHMEM OOB with lane poisoning: a live security defect on both Lisps).
 3. **WP-0.8 + 0.9** (OpenSSL 3.5 vendored, fail-closed loader), then **0.10 step 1** (report-only accounting), so the true skip count is visible before any further "green" claim.
 4. **WP-1.1** (`clock_nanosleep TIMER_ABSTIME`) **+ 1.3 + 1.5 + 1.6**, 7.5–12 ed with 1.2. This gets Allegro to 646/646 passing with only the 1C capabilities allow-listed, per the honest 1A exit. It does **not** make Allegro a gate pass yet.

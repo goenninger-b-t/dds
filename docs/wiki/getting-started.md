@@ -4,8 +4,8 @@
 
 - **SBCL** and **AllegroCL 11.0** (`alisp`), 64-bit Linux x86_64, with **Quicklisp** installed. Those
   are the two targets; Clasp was withdrawn on 2026-10-03 (ADR 0118; the last Clasp-bearing tree is the git
-  tag `clasp-last`). Whether `mlisp`, `alisp8`/`mlisp8` or macOS arm64 are also targets is open owner
-  decision D1.
+  tag `clasp-last`). `alisp` is the only AllegroCL image in scope: `mlisp`, `alisp8`/`mlisp8` and macOS
+  arm64 are not targets (owner decision D1, 2026-10-04, ADR 0124).
 - The `Makefile` drives per-implementation builds via `scripts/with-sbcl.sh` (`SBCL_BIN` overrides the
   binary) and `scripts/with-allegro.sh` (`ALISP_BIN` / `ALLEGRO_BIN`); both load Quicklisp and point ASDF at
   the repo, and both exit 127 when their binary is absent.

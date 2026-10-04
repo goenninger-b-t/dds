@@ -14,6 +14,27 @@
 - **MAY** = optional / profile-gated.
 - **Confidence tags** `(C: high|moderate|low|unknown)` mark *my* certainty about a stated external fact, not the priority of the requirement. Anything `(C: low|unknown)` MUST be verified against the cited spec before code depends on it.
 - Requirement IDs are stable handles for the plan and the verification matrix.
+- **What "full OK" requires (owner decision D28, 2026-10-04, ADR 0124 §2.2):** every MUST is built. Each
+  tagged SHOULD is classified below as **blocking** (built and verified for full OK) or **backlog** (does
+  not block full OK; it keeps the meaning above, so a deviation still needs an ADR). The list covers every
+  requirement tagged `(SHOULD)` in §5:
+  - **Blocking**, each because it is mandated elsewhere or is already a milestone deliverable:
+    FR-CDR-7 (generated monomorphic codecs: the hot-path purity rule, §1.3 item 1 and NFR-CLOS, requires
+    them); FR-LANG-5 (no data-path consing: NFR-DET restates it as a MUST); FR-DISC-4 (initial peers and
+    unicast-only mode: FR-DISC-5 says the initial-peers mechanism MUST cover the no-multicast LAN case,
+    and §8 calls unicast-only mode required for deployment realism); FR-PF-5 (LZ4: an M5 deliverable);
+    FR-PF-6 (multi-channel writers: an M6 deliverable); FR-TOOL-3 (the tshark wire harness: the M2
+    exit's instrument).
+  - **Not gating:** FR-LANG-1b (CLOS for the entity model) is a design preference; its dispatch-free
+    fast-path entry is a MUST and is verified under FR-LANG-1b's MUST clause and NFR-CLOS.
+  - **Backlog:** FR-XPORT-3 (UDPv6), FR-XPORT-4 (TCP), FR-XPORT-6 (batched syscalls), FR-API-2 (ISO C++
+    PSM-shaped API), FR-TOOL-2 (spy) and FR-DCPS-7 (the parts not yet built).
+  - **Optional, backlog:** MultiTopic (FR-DCPS-1 calls it optional; it is not a SHOULD).
+  - **MAY, not gating:** FR-DISC-5 (the Cloud-Discovery-equivalent rendezvous; its initial-peers clause
+    is carried by FR-DISC-4 above) and FR-TOOL-4 (monitoring export, P7).
+  - Untagged `(SHOULD)` clauses inside MUST requirements and the §7 NFR sections do not block full OK by
+    themselves; they block only where §9, a milestone exit gate or an ADR 0124 decision names them (for
+    example D3's 24 h soak).
 
 ---
 
@@ -73,7 +94,7 @@ Conformance is **profiled** so milestones are demonstrable and "parity" is decom
 - **P4 — Performance differentiators:** batching, async + flow controllers, SHMEM transport, Zero-Copy-over-SHMEM, FlatData-equivalent binding, serialization-time compression, fragmentation (DATA_FRAG).
 - **P5 — Durability/Reliability hardening:** TRANSIENT_LOCAL durability, durable writer history, large-data + late-joiner correctness, multi-channel writers.
 - **P6 — Security (gated):** DDS-Security plugins.
-- **P7 — Tooling/Services (gated, mostly §13):** spy, gen, monitoring hooks; services only if separately funded.
+- **P7 — Tooling/Services (gated, mostly §13):** spy, gen, monitoring hooks; services only if separately funded. **Out of scope for this release (owner decision D26, 2026-10-04, ADR 0124)**, with two exceptions that are not P7 work: FR-TOOL-1 (the type/IDL compiler, a MUST delivered under M1, D27) and FR-TOOL-3 (the tshark wire harness, used by the M2 exit). FR-TOOL-2 (spy) is in the SHOULD backlog (§0).
 
 A build is "**Connext-class (core)**" when P0–P5 pass conformance + interop + the §6 performance gates on SBCL and AllegroCL; both are required and co-equal, with no profile allowance for either (NFR-PORT, ADR 0118).
 
@@ -231,6 +252,8 @@ Targets are **parity bands relative to RTI Connext on identical hardware/OS/tran
 | NFR-PERF-8 | Steady-state heap allocation in pre-alloc mode | **0 bytes/sample** (verified by allocation counters) | moderate-high on SBCL; **not yet measurable** on AllegroCL (its `dds.pal:bytes-consed` is the constant 0, ADR 0118 §6) |
 | NFR-PERF-9 | Discovery time, 100 participants | within **2×** of Connext | moderate |
 
+**This table is the performance gate (owner decision D5, 2026-10-04, ADR 0124).** No other document sets a stricter or looser target. ADR 0062's "NFR-PERF-3 (p99.99 within 5 % of Connext)" is retracted; NFR-PERF-3 is the row above, and §9 item 3 says how it is judged.
+
 **Context anchors (verified):** RTI publishes sub-millisecond latency scaling ~linearly with payload, throughput >90% of line rate on GbE, and <100 µs at >200K samples/s; small-sample one-way latencies on fast x86 land in the tens-of-µs range; Zero-Copy reduces intra-host copies to zero; FlatData reduces copies from four to two. `(C: high — from RTI's own benchmark documentation.)`
 
 **Brutal note (C: high):** NFR-PERF-3 is the requirement most likely to fail. A GC'd runtime cannot, in general, match a pre-allocating C++ stack's worst-case jitter without GC-inhibition tricks that trade safety for determinism. Treat hard-real-time tail parity as a research risk, not a commitment. If a hard-RT customer is the actual driver, the honest answer is "use Connext (or Connext Cert/Micro) for that node."
@@ -240,10 +263,10 @@ Targets are **parity bands relative to RTI Connext on identical hardware/OS/tran
 ## 7. Non-functional requirements
 
 ### 7.1 NFR-CLOS — CLOS policy & hot-path purity
-**(MUST)** CLOS is **permitted and preferred** wherever it exhibits no performance degradation against NFR-PERF. **(MUST)** The **hot path** is CLOS-free: no `defgeneric`/`defmethod` dispatch and no per-sample CLOS instantiation in the CDR primitives, generated per-type codecs, buffer/cursor, `CacheChange`/`SampleInfo`, or the RTPS engine's per-sample type dispatch — these use `defstruct` + monomorphic functions + manual vtables. **(MUST)** `print-object` and other GFs MUST NOT appear on hot-path data structs in a way that introduces dispatch on the sample path; provide explicit printer functions for those. **(MUST)** CI enforces a **hot-path-purity gate**: the build fails if `defmethod`/`defgeneric`/`defclass` (or per-sample CLOS allocation) appears in the designated hot-path packages (`dds.cdr`, generated-codec output, `dds.core.buffer`, the engine's per-sample dispatch module, `dds.rtps.history` change ops). Outside those packages, CLOS is unrestricted and is the preferred default. **(MUST)** Any change moving the CLOS/defstruct boundary is backed by a bench measurement (FR-LANG-7).
+**(MUST)** CLOS is **permitted and preferred** wherever it exhibits no performance degradation against NFR-PERF. **(MUST)** The **hot path** is CLOS-free: no `defgeneric`/`defmethod` dispatch and no per-sample CLOS instantiation in the CDR primitives, generated per-type codecs, buffer/cursor, `CacheChange`/`SampleInfo`, or the RTPS engine's per-sample type dispatch — these use `defstruct` + monomorphic functions + manual vtables. **(MUST)** `print-object` and other GFs MUST NOT appear on hot-path data structs in a way that introduces dispatch on the sample path; provide explicit printer functions for those. **(MUST)** CI enforces a **hot-path-purity gate**: the build fails if `defmethod`/`defgeneric`/`defclass` (or per-sample CLOS allocation) appears in the designated hot-path packages (`dds.cdr`, generated-codec output, `dds.core.buffer`, the engine's per-sample dispatch module, `dds.rtps.history` change ops, and — owner decision D33, 2026-10-04, ADR 0124 — the per-sample engine paths in `dds-disc` (`dataplane.lisp`), `dds-rtps` (`reliable.lisp`) and the `dds-dcps` delivery path in `entities.lisp`; the gate's scan is widened to them by plan WP-2.10). Outside those packages, CLOS is unrestricted and is the preferred default. **(MUST)** Any change moving the CLOS/defstruct boundary is backed by a bench measurement (FR-LANG-7).
 
 ### 7.2 NFR-PORT — Portability across SBCL / AllegroCL
-**(MUST)** All layers above L0 are implementation-agnostic and depend **only** on the PAL contract. **(MUST)** SBCL and AllegroCL are co-equal first-class targets and the performance pacesetters. **(WITHDRAWN, ADR 0118)** The former one-profile trailing allowance for Clasp has no subject: Clasp is not a target from 2026-10-03 (owner directive), and no Clasp result counts toward any gate. A gap on either remaining target is a gap, recorded and owned, never a profile allowance. **(MUST)** No feature is gated behind a single implementation except where it is intrinsically impossible elsewhere (documented per case).
+**(MUST)** All layers above L0 are implementation-agnostic and depend **only** on the PAL contract. **(MUST)** SBCL and AllegroCL are co-equal first-class targets and the performance pacesetters. **Platform and image (owner decision D1, 2026-10-04, ADR 0124):** both run on Linux x86_64; the AllegroCL image is **`alisp`** (ANSI case mode, 16-bit characters) and no other — `mlisp`, `alisp8` and `mlisp8` are out of scope, and macOS arm64 is not a target. **(WITHDRAWN, ADR 0118)** The former one-profile trailing allowance for Clasp has no subject: Clasp is not a target from 2026-10-03 (owner directive), and no Clasp result counts toward any gate. A gap on either remaining target is a gap, recorded and owned, never a profile allowance. **(MUST)** No feature is gated behind a single implementation except where it is intrinsically impossible elsewhere (documented per case).
 
 ### 7.3 NFR-DET — Determinism & GC posture
 **(MUST)** Provide a **pre-allocation mode** (FR-PF-7): pools, history caches, buffers, fragment buffers, and per-reader/per-writer state are carved at init from the static, non-GC'd arena sized by `*static-arena-bytes*` (NFR-MEM); steady state allocates nothing. **(MUST)** No data-path consing (FR-LANG-5). **(SHOULD)** Tune per-impl GC (SBCL `bytes-consed-between-gcs`, generational sizing; Allegro `gsgc` parameters) and expose hooks. **(MAY, dangerous)** Short, bounded GC-inhibition windows around the tightest critical section, behind an explicit unsafe flag, only where measurement proves benefit and correctness is preserved. **(MUST)** Document the determinism gap vs. Connext honestly per impl.
@@ -280,7 +303,7 @@ Targets are **parity bands relative to RTI Connext on identical hardware/OS/tran
 
 - Target OS: Linux first (best `recvmmsg`/SHMEM/affinity story); other POSIX + Windows later via PAL.
 - 64-bit only.
-- The owner already runs AllegroCL and Connext in production → Allegro is a hard target and Connext is the available gold interop reference.
+- The owner already runs AllegroCL and Connext in production → Allegro is a hard target and Connext is the available gold interop reference. The AllegroCL image this program supports, for development, CI and production, is `alisp` only (D1, §7.2).
 - Network has multicast on the dev LAN; unicast-only mode required for deployment realism (FR-DISC-4).
 - "Subagent-driven" development is assumed (see `IMPLEMENTATION-PLAN.md` §3) — requirements are written to be independently verifiable per work package.
 
@@ -309,12 +332,12 @@ A release is **accepted as "Connext-class (core)"** iff, on **SBCL and AllegroCL
 
 ## 11. Open issues / decisions needed from owner
 
-1. ~~**FR-LANG-4 carve-out:** condition system allowed, or literally zero CLOS?~~ **RESOLVED:** CLOS is permitted and preferred wherever it shows no performance degradation; the hot path stays CLOS-free and per-sample-allocation-free (FR-LANG-0, NFR-CLOS). Remaining sub-decision: confirm the exact set of packages designated "hot path" for the purity gate (current proposal in NFR-CLOS). `(confirm package list)`
+1. ~~**FR-LANG-4 carve-out:** condition system allowed, or literally zero CLOS?~~ **RESOLVED:** CLOS is permitted and preferred wherever it shows no performance degradation; the hot path stays CLOS-free and per-sample-allocation-free (FR-LANG-0, NFR-CLOS). The package-list sub-decision is **RESOLVED 2026-10-04 (owner decision D33, ADR 0124):** the NFR-CLOS list plus the per-sample engine paths in `dds-disc` (`dataplane.lisp`), `dds-rtps` (`reliable.lisp`) and the `dds-dcps` delivery path (`entities.lisp`); plan WP-2.10 widens `gate-hotpath` to them. `(resolved)`
 2. **Scope of "Professional":** core+differentiators **+ the durability/persistence service + the distributed logging service** — RESOLVED 2026-06-18 (ADR 0021): the durability service is in scope (TRANSIENT/PERSISTENT need it); EXTENDED 2026-07-23 (ADR 0082, §5.14): the distributed logging service is in scope. The remaining Professional services stay out. `(resolved)`
-3. **Hard-RT requirement?** If yes, NFR-PERF-3 must be renegotiated or the RT nodes delegated to Connext Micro/Cert. `(decision)`
-4. **VendorId** acquisition path with OMG. `(action)`
-5. **FlatData/Zero-Copy patent clearance** — legal review owner + deadline. `(action, gating P4 ship)`
-6. **IDL vs s-expr DSL priority** for the type compiler (recommend s-expr first for velocity, IDL parser second for interop with existing `.idl`). `(decision)`
+3. **Hard-RT requirement?** If yes, NFR-PERF-3 must be renegotiated or the RT nodes delegated to Connext Micro/Cert. **PROPOSED 2026-10-04, pending owner confirmation (D25, ADR 0124 §4):** no hard-real-time tail commitment. NFR-PERF-3 would stay "measured and its gap documented" (§9 item 3), and a node that needs hard-real-time tail parity would be delegated to Connext Micro/Cert (§6 note); real-time Linux deployments get a fixed arena (D29, item 8) as a determinism measure, not a hard-real-time guarantee. The owner did not state this; D25's recommendation was only "decide explicitly", so this is a proposal inferred from the D29 directive and the existing §6/§9 text, not a decision. `(decision, proposal pending owner)`
+4. **VendorId** acquisition path with OMG. **DECIDED 2026-10-04 (D24/D25, ADR 0124 §4):** apply to OMG now — an **owner action**, outstanding. Until an id is assigned, `#x01FF` remains the documented provisional development id (FR-RTPS-2). `(owner action pending)`
+5. **FlatData/Zero-Copy patent clearance** — legal review owner + deadline. `(action, gating P4 ship)` — still open: owner action D20 (assign counsel and a deadline), ADR 0124 §6.
+6. ~~**IDL vs s-expr DSL priority** for the type compiler (recommend s-expr first for velocity, IDL parser second for interop with existing `.idl`).~~ **RESOLVED 2026-10-04 (D27, ADR 0124 §4):** both. The s-expression DSL came first and exists; the IDL 4.2 front-end is **built** as an M1 deliverable (plan WP-5.1b) and emits `define-dds-type` forms (ADR 0111 §2.1). FR-TOOL-1 stays MUST. `(resolved)`
 7. ~~**Clasp determinism stance:** accept documented gap, or invest in MPS-precise-GC tuning?~~ **RESOLVED 2026-10-03 (ADR 0118):** Clasp is withdrawn as a target; the question has no subject. `(resolved)`
 8. **NFR-MEM / FR-PF-7 versus ADR 0102 (plan decision D29).** FR-PF-7 and NFR-MEM say the hot-path arena is "allocated once at startup"; ADR 0102 (accepted, implemented) lets the arena *budget* grow in `*static-arena-growth-bytes*` chunks up to `*static-arena-max-bytes*`. Either the code reverts or the text changes. **Proposed amendment (draft, not in force):** *"All hot-path memory comes from the static, non-GC'd arena. Every hot-path pool is carved before the first sample at the documented provisioning; the arena's budget MAY grow in configured chunks up to a configured maximum (`*static-arena-max-bytes*`, ADR 0102), and steady state performs no growth and no allocation outside the arena. Reaching the maximum is RESOURCE_LIMITS, never a GC-heap fallback."* Gated by WP-2.11 (gate-arena at workload level). `(decision)`
 
