@@ -1,6 +1,7 @@
 # ADR 0100 — The SHMEM attach cache is shared mutable state, and an internal bug is not a send failure
 
-- **Status:** **Proposed**
+- **Status:** **Accepted** (2026-10-04, owner; plan decision D32, recorded in ADR 0124 §5). `internal-bug-p`
+  is NIL on AllegroCL; WP-1.19 owns that gap.
 - **Date:** 2026-07-30
 - **Requirements at stake:** **FR-XPORT-2** (SHMEM transport), **NFR-STABILITY** (a data race on the send
   path), **NFR-DET**, **NFR-PORT** (the internal-bug predicate is per-implementation).

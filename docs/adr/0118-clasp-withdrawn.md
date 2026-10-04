@@ -1,7 +1,8 @@
 # ADR 0118 — Clasp is withdrawn as a target; SBCL and AllegroCL are the two
 
-- **Status:** Proposed — the decision itself is the **owner directive of 2026-10-03** ("Clasp is DROPPED as
-  a target; targets are SBCL + AllegroCL"); this record of it awaits owner approval (plan decision D2).
+- **Status:** **Accepted** (2026-10-04, owner; recorded in ADR 0124, plan decision D2). §4's OPEN
+  rows are decided by D1 in ADR 0124: AllegroCL `alisp` only;
+  `mlisp`, `alisp8`, `mlisp8` and macOS arm64 are out of scope.
 - **Date:** 2026-10-03
 - **Requirement:** NFR-PORT (REQUIREMENTS §7.2), NFR-BUILD (conditional compilation confined to the PAL),
   the operating contract §5 (Definition of Done) and §6 (per-implementation gate invocation)

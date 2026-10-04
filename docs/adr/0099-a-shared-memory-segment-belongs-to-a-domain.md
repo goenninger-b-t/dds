@@ -1,6 +1,6 @@
 # ADR 0099 — A shared-memory segment belongs to a **domain**, not just to a participant
 
-- **Status:** **Proposed**
+- **Status:** **Accepted** (2026-10-04, owner; plan decision D32, recorded in ADR 0124 §5)
 - **Date:** 2026-07-30
 - **Requirements at stake:** **FR-XPORT-2** (SHMEM transport), **NFR-SEC-POSTURE** (a domain is an isolation
   boundary; crossing it is an isolation failure, not a performance quirk), **NFR-DET**.

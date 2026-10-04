@@ -1,7 +1,7 @@
 # ADR 0121 — One way out: `exit-process`, a bounded shutdown-hook chain, then an exit that cannot hang
 
-- **Status:** Proposed. Implemented by WP-0.11 of `docs/plans/2026-10-03-sbcl-allegro-full-ok.md`; awaits
-  owner review.
+- **Status:** **Accepted** (2026-10-04, owner; recorded in ADR 0124). Implemented by WP-0.11 of
+  `docs/plans/2026-10-03-sbcl-allegro-full-ok.md`.
 - **Date:** 2026-10-04
 - **Requirement:** NFR-PORT (SBCL and AllegroCL behave the same at exit), NFR-SEC-POSTURE (key material is
   wiped on every way out, not only the orderly one), FR-XPORT-2 (a SHMEM segment does not outlive its

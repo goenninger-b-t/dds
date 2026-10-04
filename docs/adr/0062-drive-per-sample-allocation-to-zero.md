@@ -3,6 +3,9 @@
 - **Status:** Accepted (measurement + plan). The individual mechanisms below are NOT yet implemented; each lands under its own commit with a before/after.
 - **Date:** 2026-07-13
 - **Requirements:** NFR-MEM (0 bytes/sample steady state), NFR-PERF-8, NFR-PERF-3 (p99.99 within 5 % of Connext)
+- **Forward note (2026-10-04, ADR 0124, plan decision D5):** the "p99.99 within 5 % of Connext" reading of
+  NFR-PERF-3 (above, and under Consequences) is retracted. The performance gate is REQUIREMENTS §6, where
+  NFR-PERF-3 is "within 3×", measured and its gap documented. The body below is left as written.
 - **Supersedes the working assumption of:** the WP-8 task-#29 note ("attack the RX deserialization products"), and the "zero-alloc TX" claim of `c89aae0`.
 
 ## Context

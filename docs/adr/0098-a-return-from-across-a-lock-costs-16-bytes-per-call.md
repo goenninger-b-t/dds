@@ -1,6 +1,6 @@
 # ADR 0098 — A `RETURN-FROM` out of a `HANDLER-CASE` inside a lock costs 16 bytes on **every** call
 
-- **Status:** **Proposed**
+- **Status:** **Accepted** (2026-10-04, owner; plan decision D32, recorded in ADR 0124 §5)
 - **Date:** 2026-07-29
 - **Requirements at stake:** **NFR-MEM** (zero bytes/sample in steady state; hot-path allocation is a gate,
   not a preference), **NFR-PERF-8**, **NFR-PORT** (a property that holds on one platform and not another is

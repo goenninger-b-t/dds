@@ -1,7 +1,8 @@
 # ADR 0096 — An unrouted Zero-Copy reference must return its slot; and the writer was not double-delivering
 
-- **Status:** **Proposed** — §3 and §4 are implemented and falsified; **§5 needs an owner decision** before it
-  is written.
+- **Status:** **Accepted** (2026-10-04, owner; plan decision D32, recorded in ADR 0124 §5). §3 and §4 are
+  implemented and falsified. §5 is settled by ADR 0097 (control traffic rides the DATA's lane), kept as the
+  least-risk choice (ADR 0124 §5).
 - **Date:** 2026-07-29
 - **Requirements at stake:** **FR-PF-3 / FR-PF-4** (Zero-Copy + FlatData-over-ZC), **NFR-MEM** (a bounded pool
   that stays bounded), **NFR-DET**.

@@ -1,7 +1,7 @@
 # ADR 0119 — A corrupt SHMEM cursor is hostile input: validate before use, then poison the lane
 
-- **Status:** Proposed. Implemented by WP-0.7 of `docs/plans/2026-10-03-sbcl-allegro-full-ok.md`; awaits
-  owner review.
+- **Status:** **Accepted** (2026-10-04, owner; recorded in ADR 0124). Implemented by WP-0.7 of
+  `docs/plans/2026-10-03-sbcl-allegro-full-ok.md`.
 - **Date:** 2026-10-03
 - **Requirement:** NFR-SEC-POSTURE (bounds-check every parser facing untrusted input, even at `(safety 0)`;
   the governing plan §2 counts a corrupt SHMEM cursor as hostile input), NFR-OBS (the event must be counted

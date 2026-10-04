@@ -1,6 +1,6 @@
 # ADR 0003 — SBCL added as a second landed target
 
-- **Status:** Accepted (2026-06-04)
+- **Status:** Accepted (2026-06-04) · **Partly superseded by ADR 0118** (§1, §3: the Clasp leg is withdrawn; its "Clasp + SBCL" evidence reads as SBCL-only)
 - **Deciders:** DG1SBG (owner), A0 (integrator)
 - **Updates:** ADR 0001 (relaxes its "Clasp-only" M0 baseline to "Clasp + SBCL")
 

@@ -1,6 +1,7 @@
 # ADR 0111 — Complete the type system first, then put an IDL front-end on it
 
-- **Status:** Proposed
+- **Status:** **Accepted** (2026-10-04, owner; plan decision D32, recorded in ADR 0124 §5), with Float128
+  deferred as §3 states.
 - **Date:** 2026-08-07
 - **Requirement:** FR-CDR-1/2 (MUST), FR-TYPE-1/2, FR-TOOL-1, FR-LANG-3; XTypes 1.3 §7.3.1, §7.4.1
 - **Supersedes nothing.** Opens the feature-completeness work stream that follows the closed allocation

@@ -1,6 +1,6 @@
 # ADR 0004 — M0 marked PASSED with AllegroCL exception (owner command)
 
-- **Status:** Accepted (2026-06-04)
+- **Status:** Accepted (2026-06-04) · **Partly superseded by ADR 0118** (§3: M0 must be re-passed on SBCL and AllegroCL)
 - **Decision authority:** **DG1SBG (owner), by explicit command.** Recorded by A0.
 - **Updates:** ADR 0001, ADR 0003 (closes the M0 milestone they tracked toward)
 

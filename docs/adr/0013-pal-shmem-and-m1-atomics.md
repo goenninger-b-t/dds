@@ -1,6 +1,6 @@
 # ADR 0013 — PAL extension for SHMEM transport + M1 atomics fast path
 
-- **Status:** Accepted (2026-06-14)
+- **Status:** Accepted (2026-06-14) · **Partly superseded by ADR 0118** (§1, §5: its Clasp sections have no subject)
 - **Deciders:** A0 (integrator)
 - **Amends:** ADR 0002 (the frozen L0 `DDS.PAL` contract, §7.6) — additive only, no existing
   symbol changed

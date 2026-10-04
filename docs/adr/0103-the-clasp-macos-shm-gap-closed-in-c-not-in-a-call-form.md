@@ -1,6 +1,6 @@
 # ADR 0103 — The Clasp/macOS `shm_open` gap closed in C++, not in a call form
 
-- **Status:** **Accepted** — upstream fix landed, wired here, gap closed.
+- **Status:** **Accepted** — upstream fix landed, wired here, gap closed. · **Superseded by ADR 0118** (accepted 2026-10-04)
 - **Date:** 2026-07-31
 - **Requirements at stake:** **NFR-PORT** (three implementations, documented gaps only),
   **FR-XPORT-2** (shared-memory transport).

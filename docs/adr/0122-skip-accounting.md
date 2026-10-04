@@ -1,7 +1,7 @@
 # ADR 0122 — One skip channel: every skip is named, charged to a test, and counted (step 1, report-only)
 
-- **Status:** Proposed. Step 1 implemented by WP-0.10 of `docs/plans/2026-10-03-sbcl-allegro-full-ok.md`;
-  awaits owner review. Step 2 (enforcement) is not part of this change.
+- **Status:** **Accepted** (2026-10-04, owner; recorded in ADR 0124). Step 1 implemented by WP-0.10 of
+  `docs/plans/2026-10-03-sbcl-allegro-full-ok.md`. Step 2 (enforcement) is not part of this change.
 - **Date:** 2026-10-04
 - **Requirement:** NFR-TEST (a pass count must not be wider than the coverage behind it), the operating
   contract §5 ("never mark work done with a red gate or a skipped interop/byte-exact check"), NFR-PORT (the

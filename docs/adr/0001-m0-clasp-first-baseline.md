@@ -1,6 +1,6 @@
 # ADR 0001 — M0 baseline is Clasp-first (and Clasp-only, for now)
 
-- **Status:** Accepted (2026-06-04)
+- **Status:** Accepted (2026-06-04) · **Superseded by ADR 0118** (accepted 2026-10-04)
 - **Deciders:** DG1SBG (owner), A0 (integrator)
 - **Supersedes:** —
 

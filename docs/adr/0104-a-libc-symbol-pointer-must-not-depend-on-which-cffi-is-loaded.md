@@ -1,6 +1,6 @@
 # ADR 0104 — A libc symbol POINTER must not depend on which CFFI happens to be loaded
 
-- **Status:** **Accepted** — root-caused, fixed, falsified, suite green on the affected image.
+- **Status:** **Accepted** — root-caused, fixed, falsified, suite green on the affected image. · **Partly superseded by ADR 0118** (§5(a): the Clasp branch of `%global-symbol-pointer` is removed)
 - **Date:** 2026-08-05
 - **Requirements at stake:** **NFR-PORT** (three implementations, documented gaps only), **NFR-MEM** (the
   cached pointers exist *because* the zero-allocation datagram path may not resolve a symbol per call).

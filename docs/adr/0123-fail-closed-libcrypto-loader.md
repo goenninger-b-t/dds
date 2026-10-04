@@ -1,7 +1,7 @@
 # ADR 0123 — A pinned libcrypto is the only libcrypto: fail-closed loading, symbols resolved in that file, one copy mapped
 
-- **Status:** Proposed. Implemented by WP-0.8 and WP-0.9 of `docs/plans/2026-10-03-sbcl-allegro-full-ok.md`;
-  awaits owner review.
+- **Status:** **Accepted** (2026-10-04, owner; recorded in ADR 0124; the user-prefix OpenSSL path is accepted
+  by D23). Implemented by WP-0.8 and WP-0.9 of `docs/plans/2026-10-03-sbcl-allegro-full-ok.md`.
 - **Date:** 2026-10-04
 - **Requirement:** FR-SEC-2 (vetted crypto, no hand-rolling: the vetted library must be the one actually
   called), NFR-SEC-POSTURE (fail closed), NFR-TEST (a run must not report coverage of a library it did not
