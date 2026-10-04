@@ -504,6 +504,42 @@ its planted secret wiped and both its planted segment and its participant's segm
 `run-all-tests` also lists every thread the suite started that is still alive at the end and **fails the run
 on any `dds-*` thread** (after a 5 s grace period); other threads are listed but do not fail it.
 
+### Dynamic loader — one shared object, its own symbols (ADR 0123)
+
+CFFI's `foreign-symbol-pointer` takes `:library` and **ignores it** on both SBCL and AllegroCL
+(`cffi-sbcl.lisp:399-403`, `cffi-allegro.lisp:407-410`): the lookup is process-wide, so with two copies of a
+library mapped it answers with whichever the global scope finds first. When the *file* matters (the pinned
+OpenSSL behind DARE and DDS-Security), use these PAL entries instead. They are plain CFFI + libc, identical on
+both Lisps, control plane only, and never signal (ADR 0064).
+
+| Symbol | Kind | Contract |
+|---|---|---|
+| `dds.pal:dl-open` | function | `(path)` → `(values handle reason)`. `dlopen(path, RTLD_NOW \| RTLD_LOCAL)`; `handle` is a foreign pointer, or NIL with the `dlerror` text. Pass an absolute path: a bare name is searched by ld.so's rules. |
+| `dds.pal:dl-sym` | function | `(handle name)` → pointer or NIL. `dlsym` on that handle: the object and its own dependencies only. |
+| `dds.pal:dl-object-path` | function | `(address)` → the `dli_fname` `dladdr` reports for the object containing `address`, or NIL. |
+| `dds.pal:real-path` | function | `(path)` → `realpath(3)` of `path`, or NIL. Same answer on both Lisps (unlike `truename`). |
+| `dds.pal:dl-close` | function | `(handle)` → T, or NIL when `dlclose` reports an error. For a handle that was opened and then rejected, so the refused file does not stay mapped. Never on a handle whose symbols are still in use. |
+| `dds.pal:mapped-object-paths` | function | `(stem)` → `(values paths readable-p required-p)`: the distinct files in `/proc/self/maps` whose basename is a shared-object name of `stem` (`stem.so`, `stem.so.3`, `stem.3.dylib`, `stem.dylib`; not `libcrypto++.so` or `libcryptopp.so`). `readable-p` NIL when the file cannot be read; `required-p` T where procfs is part of the platform (Linux), so an unreadable file is a fault there and not merely "unknown". |
+| `dds.pal:parse-mapped-object-paths` | function | `(text stem)` → the same rule on a string, for tests. Repeated mappings of one file count once; `" (deleted)"` is dropped; a directory named like the stem, and other libraries whose name starts with it, do not count. |
+| `dds.pal:+rtld-now+` `+rtld-local+` | constant | `2`, `0` — `bits/dlfcn.h:25`, `:38` (glibc 2.39). |
+| `dds.pal:+dl-info-size+` `+dl-info-fname-offset+` | constant | `32`, `0` — `Dl_info`, `dlfcn.h:88-94`. |
+
+The constants were read from the headers and are re-checked by `scripts/probes/dlfcn-layout.c`.
+
+```lisp
+;; Is OpenSSL_version_num really coming from the file we pinned?
+(multiple-value-bind (h why) (dds.pal:dl-open "/home/u/.local/opt/openssl-3.5/lib64/libcrypto.so.3")
+  (if (null h)
+      (format t "refused: ~a~%" why)
+      (let ((fn (dds.pal:dl-sym h "OpenSSL_version_num")))
+        (if (null fn)
+            (progn (dds.pal:dl-close h) :not-libcrypto)            ; refused: release the handle
+            (list (dds.pal:real-path (dds.pal:dl-object-path fn))  ; => the pinned file
+                  (dds.pal:mapped-object-paths "libcrypto"))))))   ; => exactly one entry, or a problem
+```
+
+`dds.dare`'s loader is the first consumer; see [Getting started — OpenSSL 3.5](getting-started.md#openssl-35-for-the-dare-and-dds-security-tests-adr-0123).
+
 ## Examples
 
 Each block below is adapted from a passing test in `src/dds-tests/`.

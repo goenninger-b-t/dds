@@ -4221,7 +4221,7 @@
 (defun* run-all-tests ()
     (function () t)
   "Run every landed test (a failure is recorded and the run continues), then report. Before the first test
-   it prints the ADR 0122 capability preflight; while each test runs, *CURRENT-TEST* names it, so every
+   it prints the ADR 0122 capability preflight and fails closed if the libcrypto preflight fails (ADR 0123); while each test runs, *CURRENT-TEST* names it, so every
    NOTE-SKIP is charged to it. Afterwards it prints the pass/fail line, the ADR 0122 coverage line (FULL /
    PARTIAL / SKIPPED / FAILED per test) and per-capability skip table, stuck teardown joins and leaked dds-*
    threads (ADR 0121), then signals TEST-FAILURE if any test failed or any dds-* thread the suite started is
@@ -4678,6 +4678,9 @@
                  ("durability-multi-relay-dedup"  . run-durability-multi-relay-dedup-test)
                  ("durability-multitopic"         . run-durability-multitopic-test)
                  ("durability-dispose-replay"     . run-durability-dispose-replay-test)
+                 ("dare-libcrypto-loader"         . run-libcrypto-loader-test)            ; ADR 0123
+                 ("dare-libcrypto-preload-rejected" . run-libcrypto-preload-rejection-test) ; ADR 0123: child Lisp, LD_PRELOAD
+                 ("dare-libcrypto-rejected-refuses" . run-libcrypto-rejected-refusal-test) ; ADR 0123: child Lisp, bad pin refuses
                  ("dare-sha384-hkdf-kat"          . run-dare-sha384-hkdf-kat-test)
                  ("dare-aes-gcm-kat"             . run-dare-aes-gcm-kat-test)
                  ("dare-image-restart-reresolve" . run-dare-image-restart-reresolve-test)
@@ -4904,6 +4907,8 @@
           (started-by (make-hash-table :test 'eq)))
       ;; ADR 0122: say what this host can do BEFORE any test can skip because of it.
       (capability-preflight)
+      ;; ADR 0123: a rejected or duplicated libcrypto ends the run here, before any test, whatever the skip mode.
+      (assert-libcrypto-preflight)
       (reset-skip-events)
       (dolist (test tests)
         (format t "~&  [test] ~a ... " (car test))

@@ -19,6 +19,8 @@
                (:file "legacy-typeobject-test")
                (:file "durability-test")
                (:file "dare-test")
+               ;; ADR 0123: the fail-closed libcrypto loader (one test starts a child Lisp under LD_PRELOAD)
+               (:file "libcrypto-loader-test")
                (:file "security-test")
                (:file "security-auth-test")
                (:file "security-access-control-test")

@@ -91,6 +91,65 @@ FULL = ran with no skip; PARTIAL = passed but skipped at least one arm; SKIPPED 
 FAILED = failed (whatever it skipped). **Step 1 is report-only: skips do not change the exit code.** Step 2
 (WP-0.10, with the ADR 0120 skip baseline) will fail a run on a skip that is not in the baseline.
 
+### OpenSSL 3.5 for the DARE and DDS-Security tests (ADR 0123)
+
+The CNSA-2.0 DARE and DDS-Security code needs **OpenSSL ≥ 3.5** (ML-KEM-1024). Linux distributions of this
+vintage ship 3.0, so build the pinned LTS release once, into your home directory, and point the suite at it:
+
+```sh
+scripts/build-openssl.sh            # OpenSSL 3.5.9 -> ${DDS_OPENSSL_PREFIX:-$HOME/.local/opt/openssl-3.5}
+. scripts/openssl-env.sh            # exports DDS_DARE_LIBCRYPTO=<prefix>/lib64/libcrypto.so.3, nothing else
+make test LISP=./scripts/with-sbcl.sh
+```
+
+`build-openssl.sh` is pinned to one version and one SHA-256, checks the release's OpenPGP signature against
+the OpenSSL release certificate fingerprint when `gpg` is available (`DDS_OPENSSL_REQUIRE_PGP=1` makes that
+mandatory), refuses any mismatch, and is a no-op when the same pin is already installed. It never deletes a
+directory it did not create: an existing, non-empty `DDS_OPENSSL_PREFIX` without the script's
+`.neodds-openssl-stamp` or `.neodds-openssl-provenance` file stops the run before anything is downloaded. It
+installs into a staging directory beside the prefix, swaps it in, and checks the result there: it compiles
+`scripts/probes/ossl-param-layout.c` against the new headers and refuses an `OSSL_PARAM` layout that
+differs from what `src/dds-dare/openssl-ffi.lisp` writes; on any failed check the previous install is put back. `openssl-env.sh` does **not** set
+`LD_LIBRARY_PATH`: only NeoDDS loads the 3.5 copy, by absolute path; everything else keeps the system library.
+
+**The loader is fail-closed.** With `DDS_DARE_LIBCRYPTO` set, that file is the only candidate. It is opened
+with `dds.pal:dl-open`, every OpenSSL symbol is resolved in that file with `dds.pal:dl-sym` (CFFI's
+`:library` argument is ignored on both SBCL and AllegroCL), `dladdr` must place `OpenSSL_version_num` inside
+it, and `/proc/self/maps` must show exactly one libcrypto. Anything else is a rejection, reported by
+`dds.dare:libcrypto-status`, and never a fallback to another copy:
+
+```lisp
+(dds.dare:libcrypto-status)
+;; pinned and verified:
+;; => :OK "/home/u/.local/opt/openssl-3.5/lib64/libcrypto.so.3" NIL T
+;; DDS_DARE_LIBCRYPTO=/nonexistent/libcrypto.so.3:
+;; => :PINNED-UNLOADABLE NIL "DDS_DARE_LIBCRYPTO=/nonexistent/libcrypto.so.3 does not exist" T
+;; pinned, plus LD_PRELOAD=libcrypto.so.3 (the system copy):
+;; => :MULTIPLE-LIBCRYPTO "/home/u/.local/opt/openssl-3.5/lib64/libcrypto.so.3" "2 libcrypto mappings: …" T
+```
+
+A rejected library is never called. `dare-available-p` answers NIL with capability `:libcrypto`, and code
+that calls an OpenSSL primitive anyway gets an error naming the function and the status (for example
+`libcrypto function EVP_Q_digest is unavailable: libcrypto pinned-unloadable …`), not a jump through a NULL
+pointer; the durability service with a DARE-wrapped backend then fails its start and exits 1.
+
+A rejection, or a second libcrypto mapped by the time the suite starts, **stops `make test`, `make fuzz`,
+`make mem` and `make corpus` before the first test** with `LIBCRYPTO PREFLIGHT FAILED`, whatever the skip
+mode, because a run against the wrong library is not a run of the right one. The preflight prints which
+file was used and how many were mapped:
+
+```
+  libcrypto loaded:   ok /home/u/.local/opt/openssl-3.5/lib64/libcrypto.so.3 (pinned by DDS_DARE_LIBCRYPTO)
+  libcrypto mappings: 1: /home/u/.local/opt/openssl-3.5/lib64/libcrypto.so.3
+```
+
+Without `DDS_DARE_LIBCRYPTO` the loader searches (Homebrew paths, then `libcrypto.so.3`), verifies what it
+finds the same way, and on a 3.0 system the DARE and security tests record `:openssl-pqc` skips as before.
+
+Measured on the reference host (Linux x86_64, 2026-10-04) with the pin: SBCL 2.2.9
+`tests: 652 passed, 0 FAILED` and `coverage: 652 FULL, 0 PARTIAL, 0 SKIPPED, 0 FAILED; 0 skip event(s)`;
+AllegroCL 11.0 ran every DARE and security test with no `:openssl-pqc` skip and none of them failed.
+
 ### `make mem` vs `make gate-mem` — read this before trusting either
 
 `make mem` measures the **codec in isolation** (serialize / deserialize / AEAD) and reports ~0 bytes per

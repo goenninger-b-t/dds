@@ -71,6 +71,10 @@
    ;; can re-resolve state it cannot carry live across restart, e.g. foreign-symbol pointers / re-mapped
    ;; libraries (dds.dare EVP re-resolution; ADR 0038/0039 saved-image residual)
    #:register-image-restart-hook
+   ;; dynamic loader (ADR 0123): open ONE shared object by path and resolve symbols IN IT. CFFI's
+   ;; foreign-symbol-pointer ignores :library on both targets, so a pinned library needs these. Control plane.
+   #:dl-open #:dl-sym #:dl-close #:dl-object-path #:real-path #:mapped-object-paths #:parse-mapped-object-paths
+   #:+rtld-now+ #:+rtld-local+ #:+dl-info-size+ #:+dl-info-fname-offset+
    ;; clock + process identity
    #:monotonic-ns #:realtime-ns #:process-id
    ;; UDPv4 sockets (native, FR-XPORT-1)

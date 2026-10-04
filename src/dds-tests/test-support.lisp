@@ -438,17 +438,37 @@
 
 (defun* %libcrypto-mapped-paths ()
     (function () list)
-  "The distinct file paths containing \"libcrypto\" in /proc/self/maps: the libcrypto the dynamic loader
-   actually mapped into this process, which is the answer to 'which OpenSSL did this run use' that a load
-   name like libcrypto.so.3 does not give. NIL where /proc/self/maps cannot be read."
-  (let ((paths '()))
-    (ignore-errors
-     (with-open-file (in "/proc/self/maps" :direction :input)
-       (loop for line = (read-line in nil nil) while line
-             do (let ((slash (position #\/ line)))
-                  (when (and slash (search "libcrypto" line :start2 slash))
-                    (pushnew (subseq line slash) paths :test #'string=))))))
-    (nreverse paths)))
+  "The distinct libcrypto files in /proc/self/maps: the libcrypto the dynamic loader actually mapped into this
+   process, which is the answer to 'which OpenSSL did this run use' that a load name like libcrypto.so.3 does
+   not give. NIL where /proc/self/maps cannot be read. The same rule the loader applies
+   (DDS.PAL:MAPPED-OBJECT-PATHS, ADR 0123): a file counts when its basename contains \"libcrypto\"."
+  (values (dds.pal:mapped-object-paths "libcrypto")))
+
+(defun* %libcrypto-preflight-failure ()
+    (function () (or null string))
+  "NIL when the libcrypto this run uses can be trusted, else the reason the run must not start (ADR 0123).
+   Two things fail it: the loader REJECTED a libcrypto (DDS.DARE:LIBCRYPTO-STATUS is neither :OK nor :ABSENT —
+   e.g. DDS_DARE_LIBCRYPTO names a missing file), or /proc/self/maps shows more than one libcrypto file NOW,
+   at suite start, whatever got mapped after the loader's own check. A skip is not the answer to either: a
+   run against the wrong library, or against two of them, is not a test of the library it reports."
+  (multiple-value-bind (status path detail) (dds.dare:libcrypto-status)
+    (let ((mapped (%libcrypto-mapped-paths)))
+      (cond ((not (member status '(:ok :absent)))
+             (format nil "libcrypto REJECTED by the loader: ~(~a~)~@[ (~a)~]~@[: ~a~]" status path detail))
+            ((> (length mapped) 1)
+             (format nil "~d libcrypto mappings (must be 1): ~{~a~^, ~}" (length mapped) mapped))
+            (t nil)))))
+
+(defun* assert-libcrypto-preflight (&optional (stream *standard-output*))
+    (function (&optional t) (eql t))
+  "Fail closed before any test runs when %LIBCRYPTO-PREFLIGHT-FAILURE names a reason (ADR 0123): print it and
+   signal TEST-FAILURE, so `make test`, `make fuzz`, `make mem` and `make corpus` exit non-zero whatever the
+   skip mode. Returns T when the libcrypto is trustworthy."
+  (let ((why (%libcrypto-preflight-failure)))
+    (when why
+      (format stream "~&⛔ LIBCRYPTO PREFLIGHT FAILED (ADR 0123): ~a~%   No test was run.~%" why)
+      (error 'test-failure :name :libcrypto-preflight :detail why)))
+  t)
 
 (defun* %openssl-version-text ()
     (function () (values (or null integer) (or null string)))
@@ -457,8 +477,8 @@
    (OpenSSL 3.0.13 headers on the reference host; the selector is unchanged in 3.5's crypto.h)."
   (if (null dds.dare::*libcrypto*)
       (values nil nil)
-      (let ((num-ptr (dds.dare::%ossl-sym "OpenSSL_version_num"))
-            (txt-ptr (dds.dare::%ossl-sym "OpenSSL_version")))
+      (let ((num-ptr (dds.dare::%ossl-sym-or-nil "OpenSSL_version_num"))
+            (txt-ptr (dds.dare::%ossl-sym-or-nil "OpenSSL_version")))
         (values (and num-ptr (cffi:foreign-funcall-pointer num-ptr nil :unsigned-long))
                 (and txt-ptr (cffi:foreign-funcall-pointer txt-ptr nil :int 0 :string))))))
 
@@ -500,11 +520,11 @@
     (multiple-value-bind (num text) (ignore-errors (%openssl-version-text))
       (format stream "  openssl:            ~:[UNAVAILABLE (~(~a~)): ~a~;available~2*~]; version ~a~@[ (0x~8,'0x)~]~%"
               ok cap reason (or text "n/a") num))
-    (format stream "  libcrypto loaded:   ~a~%"
-            (or (ignore-errors (and dds.dare::*libcrypto*
-                                    (cffi:foreign-library-pathname dds.dare::*libcrypto*)))
-                "none"))
-    (format stream "  libcrypto mapped:   ~{~a~^, ~}~%" (or (%libcrypto-mapped-paths) '("none"))))
+    (multiple-value-bind (status path detail pinned) (dds.dare:libcrypto-status)
+      (format stream "  libcrypto loaded:   ~(~a~) ~a~:[ (unpinned search)~; (pinned by DDS_DARE_LIBCRYPTO)~]~@[ — ~a~]~%"
+              status (or path "none") pinned detail))
+    (let ((mapped (%libcrypto-mapped-paths)))
+      (format stream "  libcrypto mappings: ~d~@[: ~{~a~^, ~}~]~%" (length mapped) mapped)))
   (let* ((before (dds.pal:bytes-consed))
          (_ (setf *preflight-sink* (make-list 4096)))
          (delta (- (dds.pal:bytes-consed) before)))
@@ -535,11 +555,13 @@
 (defun* run-with-skip-report (name thunk)
     (function (string function) t)
   "Run THUNK as the single test NAME outside RUN-ALL-TESTS, with the ADR 0122 skip accounting: print the
-   capability preflight, charge every NOTE-SKIP to NAME, and print the FULL / PARTIAL / SKIPPED / FAILED line
+   capability preflight, refuse to start when the libcrypto preflight fails (ASSERT-LIBCRYPTO-PREFLIGHT,
+   ADR 0123), charge every NOTE-SKIP to NAME, and print the FULL / PARTIAL / SKIPPED / FAILED line
    and the per-capability table afterwards, whether THUNK returns or signals. Returns THUNK's values; a
    condition THUNK signals propagates unchanged after the report, so the caller's exit code is exactly what it
    was without the report (step 1 is report-only). Used by `make fuzz`, `make mem` and `make corpus`."
   (capability-preflight)
+  (assert-libcrypto-preflight)
   (reset-skip-events)
   (setf *current-test* name)
   (let ((ok nil))

@@ -740,11 +740,22 @@ loaded one is older than 3.5 or lacks ML-KEM-1024. The test harness charges a DA
 ;; on a host with OpenSSL 3.0.13:
 ;; DARE unavailable (openssl-pqc): OpenSSL version 0x300000D0 < 3.5.0 (0x30500000)
 ```
- On macOS
-the bindings resolve the real homebrew `libcrypto` explicitly (a `$DDS_DARE_LIBCRYPTO` env override is
-honoured first) to avoid binding the system LibreSSL, which lacks ML-KEM; on Linux they fall back to
-`libcrypto.so.3`. No hand-rolled crypto (FR-SEC-2); OpenSSL is SBOM-pinned and recorded in
-`docs/provenance.md`.
+
+**Which libcrypto (ADR 0123).** Set `DDS_DARE_LIBCRYPTO` to the absolute path of an OpenSSL ≥ 3.5
+`libcrypto` (on Linux: `scripts/build-openssl.sh`, then `. scripts/openssl-env.sh`). That file is then the
+**only** candidate: it is opened with `dds.pal:dl-open`, every symbol is resolved in it with
+`dds.pal:dl-sym`, `dladdr` must place `OpenSSL_version_num` inside it, and exactly one libcrypto may be
+mapped. A missing file, a non-libcrypto file, or a second copy (e.g. through `LD_PRELOAD`) is a rejection —
+`dds.dare:libcrypto-status` names it and `dare-available-p` answers NIL with capability `:libcrypto` —
+never a fallback to the system library. Nothing calls through the missing library either: every OpenSSL
+call site then refuses with an error naming the function and the loader status (the `NOCOND(CRYPTO-FFI)`
+class, the same signal an OpenSSL failure raises), instead of jumping through a NULL pointer. For the
+service this means a DARE-wrapped store cannot open: the runner's start boundary sheds the spec and
+`durability-service-main` exits 1 (`:service-start-failed` with `:block nil`), with the refusal passed to
+`*durability-error-hook*`. The in-memory default store uses no crypto and still starts. Unset, the loader searches the Homebrew
+realpaths (avoiding macOS's LibreSSL, which lacks ML-KEM) and then `libcrypto.so.3`, and verifies what it
+finds the same way. No hand-rolled crypto (FR-SEC-2); OpenSSL is SBOM-pinned (3.5.9, with its tarball
+SHA-256) and recorded in `docs/provenance.md`.
 
 **Dumped-image (`save-lisp-and-die`) contract.** DARE caches every `libcrypto` function pointer (the
 `%ossl-sym` boxes) plus the `EVP_aes_256_gcm()` cipher singleton. Those pointers are resolved once at
@@ -754,7 +765,8 @@ this by resolving through **re-resolvable boxes** and registering an **image-res
 (`%dare-reresolve-foreign-pointers`) via the portable PAL seam `dds.pal:register-image-restart-hook`
 (SBCL `sb-ext:*init-hooks*`; AllegroCL `excl::*restart-init-function*`, which holds one function, so the
 PAL chains the previous value rather than overwriting it), which re-opens `libcrypto` and
-re-resolves every cached pointer on startup. So a **delivered durability-service executable** built with
+re-resolves every cached pointer on startup — through the same verified load, so a restarted image whose
+pinned library is gone ends with NIL pointers and a rejection status, not dangling ones (ADR 0123). So a **delivered durability-service executable** built with
 `save-lisp-and-die` re-resolves crypto automatically on launch — no action required by the operator.
 
 ### 7.4 Scope & follow-ons

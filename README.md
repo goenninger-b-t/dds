@@ -115,8 +115,17 @@ result; plan `docs/plans/2026-10-03-sbcl-allegro-full-ok.md`):
   `:openssl-pqc`; AllegroCL **504 FULL, 10 PARTIAL, 118 SKIPPED, 18 FAILED**, 142 events (`:openssl-pqc` 106,
   `:zc-sap-primitives` 18, `:static-vector-p` 11, `:alloc-counter` 5, `:subprocess-mode` 2). `make fuzz`,
   `make mem` and `make corpus` print the same accounting (`make corpus` counts its deferred vector as a
-  `:verified-elsewhere` skip). The step is report-only: exit codes are unchanged. Provisioning OpenSSL 3.5 (WP-0.8) and failing a run on an
-  unbaselined skip (WP-0.10 step 2) are Phase 0 work.
+  `:verified-elsewhere` skip). The step is report-only: exit codes are unchanged. Failing a run on an unbaselined skip (WP-0.10 step 2)
+  is Phase 0 work.
+- **With the pinned OpenSSL 3.5.9 (WP-0.8/0.9, ADR 0123; measured 2026-10-04):** `scripts/build-openssl.sh`
+  builds the verified release into a user prefix and `. scripts/openssl-env.sh` exports only
+  `DDS_DARE_LIBCRYPTO`. The loader is fail-closed: the pinned file is the only candidate, its symbols are
+  resolved in that file, and exactly one libcrypto may be mapped, or the run stops before its first test;
+  outside the test harness a rejected library is refused at every OpenSSL call (an error, never a NULL jump).
+  SBCL: **652/652, 652 FULL, 0 skip events** (the ~100 DARE / DDS-Security tests that skipped on 3.0.13 all
+  run and pass); `make fuzz`, `make corpus`, `make mem` pass. AllegroCL: 634/652, no security skip and no
+  security failure; its 18 failures are the known non-security set below. Hosted CI builds it only behind
+  the off-by-default switch `NEODDS_CI_OPENSSL35`.
 - **AllegroCL 11.0 (`alisp`):** `make test` reports **627/646** — 19 known failures (`AAO-FIRED`,
   `AUTO-MATCHED`, `DD-AUTO-SERVE-DYNC`, `DIS-ENABLE-RELEASES`, `FLOW-PACE-DELIVERED`, `FLOW-RR-A-DELIVERED`,
   `FLOW-TD-NO-WEDGE`, `LEASE-MATCHED`, `OFF-DEADLINE-FIRES`, `ONENODE-WRITER-A-DRAINED`, `RUNNER-C1-GOT-OWN`,

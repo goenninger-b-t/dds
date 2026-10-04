@@ -3,12 +3,15 @@
   (:use #:common-lisp #:net.goenninger.dds.lang)
   (:documentation
    "DDS.DARE — CNSA-2.0 Data-At-Rest Encryption over OpenSSL >= 3.5 libcrypto.
+    The libcrypto is pinned by DDS_DARE_LIBCRYPTO and loaded fail-closed (ADR 0123): libcrypto-status.
     Provides: dare-available-p, sha-384, hkdf-sha384 (Task 1);
     AES-256-GCM encrypt/decrypt (Task 2); ML-KEM-1024 wrap/unwrap (Task 3);
     KEM-DEM envelope seal-payload/open-payload + make-record-aad (Task 4);
     pluggable key-provider vtable + file-based ML-KEM-1024 provider (Task 5).")
   (:export
    #:dare-available-p
+   ;; ADR 0123: which libcrypto was loaded, and whether the fail-closed loader accepted or rejected it
+   #:libcrypto-status
    #:sha-384
    #:hmac-sha256
    #:hkdf-sha384
