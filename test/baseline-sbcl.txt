@@ -1,0 +1,12 @@
+# ADR 0120 transitional failure baseline: SBCL, Linux x86_64.
+# Format: <test-name> <owning-WP> [note]   (test-name = the run-all-tests registry name), or
+#         thread-leak-check <owning-WP> <max-threads> [note]   (the ADR 0121 leaked dds-* thread bound;
+#         shrinks like a skip count: a run leaking more threads than <max-threads> FAILS).
+# Shrink-only: `make gate-verification` runs scripts/test-baseline.py shrink-only, which fails when this file
+# holds an entry, or a larger count, than ANY committed version of it held. Remove a line in the commit that
+# fixes it; never add one. Reassigning the owning WP is allowed.
+# Expires at the Phase 1 exit of docs/plans/2026-10-03-sbcl-allegro-full-ok.md: the file is then empty and
+# is deleted (ADR 0120 section 5). Check a run against it: make test-ratchet LISP=...
+#
+# Measured 2026-10-04 at 767c335, SBCL 2.2.9.debian, . scripts/openssl-env.sh (OpenSSL 3.5.9, 1 libcrypto
+# mapping): make test = 654 passed, 0 FAILED, 0 leaked threads. No entries.

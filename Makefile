@@ -27,7 +27,7 @@ BENCH_TIMEOUT ?= 7200
 RUN_TIMEOUT   ?= 24h
 RUN           := $(TIMEOUT) --foreground $(RUN_TIMEOUT)
 
-.PHONY: all build test build-sbcl build-allegro test-sbcl test-allegro gate-build gate-mem gate-pal gate-quit-lint gate-skip-lint gate-nocond gate-quickload gate-verification gate-drivers \
+.PHONY: all build test test-ratchet baseline-check build-sbcl build-allegro test-sbcl test-allegro gate-build gate-mem gate-pal gate-quit-lint gate-skip-lint gate-nocond gate-quickload gate-verification gate-drivers \
         build-all test-all gate-hotpath gate-types corpus fuzz wire interop \
         square-pub square-sub square-spy large-pub large-sub gated-sub corpus-capture \
         nokey-pub nokey-sub keyed-flat-pub keyed-flat-sub \
@@ -152,6 +152,17 @@ gate-quickload: ; ./scripts/gate-quickload.sh
 # long time: 36 of 201 records had drifted into unparseable CSV (Notes written unquoted, so its commas
 # became field separators — one record split into 79 fields) plus 2 empty records from stray bare LFs.
 gate-verification: ; ./scripts/gate-verification.sh
+
+# ADR 0120, the transitional Definition of Done (until the Phase 1 exit of the governing plan): a run may
+# fail only tests listed in test/baseline-<lisp>.txt and skip only what test/skip-baseline-<lisp>.txt lists.
+# test-ratchet runs the suite for LISP and checks its log; baseline-check checks an existing LOG.
+RATCHET_LOG ?= $(or $(TMPDIR),/tmp)/neodds-test-ratchet.log
+test-ratchet:
+	@case "$(LISP)" in *allegro*) l=allegro;; *sbcl*) l=sbcl;; \
+	  *) echo "test-ratchet: cannot tell which baseline LISP=$(LISP) uses (sbcl or allegro)" >&2; exit 2;; esac; \
+	$(MAKE) --no-print-directory test LISP=$(LISP) 2>&1 | tee $(RATCHET_LOG); \
+	python3 scripts/test-baseline.py check-run $$l $(RATCHET_LOG)
+baseline-check: ; python3 scripts/test-baseline.py check-run $(BASELINE_LISP) $(LOG)
 
 # Owner directive 2026-07-14 (NON-NEGOTIABLE): no Lisp conditions in the hot path; every condition handled
 # at latest at the toplevel DDS API. Annotation lint + asserts the receiver boundary handlers still exist.

@@ -1,0 +1,41 @@
+# ADR 0120 transitional failure baseline: AllegroCL 11.0 alisp (ADR 0124 D1), Linux x86_64.
+# Format: <test-name> <owning-WP> [note]   (test-name = the run-all-tests registry name), or
+#         thread-leak-check <owning-WP> <max-threads> [note]   (the ADR 0121 leaked dds-* thread bound;
+#         shrinks like a skip count: a run leaking more threads than <max-threads> FAILS).
+# Shrink-only: `make gate-verification` runs scripts/test-baseline.py shrink-only, which fails when this file
+# holds an entry, or a larger count, than ANY committed version of it held. Remove a line in the commit that
+# fixes it; never add one. Reassigning the owning WP is allowed.
+# Expires at the Phase 1 exit of docs/plans/2026-10-03-sbcl-allegro-full-ok.md: the file is then empty and
+# is deleted (ADR 0120 section 5). Check a run against it: make test-ratchet LISP=...
+#
+# Measured 2026-10-04 at 767c335, . scripts/openssl-env.sh (OpenSSL 3.5.9, 1 libcrypto mapping):
+# make test = 636 passed, 18 FAILED, 654 total, plus thread-leak-check (8 dds-* threads). The same 18 failed
+# in the last run of ADR 0125 section 6 on the same tree. Owners follow governing plan section 1 and Phase 1:
+# waits of 0.075 s or less return immediately on AllegroCL (WP-1.1 sleep; WP-1.2 where the wait is a
+# condition variable). On the 2026-10-03 tree an image with a sleep patch passed every timing entry below
+# (plan section 1: 643/646, the 3 left being non-timing).
+#
+# -- short waits (WP-1.1 / WP-1.2)
+log-runner WP-1.1 RUNNER-C1-GOT-OWN
+flow-pacing WP-1.1 FLOW-PACE-DELIVERED
+flow-multiwriter-rr WP-1.1 FLOW-RR-A-DELIVERED
+flow-multiwriter-onenode WP-1.1 ONENODE-WRITER-A-DRAINED
+flow-teardown WP-1.1 FLOW-TD-NO-WEDGE
+flow-edf-priority-e2e WP-1.1 SCHED-A-DELIVERED (EDF)
+app-ack-overdue WP-1.1 AAO-FIRED
+dcps-deadline-monitor WP-1.1 OFF-DEADLINE-FIRES
+dcps-autonomous-discovery WP-1.1 AUTO-MATCHED
+dcps-autonomous-lease-expiry WP-1.1 LEASE-MATCHED
+dcps-disabled-endpoint-silent WP-1.1 DIS-ENABLE-RELEASES
+typelookup-endpoints WP-1.1 TLE-TIMEOUT
+dcps-type-gate WP-1.1 TG4-TIMEOUT-MATCH (failed in 3 of the 4 full runs of 2026-10-04: ADR 0125 section 6 and this measurement; passed 1 of 4 in isolation with the arena lock, 0 of 4 without)
+durability-supervisor WP-1.1 SUP-REVIVED
+durability-dynamic-topic-discovery WP-1.1 DD-AUTO-SERVE-DYNC
+pvms-reliable-bootstrap WP-1.1 B never delivered the dropped DATA via HEARTBEAT/ACKNACK
+thread-leak-check WP-1.1 8 (max dds-* threads) first seen after durability-runner-lifecycle, durability-supervisor and dcps-autonomous-lease-expiry (ADR 0121 section 7)
+# -- intermittent: did not fail in this measurement; measured failing in other runs (cited per line)
+durability-microservice-reconnect-bare WP-1.1 MS-RECONB-RECOVERS: failed 1 of the 4 full runs of 2026-10-04 (ADR 0125 section 6); passed 3 of 3 in isolation
+dcps-read-status-reset WP-1.1 RESET-BIT-BEFORE: 150 x (sleep 0.02) match wait; 24/270 (8.9 %) isolated runs at e6956e7 (ADR 0121 section 7)
+# -- not timing
+typelookup-server WP-1.5 TLS-INDEX-HIT: %tl-hash-index iteration order (plan WP-1.5)
+rti-shmem-recognition WP-1.3 NIL/:SHMAT-FAILED: shmget's -1 comes back as 4294967295 (no :int sign extension), so (minusp id) misses it and shmat fails instead (src/dds-pal/pal-net.lisp, sysv-shm attach)

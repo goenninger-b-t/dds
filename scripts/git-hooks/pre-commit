@@ -3,13 +3,22 @@
 # before every commit, so the SBOM is always current (the operating contract §5.2).
 # Activate once per clone:  git config core.hooksPath scripts/git-hooks   (or: make hooks)
 # Bypass:  SKIP_SBOM=1 git commit ...   |   git commit --no-verify
+#
+# It first refuses a commit whose ADR 0120 transitional test baselines (test/baseline-<lisp>.txt,
+# test/skip-baseline-<lisp>.txt), as STAGED, GREW against any committed version: a commit is also a push, so the
+# shrink-only rule has to hold before the commit exists, not at the next `make gate-verification`.
+# SKIP_SBOM does not bypass this check; only `git commit --no-verify` does.
 set -euo pipefail
-[ "${SKIP_SBOM:-0}" = "1" ] && exit 0
 cd "$(git rev-parse --show-toplevel)"
 if ! command -v python3 >/dev/null 2>&1; then
-  echo "pre-commit: python3 not found — cannot regenerate sbom.spdx.json (SKIP_SBOM=1 to bypass)." >&2
+  echo "pre-commit: python3 not found — cannot check the ADR 0120 baselines or regenerate sbom.spdx.json." >&2
   exit 1
 fi
+if ! python3 scripts/test-baseline.py shrink-only --staged; then
+  echo "pre-commit: an ADR 0120 test baseline is malformed or grew (see above). Baselines only shrink." >&2
+  exit 1
+fi
+[ "${SKIP_SBOM:-0}" = "1" ] && exit 0
 if ! python3 scripts/generate-sbom.py; then
   echo "pre-commit: SBOM generation failed (SKIP_SBOM=1 or 'git commit --no-verify' to bypass)." >&2
   exit 1

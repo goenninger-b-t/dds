@@ -1,0 +1,51 @@
+# ADR 0120 transitional skip baseline: AllegroCL 11.0 alisp (ADR 0124 D1), Linux x86_64.
+# Format: <capability> <test-name> <max-events> <owning-WP> [note]
+#   capability = a keyword of dds.tests:*skip-capabilities* (ADR 0122) without the colon;
+#   test-name  = the test the event is charged to, or <no test>; max-events = events allowed in that test.
+# Shrink-only: `make gate-verification` runs scripts/test-baseline.py shrink-only, which fails when this file
+# holds an entry, or a larger count, than ANY committed version of it held. Remove a line in the commit that
+# fixes it; never add one. Reassigning the owning WP is allowed.
+# Expires at the Phase 1 exit of docs/plans/2026-10-03-sbcl-allegro-full-ok.md: the file is then empty and
+# is deleted (ADR 0120 section 5). Check a run against it: make test-ratchet LISP=...
+#
+# Measured 2026-10-04 at 767c335, . scripts/openssl-env.sh (OpenSSL 3.5.9): coverage 603 FULL, 15 PARTIAL,
+# 18 SKIPPED, 18 FAILED; 51 skip events (alloc-counter 20, zc-sap-primitives 18, static-vector-p 11,
+# subprocess-mode 2; openssl-pqc, libcrypto and every other capability 0).
+#
+# -- alloc-counter: dds.pal:bytes-consed is the constant 0 on AllegroCL (WP-1.13)
+alloc-counter flatdata-zerocopy 1 WP-1.13
+alloc-counter flatdata-zc-loan-e2e 1 WP-1.13
+alloc-counter flatdata-zero-alloc 1 WP-1.13
+alloc-counter durability-microservice-huge-declared 1 WP-1.13
+alloc-counter security-gmac-payload 1 WP-1.13
+alloc-counter secured-decode-loan-alloc 1 WP-1.13
+alloc-counter secured-live-zeroalloc 3 WP-1.13
+alloc-counter secured-submsg-exhaust-passthrough 1 WP-1.13
+alloc-counter security-secured-region-into 1 WP-1.13
+alloc-counter rtps-protection-zeroalloc 2 WP-1.13
+alloc-counter user-submessage-protection-zeroalloc 1 WP-1.13
+alloc-counter secured-dataplane-mem 6 WP-1.13
+# -- zc-sap-primitives: Zero-Copy / FlatData SAP primitives gated on pal-impl-name :sbcl (WP-1.15)
+zc-sap-primitives flatdata-zc-loan-stress 1 WP-1.15
+zc-sap-primitives property-based 1 WP-1.15 the loan-acquire fuzz arm
+zc-sap-primitives n-reader-2c3-zc-uaf 1 WP-1.15
+zc-sap-primitives n-reader-2c3-zc-refcount-leak 1 WP-1.15
+zc-sap-primitives zc-pool-loan 1 WP-1.15
+zc-sap-primitives zc-loan-acquire 1 WP-1.15
+zc-sap-primitives zc-reclaim-skips-loaned 1 WP-1.15
+zc-sap-primitives zc-release-idempotent 1 WP-1.15
+zc-sap-primitives zc-loan-nofreelist 1 WP-1.15
+zc-sap-primitives zc-lockfree-acquire 1 WP-1.15
+zc-sap-primitives zc-lockfree-release 1 WP-1.15
+zc-sap-primitives zc-lockfree-release-biggen 1 WP-1.15
+zc-sap-primitives zc-lockfree-stress 1 WP-1.15
+zc-sap-primitives flatdata-sap-getter 1 WP-1.15
+zc-sap-primitives flatdata-sap-setter 1 WP-1.15
+zc-sap-primitives flatdata-view-accessor 1 WP-1.15
+zc-sap-primitives loan-write-primitive 1 WP-1.15
+zc-sap-primitives loan-write-abort 1 WP-1.15
+# -- subprocess-mode: the durability service's :process mode is gated off on AllegroCL (WP-1.16)
+subprocess-mode durability-process-smoke 1 WP-1.16
+subprocess-mode durability-process-persistent-refuse 1 WP-1.16
+# -- static-vector-p cannot tell a GC-heap array from foreign memory on AllegroCL (WP-1.19)
+static-vector-p security-keymaterial-harden 11 WP-1.19 4 arms, one inside an 8-iteration loop

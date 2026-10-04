@@ -91,6 +91,42 @@ FULL = ran with no skip; PARTIAL = passed but skipped at least one arm; SKIPPED 
 FAILED = failed (whatever it skipped). **Step 1 is report-only: skips do not change the exit code.** Step 2
 (WP-0.10, with the ADR 0120 skip baseline) will fail a run on a skip that is not in the baseline.
 
+### The transitional ratchet: known failures and skips, listed and owned (ADR 0120)
+
+Until the Phase 1 exit of the governing plan, AllegroCL still has known failures (short waits return
+immediately there, WP-1.1) and known skips (no allocation counter, WP-1.13; Zero-Copy SAP primitives gated
+off, WP-1.15; …). Instead of ignoring them, each one is a line in a committed file with the work package
+that owns it:
+
+| File | Line format |
+|---|---|
+| `test/baseline-<lisp>.txt` | `<test-name> <owning-WP> [note]`, and `thread-leak-check <owning-WP> <max-threads> [note]` for the leaked-thread bound |
+| `test/skip-baseline-<lisp>.txt` | `<capability> <test-name> <max-events> <owning-WP> [note]` |
+
+The rule for every commit: **a run may not fail a test, or skip, beyond what these files list**, and the
+files **only shrink**. The SBCL files are empty (measured with the pinned OpenSSL), so on SBCL the rule is
+already zero/zero.
+
+```sh
+. scripts/openssl-env.sh
+make test-ratchet LISP=./scripts/with-allegro.sh   # runs make test, then checks its log
+make baseline-check BASELINE_LISP=allegro LOG=/path/to/make-test.log   # check a log you already have
+make gate-verification                             # includes: no baseline grew against ANY committed version
+```
+
+`test-ratchet` prints the entries that did **not** fire in this run; when you fix one, delete its line in
+the same commit. Adding a line is never the fix: `gate-verification` compares the file with every version
+ever committed (not only `HEAD`), so re-adding a removed entry, raising a skip count or the leaked-thread
+bound, or re-creating a deleted baseline all fail. The pre-commit hook (`make hooks`) runs the same check on
+the staged copy (`test-baseline.py shrink-only --staged`), so such a commit is refused before it exists. The
+log check fails closed: a log whose failures it cannot name and count against the run's own totals (no
+`FAILURES` block, no `RUN-ALL-TESTS` line, counts that disagree) is rejected, never read as "no new
+failure". The checker proves all of this on a scratch repository and synthetic logs before every verdict
+(`python3 scripts/test-baseline.py self-test`). The ratchet is test-granular: a baselined test that fails on
+a different assertion is not seen (ADR 0120 §2.2 lists the known limits). A run the baseline accepts means "no new failure", not
+"green", and no milestone exit is declared while a baseline has entries (ADR 0127 §2). At the Phase 1 exit the
+files are deleted and the rule becomes zero/zero on both Lisps.
+
 ### OpenSSL 3.5 for the DARE and DDS-Security tests (ADR 0123)
 
 The CNSA-2.0 DARE and DDS-Security code needs **OpenSSL ≥ 3.5** (ML-KEM-1024). Linux distributions of this
