@@ -1,6 +1,7 @@
 # ADR 0102 — The arena grows in configurable chunks, up to a configurable maximum
 
 - **Status:** **Accepted** — owner requirement, implemented.
+- **Amended by:** ADR 0125 (2026-10-04, owner decision D29): this chunked growth is now the `:growable` arena mode; on real-time Linux `:auto` selects a `:fixed` arena that never grows.
 - **Date:** 2026-07-31
 - **Requirements at stake:** **FR-PF-7** (all hot-path memory from the arena), **NFR-MEM**, **NFR-DET**.
 - **Relates to:** ADR 0095 (the one process arena), **ADR 0101** (exhaustion rejects — this ADR is what

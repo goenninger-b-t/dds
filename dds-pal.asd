@@ -13,6 +13,8 @@
                ;; ADR 0123: dlopen/dlsym/dladdr/realpath on one named object, and the /proc/self/maps reader.
                ;; After pal-net, whose %SINT32 it uses for dladdr's :int return.
                (:file "pal-dl")
+               ;; ADR 0125 (D29): is the kernel real-time (PREEMPT_RT)? Two plain files, no conditional.
+               (:file "pal-rt")
                ;; ADR 0121: EXIT-PROCESS and the shutdown-hook chain. Last, because it registers the PAL's own
                ;; hook over the shm registry in pal-net and calls each backend's %HARD-EXIT.
                (:file "pal-exit"))

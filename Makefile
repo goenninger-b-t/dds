@@ -183,7 +183,9 @@ gate-mem: ; $(TIMEOUT) $(GATE_TIMEOUT) ./scripts/gate-mem.sh
 # that ONE process arena sized by *static-arena-bytes* actually bounds hot-path static memory, that a live
 # participant charges it, that a create/delete cycle RETURNS the charge (option (a) — the leak this design
 # exists to prevent), and that high-water < budget. FALSIFIES ITSELF on every run before asserting anything.
-gate-arena: ; $(TIMEOUT) $(GATE_TIMEOUT) ./scripts/gate-arena.sh
+# ADR 0125: also both arena modes — a forced-:fixed arena never grows under a real workload and refuses a
+# carve past its budget; a :growable one stops at *static-arena-max-bytes*. Runs on $(LISP) (SBCL or alisp).
+gate-arena: ; $(TIMEOUT) $(GATE_TIMEOUT) ./scripts/gate-arena.sh $(LISP)
 
 # THE CI PLATFORM, REACHABLE FROM THE DEV BOX. macOS/arm64 cannot see a whole class of defect this
 # stack has: uninitialized memory that only shows on the wire, a stack that only deadlocks under Linux

@@ -6,7 +6,10 @@
 
    Since ADR 0102 this is the STARTING budget, not the ceiling: a carve that does not fit grows the arena in
    *STATIC-ARENA-GROWTH-BYTES* chunks up to *STATIC-ARENA-MAX-BYTES*. Size this for the steady state and let
-   growth absorb the peaks; size *STATIC-ARENA-MAX-BYTES* for what the deployment can actually afford.")
+   growth absorb the peaks; size *STATIC-ARENA-MAX-BYTES* for what the deployment can actually afford.
+
+   Under *STATIC-ARENA-MODE* :FIXED (explicit, or :AUTO on real-time Linux; ADR 0125) this IS the ceiling:
+   the whole budget is reserved at init and never grows, so on a real-time deployment size it for the peak.")
 
 (defparameter *static-arena-growth-bytes* (* 8 1024 1024)
   "Chunk the arena grows by when a carve does not fit its current budget (ADR 0102, owner requirement
@@ -18,6 +21,9 @@
    ceiling stops being a meaningful operating signal. A chunk absorbs a burst in one move and leaves headroom
    that is visible in ARENA-BYTE-BUDGET. A carve LARGER than one chunk grows by as many chunks as it needs.
 
+   Read ONCE at init-arena (ADR 0125; it used to be read at every growth) and IGNORED in :FIXED mode
+   (*STATIC-ARENA-MODE*), where the arena never grows.
+
    Growth is pure ACCOUNTING — the arena is a budget, not a slab; every buffer is its own dds.pal:alloc-static
    region — so growing NEVER moves an existing carve and no live pointer is invalidated. That is what makes
    growth safe here and would not be true of a bump allocator over one contiguous block.")
@@ -28,7 +34,28 @@
 
    THIS is the number that bounds the process, and it is the one to set from what the deployment can afford.
    *STATIC-ARENA-BYTES* only decides how much is reserved before the first growth. Setting max EQUAL to the
-   initial budget restores the pre-ADR-0102 fixed-ceiling behaviour exactly.")
+   initial budget restores the pre-ADR-0102 fixed-ceiling behaviour exactly.
+
+   In :FIXED mode (*STATIC-ARENA-MODE*, ADR 0125) this is NOT consulted: the ceiling is the initial budget.")
+
+(defparameter *static-arena-mode* :auto
+  "How the process arena's budget may change after init (ADR 0125, owner decision D29 of 2026-10-04:
+   \"Arena chunked growth up to a configured upper limit. On RTL we have a fixed arena size.\").
+   Read ONCE at INIT-ARENA, like *STATIC-ARENA-BYTES*; rebinding afterwards has no effect until teardown.
+
+     :GROWABLE  ADR 0102: the budget starts at *STATIC-ARENA-BYTES* and a carve that does not fit grows it in
+                *STATIC-ARENA-GROWTH-BYTES* chunks up to *STATIC-ARENA-MAX-BYTES*.
+     :FIXED     the budget is *STATIC-ARENA-BYTES*, reserved in full at init, and NEVER changes: growth is
+                disabled and the ceiling equals the initial budget (*STATIC-ARENA-MAX-BYTES* and
+                *STATIC-ARENA-GROWTH-BYTES* are ignored). The determinism setting.
+     :AUTO      (default) :FIXED when the kernel is real-time Linux (PREEMPT_RT, detected by
+                dds.pal:real-time-kernel-p), else :GROWABLE. 'RTL = real-time Linux' is the ADR 0125
+                interpretation of the owner's wording, flagged there for owner confirmation.
+
+   Reaching the ceiling is :ARENA-EXHAUSTED -> RESOURCE_LIMITS in EVERY mode (ADR 0101), never a GC-heap
+   fallback. Any other value is a configuration error: the arena then runs :FIXED (the bounded choice) and
+   reports reason :INVALID-MODE in ARENA-REPORT, rather than signalling (ADR 0064) or silently growing.
+   The mode chosen and why are in ARENA-REPORT (:MODE, :MODE-REASON) and PROCESS-ARENA-STATUS.")
 
 ;; ARENA-EXHAUSTED (the condition) is GONE. Arena exhaustion is the ORDINARY, EXPECTED outcome NFR-MEM
 ;; demands be handled — RESOURCE_LIMITS or a documented allocating fallback, never a silent GC-heap
@@ -55,7 +82,12 @@
   ;; ROOT arena grows — a sub-arena is a charge account whose real budget is its parent's, so growth is
   ;; asked of the budget-holder (CHARGE-TO in make-buffer-pool), never of the sub-arena.
   (growths 0 :type fixnum)
-  (max-bytes 0 :type fixnum))
+  (max-bytes 0 :type fixnum)
+  ;; ADR 0125: the RESOLVED mode (never :AUTO), why it was chosen, and the growth chunk read once at init
+  ;; (0 under :FIXED). Only the budget-holder's values decide growth; a sub-arena copies them for reporting.
+  (mode :growable :type (member :growable :fixed))
+  (mode-reason :configured :type keyword)
+  (growth-bytes 0 :type fixnum))
 
 (defvar *process-arena* nil
   "THE process-wide static arena (ADR 0095), created on first use from *STATIC-ARENA-BYTES* and shared by
@@ -66,6 +98,12 @@
    component could answer 'has this process exceeded its static-memory budget?'. Rebinding this to NIL
    between runs is how a test gets a fresh budget; rebinding *STATIC-ARENA-BYTES* after the first carve has
    no effect, exactly as its own docstring says.")
+
+(defvar *process-arena-lock* (dds.pal:make-lock "dds-process-arena")
+  "Mutex serialising the first-use creation of *PROCESS-ARENA* in PROCESS-ARENA. Without it two
+   participants created concurrently on a cold process could each run INIT-ARENA (which, under
+   *STATIC-ARENA-MODE* :AUTO, reads two kernel files) and one arena — with every charge made against it —
+   would be lost. Internal; control plane only.")
 
 (defstruct* (buffer-pool (:constructor %make-buffer-pool))
   "Fixed-capacity pool of equal-size octet buffers carved from a static arena; pool-acquire/pool-release reuse them with zero per-acquisition allocation (NFR-MEM)."
@@ -86,18 +124,50 @@
 (defun* pool-high-water (pool)
     (function (buffer-pool) fixnum) "Peak in-use count seen for POOL (NFR-OBS / budget tracking)." (buffer-pool-high-water pool))
 
-(defun* init-arena (&key (bytes *static-arena-bytes*) (max-bytes *static-arena-max-bytes*))
-    (function (&key (:bytes (integer 0)) (:max-bytes (integer 0))) arena)
-  "Create the arena with an INITIAL BYTES budget and a MAX-BYTES ceiling it may grow to (ADR 0102; both read
-   once here, from *static-arena-bytes* / *static-arena-max-bytes*). Pools are carved via make-buffer-pool,
-   which grows the budget in *static-arena-growth-bytes* chunks when a carve does not fit.
+(defun* resolve-arena-mode (mode)
+    (function (t) (values (member :growable :fixed) keyword))
+  "(VALUES RESOLVED REASON) for a *STATIC-ARENA-MODE* value (ADR 0125). RESOLVED is :GROWABLE or :FIXED.
+   REASON: :CONFIGURED for an explicit :GROWABLE / :FIXED; for :AUTO the dds.pal:real-time-kernel-p source
+   (:SYSFS-REALTIME or :UTS-VERSION -> :FIXED; :NOT-REAL-TIME or :NOT-LINUX -> :GROWABLE); :INVALID-MODE for
+   any other value, which resolves to :FIXED — the bounded choice, reported, never a signal (ADR 0064).
+   Control plane: called once per INIT-ARENA."
+  (case mode
+    ((:growable :fixed) (values mode :configured))
+    (:auto (multiple-value-bind (rt source) (dds.pal:real-time-kernel-p)
+             (values (if rt :fixed :growable) source)))
+    (t (values :fixed :invalid-mode))))
+
+(defun* init-arena (&key (bytes *static-arena-bytes*) (max-bytes *static-arena-max-bytes*)
+                         (mode *static-arena-mode*) (growth-bytes *static-arena-growth-bytes*))
+    (function (&key (:bytes (integer 0)) (:max-bytes (integer 0)) (:mode t) (:growth-bytes integer)) arena)
+  "Create the arena with an INITIAL BYTES budget, a MAX-BYTES ceiling it may grow to and the GROWTH-BYTES
+   chunk it grows by (ADR 0102), under MODE (ADR 0125). All four are read ONCE here, from
+   *static-arena-bytes* / *static-arena-max-bytes* / *static-arena-mode* / *static-arena-growth-bytes*.
+   Pools are carved via make-buffer-pool, which grows the budget when a carve does not fit — in :GROWABLE
+   mode only.
+
+   :FIXED (explicit, :AUTO on a real-time kernel, or an invalid MODE): the whole BYTES budget is reserved
+   now, the ceiling is BYTES and the chunk is 0, so the budget never changes after this call. What is
+   reserved is the BUDGET: the arena is accounting, and each pool's static memory is allocated when it is
+   carved (ADR 0102 §2, ADR 0125 §3).
 
    MAX-BYTES below BYTES would make the initial reservation already over its own ceiling, so it is raised to
    BYTES — a ceiling under the floor is a configuration mistake, and silently honouring it would refuse the
-   very first carve for a reason the operator did not intend."
-  (declare (type (integer 0) bytes max-bytes))
-  (%make-arena :byte-budget bytes :bytes-used 0 :pools '() :initialized t
-               :max-bytes (max bytes max-bytes)))
+   very first carve for a reason the operator did not intend.
+
+   Every size is CLAMPED to [0, MOST-POSITIVE-FIXNUM] before it is stored (the arena's slots are fixnums).
+   A bignum setting is a configuration mistake no machine can honour anyway; clamping keeps this path
+   signal-free (ADR 0064) instead of raising a type error out of the slot store."
+  (declare (type (integer 0) bytes max-bytes) (type integer growth-bytes))
+  (let ((bytes (min bytes most-positive-fixnum))
+        (max-bytes (min max-bytes most-positive-fixnum))
+        (growth-bytes (max 0 (min growth-bytes most-positive-fixnum))))
+    (multiple-value-bind (resolved reason) (resolve-arena-mode mode)
+      (let ((fixed (eq resolved :fixed)))
+        (%make-arena :byte-budget bytes :bytes-used 0 :pools '() :initialized t
+                     :max-bytes (if fixed bytes (max bytes max-bytes))
+                     :growth-bytes (if fixed 0 growth-bytes)
+                     :mode resolved :mode-reason reason)))))
 
 (defun* %arena-grow-to-fit (arena want)
     (function (arena (integer 0)) t)
@@ -111,9 +181,12 @@
    waiting to happen, which is why this is written against the budget and not against a region.
 
    A chunk of 0 disables growth (the fixed-ceiling behaviour), and so does MAX-BYTES equal to the current
-   budget — both are legitimate configurations, not errors."
-  (let ((chunk *static-arena-growth-bytes*))
-    (when (or (<= chunk 0) (>= (arena-bytes-used arena) (arena-max-bytes arena)))
+   budget — both are legitimate configurations, not errors. A :FIXED arena (ADR 0125) never grows, whatever
+   its chunk and ceiling: the mode test comes first, so the guarantee does not rest on INIT-ARENA having
+   zeroed the chunk. The chunk is the one INIT-ARENA read, not the live special."
+  (let ((chunk (arena-growth-bytes arena)))
+    (when (or (eq (arena-mode arena) :fixed)
+              (<= chunk 0) (>= (arena-bytes-used arena) (arena-max-bytes arena)))
       (return-from %arena-grow-to-fit nil))
     (let* ((need (- (+ (arena-bytes-used arena) want) (arena-byte-budget arena))))
       (when (<= need 0) (return-from %arena-grow-to-fit t))   ; already fits; nothing to do
@@ -129,9 +202,15 @@
   "THE process-wide static arena (ADR 0095), created on first call with the *STATIC-ARENA-BYTES* budget and
    returned unchanged thereafter. Every participant sub-carves from it (MAKE-SUB-ARENA), so this one budget
    is what bounds all hot-path static memory in the image — the property FR-PF-7 asserts and that ten
-   independent per-pool arenas could not provide."
-  (or *process-arena*
-      (setf *process-arena* (init-arena))))
+   independent per-pool arenas could not provide.
+
+   Creation is serialised by *PROCESS-ARENA-LOCK*: two participants created concurrently on a cold process
+   must not each build an arena and lose one (with its charges). The lock is taken on every call, not only
+   the first — this runs once per participant/node creation (control plane, never per sample), and an
+   unlocked fast-path read would rest on memory-ordering assumptions the lock makes unnecessary."
+  (dds.pal:with-lock (*process-arena-lock*)
+    (or *process-arena*
+        (setf *process-arena* (init-arena)))))
 
 (defun* make-sub-arena (parent)
     (function (arena) arena)
@@ -146,7 +225,10 @@
    Its own BYTE-BUDGET is PARENT's, so a sub-carve is bounded by exactly the same ceiling; the sub-arena
    adds ownership and teardown, never a second limit."
   (%make-arena :byte-budget (arena-byte-budget parent) :bytes-used 0 :pools '()
-               :initialized t :parent parent :reserved 0))
+               :initialized t :parent parent :reserved 0
+               ;; ADR 0125: copied for reporting only; growth is decided by the PARENT's slots (CHARGE-TO).
+               :mode (arena-mode parent) :mode-reason (arena-mode-reason parent)
+               :max-bytes (arena-max-bytes parent) :growth-bytes 0))
 
 (defun* teardown-arena (arena)
     (function (arena) arena)
@@ -258,11 +340,32 @@
 
 (defun* arena-report (arena)
     (function (arena) list)
-  "Plist of reserved sizes per pool for startup logging (NFR-OBS)."
-  (list :byte-budget (arena-byte-budget arena)
+  "Status plist for ARENA (NFR-OBS), available ON QUERY — nothing in the stack logs it automatically; an
+   operator or a monitoring hook reads it (for the process arena: PROCESS-ARENA-STATUS). :MODE (:GROWABLE / :FIXED) and :MODE-REASON (RESOLVE-ARENA-MODE's
+   reason, ADR 0125), :BYTE-BUDGET, :BYTES-USED, :MAX-BYTES, :GROWTH-BYTES, :GROWTHS (ADR 0102), and :POOLS,
+   the reserved sizes and high-water per pool. For a sub-arena, mode, reason and ceiling are its parent's."
+  (list :mode (arena-mode arena)
+        :mode-reason (arena-mode-reason arena)
+        :byte-budget (arena-byte-budget arena)
         :bytes-used (arena-bytes-used arena)
+        :max-bytes (arena-max-bytes arena)
+        :growth-bytes (arena-growth-bytes arena)
+        :growths (arena-growths arena)
         :pools (mapcar (lambda (p)
                          (list :element-bytes (buffer-pool-element-bytes p)
                                :capacity (buffer-pool-capacity p)
                                :high-water (buffer-pool-high-water p)))
                        (arena-pools arena))))
+
+(defun* process-arena-status ()
+    (function () list)
+  "The process arena's state as a plist, or NIL when it has not been created yet (nothing has carved): the
+   same keys as ARENA-REPORT without :POOLS — :MODE, :MODE-REASON, :BYTE-BUDGET, :BYTES-USED, :MAX-BYTES,
+   :GROWTH-BYTES, :GROWTHS. The status an operator reads to see which arena mode was chosen and why
+   (ADR 0125) and how close the process is to its ceiling. Does not create the arena: a status query must
+   not perform the init it reports on. Control plane; conses a fresh plist per call."
+  (let ((a *process-arena*))
+    (when a
+      (let ((r (arena-report a)))
+        (remf r :pools)
+        r))))

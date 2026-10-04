@@ -540,6 +540,26 @@ The constants were read from the headers and are re-checked by `scripts/probes/d
 
 `dds.dare`'s loader is the first consumer; see [Getting started — OpenSSL 3.5](getting-started.md#openssl-35-for-the-dare-and-dds-security-tests-adr-0123).
 
+### Real-time kernel probe (ADR 0125)
+
+Whether the running kernel is real-time Linux (`CONFIG_PREEMPT_RT`). The arena uses it once, at init, when
+`*static-arena-mode*` is `:auto`: a real-time kernel gets a fixed arena ([CDR codec, buffers & the
+arena](cdr-and-memory.md)). Two plain files read with `open`, identical on both Lisps, no reader conditional,
+reads capped at 256 characters, never signals.
+
+| Symbol | Kind | Contract |
+|---|---|---|
+| `dds.pal:real-time-kernel-p` | function | `()` → `(values real-time-p source)`. `source` is `:sysfs-realtime` (`/sys/kernel/realtime` reads `1` — defined only in the PREEMPT_RT tree's `kernel/ksysfs.c`, under `CONFIG_PREEMPT_RT`), `:uts-version` (the kernel version string carries the token `PREEMPT_RT` — mainline `init/Makefile:30`, `:37`), `:not-real-time`, or `:not-linux`. Mainline kernels do not have `/sys/kernel/realtime`, which is why the version string is checked too. |
+| `dds.pal:classify-real-time-kernel` | function | `(linux-p sysfs-text uts-version)` → the same two values from given text: the pure decision, for tests. `PREEMPT_RT` must be a whole token (`PREEMPT_RTX` does not count); the sysfs text must start with the token `1`. |
+| `dds.pal:*rt-sysfs-path*` / `*rt-uts-version-path*` | special | `"/sys/kernel/realtime"` / `"/proc/sys/kernel/version"`. Specials so a test can point them at fixture files. |
+| `dds.pal:+rt-probe-max-chars+` | constant | `256`: the most characters read from either file (the UTS version is at most 64 bytes, `init/Makefile:35`). |
+
+```lisp
+(dds.pal:real-time-kernel-p)
+;; => NIL, :NOT-REAL-TIME   on a generic kernel ("#38~24.04.4-Ubuntu SMP PREEMPT_DYNAMIC ...")
+;; => T,   :UTS-VERSION     on a mainline PREEMPT_RT kernel ("#1 SMP PREEMPT_RT ...")
+```
+
 ## Examples
 
 Each block below is adapted from a passing test in `src/dds-tests/`.

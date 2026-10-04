@@ -3458,3 +3458,13 @@ neither emitted nor interpreted. Naming a field we have not identified is what A
   `cffi-20260101-git` sources, `src/cffi-sbcl.lisp:399-403` and `src/cffi-allegro.lisp:407-410` (MIT); nothing
   was copied.
 - No third-party code was copied into the repository.
+
+## 2026-10-04 — real-time kernel probe (ADR 0125, owner decision D29)
+
+- **`/sys/kernel/realtime`** semantics were read in `kernel/ksysfs.c` of the PREEMPT_RT stable tree
+  (`git.kernel.org/pub/scm/linux/kernel/git/rt/linux-stable-rt.git`, branches `v6.6-rt`, `v6.12-rt`,
+  `v6.19.3-rt1`; GPL-2.0), and its absence was confirmed in mainline `kernel/ksysfs.c` (torvalds/linux master,
+  7.3-rc5). The `PREEMPT_RT` token of the UTS version was read in mainline `init/Makefile:28-38` (GPL-2.0), and
+  `/proc/sys/kernel/version` in proc(5) on this host. Only the file names, the value `1` and the token
+  `PREEMPT_RT` are used, as interface facts; no kernel code was copied.
+- No third-party code was copied into the repository.

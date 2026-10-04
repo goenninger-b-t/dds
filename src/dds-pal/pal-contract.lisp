@@ -75,6 +75,10 @@
    ;; foreign-symbol-pointer ignores :library on both targets, so a pinned library needs these. Control plane.
    #:dl-open #:dl-sym #:dl-close #:dl-object-path #:real-path #:mapped-object-paths #:parse-mapped-object-paths
    #:+rtld-now+ #:+rtld-local+ #:+dl-info-size+ #:+dl-info-fname-offset+
+   ;; real-time kernel probe (ADR 0125, owner decision D29): PREEMPT_RT detection from /sys/kernel/realtime
+   ;; (PREEMPT_RT tree) and the UTS version token PREEMPT_RT (mainline). Control plane; read once at arena init.
+   #:real-time-kernel-p #:classify-real-time-kernel #:+rt-probe-max-chars+
+   #:*rt-sysfs-path* #:*rt-uts-version-path*
    ;; clock + process identity
    #:monotonic-ns #:realtime-ns #:process-id
    ;; UDPv4 sockets (native, FR-XPORT-1)

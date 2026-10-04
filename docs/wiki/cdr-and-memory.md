@@ -105,13 +105,19 @@ carved from it (NFR-MEM).
 |---|---|
 | `dds.core.arena:*static-arena-bytes*` | Master off-heap byte budget for all hot-path memory. Read **once** at `init-arena` (defaults to 64 MiB); rebinding afterwards has no effect until teardown. |
 | `dds.core.arena:arena` | The arena struct: a static off-heap region with a fixed byte budget; pools are carved from it. |
-| `dds.core.arena:init-arena` | One-shot constructor `(&key (bytes *static-arena-bytes*))`. Reads the budget once and returns a fresh arena. Production code does not call this — it uses `process-arena` + `make-sub-arena` (ADR 0095); tests still build standalone arenas with it. |
-| `dds.core.arena:process-arena` | **THE** process-wide arena, created on first call with the `*static-arena-bytes*` budget. Every participant sub-carves from it, so this one budget is what bounds all hot-path static memory in the image. Before [ADR 0095](../adr/0095-the-arena-is-an-accounting-fiction.md) there were **ten** independent per-pool arenas and `*static-arena-bytes*` was never read in production — the budget the requirement names bounded nothing. |
+| `dds.core.arena:*static-arena-growth-bytes*` | The chunk a carve-miss grows the budget by in **growable** mode (ADR 0102; default 8 MiB, `0` disables growth). Read once at `init-arena` (ADR 0125); ignored in fixed mode. |
+| `dds.core.arena:*static-arena-max-bytes*` | Hard ceiling of a **growable** arena (ADR 0102; default 256 MiB). Read once at `init-arena`; ignored in fixed mode, where the ceiling is `*static-arena-bytes*`. |
+| `dds.core.arena:*static-arena-mode*` | `:auto` (default) \| `:growable` \| `:fixed` (ADR 0125, owner decision D29). **Growable:** the budget starts at `*static-arena-bytes*` and grows in chunks up to `*static-arena-max-bytes*`. **Fixed:** the budget is `*static-arena-bytes*`, reserved at init, and never grows. **`:auto`:** fixed on real-time Linux (`dds.pal:real-time-kernel-p`), growable elsewhere. Read once at `init-arena`. Any other value runs fixed with reason `:invalid-mode`. Reaching the ceiling is `:arena-exhausted` → RESOURCE_LIMITS in both modes. |
+| `dds.core.arena:resolve-arena-mode` | `(mode)` → `(values :growable\|:fixed reason)`; reason is `:configured`, the kernel probe's source (`:sysfs-realtime`, `:uts-version`, `:not-real-time`, `:not-linux`) for `:auto`, or `:invalid-mode`. |
+| `dds.core.arena:init-arena` | One-shot constructor `(&key (bytes *static-arena-bytes*) (max-bytes *static-arena-max-bytes*) (mode *static-arena-mode*) (growth-bytes *static-arena-growth-bytes*))`. Reads all four once and returns a fresh arena; in fixed mode the ceiling is `bytes` and the chunk 0. Sizes above `most-positive-fixnum` are clamped to it rather than signalled (ADR 0064). Production code does not call this — it uses `process-arena` + `make-sub-arena` (ADR 0095); tests still build standalone arenas with it. |
+| `dds.core.arena:process-arena` | **THE** process-wide arena, created on first call with the `*static-arena-bytes*` budget. Creation is serialised by an internal lock, so participants created concurrently on a cold process share one arena. Every participant sub-carves from it, so this one budget is what bounds all hot-path static memory in the image. Before [ADR 0095](../adr/0095-the-arena-is-an-accounting-fiction.md) there were **ten** independent per-pool arenas and `*static-arena-bytes*` was never read in production — the budget the requirement names bounded nothing. |
 | `dds.core.arena:make-sub-arena` | `(parent)` — a participant's **charge account** against `PARENT`, not a pre-sized slab. Every carve charges the parent (so the parent's budget is the real ceiling) and is remembered; `teardown-arena` returns exactly that much. This is what makes a participant create/delete cycle **budget-neutral**: the arena is bump-allocated with no way to return an individual carve, so without it a long-running process that churns participants eventually cannot carve at all. Demand-grown rather than fixed, so no per-participant size has to be guessed. |
 | `dds.core.arena:arena-bytes-used` / `arena-reserved` / `arena-byte-budget` | The numbers `make gate-arena` asserts on: what the process has charged, what a sub-arena owes its parent, and the ceiling. |
 | `dds.core.arena:teardown-arena` | Free every pool's static buffers and mark the arena uninitialized. |
 | `dds.core.arena:arena-initialized-p` | True while the arena is live (between `init-arena` and `teardown-arena`). |
-| `dds.core.arena:arena-report` | Plist of byte budget, bytes used, and per-pool reserved sizes / high-water, for startup logging (NFR-OBS). |
+| `dds.core.arena:arena-report` | The arena status report (NFR-OBS), **available on query — nothing in the stack logs it automatically** (an operator or monitoring hook reads it; for the process arena use `process-arena-status`): plist of `:mode`, `:mode-reason` (ADR 0125), `:byte-budget`, `:bytes-used`, `:max-bytes`, `:growth-bytes`, `:growths`, and `:pools` (per-pool reserved sizes / high-water). |
+| `dds.core.arena:process-arena-status` | `()` → the process arena's `arena-report` without `:pools`, or NIL before the process arena exists (it does not create it). The status an operator reads for the chosen mode and the distance to the ceiling. |
+| `dds.core.arena:arena-mode` / `arena-mode-reason` / `arena-growth-bytes` / `arena-growths` / `arena-max-bytes` | Accessors: the resolved mode, why it was chosen, the chunk read at init, the growth count, the ceiling. A sub-arena reports its parent's mode, reason and ceiling. |
 | `dds.core.arena:make-buffer-pool` | `(arena element-bytes capacity)` — carve a fixed-capacity pool of `capacity` octet-buffers of `element-bytes` each, pre-allocated once. Returns `(values pool NIL)`, or `(values NIL :arena-exhausted)` when the carve does not fit the remaining budget — exhaustion is an ordinary expected **status**, not a condition (ADR 0064). Every caller must test it: the arena is stored only after the carve succeeds, so an unchecked `NIL` orphans it. |
 | `dds.core.arena:pool-acquire` | Pop a buffer from the pool. **Returns `NIL` on exhaustion** — the caller applies RESOURCE_LIMITS, never a GC-heap fallback. |
 | `dds.core.arena:pool-release` | Return a buffer to the pool. |
@@ -306,6 +312,34 @@ NameHash example: `MD5("color")[0:4]` = `70 dd a5 df`. (From `run-md5-test`.)
   growth would make every later carve another growth step and the ceiling would stop meaning anything) and is
   **counted** (`arena-growths`). Setting max equal to the initial budget, or the chunk to `0`, restores the old
   fixed-ceiling behaviour exactly.
+
+- **Growable or fixed: `*static-arena-mode*` (ADR 0125, owner decision D29).** The owner's directive:
+  *"Arena chunked growth up to a configured upper limit. On RTL we have a fixed arena size."* Off real-time
+  Linux the default `:auto` gives the growable arena above. On a `PREEMPT_RT` kernel it gives a **fixed** one:
+  the `*static-arena-bytes*` budget is reserved at init and never grows, and the max and chunk are ignored.
+  So on a real-time deployment, **size `*static-arena-bytes*` for the peak**. Force either mode with
+  `:growable` / `:fixed`. The kernel is classified by `dds.pal:real-time-kernel-p` from two sources read in
+  kernel source: `/sys/kernel/realtime` (PREEMPT_RT tree only, reads `1`) and the `PREEMPT_RT` token of
+  `/proc/sys/kernel/version` (mainline `init/Makefile`). The mainline kernel has no `/sys/kernel/realtime`,
+  so the file alone would miss a mainline RT kernel. What is fixed is the **budget**: the arena stays
+  accounting, and each pool's static memory is allocated when it is carved; there is no slab, pre-fault or
+  `mlock`. Reading "RTL" as `PREEMPT_RT` and the fixed size as `*static-arena-bytes*` are interpretations the
+  ADR flags for owner confirmation. `make gate-arena` (both Lisps) proves a forced-fixed arena never grows
+  under a real participant workload and refuses a carve one byte past its budget, and that a growable arena
+  stops at its ceiling.
+
+  ```lisp
+  ;; A fixed arena refuses what a growable one would grow into (adapted from run-arena-mode-test).
+  (let ((dds.core.arena:*process-arena* nil)
+        (dds.core.arena:*static-arena-mode* :fixed)
+        (dds.core.arena:*static-arena-bytes* 4096)
+        (dds.core.arena:*static-arena-max-bytes* (* 8 1024 1024)))
+    (let ((a (dds.core.arena:process-arena)))
+      (multiple-value-bind (pool status) (dds.core.arena:make-buffer-pool a 65536 4)
+        (assert (and (null pool) (eq status :arena-exhausted)))   ; RESOURCE_LIMITS, no growth
+        (assert (= 4096 (dds.core.arena:arena-byte-budget a))))
+      (getf (dds.core.arena:process-arena-status) :mode)))         ; => :FIXED
+  ```
 
 - **A `RETURN-FROM` that crosses a lock is not free, and its cost lands on the path that never takes it
   (ADR 0098).** `dds.pal:with-lock` expands to an `UNWIND-PROTECT`, and `HANDLER-CASE` installs a handler

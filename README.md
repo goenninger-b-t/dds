@@ -26,10 +26,12 @@ DDS is a peer-to-peer, brokerless pub/sub standard: applications declare **Topic
   `CacheChange`/`SampleInfo`, the engine's per-sample dispatch) is `defstruct` +
   monomorphized code generation + manual vtables — **no generic-function dispatch and no
   per-sample allocation**. A CI gate enforces the boundary.
-- **Static, non-GC'd memory on the hot path.** All hot-path buffers/pools are carved once at
-  startup from an off-heap arena sized by `*static-arena-bytes*`; steady state allocates
-  **zero** bytes per sample, and arena exhaustion maps to DDS `RESOURCE_LIMITS`, never a
-  silent GC-heap fallback.
+- **Static, non-GC'd memory on the hot path.** All hot-path buffers/pools are carved from an
+  off-heap arena whose budget is set at init from `*static-arena-bytes*`. By default the budget
+  may grow in configured chunks up to `*static-arena-max-bytes*`; on real-time Linux
+  (`PREEMPT_RT`) it is fixed at init and never grows (`*static-arena-mode*`, ADR 0125). Steady
+  state allocates **zero** bytes per sample, and reaching the arena's ceiling maps to DDS
+  `RESOURCE_LIMITS`, never a silent GC-heap fallback.
 - **Failures are returned, not signalled.** No Lisp condition is raised anywhere in the stack
   (ADR 0064): a fallible function returns `(values result status)`, callers propagate the
   status, and the public DDS API turns it into a `ReturnCode_t`. A malformed datagram can

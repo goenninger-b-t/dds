@@ -35,10 +35,15 @@
    "Static, startup-allocated, non-GC'd arena + fixed-capacity pools
     (IMPLEMENTATION-PLAN §7.7, REQUIREMENTS NFR-MEM). The home of
     *static-arena-bytes*, read ONCE at init-arena; later rebinding is a no-op
-    until teardown. pool-acquire returning NIL is the exhaustion signal — the
+    until teardown. *static-arena-mode* (ADR 0125) selects a budget that grows in
+    chunks up to *static-arena-max-bytes* (ADR 0102) or one that is fixed at init;
+    :auto fixes it on real-time Linux. pool-acquire returning NIL is the exhaustion signal — the
     engine maps it to RESOURCE_LIMITS, NEVER a GC-heap fallback.")
   (:export #:*static-arena-bytes* #:*static-arena-growth-bytes* #:*static-arena-max-bytes*
            #:arena-growths #:arena-max-bytes
+           ;; ADR 0125 (owner decision D29): growable vs fixed arena, :AUTO = fixed on real-time Linux
+           #:*static-arena-mode* #:resolve-arena-mode #:arena-mode #:arena-mode-reason #:arena-growth-bytes
+           #:process-arena-status
            #:arena #:init-arena #:teardown-arena
            #:*process-arena* #:process-arena #:make-sub-arena
            #:arena-byte-budget #:arena-bytes-used #:arena-reserved #:arena-pools

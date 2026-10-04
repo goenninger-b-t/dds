@@ -102,10 +102,14 @@
                     untouched, zero growths. A configuration, not an error.
      4 WHOLE CHUNKS — a carve just over the budget grows by a FULL chunk, not by the exact shortfall.
                     Exact-fit growth would make every later carve another growth step, so the budget would
-                    creep up one allocation at a time and the ceiling would stop being an operating signal."
+                    creep up one allocation at a time and the ceiling would stop being an operating signal.
+
+   Every arm pins *STATIC-ARENA-MODE* :GROWABLE (ADR 0125). Without it the default :AUTO resolves to :FIXED
+   on a real-time kernel and arms 1 and 4 would fail there for a reason that has nothing to do with growth."
   (let ((mib (* 1024 1024)))
     ;; 1 — GROWS
     (let ((dds.core.arena:*process-arena* nil)
+          (dds.core.arena:*static-arena-mode* :growable)   ; ADR 0125: ADR 0102 is the :GROWABLE mode
           (dds.core.arena:*static-arena-bytes* 4096)
           (dds.core.arena:*static-arena-growth-bytes* mib)
           (dds.core.arena:*static-arena-max-bytes* (* 8 mib)))
@@ -120,6 +124,7 @@
                   "the growth must be COUNTED, so it is observable rather than silent"))))
     ;; 2 — CEILING
     (let ((dds.core.arena:*process-arena* nil)
+          (dds.core.arena:*static-arena-mode* :growable)   ; ADR 0125: ADR 0102 is the :GROWABLE mode
           (dds.core.arena:*static-arena-bytes* 4096)
           (dds.core.arena:*static-arena-growth-bytes* mib)
           (dds.core.arena:*static-arena-max-bytes* 8192))
@@ -133,6 +138,7 @@
                   "the budget must never exceed the configured MAX"))))
     ;; 3 — DISABLABLE
     (let ((dds.core.arena:*process-arena* nil)
+          (dds.core.arena:*static-arena-mode* :growable)   ; ADR 0125: ADR 0102 is the :GROWABLE mode
           (dds.core.arena:*static-arena-bytes* 4096)
           (dds.core.arena:*static-arena-growth-bytes* 0)
           (dds.core.arena:*static-arena-max-bytes* (* 8 mib)))
@@ -144,6 +150,7 @@
                   "chunk 0 must restore the fixed-ceiling behaviour exactly (refused, budget untouched)"))))
     ;; 4 — WHOLE CHUNKS
     (let ((dds.core.arena:*process-arena* nil)
+          (dds.core.arena:*static-arena-mode* :growable)   ; ADR 0125: ADR 0102 is the :GROWABLE mode
           (dds.core.arena:*static-arena-bytes* 4096)
           (dds.core.arena:*static-arena-growth-bytes* mib)
           (dds.core.arena:*static-arena-max-bytes* (* 64 mib)))
@@ -152,6 +159,203 @@
         (%check :arena-grow-whole-chunks (= (dds.core.arena:arena-byte-budget a) (+ 4096 mib))
                 (format nil "growth must take a WHOLE chunk, not the exact shortfall (budget ~a, expected ~a)"
                         (dds.core.arena:arena-byte-budget a) (+ 4096 mib))))))
+  t)
+
+(defun* run-arena-mode-test ()
+    (function () (eql t))
+  "ADR 0125 (owner decision D29, 2026-10-04): the arena is GROWABLE up to a configured ceiling by default and
+   FIXED on real-time Linux; *STATIC-ARENA-MODE* (:AUTO / :GROWABLE / :FIXED) overrides the detection.
+
+   Each arm can fail, and the CONTRAST arm is what proves the FIXED arms test the mode rather than the
+   numbers: the identical configuration under :GROWABLE grows and carves, so a refusal under :FIXED is the
+   mode's doing.
+     1 FIXED NEVER GROWS — 4 KiB initial, 8 MiB max, 1 MiB chunk: a 256 KiB carve is REFUSED with
+                          :ARENA-EXHAUSTED; budget stays 4096, ceiling is 4096, zero growths, chunk 0.
+                          1b: an arena marked :FIXED that still carries a chunk and a high ceiling does
+                          not grow either, so the guarantee is the mode test, not only INIT-ARENA's zeroing.
+     2 CONTRAST          — the same numbers under :GROWABLE: the carve succeeds and the budget grew.
+     3 FIXED, SUB-ARENA  — a carve through a participant-style sub-arena of a :FIXED root is refused and the
+                          ROOT did not grow (growth is asked of the budget-holder, ADR 0102 §2).
+     4 FIXED STILL CARVES — within the budget a :FIXED arena carves normally, and a later carve past it is
+                          refused, the budget unchanged throughout.
+     5 AUTO FOLLOWS THE KERNEL — :AUTO resolves to :FIXED iff dds.pal:real-time-kernel-p says so, with that
+                          probe's source as the reason.
+     6 INVALID MODE      — an unknown value runs :FIXED with reason :INVALID-MODE (bounded, reported).
+                          6b: OVERSIZE settings (bignum budget/ceiling/chunk, negative chunk) are clamped
+                          to the arena's fixnum slots, never signalled (ADR 0064).
+     7 READ ONCE         — rebinding *STATIC-ARENA-MODE* after the process arena exists changes nothing, and
+                          PROCESS-ARENA-STATUS reports the mode chosen at init (NIL before init).
+     8 PAL CLASSIFIER    — every branch of dds.pal:classify-real-time-kernel on fixture text, including the
+                          near-misses PREEMPT_RTX / PREEMPT_DYNAMIC / a sysfs file reading 0, and the
+                          bounded read of an over-long probe file through *RT-SYSFS-PATH*."
+  (let ((mib (* 1024 1024)))
+    (flet ((fresh (mode thunk)
+             (let ((dds.core.arena:*process-arena* nil)
+                   (dds.core.arena:*static-arena-mode* mode)
+                   (dds.core.arena:*static-arena-bytes* 4096)
+                   (dds.core.arena:*static-arena-growth-bytes* mib)
+                   (dds.core.arena:*static-arena-max-bytes* (* 8 mib)))
+               (let ((a (dds.core.arena:process-arena)))
+                 (unwind-protect (funcall thunk a)
+                   (dds.core.arena:teardown-arena a))))))   ; idempotent; frees what an arm carved
+      ;; 1 — FIXED NEVER GROWS
+      (fresh :fixed
+             (lambda (a)
+               (multiple-value-bind (pool status) (dds.core.arena:make-buffer-pool a 65536 4)
+                 (%check :arena-mode-fixed-refuses (and (null pool) (eq status :arena-exhausted))
+                         (format nil "a :FIXED arena must REFUSE a carve over its budget, not grow (got ~a/~a)"
+                                 (if pool "pool" "nil") status))
+                 (%check :arena-mode-fixed-no-growth
+                         (and (= 4096 (dds.core.arena:arena-byte-budget a))
+                              (= 4096 (dds.core.arena:arena-max-bytes a))
+                              (zerop (dds.core.arena:arena-growths a))
+                              (zerop (dds.core.arena:arena-growth-bytes a)))
+                         (format nil "a :FIXED arena's budget must never change (budget ~d, max ~d, growths ~d, chunk ~d)"
+                                 (dds.core.arena:arena-byte-budget a) (dds.core.arena:arena-max-bytes a)
+                                 (dds.core.arena:arena-growths a) (dds.core.arena:arena-growth-bytes a)))
+                 (let ((r (dds.core.arena:arena-report a)))
+                   (%check :arena-mode-fixed-reported
+                           (and (eq (getf r :mode) :fixed) (eq (getf r :mode-reason) :configured))
+                           (format nil "the arena report must name the mode and why (~s)" r))))))
+      ;; 1b — the MODE itself refuses growth, not only the zeroed chunk/ceiling INIT-ARENA installs: an arena
+      ;; marked :FIXED but carrying a live chunk and a high ceiling must still not grow (%arena-grow-to-fit's
+      ;; first test). Built directly, because INIT-ARENA can never produce this combination.
+      (let ((a (dds.core.arena::%make-arena :byte-budget 4096 :initialized t :mode :fixed
+                                            :mode-reason :configured :growth-bytes mib :max-bytes (* 8 mib))))
+        (multiple-value-bind (pool status) (dds.core.arena:make-buffer-pool a 65536 4)
+          (%check :arena-mode-fixed-guard
+                  (and (null pool) (eq status :arena-exhausted) (= 4096 (dds.core.arena:arena-byte-budget a)))
+                  (format nil "the :FIXED mode test must refuse growth even with a live chunk and ceiling (got ~a/~a, budget ~d)"
+                          (if pool "pool" "nil") status (dds.core.arena:arena-byte-budget a))))
+        (dds.core.arena:teardown-arena a))
+      ;; 2 — CONTRAST: the same numbers, growable
+      (fresh :growable
+             (lambda (a)
+               (multiple-value-bind (pool status) (dds.core.arena:make-buffer-pool a 65536 4)
+                 (%check :arena-mode-growable-contrast
+                         (and pool (null status) (> (dds.core.arena:arena-byte-budget a) 4096)
+                              (eq (dds.core.arena:arena-mode a) :growable))
+                         (format nil "CONTRAST: the same carve under :GROWABLE must succeed by growing (got ~a/~a, budget ~d)"
+                                 (if pool "pool" "nil") status (dds.core.arena:arena-byte-budget a))))))
+      ;; 3 — FIXED through a sub-arena
+      (fresh :fixed
+             (lambda (a)
+               (let ((sub (dds.core.arena:make-sub-arena a)))
+                 (multiple-value-bind (pool status) (dds.core.arena:make-buffer-pool sub 65536 4)
+                   (%check :arena-mode-fixed-sub-refuses
+                           (and (null pool) (eq status :arena-exhausted)
+                                (= 4096 (dds.core.arena:arena-byte-budget a))
+                                (zerop (dds.core.arena:arena-growths a))
+                                (eq (dds.core.arena:arena-mode sub) :fixed))
+                           (format nil "a sub-arena of a :FIXED root must be refused and the root must not grow (got ~a/~a, root budget ~d)"
+                                   (if pool "pool" "nil") status (dds.core.arena:arena-byte-budget a))))
+                 (dds.core.arena:teardown-arena sub))))
+      ;; 4 — FIXED still carves within its budget
+      (fresh :fixed
+             (lambda (a)
+               (multiple-value-bind (p1 s1) (dds.core.arena:make-buffer-pool a 1024 2)
+                 (multiple-value-bind (p2 s2) (dds.core.arena:make-buffer-pool a 1024 4)
+                   (%check :arena-mode-fixed-carves-within
+                           (and p1 (null s1) (null p2) (eq s2 :arena-exhausted)
+                                (= 2048 (dds.core.arena:arena-bytes-used a))
+                                (= 4096 (dds.core.arena:arena-byte-budget a)))
+                           (format nil "a :FIXED arena must carve within its budget and refuse past it (~a/~a then ~a/~a, used ~d)"
+                                   (if p1 "pool" "nil") s1 (if p2 "pool" "nil") s2
+                                   (dds.core.arena:arena-bytes-used a)))))
+               (dds.core.arena:teardown-arena a))))
+    ;; 5 — AUTO follows the kernel probe
+    (multiple-value-bind (rt source) (dds.pal:real-time-kernel-p)
+      (multiple-value-bind (mode reason) (dds.core.arena:resolve-arena-mode :auto)
+        (%check :arena-mode-auto-follows-kernel
+                (and (eq mode (if rt :fixed :growable)) (eq reason source))
+                (format nil ":AUTO must resolve to :FIXED iff the kernel is real-time (probe ~a/~a, resolved ~a/~a)"
+                        rt source mode reason))))
+    ;; 6 — INVALID mode is bounded and reported
+    (multiple-value-bind (mode reason) (dds.core.arena:resolve-arena-mode :elastic)
+      (%check :arena-mode-invalid-is-fixed (and (eq mode :fixed) (eq reason :invalid-mode))
+              (format nil "an unknown mode must run :FIXED with reason :INVALID-MODE (got ~a/~a)" mode reason)))
+    ;; 6b — OVERSIZE settings are clamped to the fixnum slots, never signalled (ADR 0064, ADR 0125 §5): a
+    ;; bignum budget / ceiling / chunk and a negative chunk build an arena instead of raising a type error.
+    ;; Accounting only — nothing is allocated, so the huge numbers cost nothing.
+    (let ((a (handler-case (dds.core.arena:init-arena :bytes (1+ most-positive-fixnum)
+                                                      :max-bytes (* 2 most-positive-fixnum)
+                                                      :growth-bytes (expt 2 70) :mode :growable)
+               (error (e) e)))
+          (b (handler-case (dds.core.arena:init-arena :bytes 4096 :max-bytes 8192 :growth-bytes -5
+                                                      :mode :growable)
+               (error (e) e))))
+      (%check :arena-mode-oversize-clamped
+              (and (typep a 'dds.core.arena:arena)
+                   (= most-positive-fixnum (dds.core.arena:arena-byte-budget a))
+                   (= most-positive-fixnum (dds.core.arena:arena-max-bytes a))
+                   (= most-positive-fixnum (dds.core.arena:arena-growth-bytes a))
+                   (typep b 'dds.core.arena:arena)
+                   (zerop (dds.core.arena:arena-growth-bytes b)))
+              (format nil "oversize / negative arena settings must clamp, not signal (got ~a / ~a)" a b))
+      (when (typep a 'dds.core.arena:arena) (dds.core.arena:teardown-arena a))
+      (when (typep b 'dds.core.arena:arena) (dds.core.arena:teardown-arena b)))
+    ;; 7 — READ ONCE, and the status
+    (let ((dds.core.arena:*process-arena* nil)
+          (dds.core.arena:*static-arena-mode* :growable)
+          (dds.core.arena:*static-arena-bytes* 4096)
+          (dds.core.arena:*static-arena-growth-bytes* mib)
+          (dds.core.arena:*static-arena-max-bytes* (* 8 mib)))
+      (%check :arena-mode-status-before-init (null (dds.core.arena:process-arena-status))
+              "PROCESS-ARENA-STATUS must be NIL, and must not create the arena, before anything carved")
+      (let ((a (dds.core.arena:process-arena)))
+        (let ((dds.core.arena:*static-arena-mode* :fixed))
+          (multiple-value-bind (pool status) (dds.core.arena:make-buffer-pool a 65536 4)
+            (%check :arena-mode-read-once
+                    (and pool (null status) (eq (dds.core.arena:arena-mode a) :growable))
+                    (format nil "rebinding the mode after init must have no effect (got ~a/~a, mode ~a)"
+                            (if pool "pool" "nil") status (dds.core.arena:arena-mode a)))))
+        (let ((st (dds.core.arena:process-arena-status)))
+          (%check :arena-mode-status
+                  (and (eq (getf st :mode) :growable) (eq (getf st :mode-reason) :configured)
+                       (= (getf st :growths) 1) (eq (getf st :pools 'absent) 'absent)
+                       (eql (getf st :byte-budget) (dds.core.arena:arena-byte-budget a)))
+                  (format nil "PROCESS-ARENA-STATUS must report the init-time mode and the growth (~s)" st)))
+        (dds.core.arena:teardown-arena a))))
+  ;; 8 — the PAL classifier, every branch
+  (flet ((cls (linux sys uts) (multiple-value-list (dds.pal:classify-real-time-kernel linux sys uts))))
+    (loop for (linux sys uts want) in
+          '((nil "1" "#1 SMP PREEMPT_RT x" (nil :not-linux))
+            (t "1" nil (t :sysfs-realtime))
+            (t "  1 " nil (t :sysfs-realtime))
+            (t "0" "#1 SMP PREEMPT_DYNAMIC x" (nil :not-real-time))
+            (t "10" nil (nil :not-real-time))
+            (t nil "#1 SMP PREEMPT_RT Mon Sep 14 16:37:11 UTC 2026" (t :uts-version))
+            (t "0" "#1 SMP PREEMPT_RT x" (t :uts-version))
+            (t nil "#1 SMP PREEMPT_RTX x" (nil :not-real-time))
+            (t nil "#38~24.04.4-Ubuntu SMP PREEMPT_DYNAMIC Mon Sep 14 16:37:11 UTC 2" (nil :not-real-time))
+            (t nil "" (nil :not-real-time))
+            (t nil nil (nil :not-real-time)))
+          for got = (cls linux sys uts)
+          do (%check :arena-mode-pal-classifier (equal got want)
+                     (format nil "classify-real-time-kernel ~s ~s ~s: got ~s, want ~s" linux sys uts got want))))
+  ;; the real probe reads a fixture through *RT-SYSFS-PATH*, bounded
+  (when (member :linux *features*)
+    (let ((path (merge-pathnames (format nil "dds-rt-probe-~d.txt" (dds.pal:process-id))
+                                 (uiop:temporary-directory))))
+      (unwind-protect
+           (progn
+             (with-open-file (o path :direction :output :if-exists :supersede)
+               (write-string "1" o)
+               (loop repeat 10000 do (write-char #\Space o)))
+             (let ((dds.pal:*rt-sysfs-path* (namestring path)))
+               (multiple-value-bind (rt source) (dds.pal:real-time-kernel-p)
+                 (%check :arena-mode-pal-fixture (and rt (eq source :sysfs-realtime))
+                         (format nil "a sysfs fixture reading 1 must be detected (got ~a/~a)" rt source)))
+               (%check :arena-mode-pal-bounded
+                       (= dds.pal:+rt-probe-max-chars+
+                          (length (dds.pal::read-rt-probe-file (namestring path))))
+                       "the probe read must be bounded by +RT-PROBE-MAX-CHARS+"))
+             (let ((dds.pal:*rt-sysfs-path* "/nonexistent/dds-rt-probe"))
+               (multiple-value-bind (rt source) (dds.pal:real-time-kernel-p)
+                 (%check :arena-mode-pal-absent-file
+                         (or (eq source :uts-version) (and (null rt) (eq source :not-real-time)))
+                         (format nil "an absent sysfs file must fall through to the UTS check (got ~a/~a)" rt source)))))
+        (ignore-errors (delete-file path)))))
   t)
 
 (defun* run-arena-exhaustion-test ()
